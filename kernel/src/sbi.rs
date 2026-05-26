@@ -1,12 +1,28 @@
-//! SBI console output and system control wrappers.
+//! Console output and system control.
 //!
-//! Uses the modern DBCN (Debug Console) extension instead of legacy SBI calls.
+//! Uses direct UART MMIO for console output (works on all SBI versions)
+//! and SBI standard calls for system reset and timer.
 
-use sbi_rt::{NoReason, Shutdown, console_write_byte, system_reset};
+use sbi_rt::{NoReason, Shutdown, system_reset};
 
-/// Write a single byte to the debug console (blocking).
+/// Write a single byte to UART0 (0x10000000) via MMIO.
+///
+/// This bypasses SBI entirely and writes directly to the UART hardware,
+/// ensuring compatibility with all SBI versions (1.0, 2.0, etc.).
 pub fn console_putchar(c: u8) {
-    console_write_byte(c);
+    const UART0_BASE: usize = 0x1000_0000;
+    const UART_LSR: usize = 5;
+    const UART_THR: usize = 0;
+    const LSR_TX_EMPTY: u8 = 0x20;
+
+    let base = UART0_BASE;
+    // Wait until TX buffer is empty
+    while unsafe { core::ptr::read_volatile((base + UART_LSR) as *const u8) } & LSR_TX_EMPTY == 0 {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        core::ptr::write_volatile((base + UART_THR) as *mut u8, c);
+    }
 }
 
 /// Shutdown the system via SBI system reset.
@@ -15,10 +31,13 @@ pub fn shutdown() -> ! {
     loop {}
 }
 
-/// Print a raw byte string to the debug console.
+/// Print a raw byte string to the console.
 pub fn print(s: &str) {
     for byte in s.bytes() {
-        console_write_byte(byte);
+        if byte == b'\n' {
+            console_putchar(b'\r');
+        }
+        console_putchar(byte);
     }
 }
 
