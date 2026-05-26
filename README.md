@@ -1,97 +1,242 @@
 # KarteOS
 
-A modern RISC-V operating system written in Rust.
+<p align="center">
+  <strong>A modern RISC-V 64-bit operating system written in Rust</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/target-riscv64gc-blue" />
+  <img src="https://img.shields.io/badge/edition-2024-orange" />
+  <img src="https://img.shields.io/badge/platform-QEMU%20virt-green" />
+  <img src="https://img.shields.io/badge/license-MIT-informational" />
+</p>
+
+---
+
+## Overview
+
+KarteOS is a from-scratch operating system targeting **RISC-V 64-bit** (RV64GC), built entirely in Rust 2024 Edition. It runs on QEMU's `virt` machine and leverages OpenSBI as the M-mode firmware layer.
+
+**2512+ lines** of Rust and RISC-V assembly implementing a full OS stack: boot, memory management, virtual memory, trap handling, device drivers, filesystem, networking, system calls, multi-tasking, and SMP multi-core support.
 
 ## Features
 
-- **RISC-V 64-bit** (RV64GC) support, running on QEMU `virt` machine
-- **Rust 2024 Edition** with modern language features
-- **S-mode kernel** running on top of OpenSBI
-- **Sv39 virtual memory** with 3-level page tables
-- **Physical memory manager** using bitmap frame allocator
-- **Kernel heap** via buddy system allocator
-- **Trap handling** framework with timer interrupts
-- **PLIC driver** for external interrupt control
-- **UART driver** (ns16550a MMIO)
-- **Round-Robin scheduler** with multiple demo tasks
+### Core
+- **RISC-V 64-bit** (RV64GC) — runs on QEMU `virt` machine with OpenSBI
+- **Rust 2024 Edition** — uses modern `#[unsafe(no_mangle)]`, `unsafe extern`, atomic types
+- **S-mode kernel** — runs in Supervisor mode on top of OpenSBI (M-mode)
+- **Sv39 virtual memory** — 3-level page tables with identity mapping
 
-## Prerequisites
+### Memory Management
+- **Physical frame allocator** — bitmap-based, manages 127 MB of RAM
+- **Kernel heap** — buddy system allocator, 1 MB initial heap
+- **Page table management** — map/unmap, identity mapping, MMIO mapping
+
+### Hardware Support
+- **UART driver** — ns16550a MMIO serial console
+- **PLIC driver** — Platform-Level Interrupt Controller (per-hart enable/claim/complete)
+- **Trap framework** — full context save/restore, exception dispatch, timer interrupts
+- **VirtIO block device** — MMIO transport, DMA-compatible, probe & block read/write
+- **VirtIO network** — VirtQueue management, MAC address, packet send/recv
+
+### OS Services
+- **System calls** — `write`, `exit`, `yield`, `getpid` via `ecall` (UserEnvCall)
+- **Round-Robin scheduler** — context-switching with callee-saved register save/restore
+- **In-memory filesystem** — create, read, write, delete, list operations
+- **SMP multi-core** — BSP init + secondary hart startup via SBI `hart_start`
+- **SpinLock** — kernel synchronization primitive with RAII guard
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│              User Applications (U-mode)          │
+├─────────────────────────────────────────────────┤
+│        System Call Interface (ecall)             │
+├───────────┬──────────────┬───────────────────────┤
+│ Scheduler │  Filesystem  │    Device Drivers     │
+│ (RR + CS) │  (in-memory) │  UART / VirtIO        │
+├───────────┴──────────────┴───────────────────────┤
+│           SMP Multi-Core Manager                  │
+├──────────────────────────────────────────────────┤
+│          Virtual Memory Manager (Sv39)           │
+├──────────────────────────────────────────────────┤
+│        Physical Memory Manager (bitmap)          │
+├──────────────────────────────────────────────────┤
+│         Sync Primitives (SpinLock<T>)            │
+├──────────────────────────────────────────────────┤
+│     Arch Layer (Trap, PLIC, Timer, SMP)          │
+├──────────────────────────────────────────────────┤
+│           HAL: SBI / UART (MMIO)                 │
+├──────────────────────────────────────────────────┤
+│              OpenSBI (M-mode)                     │
+└──────────────────────────────────────────────────┘
+```
+
+## Quick Start
+
+### Prerequisites
 
 ```bash
 # Install Rust RISC-V target
 rustup target add riscv64gc-unknown-none-elf
 
-# Install QEMU
-sudo apt install qemu-system-misc
+# Install QEMU and cross-compiler
+sudo apt install qemu-system-misc gcc-riscv64-linux-gnu
 ```
 
-## Build & Run
+### Build & Run
 
 ```bash
+git clone https://github.com/ai-pivot/karte-os.git
+cd karte-os
+
 # Build
 make build
 
-# Run in QEMU
+# Run in QEMU (single core)
 make run
 
-# Debug with GDB
-make debug
+# Run with 4 cores (SMP)
+qemu-system-riscv64 -machine virt -cpu rv64 -nographic \
+  -bios default -m 128M -smp 4 \
+  -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel
 ```
 
-## Architecture
+### Expected Output
 
 ```
-┌──────────────────────────────────────┐
-│         User Applications            │
-├──────────────────────────────────────┤
-│     System Call Interface (ecall)    │
-├──────────┬──────────┬────────────────┤
-│ Process  │ Filesystem│   Drivers     │
-│ Manager  │  (VFS)   │  (VirtIO)     │
-├──────────┴──────────┴────────────────┤
-│      Scheduler / Executor            │
-├──────────────────────────────────────┤
-│    Virtual Memory (Sv39)             │
-├──────────────────────────────────────┤
-│    Physical Memory Manager (Buddy)   │
-├──────────────────────────────────────┤
-│    Sync Primitives (SpinLock)        │
-├──────────────────────────────────────┤
-│    Arch Layer (Trap, PLIC, Timer)    │
-├──────────────────────────────────────┤
-│    HAL: SBI / UART (MMIO)           │
-├──────────────────────────────────────┤
-│    OpenSBI (M-mode)                  │
-└──────────────────────────────────────┘
+OpenSBI v1.3.1 ...
+...
+=== KarteOS v0.2.0 ===
+  Booting on hart 0
+  DTB pointer: 0x87e00000
+[init] Setting up trap handling...
+[smp] BSP (hart 0) initialized
+[init] Initializing physical memory...
+[pmm] Initialized: 127 MB available
+[init] Setting up virtual memory...
+[vmm] Sv39 page table activated at 0x8021b000
+[init] Initializing kernel heap...
+[heap] Initialized: 1024 KB heap at 0x80261000
+[init] Probing VirtIO devices...
+[init] Initializing filesystem...
+[fs] In-memory file system initialized
+[init] Probing network devices...
+[init] Enabling timer interrupts...
+[init] Initializing PLIC...
+[init] Starting secondary harts...
+[init] Initializing scheduler...
+[sched] Scheduler initialized with 3 tasks (context-switching mode)
+=== KarteOS initialized successfully ===
+[timer] tick 100 (1s)
+[timer] tick 200 (2s)
+...
 ```
+
+### Exit QEMU
+
+Press `Ctrl+A` then `X`.
 
 ## Project Structure
 
 ```
-kernel/src/
-├── main.rs           # Entry point and initialization
-├── entry.S           # Boot assembly (BSS clear, stack setup)
-├── lang_items.rs     # Panic handler
-├── sbi.rs            # SBI console and system control
-├── arch/
-│   ├── trap.rs       # Trap handling framework
-│   └── plic.rs       # PLIC interrupt controller
-├── driver/
-│   └── uart.rs       # ns16550a UART driver
-├── mm/
-│   ├── pmm.rs        # Physical frame allocator (bitmap)
-│   ├── vmm.rs        # Sv39 virtual memory manager
-│   └── heap.rs       # Kernel heap allocator
-├── sync/
-│   └── spinlock.rs   # Kernel spinlock
-└── sched/
-    ├── mod.rs        # Round-Robin scheduler
-    └── task.rs       # Task control block
+karte-os/
+├── Cargo.toml                 # Workspace root
+├── Makefile                    # Build & run targets
+├── .cargo/config.toml          # Target and linker config
+├── rust-toolchain.toml         # Toolchain specification
+├── kernel/
+│   ├── Cargo.toml              # Kernel crate dependencies
+│   ├── memory.x                # Linker script (0x80200000, 128MB RAM)
+│   ├── build.rs                # Build script (linker search path)
+│   └── src/
+│       ├── main.rs             # #[entry] kmain — 10-phase init
+│       ├── entry.S             # Boot: BSS clear, stack setup
+│       ├── lang_items.rs       # Panic handler
+│       ├── sbi.rs              # SBI console + shutdown
+│       ├── arch/
+│       │   ├── trap.rs         # Trap context + dispatch + timer
+│       │   ├── plic.rs         # PLIC interrupt controller
+│       │   └── smp.rs          # SMP multi-core management
+│       ├── driver/
+│       │   ├── uart.rs         # ns16550a UART (MMIO)
+│       │   ├── virtio.rs       # VirtIO block device (MMIO)
+│       │   ├── net.rs          # VirtIO network (MMIO)
+│       │   └── fs.rs           # In-memory filesystem
+│       ├── mm/
+│       │   ├── pmm.rs          # Bitmap physical frame allocator
+│       │   ├── vmm.rs          # Sv39 page tables
+│       │   └── heap.rs         # Buddy system kernel heap
+│       ├── sync/
+│       │   └── spinlock.rs     # SpinLock<T> + RAII guard
+│       ├── sched/
+│       │   ├── mod.rs          # Round-Robin scheduler
+│       │   ├── task.rs         # TaskContext + TaskControlBlock
+│       │   └── switch.S        # Context switch (callee-saved regs)
+│       └── syscall/
+│           └── mod.rs          # Syscall dispatch (write/exit/yield/getpid)
+└── docs/
+    ├── plan-riscv-os.md         # Development plan
+    └── agent/                   # Knowledge base (for AI-assisted dev)
 ```
 
-## Exit QEMU
+## Boot Sequence
 
-Press `Ctrl+A` then `X` to exit QEMU.
+```
+QEMU → OpenSBI (M-mode) → _start (entry.S) → kmain (main.rs)
+                                    │
+                                    ├── 1. UART + SBI console
+                                    ├── 2. Trap vector setup
+                                    ├── 3. SMP BSP init
+                                    ├── 4. Physical memory (PMM)
+                                    ├── 5. Virtual memory (Sv39)
+                                    ├── 6. Kernel heap
+                                    ├── 7. VirtIO device probe
+                                    ├── 8. Filesystem init
+                                    ├── 9. Network probe
+                                    ├── 10. Timer + PLIC + Scheduler
+                                    └── Enable interrupts → idle loop
+```
+
+## Key Technical Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Firmware | OpenSBI (QEMU default) | No custom M-mode code needed |
+| Memory model | Sv39 | Standard RISC-V, well-supported |
+| Frame allocator | Bitmap | Simple, sufficient for personal OS |
+| Heap allocator | buddy_system_allocator crate | Mature, no_std compatible |
+| Scheduler | Round-Robin + timer preemption | Simple, deterministic |
+| VirtIO transport | MMIO | QEMU virt standard |
+| Edition | Rust 2024 | Latest safety features |
+
+## Dependencies
+
+| Crate | Purpose |
+|-------|---------|
+| `riscv` | CSR access, register definitions |
+| `sbi-rt` | SBI ecall wrappers (legacy + standard) |
+| `buddy_system_allocator` | Kernel heap allocator |
+| `virtio-drivers` | VirtIO device drivers |
+| `spin` | Mutex primitives |
+| `bitflags` | Page table entry flags |
+
+## Development
+
+KarteOS was developed using a **multi-agent parallel workflow**:
+- Phase 1: 3 agents in parallel (scheduler, VirtIO block+FS, VirtIO net)
+- Phase 2: 2 agents in parallel (syscalls, SMP)
+- Integration + verification between phases
+
+## Roadmap
+
+- [ ] User-mode process loader (ELF)
+- [ ] Virtual file system (VFS) layer
+- [ ] VirtIO GPU / framebuffer console
+- [ ] TCP/IP network stack (smoltcp)
+- [ ] Complete POSIX-like syscall interface
+- [ ] Real hardware support (SiFive, StarFive)
 
 ## License
 
