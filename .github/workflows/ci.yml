@@ -11,9 +11,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-permissions:
-  contents: read
-
 jobs:
   # ── Job 1: Build ──
   build:
@@ -171,7 +168,6 @@ jobs:
           echo "=== Boot Output ==="
           grep -a 'KarteOS\|init\|user\|Hello\|virtio\|process' /tmp/boot-output.log | head -30 || true
           
-          # Check that kernel booted and user program ran
           if grep -qa "Hello from user" /tmp/boot-output.log || grep -qa "KarteOS initialized successfully" /tmp/boot-output.log; then
             echo "Boot test PASSED"
           else
