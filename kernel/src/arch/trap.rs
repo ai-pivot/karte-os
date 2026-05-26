@@ -172,18 +172,58 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
             }
             12 | 13 | 15 => {
                 // Instruction/Load/Store page fault
-                crate::console_println!(
-                    "[trap] Page fault (code={}) at sepc={:#x}, stval={:#x}",
-                    code,
-                    ctx.sepc,
-                    stval
-                );
-                // If from user mode, kill the process
-                if ctx.sscratch != 0 {
-                    crate::console_println!("[trap] Killing user process");
-                    crate::syscall::dispatch(93, [1, 0, 0, 0, 0, 0]); // sys_exit(1)
+                let fault_addr = stval;
+                let heap_base = crate::process::USER_HEAP_BASE;
+                let heap_limit = crate::process::USER_HEAP_LIMIT;
+
+                // Check if fault is in user heap area (lazy allocation)
+                if from_user && fault_addr >= heap_base && fault_addr < heap_limit {
+                    // Lazy page allocation: map a new page at the faulting address
+                    let page_size = crate::mm::pmm::page_size();
+                    let page_addr = fault_addr & !(page_size - 1); // Align down
+
+                    let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+
+                    // Check if already mapped (shouldn't be, but safety check)
+                    if crate::mm::vmm::translate_user(kernel_pt, page_addr).is_none() {
+                        if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                            unsafe {
+                                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                            }
+                            crate::mm::vmm::map(
+                                kernel_pt,
+                                page_addr,
+                                frame,
+                                crate::mm::vmm::PTEFlags::URW,
+                            );
+                            unsafe {
+                                core::arch::asm!("sfence.vma");
+                            }
+                            // Update brk if needed
+                            let new_brk = page_addr + page_size;
+                            if new_brk > crate::sched::current_brk() {
+                                crate::sched::set_current_brk(new_brk);
+                            }
+                            // Don't advance sepc — retry the faulting instruction
+                        }
+                        // else: OOM — fall through to not advancing sepc (still retry)
+                    }
+                    // Page already mapped or just allocated — don't advance sepc, retry instruction
+                    // (no ctx.sepc modification)
                 } else {
-                    skip_trap_instruction(ctx);
+                    // Not in heap area — fatal page fault
+                    crate::console_println!(
+                        "[trap] Page fault (code={}) at sepc={:#x}, stval={:#x}",
+                        code,
+                        ctx.sepc,
+                        stval
+                    );
+                    if from_user {
+                        crate::console_println!("[trap] Killing user process");
+                        crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]); // sys_exit(1)
+                    } else {
+                        skip_trap_instruction(ctx);
+                    }
                 }
             }
             _ => {

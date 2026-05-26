@@ -29,12 +29,15 @@ struct Scheduler {
     tasks: [Option<TaskControlBlock>; MAX_TASKS],
     current: usize,
     count: usize,
+    /// Current program break (top of user heap)
+    current_brk: usize,
 }
 
 static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     tasks: [const { None }; MAX_TASKS],
     current: 0,
     count: 0,
+    current_brk: crate::process::USER_HEAP_BASE,
 });
 
 /// Task entry functions
@@ -270,11 +273,10 @@ pub fn add_user_process(
 
 /// Get current process brk (program break for heap).
 pub fn current_brk() -> usize {
-    // TODO: per-process brk tracking
-    crate::process::USER_HEAP_BASE
+    SCHEDULER.lock().current_brk
 }
 
 /// Set current process brk.
-pub fn set_current_brk(_addr: usize) {
-    // TODO: actually allocate pages for heap growth
+pub fn set_current_brk(addr: usize) {
+    SCHEDULER.lock().current_brk = addr;
 }

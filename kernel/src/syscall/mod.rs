@@ -15,6 +15,7 @@ pub const SYS_WRITE: usize = 2;
 pub const SYS_READ: usize = 3;
 pub const SYS_BRK: usize = 4;
 pub const SYS_GETPID: usize = 5;
+pub const SYS_MMAP: usize = 6;
 
 // Level 2: Filesystem (reserved)
 pub const SYS_OPEN: usize = 10;
@@ -47,6 +48,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_READ => sys_read(args[0] as i32, args[1], args[2]),
         SYS_BRK => sys_brk(args[0]),
         SYS_GETPID => sys_getpid(),
+        SYS_MMAP => sys_mmap(args[0], args[1], args[2]),
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
             ERR_INVAL
@@ -78,14 +80,16 @@ fn sys_exit(code: i32) -> isize {
 
 /// Syscall 2: Write to file descriptor.
 fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
-    if buf == 0 || len == 0 {
+    if buf == 0 || len == 0 || len > 65536 {
         return ERR_INVAL;
     }
     match fd {
         1 | 2 => {
-            // stdout/stderr: write to console
-            let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-            crate::sbi::print(core::str::from_utf8(data).unwrap_or("[invalid utf8]"));
+            // stdout/stderr: write to console byte by byte
+            for i in 0..len {
+                let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+                crate::sbi::console_putchar(byte);
+            }
             len as isize
         }
         _ => ERR_INVAL,
@@ -100,21 +104,117 @@ fn sys_read(_fd: i32, _buf: usize, _len: usize) -> isize {
 
 /// Syscall 4: Set/get program break (heap pointer).
 fn sys_brk(addr: usize) -> isize {
-    // TODO: actually manage user heap pages
-    // For now, just return current brk
+    let current = crate::sched::current_brk();
     if addr == 0 {
-        // Query current brk
-        crate::sched::current_brk() as isize
-    } else {
-        // Set new brk
-        crate::sched::set_current_brk(addr);
-        addr as isize
+        return current as isize;
     }
+
+    // Validate: new brk must be in heap range
+    let heap_base = crate::process::USER_HEAP_BASE;
+    let heap_limit = crate::process::USER_HEAP_LIMIT;
+    if addr < heap_base || addr > heap_limit {
+        return ERR_INVAL;
+    }
+
+    // Only grow, never shrink (Phase 2 simplification)
+    if addr <= current {
+        return current as isize;
+    }
+
+    // Allocate and map pages from current brk to new brk
+    let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+    let page_size = crate::mm::pmm::page_size();
+    let start_page = (current + page_size - 1) & !(page_size - 1); // Round up
+    let end_page = (addr + page_size - 1) & !(page_size - 1);
+
+    let mut vaddr = start_page;
+    while vaddr < end_page {
+        // Check if already mapped
+        if crate::mm::vmm::translate_user(kernel_pt, vaddr).is_none() {
+            let frame = match crate::mm::pmm::alloc_frame() {
+                Some(f) => f,
+                None => return ERR_NOMEM,
+            };
+            // Zero the page
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            }
+            // Map with URW flags (user readable/writable, no execute)
+            crate::mm::vmm::map(kernel_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
+        }
+        vaddr += page_size;
+    }
+
+    // Flush TLB
+    unsafe {
+        core::arch::asm!("sfence.vma");
+    }
+
+    crate::sched::set_current_brk(addr);
+    addr as isize
 }
 
 /// Syscall 5: Get process ID.
 fn sys_getpid() -> isize {
     crate::sched::current_task_id() as isize
+}
+
+/// Syscall 6: Map anonymous memory.
+/// `addr` = hint address (0 = kernel chooses), `len` = size, `flags` = prot flags
+/// Returns the mapped virtual address, or error.
+/// Simple implementation: always maps at the hint address or at brk.
+fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
+    if len == 0 {
+        return ERR_INVAL;
+    }
+
+    let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+    let page_size = crate::mm::pmm::page_size();
+
+    // Determine mapping range
+    // If addr is 0, use current brk as base
+    let base = if addr == 0 {
+        let current_brk = crate::sched::current_brk();
+        // Align up
+        (current_brk + page_size - 1) & !(page_size - 1)
+    } else {
+        // Align down
+        addr & !(page_size - 1)
+    };
+
+    let end = (base + len + page_size - 1) & !(page_size - 1);
+
+    // Validate range is within user heap area
+    if base < crate::process::USER_HEAP_BASE || end > crate::process::USER_HEAP_LIMIT {
+        return ERR_INVAL;
+    }
+
+    // Allocate and map pages
+    let mut vaddr = base;
+    while vaddr < end {
+        if crate::mm::vmm::translate_user(kernel_pt, vaddr).is_none() {
+            let frame = match crate::mm::pmm::alloc_frame() {
+                Some(f) => f,
+                None => return ERR_NOMEM,
+            };
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            }
+            crate::mm::vmm::map(kernel_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
+        }
+        vaddr += page_size;
+    }
+
+    unsafe {
+        core::arch::asm!("sfence.vma");
+    }
+
+    // If addr was 0, advance brk
+    if addr == 0 {
+        crate::sched::set_current_brk(end);
+    }
+
+    base as isize
 }
 
 // ─── Tests ────────────────────────────────────────────────────────
@@ -150,8 +250,28 @@ pub fn run_tests() {
         dispatch(SYS_BRK, [0, 0, 0, 0, 0, 0]) >= 0
     });
 
+    crate::test::run_test("syscall_brk_grows_heap", || {
+        let current = dispatch(SYS_BRK, [0, 0, 0, 0, 0, 0]) as usize;
+        let new_brk = current + 4096;
+        let result = dispatch(SYS_BRK, [new_brk, 0, 0, 0, 0, 0]);
+        result == new_brk as isize
+    });
+
+    crate::test::run_test("syscall_brk_invalid_addr_returns_error", || {
+        dispatch(SYS_BRK, [0xFFFF_FFFF, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
     crate::test::run_test("syscall_yield_returns_zero", || {
         // Using old number for backward compat
         true // Just check constant exists
+    });
+
+    crate::test::run_test("syscall_mmap_allocates_memory", || {
+        let result = dispatch(SYS_MMAP, [0, 4096, 0, 0, 0, 0]);
+        result >= 0
+    });
+
+    crate::test::run_test("syscall_mmap_zero_len_returns_error", || {
+        dispatch(SYS_MMAP, [0, 0, 0, 0, 0, 0]) == ERR_INVAL
     });
 }

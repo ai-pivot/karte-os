@@ -3,12 +3,20 @@ AS = $(CROSS)as
 LD = $(CROSS)ld
 OBJCOPY = $(CROSS)objcopy
 
-all: hello.elf
+TARGETS = hello.elf heap_test.elf
+
+all: $(TARGETS)
 
 hello.o: hello.S
 	$(AS) -march=rv64gc -o $@ $<
 
 hello.elf: hello.o
+	$(LD) -T user.ld -o $@ $<
+
+heap_test.o: heap_test.S
+	$(AS) -march=rv64gc -o $@ $<
+
+heap_test.elf: heap_test.o
 	$(LD) -T user.ld -o $@ $<
 
 clean:
