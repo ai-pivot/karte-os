@@ -2,10 +2,11 @@
 .global _start
 _start:
     # OpenSBI passes hart_id in a0, dtb pointer in a1
-    # Only let hart 0 proceed, park all other harts
-    bnez    a0, .park
+    # Any hart can be the boot hart (OpenSBI decides).
+    # Secondary harts from SBI hart_start go to _secondary_hart_trampoline.
+    # All harts arriving here are the boot hart candidate.
 
-    # Set up stack pointer (use boot stack defined in linker script)
+    # Set up stack pointer
     la      sp, _boot_stack_top
 
     # Clear BSS section

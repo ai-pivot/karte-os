@@ -79,6 +79,7 @@ fn handle_timer() {
         );
     }
     set_next_timer();
+    crate::sched::schedule();
 }
 
 /// Trap handler (called from assembly).
@@ -107,6 +108,17 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
     match trap {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             handle_timer();
+        }
+        Trap::Exception(Exception::UserEnvCall) => {
+            // RISC-V ecall from U-mode: a7=syscall_id, a0-a5=args
+            let syscall_id = ctx.x[17]; // a7
+            let args = [
+                ctx.x[10], ctx.x[11], ctx.x[12],
+                ctx.x[13], ctx.x[14], ctx.x[15],
+            ];
+            let result = crate::syscall::dispatch(syscall_id, args);
+            ctx.x[10] = result as usize; // a0 = return value
+            ctx.sepc += 4; // skip ecall instruction
         }
         Trap::Exception(e) => {
             crate::console_println!(

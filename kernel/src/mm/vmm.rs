@@ -130,6 +130,13 @@ pub fn init() {
     // Map UART MMIO (0x10000000 - 0x10001000)
     map(root, 0x1000_0000, 0x1000_0000, PTEFlags::KRW);
 
+    // Map VirtIO MMIO devices (0x10001000 - 0x10003000)
+    // 8 devices at 0x200 stride, each may access up to 0x200 bytes
+    // Map 2 pages to cover all 8 devices
+    for addr in (0x1000_1000..0x1000_3000).step_by(PAGE_SIZE) {
+        map(root, addr, addr, PTEFlags::KRW);
+    }
+
     // Map PLIC (0x0C000000 - 0x0C400000) - needs multiple pages
     // Priority, enable, pending, threshold, claim/complete registers
     for addr in (0x0C00_0000..0x0C40_0000).step_by(PAGE_SIZE) {

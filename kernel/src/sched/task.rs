@@ -1,4 +1,4 @@
-// kernel/src/sched/task.rs — Task data structures
+// kernel/src/sched/task.rs — Task data structures for context-switching scheduler
 
 /// Task state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -9,47 +9,14 @@ pub enum TaskState {
     Exited,
 }
 
-/// Task control block
-#[repr(C)]
-pub struct TaskControlBlock {
-    /// Saved kernel stack pointer (for context switch)
-    pub kstack_ptr: usize,
-    /// Task ID
-    pub tid: usize,
-    /// Task state
-    pub state: TaskState,
-    /// Entry point
-    pub entry: usize,
-}
-
-impl TaskControlBlock {
-    pub fn new(tid: usize, entry: usize, stack_top: usize) -> Self {
-        Self {
-            kstack_ptr: stack_top,
-            tid,
-            state: TaskState::Ready,
-            entry,
-        }
-    }
-}
-
-/// Task context for context switching (callee-saved registers)
+/// Task context for context switching (callee-saved registers).
+/// This struct is used for initial task setup. At runtime, the actual
+/// register state is saved on the task's kernel stack by __switch.
 #[repr(C)]
 pub struct TaskContext {
-    pub ra: usize, // Return address
-    pub sp: usize, // Stack pointer
-    pub s0: usize, // s0/fp
-    pub s1: usize,
-    pub s2: usize,
-    pub s3: usize,
-    pub s4: usize,
-    pub s5: usize,
-    pub s6: usize,
-    pub s7: usize,
-    pub s8: usize,
-    pub s9: usize,
-    pub s10: usize,
-    pub s11: usize,
+    pub ra: usize,
+    pub sp: usize,
+    pub s: [usize; 12], // s0-s11
 }
 
 impl TaskContext {
@@ -57,26 +24,33 @@ impl TaskContext {
         Self {
             ra: 0,
             sp: 0,
-            s0: 0,
-            s1: 0,
-            s2: 0,
-            s3: 0,
-            s4: 0,
-            s5: 0,
-            s6: 0,
-            s7: 0,
-            s8: 0,
-            s9: 0,
-            s10: 0,
-            s11: 0,
+            s: [0; 12],
         }
     }
 
-    pub fn set_entry(&mut self, entry: usize) {
-        self.ra = entry;
+    /// Create a new task context that will start executing at `entry` with given stack
+    pub fn goto(entry: usize, kstack_top: usize) -> Self {
+        Self {
+            ra: entry,
+            sp: kstack_top,
+            s: [0; 12],
+        }
     }
+}
 
-    pub fn set_stack(&mut self, sp: usize) {
-        self.sp = sp;
+/// Task control block
+pub struct TaskControlBlock {
+    pub context: TaskContext,
+    pub tid: usize,
+    pub state: TaskState,
+}
+
+impl TaskControlBlock {
+    pub fn new(tid: usize) -> Self {
+        Self {
+            context: TaskContext::new(),
+            tid,
+            state: TaskState::Ready,
+        }
     }
 }
