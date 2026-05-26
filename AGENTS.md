@@ -19,7 +19,7 @@ QEMU exit: `Ctrl+A` then `X`.
 
 ## ⚠️ Pre-Commit Checklist — MUST follow before every git commit
 
-**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (54 tests), boot-test, smp-test.**
+**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (59 tests), boot-test, smp-test.**
 ALL 5 must pass. Before committing, run:
 
 ```bash
@@ -52,6 +52,7 @@ Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases �
 
 - `user/hello.S` — Minimal "Hello from user!" via sys_write + sys_exit
 - `user/heap_test.S` — Tests brk heap allocation (single-page + 8-page) with read/write verification
+- `user/file_test.S` — Tests sys_open/close/read/write file operations with data verification
 - `user/user.ld` — Linker script: entry at 0x1000
 - User programs are embedded into the kernel via `include_bytes!()` at compile time
 - **Build before kernel**: `cd user && make` generates `*.elf` files that the kernel references
@@ -69,6 +70,8 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 4 | brk | (addr) — 0 to query, >0 to grow |
 | 5 | getpid | () |
 | 6 | mmap | (addr, len, flags) |
+| 10 | open | (path, path_len, flags) |
+| 11 | close | (fd) |
 
 ## GOTCHAS
 
@@ -81,7 +84,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **Compressed instructions** — trap skip must check instruction length (16-bit vs 32-bit)
 - **sret timing** — disable SIE before sret sequence to prevent timer interrupt preemption
 - **QEMU boot hart**: With `-smp N`, OpenSBI may boot on hart 1 (not always hart 0)
-- **VirtIO MMIO**: Probe may hang on QEMU virt without explicit devices — disabled for now
+- **VirtIO MMIO**: Fixed — stride is 0x1000 (page-sized), not 0x200. Requires `-device virtio-blk-device` in QEMU for block device.
 - **amoswap/lr/sc**: RISC-V atomic extensions NOT available on bare target
 - **sys_write**: Use byte-by-byte `read_volatile` + `console_putchar`, NOT `from_raw_parts` + `from_utf8` (causes bounds panic in S-mode trap context)
 
@@ -99,9 +102,9 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 
 ## Testing
 
-- **54 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU
+- **59 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU
 - **Test mode**: `cargo build --release --features test_mode` compiles test kernel
 - **Test framework**: `kernel/src/test.rs` — TAP-style `run_test(name, || bool)` API
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`
 - **CI**: GitHub Actions runs build + lint + test + boot-test + smp-test on every push
-- **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), Task (6), Syscall (8) = **52 tests** + 2 mmap tests = **54 tests**
+- **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), Task (6), Syscall (15) = **59 tests**

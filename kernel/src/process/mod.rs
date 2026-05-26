@@ -88,9 +88,10 @@ impl Process {
         }
 
         // 4. Map user stack in kernel page table (URW, no execute)
-        for i in (0..USER_STACK_PAGES).rev() {
+        // Map from USER_STACK_TOP downward for USER_STACK_PAGES pages
+        for i in 0..USER_STACK_PAGES {
             let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
-            let vaddr = USER_STACK_BASE + i * pmm::page_size();
+            let vaddr = USER_STACK_TOP - (i + 1) * pmm::page_size();
             vmm::map(kernel_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 

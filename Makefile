@@ -1,4 +1,4 @@
-.PHONY: build run debug clean doc check build-test test boot-test
+.PHONY: build run debug clean doc check build-test test boot-test smp-test test-run disk.img
 
 # Project settings
 KERNEL_BIN := target/riscv64gc-unknown-none-elf/release/karte-os-kernel
@@ -12,22 +12,28 @@ QEMU_FLAGS := \
 	-nographic \
 	-bios default \
 	-m 128M \
-	-smp 1
+	-smp 1 \
+	-drive id=blk0,file=disk.img,format=raw,if=none \
+	-device virtio-blk-device,drive=blk0
+
+# Ensure disk image exists
+disk.img:
+	dd if=/dev/zero of=disk.img bs=1M count=1 2>/dev/null
 
 # Build the kernel
 build:
 	cargo build --release -p karte-os-kernel
 
 # Run in QEMU
-run: build
+run: build disk.img
 	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF)
 
 # Run with GDB support
-debug: build
+debug: build disk.img
 	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) -S -s
 
 # Run for 10 seconds then kill (for CI testing)
-test-run: build
+test-run: build disk.img
 	timeout 10 $(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) || true
 
 # Clean build artifacts
@@ -51,9 +57,11 @@ test: build-test
 	bash scripts/run-tests.sh
 
 # Run boot test (normal mode)
-boot-test: build
+boot-test: build disk.img
 	@echo "Running boot test..."
 	@timeout 10 qemu-system-riscv64 -machine virt -cpu rv64 -nographic \
 		-bios default -m 128M -smp 1 \
-		-kernel $(KERNEL_ELF) 2>&1 | grep -qa "initialized successfully" \
-		&& echo "✅ Boot test passed" || echo "❌ Boot test failed"
+		-drive id=blk0,file=disk.img,format=raw,if=none \
+		-device virtio-blk-device,drive=blk0 \
+		-kernel $(KERNEL_ELF) 2>&1 | grep -qa "Hello from user" \
+		&& echo "Boot test passed" || echo "Boot test failed"

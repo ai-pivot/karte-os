@@ -148,6 +148,9 @@ jobs:
       - name: Build user programs
         run: cd user && make clean && make
 
+      - name: Create disk image
+        run: dd if=/dev/zero of=disk.img bs=1M count=1
+
       - name: Build kernel
         run: make build
 
@@ -156,11 +159,13 @@ jobs:
           timeout 10 qemu-system-riscv64 \
             -machine virt -cpu rv64 -nographic \
             -bios default -m 128M -smp 1 \
+            -drive id=blk0,file=disk.img,format=raw,if=none \
+            -device virtio-blk-device,drive=blk0 \
             -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
             > /tmp/boot-output.log 2>&1 || true
           
           echo "=== Boot Output ==="
-          grep -a 'KarteOS\|init\|user\|Hello\|timer\|process' /tmp/boot-output.log | head -30 || true
+          grep -a 'KarteOS\|init\|user\|Hello\|virtio\|process' /tmp/boot-output.log | head -30 || true
           
           # Check that kernel booted and user program ran
           if grep -qa "Hello from user" /tmp/boot-output.log || grep -qa "KarteOS initialized successfully" /tmp/boot-output.log; then
@@ -201,6 +206,9 @@ jobs:
       - name: Build user programs
         run: cd user && make clean && make
 
+      - name: Create disk image
+        run: dd if=/dev/zero of=disk.img bs=1M count=1
+
       - name: Build kernel
         run: make build
 
@@ -209,11 +217,13 @@ jobs:
           timeout 10 qemu-system-riscv64 \
             -machine virt -cpu rv64 -nographic \
             -bios default -m 128M -smp 4 \
+            -drive id=blk0,file=disk.img,format=raw,if=none \
+            -device virtio-blk-device,drive=blk0 \
             -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
             > /tmp/smp-output.log 2>&1 || true
           
           echo "=== SMP Output ==="
-          grep -a 'KarteOS\|smp\|hart\|user\|Hello' /tmp/smp-output.log | head -20 || true
+          grep -a 'KarteOS\|smp\|hart\|user\|Hello\|virtio' /tmp/smp-output.log | head -20 || true
           
           if grep -qa "Hello from user" /tmp/smp-output.log || grep -qa "KarteOS v0.2.0" /tmp/smp-output.log || grep -qa "KarteOS initialized successfully" /tmp/smp-output.log; then
             echo "SMP boot test PASSED"

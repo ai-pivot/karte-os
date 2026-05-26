@@ -9,9 +9,9 @@ use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE, PhysAddr};
 use crate::mm::pmm;
 use crate::sync::spinlock::SpinLock;
 
-// QEMU virt machine: VirtIO MMIO devices start at 0x10001000, spaced 0x200 apart.
+// QEMU virt machine: VirtIO MMIO devices start at 0x10001000, spaced 0x1000 (4KB) apart.
 const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
-const VIRTIO_MMIO_STRIDE: usize = 0x200;
+const VIRTIO_MMIO_STRIDE: usize = 0x1000;
 const VIRTIO_MMIO_MAX_DEVICES: usize = 8;
 
 /// Global VirtIO block device instance, protected by a spinlock.
@@ -126,6 +126,15 @@ pub fn probe_virtio_devices() {
             device_id
         );
 
+        // Device type 0 = empty transport (no real device), skip it
+        if device_id == 0 {
+            crate::console_println!(
+                "[virtio] Slot {}: empty transport (device_id=0), skipping",
+                i
+            );
+            continue;
+        }
+
         // Device type 2 = Block device
         if device_id == 2 {
             crate::console_println!("[virtio] Initializing block device...");
@@ -138,6 +147,12 @@ pub fn probe_virtio_devices() {
                     crate::console_println!("[virtio] Failed to init block device: {:?}", e);
                 }
             }
+        } else {
+            crate::console_println!(
+                "[virtio] Slot {}: unsupported device type {}, skipping",
+                i,
+                device_id
+            );
         }
     }
 

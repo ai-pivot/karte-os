@@ -35,6 +35,26 @@ pub const ERR_NOMEM: isize = -2;
 pub const ERR_NOENT: isize = -3; // No such file or directory
 pub const ERR_IO: isize = -4;
 
+// ─── Global FD table (single-process simplification) ────────────────
+
+extern crate alloc;
+
+use crate::driver::fs::{FdTable, MAX_FDS, O_CREAT};
+#[cfg(feature = "test_mode")]
+use crate::driver::fs::{O_RDONLY, O_RDWR, O_WRONLY};
+use crate::sync::spinlock::SpinLock;
+
+static FD_TABLE: SpinLock<Option<FdTable>> = SpinLock::new(None);
+
+/// Lock the global FD table (initializing if needed).
+fn lock_fd_table() -> crate::sync::spinlock::SpinLockGuard<'static, Option<FdTable>> {
+    let mut guard = FD_TABLE.lock();
+    if guard.is_none() {
+        *guard = Some(FdTable::new());
+    }
+    guard
+}
+
 /// Dispatch a syscall.
 ///
 /// Called from trap_handler when UserEnvCall is detected.
@@ -49,6 +69,8 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_BRK => sys_brk(args[0]),
         SYS_GETPID => sys_getpid(),
         SYS_MMAP => sys_mmap(args[0], args[1], args[2]),
+        SYS_OPEN => sys_open(args[0], args[1], args[2] as u32),
+        SYS_CLOSE => sys_close(args[0] as i32),
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
             ERR_INVAL
@@ -92,14 +114,93 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             }
             len as isize
         }
-        _ => ERR_INVAL,
+        _ => {
+            // File fd: get name and position
+            let (name, pos) = {
+                let table = lock_fd_table();
+                match table.as_ref().unwrap().get(fd as usize) {
+                    Some(f) => (f.name.clone(), f.pos),
+                    None => return ERR_INVAL,
+                }
+            };
+
+            // Read current file data, modify at pos, write back
+            {
+                let mut fs = crate::driver::fs::global_fs();
+                let mut data = fs
+                    .read(&name)
+                    .map(|d| alloc::vec::Vec::from(d))
+                    .unwrap_or_default();
+                let end = pos + len;
+                if end > data.len() {
+                    data.resize(end, 0);
+                }
+                for i in 0..len {
+                    data[pos + i] = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+                }
+                let _ = fs.write(&name, &data);
+            }
+
+            // Update seek position
+            {
+                let mut table = lock_fd_table();
+                if let Some(f) = table.as_mut().unwrap().get_mut(fd as usize) {
+                    f.pos += len;
+                }
+            }
+
+            len as isize
+        }
     }
 }
 
 /// Syscall 3: Read from file descriptor.
-fn sys_read(_fd: i32, _buf: usize, _len: usize) -> isize {
-    // Not implemented yet
-    ERR_INVAL
+fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
+    if buf == 0 || len == 0 || len > 65536 {
+        return ERR_INVAL;
+    }
+
+    // stdin not implemented
+    if fd == 0 {
+        return ERR_INVAL;
+    }
+
+    // Get file info from fd table
+    let (name, pos) = {
+        let table = lock_fd_table();
+        match table.as_ref().unwrap().get(fd as usize) {
+            Some(f) => (f.name.clone(), f.pos),
+            None => return ERR_INVAL,
+        }
+    };
+
+    // Read from in-memory FS
+    let data = {
+        let fs = crate::driver::fs::global_fs();
+        match fs.read(&name) {
+            Some(d) => alloc::vec::Vec::from(d),
+            None => return ERR_NOENT,
+        }
+    };
+
+    // Copy from current position
+    if pos >= data.len() {
+        return 0; // EOF
+    }
+    let to_read = core::cmp::min(len, data.len() - pos);
+    for i in 0..to_read {
+        unsafe { core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i]) };
+    }
+
+    // Update seek position
+    {
+        let mut table = lock_fd_table();
+        if let Some(f) = table.as_mut().unwrap().get_mut(fd as usize) {
+            f.pos += to_read;
+        }
+    }
+
+    to_read as isize
 }
 
 /// Syscall 4: Set/get program break (heap pointer).
@@ -217,6 +318,57 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
     base as isize
 }
 
+/// Syscall 10: Open a file.
+/// `path` = pointer to file path string, `path_len` = length, `flags` = open flags.
+/// Returns the file descriptor number, or a negative error code.
+fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
+    if path == 0 || path_len == 0 || path_len > 256 {
+        return ERR_INVAL;
+    }
+
+    // Read path from user memory
+    let mut path_buf = alloc::vec::Vec::new();
+    for i in 0..path_len {
+        let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
+        path_buf.push(byte);
+    }
+    let name = alloc::string::String::from_utf8(path_buf).unwrap_or_default();
+    if name.is_empty() {
+        return ERR_INVAL;
+    }
+
+    // Check/create file in FS
+    {
+        let mut fs = crate::driver::fs::global_fs();
+        if flags & O_CREAT != 0 {
+            let _ = fs.create(&name);
+        }
+        if fs.read(&name).is_none() && (flags & O_CREAT == 0) {
+            return ERR_NOENT;
+        }
+    }
+
+    // Allocate fd
+    let mut table = lock_fd_table();
+    match table.as_mut().unwrap().alloc(name, flags) {
+        Some(fd) => fd as isize,
+        None => ERR_NOMEM,
+    }
+}
+
+/// Syscall 11: Close a file descriptor.
+fn sys_close(fd: i32) -> isize {
+    if fd < 0 || fd as usize >= MAX_FDS {
+        return ERR_INVAL;
+    }
+    let mut table = lock_fd_table();
+    if table.as_mut().unwrap().close(fd as usize) {
+        ERR_OK
+    } else {
+        ERR_INVAL
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────
 
 #[cfg(feature = "test_mode")]
@@ -273,5 +425,147 @@ pub fn run_tests() {
 
     crate::test::run_test("syscall_mmap_zero_len_returns_error", || {
         dispatch(SYS_MMAP, [0, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    // ── File syscall tests ──
+
+    crate::test::run_test("syscall_open_close", || {
+        // Create a test file in the global FS
+        {
+            let mut fs = crate::driver::fs::global_fs();
+            let _ = fs.write("_sys_test_oc.txt", b"hello");
+        }
+        let path = b"_sys_test_oc.txt";
+        let fd = dispatch(
+            SYS_OPEN,
+            [
+                path.as_ptr() as usize,
+                path.len(),
+                O_RDONLY as usize,
+                0,
+                0,
+                0,
+            ],
+        );
+        if fd < 0 {
+            return false;
+        }
+        let close_result = dispatch(SYS_CLOSE, [fd as usize, 0, 0, 0, 0, 0]);
+        close_result == ERR_OK
+    });
+
+    crate::test::run_test("syscall_open_nonexistent", || {
+        let path = b"_sys_test_noexist.txt";
+        let fd = dispatch(
+            SYS_OPEN,
+            [
+                path.as_ptr() as usize,
+                path.len(),
+                O_RDONLY as usize,
+                0,
+                0,
+                0,
+            ],
+        );
+        fd == ERR_NOENT
+    });
+
+    crate::test::run_test("syscall_open_read_close", || {
+        // Create a test file
+        {
+            let mut fs = crate::driver::fs::global_fs();
+            let _ = fs.write("_sys_test_read.txt", b"hello world");
+        }
+        let path = b"_sys_test_read.txt";
+        let fd = dispatch(
+            SYS_OPEN,
+            [
+                path.as_ptr() as usize,
+                path.len(),
+                O_RDONLY as usize,
+                0,
+                0,
+                0,
+            ],
+        );
+        if fd < 0 {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        let n = dispatch(
+            SYS_READ,
+            [fd as usize, buf.as_mut_ptr() as usize, 64, 0, 0, 0],
+        );
+        dispatch(SYS_CLOSE, [fd as usize, 0, 0, 0, 0, 0]);
+        n == 11 && buf[..11] == b"hello world"[..]
+    });
+
+    crate::test::run_test("syscall_open_write_read", || {
+        // Create a test file
+        {
+            let mut fs = crate::driver::fs::global_fs();
+            let _ = fs.write("_sys_test_rw.txt", b"initial");
+        }
+        // Open for writing
+        let path = b"_sys_test_rw.txt";
+        let fd_w = dispatch(
+            SYS_OPEN,
+            [
+                path.as_ptr() as usize,
+                path.len(),
+                O_WRONLY as usize,
+                0,
+                0,
+                0,
+            ],
+        );
+        if fd_w < 0 {
+            return false;
+        }
+        // Write new data
+        let write_data = b"world!!";
+        let n = dispatch(
+            SYS_WRITE,
+            [
+                fd_w as usize,
+                write_data.as_ptr() as usize,
+                write_data.len(),
+                0,
+                0,
+                0,
+            ],
+        );
+        dispatch(SYS_CLOSE, [fd_w as usize, 0, 0, 0, 0, 0]);
+        if n != write_data.len() as isize {
+            return false;
+        }
+        // Re-open for reading and verify
+        let fd_r = dispatch(
+            SYS_OPEN,
+            [
+                path.as_ptr() as usize,
+                path.len(),
+                O_RDONLY as usize,
+                0,
+                0,
+                0,
+            ],
+        );
+        if fd_r < 0 {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        let n = dispatch(
+            SYS_READ,
+            [fd_r as usize, buf.as_mut_ptr() as usize, 64, 0, 0, 0],
+        );
+        dispatch(SYS_CLOSE, [fd_r as usize, 0, 0, 0, 0, 0]);
+        n == 7 && buf[..7] == b"world!!"[..]
+    });
+
+    crate::test::run_test("syscall_close_invalid", || {
+        // fd 99 is not allocated
+        let result = dispatch(SYS_CLOSE, [99, 0, 0, 0, 0, 0]);
+        result == ERR_INVAL
     });
 }

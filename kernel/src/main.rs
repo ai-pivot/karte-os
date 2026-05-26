@@ -56,9 +56,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         arch::smp::init_bsp(hartid);
 
         crate::console_println!("[init] Probing VirtIO devices...");
-        // TODO: VirtIO probe hangs on QEMU virt without -device virtio-blk-device
-        // Skip for now; will fix after user mode is working
-        // driver::virtio::probe_virtio_devices();
+        driver::virtio::probe_virtio_devices();
 
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();

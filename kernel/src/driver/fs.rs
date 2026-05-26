@@ -121,6 +121,104 @@ pub fn init() {
     crate::console_println!("[fs] In-memory file system initialized");
 }
 
+// ─── VFS Abstraction ────────────────────────────────────────────────
+
+/// Maximum number of open file descriptors per process
+pub const MAX_FDS: usize = 32;
+
+/// File open flags
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_RDWR: u32 = 2;
+pub const O_CREAT: u32 = 0x100;
+pub const O_TRUNC: u32 = 0x200;
+
+/// A file descriptor entry — wraps an in-memory file with seek position
+pub struct FileDescriptor {
+    /// Name of the file in the in-memory filesystem
+    pub name: String,
+    /// Current seek position
+    pub pos: usize,
+    /// Open flags (O_RDONLY, O_WRONLY, O_RDWR)
+    pub flags: u32,
+    /// Whether this fd is valid
+    pub valid: bool,
+}
+
+/// Per-process file descriptor table
+pub struct FdTable {
+    fds: [Option<FileDescriptor>; MAX_FDS],
+}
+
+impl FdTable {
+    pub fn new() -> Self {
+        let mut table = FdTable {
+            fds: core::array::from_fn(|_| None),
+        };
+        // Pre-allocate stdin/stdout/stderr slots
+        table.fds[0] = Some(FileDescriptor {
+            name: String::from("stdin"),
+            pos: 0,
+            flags: O_RDONLY,
+            valid: true,
+        });
+        table.fds[1] = Some(FileDescriptor {
+            name: String::from("stdout"),
+            pos: 0,
+            flags: O_WRONLY,
+            valid: true,
+        });
+        table.fds[2] = Some(FileDescriptor {
+            name: String::from("stderr"),
+            pos: 0,
+            flags: O_WRONLY,
+            valid: true,
+        });
+        table
+    }
+
+    /// Allocate a new fd, returns the fd number or None if table full
+    pub fn alloc(&mut self, name: String, flags: u32) -> Option<usize> {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = Some(FileDescriptor {
+                    name,
+                    pos: 0,
+                    flags,
+                    valid: true,
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Get a reference to a file descriptor
+    pub fn get(&self, fd: usize) -> Option<&FileDescriptor> {
+        self.fds
+            .get(fd)
+            .and_then(|opt| opt.as_ref().filter(|f| f.valid))
+    }
+
+    /// Get a mutable reference to a file descriptor
+    pub fn get_mut(&mut self, fd: usize) -> Option<&mut FileDescriptor> {
+        self.fds
+            .get_mut(fd)
+            .and_then(|opt| opt.as_mut().filter(|f| f.valid))
+    }
+
+    /// Close a file descriptor
+    pub fn close(&mut self, fd: usize) -> bool {
+        if let Some(slot) = self.fds.get_mut(fd) {
+            if slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = None;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[cfg(feature = "test_mode")]
 pub fn run_tests() {
     crate::console_println!("");
