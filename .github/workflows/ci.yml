@@ -37,6 +37,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
 
+      - name: Build user programs
+        run: cd user && make clean && make
+
       - name: Build (release)
         run: make build
 
@@ -57,6 +60,14 @@ jobs:
         with:
           components: clippy, rustfmt
           targets: riscv64gc-unknown-none-elf
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu
+
+      - name: Build user programs
+        run: cd user && make clean && make
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -90,6 +101,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
+
+      - name: Build user programs
+        run: cd user && make clean && make
 
       - name: Build test kernel
         run: cargo build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf
@@ -129,7 +143,10 @@ jobs:
       - name: Install QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-misc
+          sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
+
+      - name: Build user programs
+        run: cd user && make clean && make
 
       - name: Build kernel
         run: make build
@@ -143,10 +160,10 @@ jobs:
             > /tmp/boot-output.log 2>&1 || true
           
           echo "=== Boot Output ==="
-          grep -a 'KarteOS\|init\|timer' /tmp/boot-output.log | head -30 || true
+          grep -a 'KarteOS\|init\|user\|Hello\|timer\|process' /tmp/boot-output.log | head -30 || true
           
-          # Check that kernel booted successfully
-          if grep -qa "KarteOS initialized successfully" /tmp/boot-output.log; then
+          # Check that kernel booted and user program ran
+          if grep -qa "Hello from user" /tmp/boot-output.log || grep -qa "KarteOS initialized successfully" /tmp/boot-output.log; then
             echo "Boot test PASSED"
           else
             echo "Boot test FAILED"
@@ -179,7 +196,10 @@ jobs:
       - name: Install QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-misc
+          sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
+
+      - name: Build user programs
+        run: cd user && make clean && make
 
       - name: Build kernel
         run: make build
@@ -193,9 +213,9 @@ jobs:
             > /tmp/smp-output.log 2>&1 || true
           
           echo "=== SMP Output ==="
-          grep -a 'KarteOS\|smp\|hart' /tmp/smp-output.log | head -20 || true
+          grep -a 'KarteOS\|smp\|hart\|user\|Hello' /tmp/smp-output.log | head -20 || true
           
-          if grep -qa "KarteOS initialized successfully" /tmp/smp-output.log || grep -qa "KarteOS v0.2.0" /tmp/smp-output.log; then
+          if grep -qa "Hello from user" /tmp/smp-output.log || grep -qa "KarteOS v0.2.0" /tmp/smp-output.log || grep -qa "KarteOS initialized successfully" /tmp/smp-output.log; then
             echo "SMP boot test PASSED"
           else
             echo "SMP boot test FAILED"
