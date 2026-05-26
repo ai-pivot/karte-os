@@ -61,3 +61,49 @@ fn sys_yield() -> isize {
 fn sys_getpid() -> isize {
     crate::sched::current_task_id() as isize
 }
+
+#[cfg(feature = "test_mode")]
+pub fn run_tests() {
+    crate::console_println!("");
+    crate::console_println!("── Syscall Tests ──");
+
+    // Test 1: Unknown syscall returns -1
+    crate::test::run_test("syscall_unknown_returns_error", || {
+        dispatch(9999, [0, 0, 0, 0, 0, 0]) == -1
+    });
+
+    // Test 2: sys_getpid returns valid task id
+    crate::test::run_test("syscall_getpid_returns_valid", || {
+        let pid = dispatch(SYS_GETPID, [0, 0, 0, 0, 0, 0]);
+        pid >= 0
+    });
+
+    // Test 3: sys_write to invalid fd returns -1
+    crate::test::run_test("syscall_write_bad_fd_returns_error", || {
+        let result = dispatch(SYS_WRITE, [0, 0, 0, 0, 0, 0]); // fd=0
+        result == -1
+    });
+
+    // Test 4: sys_write to stdout succeeds
+    crate::test::run_test("syscall_write_stdout_succeeds", || {
+        // Write "Hi" to fd=1
+        let msg = b"Hi";
+        let result = dispatch(SYS_WRITE, [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0]);
+        result == 2
+    });
+
+    // Test 5: Syscall constants are correct
+    crate::test::run_test("syscall_constants_correct", || {
+        SYS_READ == 63
+            && SYS_WRITE == 64
+            && SYS_EXIT == 93
+            && SYS_YIELD == 124
+            && SYS_GETPID == 172
+            && SYS_SBRK == 214
+    });
+
+    // Test 6: sys_yield returns 0
+    crate::test::run_test("syscall_yield_returns_zero", || {
+        dispatch(SYS_YIELD, [0, 0, 0, 0, 0, 0]) == 0
+    });
+}

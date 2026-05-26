@@ -8,7 +8,12 @@
   <img src="https://img.shields.io/badge/target-riscv64gc-blue" />
   <img src="https://img.shields.io/badge/edition-2024-orange" />
   <img src="https://img.shields.io/badge/platform-QEMU%20virt-green" />
+  <img src="https://img.shields.io/badge/tests-50%20passed-brightgreen" />
   <img src="https://img.shields.io/badge/license-MIT-informational" />
+</p>
+
+<p align="center">
+  <img src="https://github.com/ai-pivot/karte-os/actions/workflows/ci.yml/badge.svg" alt="CI" />
 </p>
 
 ---
@@ -137,6 +142,49 @@ OpenSBI v1.3.1 ...
 ### Exit QEMU
 
 Press `Ctrl+A` then `X`.
+
+## Testing
+
+KarteOS includes **50 integration tests** that run inside QEMU as a specialized test kernel.
+
+```bash
+# Run all tests
+make test
+
+# Build test kernel only
+make build-test
+
+# Boot test (normal mode)
+make boot-test
+```
+
+### Test Coverage
+
+| Module | Tests | Coverage |
+|--------|-------|----------|
+| **PMM** (Physical Memory) | 6 | alloc, dealloc, cycle, uniqueness, reuse, alignment |
+| **VMM** (Virtual Memory) | 6 | page table creation, map, identity map, PTE flags/PPN/leaf |
+| **Heap** (Allocator) | 6 | Vec, String, large alloc, Box, multiple allocs, drop/realloc |
+| **Filesystem** | 15 | CRUD, append, overwrite, duplicates, edge cases |
+| **SpinLock** | 5 | lock/unlock, modify, guard drop, complex data, sequential |
+| **Task** | 6 | context zeroed, goto, TCB creation, state transitions |
+| **Syscall** | 6 | dispatch, getpid, write fd, yield, constants |
+| **Total** | **50** | 7 modules fully tested |
+
+### How It Works
+
+1. `--features test_mode` compiles a test kernel with `run_tests()` in each module
+2. QEMU boots the test kernel → runs all tests → prints TAP output → shuts down
+3. `scripts/run-tests.sh` parses output and reports pass/fail
+
+### CI
+
+Every push and PR triggers GitHub Actions:
+- **Build** — `cargo build --release` for riscv64gc target
+- **Lint** — `cargo fmt --check` + `cargo clippy`
+- **Test** — Build test kernel + run in QEMU, verify all 50 pass
+- **Boot Test** — Normal mode boot, verify init sequence completes
+- **SMP Test** — 4-core boot, verify multi-hart init
 
 ## Project Structure
 

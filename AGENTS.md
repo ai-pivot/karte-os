@@ -8,6 +8,9 @@
 make build          # Build kernel (cargo build --release)
 make run            # Run in QEMU (single core)
 make debug          # Run with GDB stub (-S -s)
+make test           # Build test kernel + run 50 tests in QEMU
+make build-test     # Build test kernel only
+make boot-test      # Boot test (normal mode, verifies init sequence)
 make clean          # Clean all artifacts
 ```
 
@@ -48,3 +51,12 @@ Boot flow: QEMU → OpenSBI → `_start` (entry.S: BSS clear, stack setup) → `
 | `docs/agent/trap.md` | Trap frame layout, exception dispatch, timer interrupts, syscall handling |
 | `docs/agent/smp.md` | SMP hart management, BSP/secondary init, SBI hart_start |
 | `docs/agent/conventions.md` | Rust 2024 patterns, coding style, error handling |
+
+## Testing
+
+- **50 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU
+- **Test mode**: `cargo build --release --features test_mode` compiles test kernel
+- **Test framework**: `kernel/src/test.rs` — TAP-style `run_test(name, || bool)` API
+- **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`
+- **CI**: GitHub Actions runs build + lint + test + boot-test + smp-test on every push
+- **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), Task (6), Syscall (6) = **50 tests**

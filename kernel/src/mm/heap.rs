@@ -46,3 +46,58 @@ fn allocate_contiguous_pages(count: usize) -> usize {
 
     first_frame.expect("heap allocation returned no frames")
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(feature = "test_mode")]
+pub fn run_tests() {
+    crate::console_println!("");
+    crate::console_println!("── Heap Tests ──");
+
+    // Test 1: Vec allocation
+    crate::test::run_test("heap_vec_alloc", || {
+        let mut v: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        for i in 0..100u32 {
+            v.push(i);
+        }
+        v.len() == 100 && v[99] == 99
+    });
+
+    // Test 2: String allocation
+    crate::test::run_test("heap_string_alloc", || {
+        let s: alloc::string::String = alloc::string::String::from("Hello, KarteOS!");
+        s.len() == 15 && s.starts_with("Hello")
+    });
+
+    // Test 3: Large allocation
+    crate::test::run_test("heap_large_alloc", || {
+        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(4096);
+        for i in 0..256u16 {
+            v.push(i as u8);
+        }
+        v.len() == 256
+    });
+
+    // Test 4: Box allocation
+    crate::test::run_test("heap_box_alloc", || {
+        let b = alloc::boxed::Box::new(42usize);
+        *b == 42
+    });
+
+    // Test 5: Multiple Vecs
+    crate::test::run_test("heap_multiple_vecs", || {
+        let v1: alloc::vec::Vec<u8> = (0..50).collect();
+        let v2: alloc::vec::Vec<u8> = (100..150).collect();
+        let v3: alloc::vec::Vec<u8> = (200..250).collect();
+        v1.len() == 50 && v2.len() == 50 && v3.len() == 50
+    });
+
+    // Test 6: Drop and realloc
+    crate::test::run_test("heap_drop_realloc", || {
+        {
+            let _v: alloc::vec::Vec<usize> = (0..1000).collect();
+        } // dropped here
+        let v: alloc::vec::Vec<usize> = (0..1000).collect();
+        v.len() == 1000
+    });
+}

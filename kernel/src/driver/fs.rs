@@ -121,3 +121,118 @@ pub fn global_fs() -> crate::sync::spinlock::SpinLockGuard<'static, FileSystem> 
 pub fn init() {
     crate::console_println!("[fs] In-memory file system initialized");
 }
+
+#[cfg(feature = "test_mode")]
+pub fn run_tests() {
+    crate::console_println!("");
+    crate::console_println!("── Filesystem Tests ──");
+
+    // Test 1: Create file
+    crate::test::run_test("fs_create_file", || {
+        let mut fs = FileSystem::new();
+        fs.create("test.txt").is_ok()
+    });
+
+    // Test 2: Create duplicate file fails
+    crate::test::run_test("fs_create_duplicate_fails", || {
+        let mut fs = FileSystem::new();
+        fs.create("dup.txt").is_ok() && fs.create("dup.txt").is_err()
+    });
+
+    // Test 3: Write and read
+    crate::test::run_test("fs_write_and_read", || {
+        let mut fs = FileSystem::new();
+        fs.write("data.bin", &[1, 2, 3, 4]).is_ok()
+            && fs.read("data.bin") == Some(&[1u8, 2, 3, 4][..])
+    });
+
+    // Test 4: Write to non-existent file creates it
+    crate::test::run_test("fs_write_creates_file", || {
+        let mut fs = FileSystem::new();
+        fs.write("auto.txt", b"hello").is_ok()
+            && fs.read("auto.txt").is_some()
+    });
+
+    // Test 5: Write overwrites existing
+    crate::test::run_test("fs_write_overwrites", || {
+        let mut fs = FileSystem::new();
+        fs.write("f.txt", b"old").is_ok();
+        fs.write("f.txt", b"new").is_ok();
+        fs.read("f.txt") == Some(&b"new"[..])
+    });
+
+    // Test 6: Append to existing file
+    crate::test::run_test("fs_append", || {
+        let mut fs = FileSystem::new();
+        fs.write("a.txt", b"hello").is_ok();
+        fs.append("a.txt", b" world").is_ok();
+        fs.read("a.txt") == Some(&b"hello world"[..])
+    });
+
+    // Test 7: Append to non-existent file fails
+    crate::test::run_test("fs_append_nonexistent_fails", || {
+        let mut fs = FileSystem::new();
+        fs.append("nope.txt", b"data").is_err()
+    });
+
+    // Test 8: Delete file
+    crate::test::run_test("fs_delete", || {
+        let mut fs = FileSystem::new();
+        fs.create("del.txt").is_ok();
+        fs.delete("del.txt").is_ok() && fs.read("del.txt").is_none()
+    });
+
+    // Test 9: Delete non-existent fails
+    crate::test::run_test("fs_delete_nonexistent_fails", || {
+        let mut fs = FileSystem::new();
+        fs.delete("nope").is_err()
+    });
+
+    // Test 10: Read non-existent returns None
+    crate::test::run_test("fs_read_nonexistent_none", || {
+        let fs = FileSystem::new();
+        fs.read("nope").is_none()
+    });
+
+    // Test 11: List files
+    crate::test::run_test("fs_list_files", || {
+        let mut fs = FileSystem::new();
+        fs.create("a").is_ok();
+        fs.create("b").is_ok();
+        fs.create("c").is_ok();
+        fs.list().len() == 3
+    });
+
+    // Test 12: File count
+    crate::test::run_test("fs_file_count", || {
+        let mut fs = FileSystem::new();
+        fs.create("x").is_ok();
+        fs.create("y").is_ok();
+        fs.file_count() == 2
+    });
+
+    // Test 13: Empty file has no data
+    crate::test::run_test("fs_empty_file_no_data", || {
+        let mut fs = FileSystem::new();
+        fs.create("empty").is_ok();
+        fs.read("empty") == Some(&[][..])
+    });
+
+    // Test 14: Large file write/read
+    crate::test::run_test("fs_large_file", || {
+        let mut fs = FileSystem::new();
+        let data: alloc::vec::Vec<u8> = (0..=255u8).collect();
+        fs.write("big.bin", &data).is_ok();
+        let read = fs.read("big.bin");
+        read.is_some() && read.unwrap().len() == 256 && read.unwrap()[255] == 255
+    });
+
+    // Test 15: Delete then recreate
+    crate::test::run_test("fs_delete_recreate", || {
+        let mut fs = FileSystem::new();
+        fs.write("r.txt", b"v1").is_ok();
+        fs.delete("r.txt").is_ok();
+        fs.create("r.txt").is_ok();
+        fs.read("r.txt") == Some(&[][..])
+    });
+}

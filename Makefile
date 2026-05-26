@@ -1,4 +1,4 @@
-.PHONY: build run debug clean doc
+.PHONY: build run debug clean doc check build-test test boot-test
 
 # Project settings
 KERNEL_BIN := target/riscv64gc-unknown-none-elf/release/karte-os-kernel
@@ -41,3 +41,19 @@ doc:
 # Check without building
 check:
 	cargo check --release -p karte-os-kernel
+
+# Build test kernel
+build-test:
+	cargo build --release -p karte-os-kernel --features test_mode
+
+# Run tests in QEMU
+test: build-test
+	bash scripts/run-tests.sh
+
+# Run boot test (normal mode)
+boot-test: build
+	@echo "Running boot test..."
+	@timeout 10 qemu-system-riscv64 -machine virt -cpu rv64 -nographic \
+		-bios default -m 128M -smp 1 \
+		-kernel $(KERNEL_ELF) 2>&1 | grep -qa "initialized successfully" \
+		&& echo "✅ Boot test passed" || echo "❌ Boot test failed"

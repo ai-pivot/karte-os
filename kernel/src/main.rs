@@ -14,69 +14,74 @@ pub mod sbi;
 pub mod sched;
 pub mod sync;
 pub mod syscall;
+pub mod test;
 
 #[unsafe(no_mangle)]
-extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
-    // Phase 1: Early init - UART + SBI console
+unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
+    // ── Common init (both normal & test mode) ──
     driver::uart::Uart::new(0x1000_0000).init();
     crate::console_println!("=== KarteOS v0.2.0 ===");
     crate::console_println!("  Booting on hart {}", hartid);
-    crate::console_println!("  DTB pointer: {:#x}", dtb_ptr);
 
-    // Phase 2: Trap initialization
-    crate::console_println!("[init] Setting up trap handling...");
     arch::trap::init();
-
-    // Phase 2.5: SMP — mark BSP as running
-    crate::console_println!("[init] Initializing SMP...");
-    arch::smp::init_bsp(hartid);
-
-    // Phase 3: Physical memory
-    crate::console_println!("[init] Initializing physical memory...");
     mm::pmm::init();
-
-    // Phase 4: Virtual memory + heap
-    crate::console_println!("[init] Setting up virtual memory...");
     mm::vmm::init();
-    crate::console_println!("[init] Initializing kernel heap...");
     mm::heap::init();
 
-    // Phase 5: VirtIO devices
-    crate::console_println!("[init] Probing VirtIO devices...");
-    driver::virtio::probe_virtio_devices();
+    // ── Test mode ──
+    #[cfg(feature = "test_mode")]
+    {
+        crate::console_println!("[test] Running test suite...");
+        crate::console_println!("");
 
-    // Phase 6: Filesystem
-    crate::console_println!("[init] Initializing filesystem...");
-    driver::fs::init();
+        crate::mm::pmm::run_tests();
+        crate::mm::vmm::run_tests();
+        crate::mm::heap::run_tests();
+        crate::driver::fs::run_tests();
+        crate::sync::spinlock::run_tests();
+        crate::sched::task::run_tests();
+        crate::syscall::run_tests();
 
-    // Phase 7: Network
-    crate::console_println!("[init] Probing network devices...");
-    driver::net::test_net();
+        crate::test::print_summary();
+        crate::sbi::shutdown()
+    }
 
-    // Phase 8: Enable timer interrupt
-    crate::console_println!("[init] Enabling timer interrupts...");
-    arch::trap::enable_timer_interrupt();
-    crate::console_println!("[init] Setting first timer...");
-    arch::trap::set_next_timer();
+    // ── Normal mode ──
+    #[cfg(not(feature = "test_mode"))]
+    {
+        crate::console_println!("  DTB pointer: {:#x}", dtb_ptr);
 
-    // Phase 9: PLIC
-    crate::console_println!("[init] Initializing PLIC...");
-    arch::plic::init(0);
+        crate::console_println!("[init] Initializing SMP...");
+        arch::smp::init_bsp(hartid);
 
-    // Phase 9.5: Start secondary harts
-    crate::console_println!("[init] Starting secondary harts...");
-    arch::smp::start_secondary_harts(4);
+        crate::console_println!("[init] Probing VirtIO devices...");
+        driver::virtio::probe_virtio_devices();
 
-    // Phase 10: Scheduler with context switching
-    crate::console_println!("[init] Initializing scheduler...");
-    sched::init();
+        crate::console_println!("[init] Initializing filesystem...");
+        driver::fs::init();
 
-    // Enable global S-mode interrupts
-    unsafe { riscv::register::sstatus::set_sie() };
-    crate::console_println!("=== KarteOS initialized successfully ===");
+        crate::console_println!("[init] Probing network devices...");
+        driver::net::test_net();
 
-    // Main task loop — scheduler runs via timer interrupts
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+        crate::console_println!("[init] Enabling timer interrupts...");
+        arch::trap::enable_timer_interrupt();
+        crate::console_println!("[init] Setting first timer...");
+        arch::trap::set_next_timer();
+
+        crate::console_println!("[init] Initializing PLIC...");
+        arch::plic::init(0);
+
+        crate::console_println!("[init] Starting secondary harts...");
+        arch::smp::start_secondary_harts(4);
+
+        crate::console_println!("[init] Initializing scheduler...");
+        sched::init();
+
+        unsafe { riscv::register::sstatus::set_sie() };
+        crate::console_println!("=== KarteOS initialized successfully ===");
+
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
     }
 }

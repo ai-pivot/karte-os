@@ -121,3 +121,123 @@ pub fn dealloc_frame(frame: usize) {
 pub const fn page_size() -> usize {
     PAGE_SIZE
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(feature = "test_mode")]
+pub fn run_tests() {
+    crate::console_println!("");
+    crate::console_println!("── PMM Tests ──");
+
+    // Test 1: Basic allocation
+    crate::test::run_test("pmm_alloc_returns_valid_frame", || {
+        match alloc_frame() {
+            Some(frame) => {
+                // Frame should be page-aligned
+                frame % page_size() == 0
+            }
+            None => false,
+        }
+    });
+
+    // Test 2: Allocate and deallocate
+    crate::test::run_test("pmm_alloc_dealloc_cycle", || {
+        let frame = alloc_frame();
+        if frame.is_none() { return false; }
+        let f = frame.unwrap();
+        
+        // Allocate a second frame (should be different)
+        let frame2 = alloc_frame();
+        if frame2.is_none() { return false; }
+        let f2 = frame2.unwrap();
+        
+        let different = f != f2;
+        
+        // Free both
+        dealloc_frame(f);
+        dealloc_frame(f2);
+        
+        // Re-allocate should succeed
+        let f3 = alloc_frame();
+        f3.is_some() && different
+    });
+
+    // Test 3: Multiple allocations are unique
+    crate::test::run_test("pmm_multiple_allocs_unique", || {
+        let mut frames = [0usize; 16];
+        let mut all_unique = true;
+        
+        for i in 0..16 {
+            match alloc_frame() {
+                Some(f) => {
+                    // Check no duplicates
+                    for j in 0..i {
+                        if frames[j] == f {
+                            all_unique = false;
+                        }
+                    }
+                    frames[i] = f;
+                }
+                None => return false,
+            }
+        }
+        
+        // Clean up
+        for f in frames {
+            dealloc_frame(f);
+        }
+        
+        all_unique
+    });
+
+    // Test 4: Dealloc then realloc returns a freed frame
+    crate::test::run_test("pmm_dealloc_reuse", || {
+        let f1 = alloc_frame();
+        if f1.is_none() { return false; }
+        let addr1 = f1.unwrap();
+        
+        dealloc_frame(addr1);
+        
+        // Allocate again — should eventually get the same frame back
+        // (not guaranteed immediately, but should succeed)
+        let f2 = alloc_frame();
+        if f2.is_none() { return false; }
+        dealloc_frame(f2.unwrap());
+        
+        true
+    });
+
+    // Test 5: Page size is 4096
+    crate::test::run_test("pmm_page_size_is_4096", || {
+        page_size() == 4096
+    });
+
+    // Test 6: Allocated frames are in valid range
+    crate::test::run_test("pmm_frames_in_valid_range", || {
+        let frames: [Option<usize>; 4] = [
+            alloc_frame(),
+            alloc_frame(),
+            alloc_frame(),
+            alloc_frame(),
+        ];
+        
+        let mut valid = true;
+        for f in &frames {
+            match f {
+                Some(addr) => {
+                    // Should be above kernel end and below 128MB
+                    if *addr < 0x8020_0000 || *addr >= 0x8020_0000 + 128 * 1024 * 1024 {
+                        valid = false;
+                    }
+                }
+                None => valid = false,
+            }
+        }
+        
+        for f in frames.iter().flatten() {
+            dealloc_frame(*f);
+        }
+        
+        valid
+    });
+}

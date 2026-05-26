@@ -3,6 +3,10 @@ name = "karte-os-kernel"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+test_mode = []
+
 [dependencies]
 riscv = "0.12"
 riscv-rt = "0.13"

@@ -153,3 +153,88 @@ pub fn init() {
 
     crate::console_println!("[vmm] Sv39 page table activated at {:#x}", root_addr);
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(feature = "test_mode")]
+pub fn run_tests() {
+    crate::console_println!("");
+    crate::console_println!("── VMM Tests ──");
+
+    // Test 1: Create empty page table
+    crate::test::run_test("vmm_create_page_table", || {
+        let pt = PageTable::zeroed();
+        let addr = pt as *const PageTable as usize;
+        // Should be page-aligned
+        addr % 4096 == 0
+    });
+
+    // Test 2: Map a single page
+    crate::test::run_test("vmm_map_single_page", || {
+        let root = PageTable::zeroed();
+        map(root, 0x8040_0000, 0x8040_0000, PTEFlags::KRW);
+        // Check that L0 entry exists and is valid
+        let vpn2 = (0x8040_0000 >> 30) & 0x1FF;
+        let vpn1 = (0x8040_0000 >> 21) & 0x1FF;
+        let vpn0 = (0x8040_0000 >> 12) & 0x1FF;
+        
+        let l2_entry = root.entries[vpn2];
+        if !l2_entry.is_valid() { return false; }
+        
+        let l1_table = unsafe { &*((l2_entry.ppn() << 12) as *const PageTable) };
+        let l1_entry = l1_table.entries[vpn1];
+        if !l1_entry.is_valid() { return false; }
+        
+        let l0_table = unsafe { &*((l1_entry.ppn() << 12) as *const PageTable) };
+        let l0_entry = l0_table.entries[vpn0];
+        
+        l0_entry.is_valid() && l0_entry.ppn() == (0x8040_0000 >> 12)
+    });
+
+    // Test 3: Identity map range
+    crate::test::run_test("vmm_identity_map_range", || {
+        let root = PageTable::zeroed();
+        identity_map(root, 0x8050_0000, 0x8050_3000, PTEFlags::KRWX);
+        
+        // Check first and last pages
+        for addr in [0x8050_0000, 0x8050_1000, 0x8050_2000] {
+            let vpn2 = (addr >> 30) & 0x1FF;
+            let vpn1 = (addr >> 21) & 0x1FF;
+            let vpn0 = (addr >> 12) & 0x1FF;
+            
+            let l2 = root.entries[vpn2];
+            if !l2.is_valid() { return false; }
+            let l1t = unsafe { &*((l2.ppn() << 12) as *const PageTable) };
+            let l1 = l1t.entries[vpn1];
+            if !l1.is_valid() { return false; }
+            let l0t = unsafe { &*((l1.ppn() << 12) as *const PageTable) };
+            let l0 = l0t.entries[vpn0];
+            if !l0.is_valid() || l0.ppn() != (addr >> 12) { return false; }
+        }
+        true
+    });
+
+    // Test 4: PTE flags are correct
+    crate::test::run_test("vmm_pte_flags", || {
+        let pte = PTE::new(0x12345, PTEFlags::KRWX);
+        let flags = pte.flags();
+        flags.contains(PTEFlags::V)
+            && flags.contains(PTEFlags::R)
+            && flags.contains(PTEFlags::W)
+            && flags.contains(PTEFlags::X)
+            && !flags.contains(PTEFlags::U)
+    });
+
+    // Test 5: PTE PPN extraction
+    crate::test::run_test("vmm_pte_ppn", || {
+        let pte = PTE::new(0xABCD, PTEFlags::KRW);
+        pte.ppn() == 0xABCD
+    });
+
+    // Test 6: PTE is_leaf detection
+    crate::test::run_test("vmm_pte_leaf_detection", || {
+        let leaf = PTE::new(0x100, PTEFlags::KRW);
+        let non_leaf = PTE::new(0x200, PTEFlags::V);
+        leaf.is_leaf() && !non_leaf.is_leaf()
+    });
+}

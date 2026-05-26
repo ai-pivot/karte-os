@@ -62,3 +62,63 @@ impl<T> Drop for SpinLockGuard<'_, T> {
         self.lock.unlock();
     }
 }
+
+#[cfg(feature = "test_mode")]
+pub fn run_tests() {
+    crate::console_println!("");
+    crate::console_println!("── SpinLock Tests ──");
+
+    // Test 1: Lock and unlock
+    crate::test::run_test("spinlock_lock_unlock", || {
+        let lock = SpinLock::new(42usize);
+        let guard = lock.lock();
+        *guard == 42
+    });
+
+    // Test 2: Modify through guard
+    crate::test::run_test("spinlock_modify_via_guard", || {
+        let lock = SpinLock::new(0usize);
+        {
+            let mut guard = lock.lock();
+            *guard = 100;
+        }
+        let guard = lock.lock();
+        *guard == 100
+    });
+
+    // Test 3: Guard drops and releases lock
+    crate::test::run_test("spinlock_guard_drop_releases", || {
+        let lock = SpinLock::new(1usize);
+        {
+            let _g = lock.lock();
+        }
+        // Should be able to lock again (would deadlock if not released)
+        let guard = lock.lock();
+        *guard == 1
+    });
+
+    // Test 4: Lock with complex data
+    crate::test::run_test("spinlock_complex_data", || {
+        let lock = SpinLock::new([0usize; 4]);
+        {
+            let mut g = lock.lock();
+            g[0] = 10;
+            g[1] = 20;
+            g[2] = 30;
+            g[3] = 40;
+        }
+        let g = lock.lock();
+        g[0] == 10 && g[1] == 20 && g[2] == 30 && g[3] == 40
+    });
+
+    // Test 5: Multiple sequential locks
+    crate::test::run_test("spinlock_sequential_locks", || {
+        let lock = SpinLock::new(0usize);
+        for i in 0..10usize {
+            let mut g = lock.lock();
+            *g = i;
+        }
+        let g = lock.lock();
+        *g == 9
+    });
+}

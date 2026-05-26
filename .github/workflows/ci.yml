@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Job 1: Build ──
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install QEMU and cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
+
+      - name: Build (release)
+        run: make build
+
+      - name: Upload kernel binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-binary
+          path: target/riscv64gc-unknown-none-elf/release/karte-os-kernel
+
+  # ── Job 2: Lint ──
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --release -p karte-os-kernel --target riscv64gc-unknown-none-elf -- -D warnings -A deprecated
+
+  # ── Job 3: QEMU Integration Tests ──
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
+
+      - name: Build test kernel
+        run: cargo build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf
+
+      - name: Run QEMU tests
+        run: bash scripts/run-tests.sh
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: /tmp/qemu-test-output.log
+
+  # ── Job 4: QEMU Boot Test (normal mode) ──
+  boot-test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc
+
+      - name: Download kernel binary
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-binary
+
+      - name: Boot test
+        run: |
+          timeout 10 qemu-system-riscv64 \
+            -machine virt -cpu rv64 -nographic \
+            -bios default -m 128M -smp 1 \
+            -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
+            > /tmp/boot-output.log 2>&1 || true
+          
+          echo "=== Boot Output ==="
+          cat /tmp/boot-output.log | grep -a 'KarteOS\|init\|timer' | head -30
+          
+          # Check that kernel booted successfully
+          if grep -qa "KarteOS initialized successfully" /tmp/boot-output.log; then
+            echo "✅ Boot test PASSED"
+          else
+            echo "❌ Boot test FAILED"
+            cat /tmp/boot-output.log
+            exit 1
+          fi
+
+  # ── Job 5: SMP Boot Test ──
+  smp-test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc
+
+      - name: Download kernel binary
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-binary
+
+      - name: SMP boot test
+        run: |
+          timeout 10 qemu-system-riscv64 \
+            -machine virt -cpu rv64 -nographic \
+            -bios default -m 128M -smp 4 \
+            -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
+            > /tmp/smp-output.log 2>&1 || true
+          
+          echo "=== SMP Output ==="
+          cat /tmp/smp-output.log | grep -a 'KarteOS\|smp\|hart' | head -20
+          
+          if grep -qa "KarteOS initialized successfully" /tmp/smp-output.log; then
+            echo "✅ SMP boot test PASSED"
+          else
+            echo "❌ SMP boot test FAILED"
+            exit 1
+          fi
