@@ -2,7 +2,7 @@
 //!
 //! Uses the modern DBCN (Debug Console) extension instead of legacy SBI calls.
 
-use sbi_rt::{console_write_byte, system_reset, Shutdown, NoReason};
+use sbi_rt::{NoReason, Shutdown, console_write_byte, system_reset};
 
 /// Write a single byte to the debug console (blocking).
 pub fn console_putchar(c: u8) {
