@@ -201,24 +201,21 @@ impl VirtIONet {
         for i in 0..VIRTIO_MAX_DEVICES {
             let base = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
 
-            let magic = unsafe {
-                core::ptr::read_volatile((base + VIRTIO_MMIO_MAGIC) as *const u32)
-            };
+            let magic =
+                unsafe { core::ptr::read_volatile((base + VIRTIO_MMIO_MAGIC) as *const u32) };
             if magic != VIRTIO_MAGIC {
                 continue;
             }
 
-            let version = unsafe {
-                core::ptr::read_volatile((base + VIRTIO_MMIO_VERSION) as *const u32)
-            };
+            let version =
+                unsafe { core::ptr::read_volatile((base + VIRTIO_MMIO_VERSION) as *const u32) };
             if version != 2 {
                 // We expect VirtIO MMIO version 2 (legacy is 1)
                 continue;
             }
 
-            let device_id = unsafe {
-                core::ptr::read_volatile((base + VIRTIO_MMIO_DEVICE_ID) as *const u32)
-            };
+            let device_id =
+                unsafe { core::ptr::read_volatile((base + VIRTIO_MMIO_DEVICE_ID) as *const u32) };
             if device_id == VIRTIO_ID_NET {
                 return Some(Self::new(base));
             }
@@ -264,9 +261,7 @@ impl VirtIONet {
 
         // Step 5: FEATURES_OK
         self.set_status(
-            VIRTIO_STATUS_ACKNOWLEDGE
-                | VIRTIO_STATUS_DRIVER
-                | VIRTIO_STATUS_FEATURES_OK,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
         );
 
         // Verify FEATURES_OK is still set
@@ -298,27 +293,16 @@ impl VirtIONet {
 
     /// Set up a single VirtQueue: allocate memory via the static pool, write
     /// descriptor / available / used ring addresses into MMIO registers.
-    fn setup_queue(
-        &self,
-        queue_index: u32,
-        queue_mem_lock: &spin::Mutex<Option<QueueMem>>,
-    ) {
+    fn setup_queue(&self, queue_index: u32, queue_mem_lock: &spin::Mutex<Option<QueueMem>>) {
         // Select the queue
         self.write32(VIRTIO_MMIO_QUEUE_SEL, queue_index);
 
         let num_max = self.read32(VIRTIO_MMIO_QUEUE_NUM_MAX);
         if num_max == 0 {
-            crate::console_println!(
-                "[net] Queue {} not available on device",
-                queue_index
-            );
+            crate::console_println!("[net] Queue {} not available on device", queue_index);
             return;
         }
-        crate::console_println!(
-            "[net] Queue {} max descriptors: {}",
-            queue_index,
-            num_max
-        );
+        crate::console_println!("[net] Queue {} max descriptors: {}", queue_index, num_max);
 
         // Set queue size
         self.write32(VIRTIO_MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
@@ -397,8 +381,7 @@ impl VirtIONet {
 
         // Copy packet into data buffer
         let buf_offset = (desc_idx as usize) * NET_MAX_PACKET_SIZE;
-        mem.data[buf_offset..buf_offset + total_len]
-            .copy_from_slice(&packet_buf[..total_len]);
+        mem.data[buf_offset..buf_offset + total_len].copy_from_slice(&packet_buf[..total_len]);
 
         // Set up descriptor
         let buf_addr = &mem.data[buf_offset] as *const _ as u64;
@@ -467,9 +450,7 @@ impl VirtIONet {
 
             // Copy payload (skip VirtIO net header) into caller's buffer
             let data_start = VIRTIO_NET_HDR_SIZE;
-            buf[..payload_len].copy_from_slice(
-                &mem.data[data_start..total_len],
-            );
+            buf[..payload_len].copy_from_slice(&mem.data[data_start..total_len]);
 
             // Re-queue the descriptor for future receives
             let desc_idx: u16 = 0;

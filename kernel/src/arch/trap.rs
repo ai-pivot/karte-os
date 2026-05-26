@@ -3,8 +3,11 @@
 
 use core::arch::global_asm;
 
+use riscv::interrupt::{
+    Trap,
+    supervisor::{Exception, Interrupt},
+};
 use riscv::register::{scause, sie, stval, stvec};
-use riscv::interrupt::{Trap, supervisor::{Exception, Interrupt}};
 
 unsafe extern "C" {
     fn trap_entry();
@@ -72,11 +75,7 @@ static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
 fn handle_timer() {
     let ticks = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if ticks % 100 == 0 {
-        crate::console_println!(
-            "[timer] tick {} ({}s)",
-            ticks,
-            ticks / 100
-        );
+        crate::console_println!("[timer] tick {} ({}s)", ticks, ticks / 100);
     }
     set_next_timer();
     crate::sched::schedule();
@@ -113,8 +112,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
             // RISC-V ecall from U-mode: a7=syscall_id, a0-a5=args
             let syscall_id = ctx.x[17]; // a7
             let args = [
-                ctx.x[10], ctx.x[11], ctx.x[12],
-                ctx.x[13], ctx.x[14], ctx.x[15],
+                ctx.x[10], ctx.x[11], ctx.x[12], ctx.x[13], ctx.x[14], ctx.x[15],
             ];
             let result = crate::syscall::dispatch(syscall_id, args);
             ctx.x[10] = result as usize; // a0 = return value

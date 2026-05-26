@@ -26,7 +26,12 @@ pub fn print_summary() {
 
     crate::console_println!("");
     crate::console_println!("──────────────────────────────────────────");
-    crate::console_println!("  Test Results: {}/{} passed, {} failed", passed, total, failed);
+    crate::console_println!(
+        "  Test Results: {}/{} passed, {} failed",
+        passed,
+        total,
+        failed
+    );
     crate::console_println!("──────────────────────────────────────────");
 
     if failed == 0 {

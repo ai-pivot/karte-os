@@ -1,5 +1,5 @@
 /// SBI console output and system control wrappers
-use sbi_rt::{self, system_reset, Shutdown, NoReason};
+use sbi_rt::{self, NoReason, Shutdown, system_reset};
 
 /// Print to SBI console (low-level, single character)
 pub fn console_putchar(c: u8) {

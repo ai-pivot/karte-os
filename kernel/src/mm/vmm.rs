@@ -177,17 +177,21 @@ pub fn run_tests() {
         let vpn2 = (0x8040_0000 >> 30) & 0x1FF;
         let vpn1 = (0x8040_0000 >> 21) & 0x1FF;
         let vpn0 = (0x8040_0000 >> 12) & 0x1FF;
-        
+
         let l2_entry = root.entries[vpn2];
-        if !l2_entry.is_valid() { return false; }
-        
+        if !l2_entry.is_valid() {
+            return false;
+        }
+
         let l1_table = unsafe { &*((l2_entry.ppn() << 12) as *const PageTable) };
         let l1_entry = l1_table.entries[vpn1];
-        if !l1_entry.is_valid() { return false; }
-        
+        if !l1_entry.is_valid() {
+            return false;
+        }
+
         let l0_table = unsafe { &*((l1_entry.ppn() << 12) as *const PageTable) };
         let l0_entry = l0_table.entries[vpn0];
-        
+
         l0_entry.is_valid() && l0_entry.ppn() == (0x8040_0000 >> 12)
     });
 
@@ -195,21 +199,27 @@ pub fn run_tests() {
     crate::test::run_test("vmm_identity_map_range", || {
         let root = PageTable::zeroed();
         identity_map(root, 0x8050_0000, 0x8050_3000, PTEFlags::KRWX);
-        
+
         // Check first and last pages
         for addr in [0x8050_0000, 0x8050_1000, 0x8050_2000] {
             let vpn2 = (addr >> 30) & 0x1FF;
             let vpn1 = (addr >> 21) & 0x1FF;
             let vpn0 = (addr >> 12) & 0x1FF;
-            
+
             let l2 = root.entries[vpn2];
-            if !l2.is_valid() { return false; }
+            if !l2.is_valid() {
+                return false;
+            }
             let l1t = unsafe { &*((l2.ppn() << 12) as *const PageTable) };
             let l1 = l1t.entries[vpn1];
-            if !l1.is_valid() { return false; }
+            if !l1.is_valid() {
+                return false;
+            }
             let l0t = unsafe { &*((l1.ppn() << 12) as *const PageTable) };
             let l0 = l0t.entries[vpn0];
-            if !l0.is_valid() || l0.ppn() != (addr >> 12) { return false; }
+            if !l0.is_valid() || l0.ppn() != (addr >> 12) {
+                return false;
+            }
         }
         true
     });

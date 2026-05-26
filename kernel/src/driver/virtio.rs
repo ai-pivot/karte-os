@@ -2,9 +2,9 @@
 
 use core::ptr::NonNull;
 
-use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
+use virtio_drivers::device::blk::{SECTOR_SIZE, VirtIOBlk};
 use virtio_drivers::transport::mmio::MmioTransport;
-use virtio_drivers::{BufferDirection, Hal, PhysAddr, PAGE_SIZE};
+use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE, PhysAddr};
 
 use crate::mm::pmm;
 use crate::sync::spinlock::SpinLock;
@@ -150,11 +150,10 @@ fn init_blk_device(mmio_base: usize, mmio_size: usize) -> Result<(), virtio_driv
 
     // Safety: mmio_base points to a valid VirtIO MMIO region on the QEMU virt platform.
     // The memory is MMIO and remains valid for the lifetime of the OS.
-    let transport = unsafe { MmioTransport::new(header, mmio_size) }
-        .map_err(|e| {
-            crate::console_println!("[virtio] MmioTransport error: {:?}", e);
-            virtio_drivers::Error::IoError
-        })?;
+    let transport = unsafe { MmioTransport::new(header, mmio_size) }.map_err(|e| {
+        crate::console_println!("[virtio] MmioTransport error: {:?}", e);
+        virtio_drivers::Error::IoError
+    })?;
 
     let blk = VirtIOBlk::<VirtIOHal, _>::new(transport)?;
 

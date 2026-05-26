@@ -95,10 +95,7 @@ pub fn start_secondary_harts(total_harts: usize) {
                     allocated += 1;
                 }
                 None => {
-                    crate::console_println!(
-                        "[smp] Failed to allocate stack for hart {}",
-                        hartid
-                    );
+                    crate::console_println!("[smp] Failed to allocate stack for hart {}", hartid);
                     break;
                 }
             }
@@ -130,11 +127,7 @@ pub fn start_secondary_harts(total_harts: usize) {
         if result.is_ok() {
             crate::console_println!("[smp] Started hart {}", hartid);
         } else {
-            crate::console_println!(
-                "[smp] Failed to start hart {}: error {:?}",
-                hartid,
-                result
-            );
+            crate::console_println!("[smp] Failed to start hart {}: error {:?}", hartid, result);
         }
     }
 }

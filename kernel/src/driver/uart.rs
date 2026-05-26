@@ -2,7 +2,7 @@
 // QEMU virt machine UART is ns16550a compatible at 0x1000_0000
 
 use core::fmt;
-use core::option::Option::{self, Some, None};
+use core::option::Option::{self, None, Some};
 use core::result::Result::Ok;
 
 #[allow(unused)]

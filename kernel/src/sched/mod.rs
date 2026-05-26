@@ -5,9 +5,9 @@ pub mod task;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use task::{TaskControlBlock, TaskContext, TaskState};
 use crate::mm::pmm;
 use crate::sync::spinlock::SpinLock;
+use task::{TaskContext, TaskControlBlock, TaskState};
 
 // Embed the context-switch assembly
 global_asm!(include_str!("switch.S"));
@@ -90,14 +90,20 @@ pub fn init() {
             let stack_base = match pmm::alloc_frame() {
                 Some(f) => f,
                 None => {
-                    crate::console_println!("[sched] ERROR: failed to allocate stack for task {}", tid);
+                    crate::console_println!(
+                        "[sched] ERROR: failed to allocate stack for task {}",
+                        tid
+                    );
                     return;
                 }
             };
             // Allocate remaining 3 frames (contiguous, PMM allocates sequentially)
             for _ in 0..3 {
                 if pmm::alloc_frame().is_none() {
-                    crate::console_println!("[sched] ERROR: failed to allocate stack for task {}", tid);
+                    crate::console_println!(
+                        "[sched] ERROR: failed to allocate stack for task {}",
+                        tid
+                    );
                     return;
                 }
             }

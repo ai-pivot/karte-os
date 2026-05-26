@@ -28,16 +28,12 @@ static FS: SpinLock<FileSystem> = SpinLock::new(FileSystem::new_internal());
 impl FileSystem {
     /// Internal constructor used for static initialization.
     const fn new_internal() -> Self {
-        Self {
-            files: Vec::new(),
-        }
+        Self { files: Vec::new() }
     }
 
     /// Create a new empty file system.
     pub fn new() -> Self {
-        Self {
-            files: Vec::new(),
-        }
+        Self { files: Vec::new() }
     }
 
     /// Create a new empty file with the given name.
@@ -85,7 +81,10 @@ impl FileSystem {
 
     /// Read the contents of a file by name.
     pub fn read(&self, name: &str) -> Option<&[u8]> {
-        self.files.iter().find(|f| f.name == name).map(|f| f.data.as_slice())
+        self.files
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.data.as_slice())
     }
 
     /// Delete a file by name.
@@ -149,8 +148,7 @@ pub fn run_tests() {
     // Test 4: Write to non-existent file creates it
     crate::test::run_test("fs_write_creates_file", || {
         let mut fs = FileSystem::new();
-        fs.write("auto.txt", b"hello").is_ok()
-            && fs.read("auto.txt").is_some()
+        fs.write("auto.txt", b"hello").is_ok() && fs.read("auto.txt").is_some()
     });
 
     // Test 5: Write overwrites existing

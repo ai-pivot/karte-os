@@ -38,9 +38,8 @@ impl FrameAllocator {
         let managed_start = (bitmap_start + bitmap_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let managed_frames = (end - managed_start) / PAGE_SIZE;
 
-        let bitmap = unsafe {
-            core::slice::from_raw_parts_mut(bitmap_start as *mut u64, bitmap_words)
-        };
+        let bitmap =
+            unsafe { core::slice::from_raw_parts_mut(bitmap_start as *mut u64, bitmap_words) };
 
         // Mark bitmap region as used
         let bitmap_frames = (managed_start - start + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -102,10 +101,7 @@ pub fn init() {
     let allocator = FrameAllocator::new();
     let available_mb = allocator.total_frames * PAGE_SIZE / 1024 / 1024;
     *FRAME_ALLOCATOR.lock() = Some(allocator);
-    crate::console_println!(
-        "[pmm] Initialized: {} MB available",
-        available_mb
-    );
+    crate::console_println!("[pmm] Initialized: {} MB available", available_mb);
 }
 
 pub fn alloc_frame() -> Option<usize> {
@@ -143,20 +139,24 @@ pub fn run_tests() {
     // Test 2: Allocate and deallocate
     crate::test::run_test("pmm_alloc_dealloc_cycle", || {
         let frame = alloc_frame();
-        if frame.is_none() { return false; }
+        if frame.is_none() {
+            return false;
+        }
         let f = frame.unwrap();
-        
+
         // Allocate a second frame (should be different)
         let frame2 = alloc_frame();
-        if frame2.is_none() { return false; }
+        if frame2.is_none() {
+            return false;
+        }
         let f2 = frame2.unwrap();
-        
+
         let different = f != f2;
-        
+
         // Free both
         dealloc_frame(f);
         dealloc_frame(f2);
-        
+
         // Re-allocate should succeed
         let f3 = alloc_frame();
         f3.is_some() && different
@@ -166,7 +166,7 @@ pub fn run_tests() {
     crate::test::run_test("pmm_multiple_allocs_unique", || {
         let mut frames = [0usize; 16];
         let mut all_unique = true;
-        
+
         for i in 0..16 {
             match alloc_frame() {
                 Some(f) => {
@@ -181,46 +181,44 @@ pub fn run_tests() {
                 None => return false,
             }
         }
-        
+
         // Clean up
         for f in frames {
             dealloc_frame(f);
         }
-        
+
         all_unique
     });
 
     // Test 4: Dealloc then realloc returns a freed frame
     crate::test::run_test("pmm_dealloc_reuse", || {
         let f1 = alloc_frame();
-        if f1.is_none() { return false; }
+        if f1.is_none() {
+            return false;
+        }
         let addr1 = f1.unwrap();
-        
+
         dealloc_frame(addr1);
-        
+
         // Allocate again — should eventually get the same frame back
         // (not guaranteed immediately, but should succeed)
         let f2 = alloc_frame();
-        if f2.is_none() { return false; }
+        if f2.is_none() {
+            return false;
+        }
         dealloc_frame(f2.unwrap());
-        
+
         true
     });
 
     // Test 5: Page size is 4096
-    crate::test::run_test("pmm_page_size_is_4096", || {
-        page_size() == 4096
-    });
+    crate::test::run_test("pmm_page_size_is_4096", || page_size() == 4096);
 
     // Test 6: Allocated frames are in valid range
     crate::test::run_test("pmm_frames_in_valid_range", || {
-        let frames: [Option<usize>; 4] = [
-            alloc_frame(),
-            alloc_frame(),
-            alloc_frame(),
-            alloc_frame(),
-        ];
-        
+        let frames: [Option<usize>; 4] =
+            [alloc_frame(), alloc_frame(), alloc_frame(), alloc_frame()];
+
         let mut valid = true;
         for f in &frames {
             match f {
@@ -233,11 +231,11 @@ pub fn run_tests() {
                 None => valid = false,
             }
         }
-        
+
         for f in frames.iter().flatten() {
             dealloc_frame(*f);
         }
-        
+
         valid
     });
 }

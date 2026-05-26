@@ -81,11 +81,17 @@ pub fn run_tests() {
     // Test 4: Task state transitions
     crate::test::run_test("task_state_transitions", || {
         let mut tcb = TaskControlBlock::new(1);
-        if tcb.state != TaskState::Ready { return false; }
+        if tcb.state != TaskState::Ready {
+            return false;
+        }
         tcb.state = TaskState::Running;
-        if tcb.state != TaskState::Running { return false; }
+        if tcb.state != TaskState::Running {
+            return false;
+        }
         tcb.state = TaskState::Blocked;
-        if tcb.state != TaskState::Blocked { return false; }
+        if tcb.state != TaskState::Blocked {
+            return false;
+        }
         tcb.state = TaskState::Exited;
         tcb.state == TaskState::Exited
     });

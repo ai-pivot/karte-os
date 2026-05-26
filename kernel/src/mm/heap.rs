@@ -14,7 +14,9 @@ pub fn init() {
     let heap_start = allocate_contiguous_pages(HEAP_PAGES);
 
     unsafe {
-        HEAP_ALLOCATOR.lock().init(heap_start, HEAP_PAGES * pmm::page_size());
+        HEAP_ALLOCATOR
+            .lock()
+            .init(heap_start, HEAP_PAGES * pmm::page_size());
     }
 
     crate::console_println!(

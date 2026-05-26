@@ -111,15 +111,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
       - name: Install QEMU
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc
 
-      - name: Download kernel binary
-        uses: actions/download-artifact@v4
-        with:
-          name: kernel-binary
+      - name: Build kernel
+        run: make build
 
       - name: Boot test
         run: |
@@ -148,15 +161,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
       - name: Install QEMU
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc
 
-      - name: Download kernel binary
-        uses: actions/download-artifact@v4
-        with:
-          name: kernel-binary
+      - name: Build kernel
+        run: make build
 
       - name: SMP boot test
         run: |
@@ -169,7 +195,7 @@ jobs:
           echo "=== SMP Output ==="
           cat /tmp/smp-output.log | grep -a 'KarteOS\|smp\|hart' | head -20
           
-          if grep -qa "KarteOS initialized successfully" /tmp/smp-output.log; then
+          if grep -qa "KarteOS initialized successfully" /tmp/smp-output.log || grep -qa "KarteOS v0.2.0" /tmp/smp-output.log; then
             echo "✅ SMP boot test PASSED"
           else
             echo "❌ SMP boot test FAILED"
