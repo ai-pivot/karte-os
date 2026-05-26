@@ -217,3 +217,64 @@ pub fn mark_current_exited() {
         t.state = TaskState::Exited;
     }
 }
+
+/// Add a user process to the scheduler.
+/// `process` is the user process created by Process::from_elf().
+/// Returns the task ID or None on failure.
+pub fn add_user_process(
+    entry: usize,
+    user_stack_top: usize,
+    kernel_stack_top: usize,
+    _page_table_ppn: usize,
+) -> Option<usize> {
+    let mut sched = SCHEDULER.lock();
+    if sched.count >= MAX_TASKS {
+        return None;
+    }
+
+    let tid = sched.count;
+
+    // Set up the kernel stack with a TrapContext for the first U-mode entry
+    // TrapContext layout: x[32] + sstatus + sepc + sscratch = 280 bytes
+    let trap_ctx_top = kernel_stack_top;
+    let trap_ctx_base = trap_ctx_top - 280;
+
+    unsafe {
+        let ctx = trap_ctx_base as *mut usize;
+        // Zero everything
+        for i in 0..35 {
+            *ctx.add(i) = 0;
+        }
+        // x[0] = 0 (zero)
+        // x[2] = kernel_stack_top (will be sp during kernel trap handling)
+        *ctx.add(2) = kernel_stack_top;
+        // sstatus at offset 256/8 = 32: SPP=0, SPIE=1
+        *ctx.add(32) = 0x20; // SPIE bit set
+        // sepc at offset 264/8 = 33: entry point
+        *ctx.add(33) = entry;
+        // sscratch at offset 272/8 = 34: user sp
+        *ctx.add(34) = user_stack_top;
+    }
+
+    // The task's saved SP points to the trap context
+    TASK_SPS[tid].store(trap_ctx_base, Ordering::Relaxed);
+
+    // Create TCB
+    let mut tcb = TaskControlBlock::new(tid);
+    tcb.context = TaskContext::goto(entry, kernel_stack_top);
+    sched.tasks[tid] = Some(tcb);
+    sched.count += 1;
+
+    Some(tid)
+}
+
+/// Get current process brk (program break for heap).
+pub fn current_brk() -> usize {
+    // TODO: per-process brk tracking
+    crate::process::USER_HEAP_BASE
+}
+
+/// Set current process brk.
+pub fn set_current_brk(_addr: usize) {
+    // TODO: actually allocate pages for heap growth
+}

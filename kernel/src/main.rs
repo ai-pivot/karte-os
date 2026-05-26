@@ -10,6 +10,7 @@ pub mod arch;
 pub mod driver;
 pub mod lang_items;
 pub mod mm;
+pub mod process;
 pub mod sbi;
 pub mod sched;
 pub mod sync;
@@ -55,13 +56,16 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         arch::smp::init_bsp(hartid);
 
         crate::console_println!("[init] Probing VirtIO devices...");
-        driver::virtio::probe_virtio_devices();
+        // TODO: VirtIO probe hangs on QEMU virt without -device virtio-blk-device
+        // Skip for now; will fix after user mode is working
+        // driver::virtio::probe_virtio_devices();
 
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
 
         crate::console_println!("[init] Probing network devices...");
-        driver::net::test_net();
+        // TODO: Skip net probe for now
+        // driver::net::test_net();
 
         crate::console_println!("[init] Enabling timer interrupts...");
         arch::trap::enable_timer_interrupt();
@@ -76,6 +80,52 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
         crate::console_println!("[init] Initializing scheduler...");
         sched::init();
+
+        // ── Load user program ──
+        crate::console_println!("[init] Loading user program...");
+        let elf_data = include_bytes!("../../user/hello.elf");
+        match process::Process::from_elf(elf_data) {
+            Ok(proc) => {
+                crate::console_println!(
+                    "[init] User process loaded: pid={}, entry={:#x}",
+                    proc.pid,
+                    proc.entry
+                );
+                crate::console_println!(
+                    "[init]   kstack={:#x}, ustack={:#x}",
+                    proc.kernel_stack_top,
+                    proc.user_stack_top
+                );
+
+                // Build TrapContext on kernel stack for first U-mode entry
+                let trap_ctx_base = proc.kernel_stack_top - 280;
+                unsafe {
+                    let ctx = trap_ctx_base as *mut usize;
+                    // Zero everything
+                    for i in 0..35 {
+                        *ctx.add(i) = 0;
+                    }
+                    // x[2] = kernel sp
+                    *ctx.add(2) = proc.kernel_stack_top;
+                    // sstatus at offset 32 (256/8): SPP=0, SPIE=1
+                    *ctx.add(32) = 0x20;
+                    // sepc at offset 33 (264/8): user entry
+                    *ctx.add(33) = proc.entry;
+                    // sscratch at offset 34 (272/8): user sp
+                    *ctx.add(34) = proc.user_stack_top;
+                }
+
+                crate::console_println!("[init] Entering user mode...");
+                // Disable interrupts during the critical sret sequence
+                unsafe { riscv::register::sstatus::clear_sie() };
+                arch::trap::first_enter_user(unsafe {
+                    &mut *(trap_ctx_base as *mut arch::trap::TrapContext)
+                });
+            }
+            Err(e) => {
+                crate::console_println!("[init] Failed to load user program: {}", e);
+            }
+        }
 
         unsafe { riscv::register::sstatus::set_sie() };
         crate::console_println!("=== KarteOS initialized successfully ===");

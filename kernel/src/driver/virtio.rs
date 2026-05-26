@@ -120,8 +120,9 @@ pub fn probe_virtio_devices() {
 
         let device_id = unsafe { core::ptr::read_volatile((mmio_base + 8) as *const u32) };
         crate::console_println!(
-            "[virtio] Found device at {:#x}: type={}",
-            mmio_base,
+            "[virtio] Slot {}: magic={:#x}, type={}",
+            i,
+            magic,
             device_id
         );
 

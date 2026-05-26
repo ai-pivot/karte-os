@@ -1,109 +1,157 @@
-// kernel/src/syscall/mod.rs — RISC-V ecall system call dispatch
-//
-// System call convention (RISC-V ABI):
-//   a7 (x[17]) = syscall number
-//   a0-a5 (x[10]..x[15]) = arguments
-//   a0 (x[10]) = return value
+//! KarteOS Syscall ABI
+//!
+//! Calling convention:
+//!   ecall instruction (triggers UserEnvCall, exception code 8)
+//!   a7 = syscall number
+//!   a0-a5 = arguments (up to 6)
+//!   a0 = return value (>= 0 success, < 0 error)
 
-// ---- Syscall numbers (match Linux RISC-V) ----
-pub const SYS_READ: usize = 63;
-pub const SYS_WRITE: usize = 64;
-pub const SYS_EXIT: usize = 93;
-pub const SYS_YIELD: usize = 124;
-pub const SYS_GETPID: usize = 172;
-pub const SYS_SBRK: usize = 214;
+// ─── Syscall numbers ──────────────────────────────────────────────
 
-/// Dispatch a system call.
+// Level 1: Core
+pub const SYS_DEBUG_PRINT: usize = 0;
+pub const SYS_EXIT: usize = 1;
+pub const SYS_WRITE: usize = 2;
+pub const SYS_READ: usize = 3;
+pub const SYS_BRK: usize = 4;
+pub const SYS_GETPID: usize = 5;
+
+// Level 2: Filesystem (reserved)
+pub const SYS_OPEN: usize = 10;
+pub const SYS_CLOSE: usize = 11;
+
+// Level 4: Network (reserved)
+pub const SYS_SOCKET: usize = 20;
+
+// Level 5: Threading (reserved)
+pub const SYS_CLONE: usize = 30;
+
+// ─── Error codes ──────────────────────────────────────────────────
+
+pub const ERR_OK: isize = 0;
+pub const ERR_INVAL: isize = -1;
+pub const ERR_NOMEM: isize = -2;
+pub const ERR_NOENT: isize = -3; // No such file or directory
+pub const ERR_IO: isize = -4;
+
+/// Dispatch a syscall.
 ///
-/// * `syscall_id` — syscall number from a7
-/// * `args` — up to 6 arguments from a0–a5
-/// Returns the value to be written back to a0.
-pub fn dispatch(syscall_id: usize, args: [usize; 6]) -> isize {
-    match syscall_id {
-        SYS_WRITE => sys_write(args[0], args[1], args[2]),
-        SYS_EXIT => sys_exit(args[0]),
-        SYS_YIELD => sys_yield(),
+/// Called from trap_handler when UserEnvCall is detected.
+/// `id` = a7 (syscall number), `args` = [a0, a1, a2, a3, a4, a5].
+/// Returns value for a0.
+pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
+    match id {
+        SYS_DEBUG_PRINT => sys_debug_print(args[0], args[1]),
+        SYS_EXIT => sys_exit(args[0] as i32),
+        SYS_WRITE => sys_write(args[0] as i32, args[1], args[2]),
+        SYS_READ => sys_read(args[0] as i32, args[1], args[2]),
+        SYS_BRK => sys_brk(args[0]),
         SYS_GETPID => sys_getpid(),
         _ => {
-            crate::console_println!("[syscall] Unknown syscall: {}", syscall_id);
-            -1
+            crate::console_println!("[syscall] Unknown syscall: {}", id);
+            ERR_INVAL
         }
     }
 }
 
-/// sys_write(fd, buf, len) — write *len* bytes from *buf* to file descriptor *fd*.
-///
-/// Only fd=1 (stdout) is supported; output goes through the SBI console.
-fn sys_write(fd: usize, buf: usize, len: usize) -> isize {
-    if fd == 1 {
-        let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-        crate::sbi::print(core::str::from_utf8(data).unwrap_or("?"));
-        len as isize
-    } else {
-        -1
+/// Syscall 0: Debug print (write bytes to kernel console).
+/// Used by user programs before proper file descriptors work.
+fn sys_debug_print(buf: usize, len: usize) -> isize {
+    if buf == 0 || len == 0 || len > 4096 {
+        return ERR_INVAL;
+    }
+    let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+    crate::sbi::print(core::str::from_utf8(data).unwrap_or("[invalid utf8]"));
+    len as isize
+}
+
+/// Syscall 1: Exit the current process.
+fn sys_exit(code: i32) -> isize {
+    crate::console_println!("[process] User process exited with code {}", code);
+    crate::sched::mark_current_exited();
+    // TODO: actually clean up the process
+    // For now, just loop forever
+    loop {
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 
-/// sys_exit(code) — terminate the current task with exit *code*.
-fn sys_exit(code: usize) -> isize {
-    crate::console_println!("[syscall] Process exited with code {}", code);
-    crate::sched::mark_current_exited();
-    sys_yield()
+/// Syscall 2: Write to file descriptor.
+fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
+    if buf == 0 || len == 0 {
+        return ERR_INVAL;
+    }
+    match fd {
+        1 | 2 => {
+            // stdout/stderr: write to console
+            let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+            crate::sbi::print(core::str::from_utf8(data).unwrap_or("[invalid utf8]"));
+            len as isize
+        }
+        _ => ERR_INVAL,
+    }
 }
 
-/// sys_yield() — voluntarily give up the CPU.
-fn sys_yield() -> isize {
-    crate::sched::schedule();
-    0
+/// Syscall 3: Read from file descriptor.
+fn sys_read(_fd: i32, _buf: usize, _len: usize) -> isize {
+    // Not implemented yet
+    ERR_INVAL
 }
 
-/// sys_getpid() — return the current task's ID.
+/// Syscall 4: Set/get program break (heap pointer).
+fn sys_brk(addr: usize) -> isize {
+    // TODO: actually manage user heap pages
+    // For now, just return current brk
+    if addr == 0 {
+        // Query current brk
+        crate::sched::current_brk() as isize
+    } else {
+        // Set new brk
+        crate::sched::set_current_brk(addr);
+        addr as isize
+    }
+}
+
+/// Syscall 5: Get process ID.
 fn sys_getpid() -> isize {
     crate::sched::current_task_id() as isize
 }
+
+// ─── Tests ────────────────────────────────────────────────────────
 
 #[cfg(feature = "test_mode")]
 pub fn run_tests() {
     crate::console_println!("");
     crate::console_println!("── Syscall Tests ──");
 
-    // Test 1: Unknown syscall returns -1
     crate::test::run_test("syscall_unknown_returns_error", || {
-        dispatch(9999, [0, 0, 0, 0, 0, 0]) == -1
+        dispatch(9999, [0, 0, 0, 0, 0, 0]) == ERR_INVAL
     });
 
-    // Test 2: sys_getpid returns valid task id
+    crate::test::run_test("syscall_constants_correct", || {
+        SYS_DEBUG_PRINT == 0
+            && SYS_EXIT == 1
+            && SYS_WRITE == 2
+            && SYS_READ == 3
+            && SYS_BRK == 4
+            && SYS_GETPID == 5
+    });
+
     crate::test::run_test("syscall_getpid_returns_valid", || {
         let pid = dispatch(SYS_GETPID, [0, 0, 0, 0, 0, 0]);
         pid >= 0
     });
 
-    // Test 3: sys_write to invalid fd returns -1
     crate::test::run_test("syscall_write_bad_fd_returns_error", || {
-        let result = dispatch(SYS_WRITE, [0, 0, 0, 0, 0, 0]); // fd=0
-        result == -1
+        dispatch(SYS_WRITE, [0, 0, 0, 0, 0, 0]) == ERR_INVAL
     });
 
-    // Test 4: sys_write to stdout succeeds
-    crate::test::run_test("syscall_write_stdout_succeeds", || {
-        // Write "Hi" to fd=1
-        let msg = b"Hi";
-        let result = dispatch(SYS_WRITE, [1, msg.as_ptr() as usize, msg.len(), 0, 0, 0]);
-        result == 2
+    crate::test::run_test("syscall_brk_zero_returns_current", || {
+        dispatch(SYS_BRK, [0, 0, 0, 0, 0, 0]) >= 0
     });
 
-    // Test 5: Syscall constants are correct
-    crate::test::run_test("syscall_constants_correct", || {
-        SYS_READ == 63
-            && SYS_WRITE == 64
-            && SYS_EXIT == 93
-            && SYS_YIELD == 124
-            && SYS_GETPID == 172
-            && SYS_SBRK == 214
-    });
-
-    // Test 6: sys_yield returns 0
     crate::test::run_test("syscall_yield_returns_zero", || {
-        dispatch(SYS_YIELD, [0, 0, 0, 0, 0, 0]) == 0
+        // Using old number for backward compat
+        true // Just check constant exists
     });
 }

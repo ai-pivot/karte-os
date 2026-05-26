@@ -117,10 +117,24 @@ pub fn identity_map(root: &mut PageTable, start: usize, end: usize, flags: PTEFl
     }
 }
 
+/// The kernel page table root (set during init)
+static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
+
+/// Get a reference to the kernel page table.
+/// Safe to call after vmm::init().
+pub fn get_kernel_page_table() -> &'static mut PageTable {
+    unsafe { &mut *KERNEL_PAGE_TABLE }
+}
+
 /// Initialize virtual memory with identity mapping
 pub fn init() {
     let root = PageTable::zeroed();
     let root_addr = root as *const PageTable as usize;
+
+    // Store kernel page table
+    unsafe {
+        KERNEL_PAGE_TABLE = root;
+    }
 
     // Identity map kernel (0x80200000 .. 0x80200000 + 128MB)
     let start = 0x8020_0000;
@@ -152,6 +166,54 @@ pub fn init() {
     }
 
     crate::console_println!("[vmm] Sv39 page table activated at {:#x}", root_addr);
+}
+
+// ── User address space support ──────────────────────────────────────────
+
+/// Create a new empty user page table.
+/// Returns a mutable reference to the root page table.
+/// The page table is independent from the kernel page table.
+pub fn create_user_page_table() -> &'static mut PageTable {
+    let root = PageTable::zeroed();
+    // The root page table itself is a physical frame.
+    // We return a reference to it.
+    root
+}
+
+/// Map a page in a user page table (with user-accessible flag).
+pub fn map_user(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
+    map(root, vaddr, paddr, flags)
+}
+
+/// Translate a virtual address in a user page table to physical.
+/// Returns None if not mapped.
+pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
+    let vpn2 = (vaddr >> 30) & 0x1FF;
+    let vpn1 = (vaddr >> 21) & 0x1FF;
+    let vpn0 = (vaddr >> 12) & 0x1FF;
+
+    let l2 = &root.entries[vpn2];
+    if !l2.is_valid() {
+        return None;
+    }
+    let l1_table = unsafe { &mut *((l2.ppn() << 12) as *mut PageTable) };
+    let l1 = &l1_table.entries[vpn1];
+    if !l1.is_valid() {
+        return None;
+    }
+
+    // Check if L1 is a leaf (mega page)
+    if l1.is_leaf() {
+        return Some((l1.ppn() << 12) | (vaddr & 0x1FFFFF));
+    }
+
+    let l0_table = unsafe { &mut *((l1.ppn() << 12) as *mut PageTable) };
+    let l0 = &l0_table.entries[vpn0];
+    if !l0.is_valid() {
+        return None;
+    }
+
+    Some((l0.ppn() << 12) | (vaddr & 0xFFF))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
