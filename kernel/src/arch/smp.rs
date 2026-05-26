@@ -122,7 +122,8 @@ pub fn start_secondary_harts(total_harts: usize) {
 
         // Use SBI to start the hart — entry point is the assembly trampoline
         let entry_addr = _secondary_hart_trampoline as *const () as usize;
-        let result = sbi_rt::hart_start(hartid, entry_addr, hartid);
+        let result =
+            unsafe { sbi::hsm::hart_start(hartid, sbi::PhysicalAddress::new(entry_addr), hartid) };
 
         if result.is_ok() {
             crate::console_println!("[smp] Started hart {}", hartid);

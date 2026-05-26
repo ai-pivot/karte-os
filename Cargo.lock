@@ -54,7 +54,7 @@ dependencies = [
  "buddy_system_allocator",
  "riscv",
  "riscv-rt",
- "sbi-rt",
+ "sbi",
  "spin 0.12.0",
  "virtio-drivers",
 ]
@@ -167,22 +167,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sbi-rt"
-version = "0.0.4"
+name = "sbi"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48f7bf85822c8b453d7e3fca7de39684032f5c06c1ed338ad8d47f4a79c1d49a"
-dependencies = [
- "sbi-spec",
-]
-
-[[package]]
-name = "sbi-spec"
-version = "0.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "785b91fcc41c7426fc07510be49ed1db44f002b45d45c175ec7f155c3cd447a9"
-dependencies = [
- "bitflags",
-]
+checksum = "5c64a569a412de4ad7b123f429e434751d74dd7ed25654af962b93c4d1cd584e"
 
 [[package]]
 name = "scopeguard"

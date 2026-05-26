@@ -66,7 +66,7 @@ pub fn set_next_timer() {
     const CLOCK_FREQ: usize = 10_000_000;
     const TICKS_PER_MS: usize = CLOCK_FREQ / 1000;
     let next = riscv::register::time::read() + 10 * TICKS_PER_MS;
-    sbi_rt::set_timer(next as u64);
+    let _ = sbi::timer::set_timer(next as u64);
 }
 
 use core::sync::atomic::{AtomicUsize, Ordering};

@@ -3,7 +3,7 @@
 //! Uses direct UART MMIO for console output (works on all SBI versions)
 //! and SBI standard calls for system reset and timer.
 
-use sbi_rt::{NoReason, Shutdown, system_reset};
+use sbi::system_reset::{ResetReason, ResetType, system_reset};
 
 /// Write a single byte to UART0 (0x10000000) via MMIO.
 ///
@@ -27,7 +27,7 @@ pub fn console_putchar(c: u8) {
 
 /// Shutdown the system via SBI system reset.
 pub fn shutdown() -> ! {
-    system_reset(Shutdown, NoReason);
+    let _ = system_reset(ResetType::Shutdown, ResetReason::NoReason);
     loop {}
 }
 
