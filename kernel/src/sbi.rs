@@ -1,25 +1,28 @@
-/// SBI console output and system control wrappers
-use sbi_rt::{self, NoReason, Shutdown, system_reset};
+//! SBI console output and system control wrappers.
+//!
+//! Uses the modern DBCN (Debug Console) extension instead of legacy SBI calls.
 
-/// Print to SBI console (low-level, single character)
+use sbi_rt::{console_write_byte, system_reset, Shutdown, NoReason};
+
+/// Write a single byte to the debug console (blocking).
 pub fn console_putchar(c: u8) {
-    sbi_rt::legacy::console_putchar(c as usize);
+    console_write_byte(c);
 }
 
-/// Shutdown the system via SBI
+/// Shutdown the system via SBI system reset.
 pub fn shutdown() -> ! {
     system_reset(Shutdown, NoReason);
     loop {}
 }
 
-/// Print a string to SBI console
+/// Print a raw byte string to the debug console.
 pub fn print(s: &str) {
     for byte in s.bytes() {
-        console_putchar(byte);
+        console_write_byte(byte);
     }
 }
 
-/// Print formatted string to SBI console
+/// Formatted console output target.
 pub struct Console;
 
 impl core::fmt::Write for Console {

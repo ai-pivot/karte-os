@@ -46,7 +46,10 @@ impl TrapContext {
 /// Set up the trap vector (Direct mode).
 pub fn init() {
     unsafe {
-        stvec::write(trap_entry as *const () as usize, stvec::TrapMode::Direct);
+        stvec::write(stvec::Stvec::new(
+            trap_entry as *const () as usize,
+            stvec::TrapMode::Direct,
+        ));
     }
 }
 
