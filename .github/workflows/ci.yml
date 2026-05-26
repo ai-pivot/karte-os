@@ -13,6 +13,9 @@ env:
 
 permissions:
   contents: read
+  actions: read
+  checks: read
+  metadata: read
 
 jobs:
   # ── Job 1: Build ──
@@ -20,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -58,6 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -85,6 +92,8 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -128,6 +137,8 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -171,7 +182,6 @@ jobs:
           echo "=== Boot Output ==="
           grep -a 'KarteOS\|init\|user\|Hello\|virtio\|process' /tmp/boot-output.log | head -30 || true
           
-          # Check that kernel booted and user program ran
           if grep -qa "Hello from user" /tmp/boot-output.log || grep -qa "KarteOS initialized successfully" /tmp/boot-output.log; then
             echo "Boot test PASSED"
           else
@@ -186,6 +196,8 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
