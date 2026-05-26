@@ -11,20 +11,12 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-permissions:
-  contents: read
-  actions: read
-  checks: read
-  metadata: read
-
 jobs:
   # ── Job 1: Build ──
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -63,8 +55,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -92,8 +82,6 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -137,8 +125,6 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -196,8 +182,6 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install Rust
         run: |
