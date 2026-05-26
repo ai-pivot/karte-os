@@ -143,14 +143,14 @@ jobs:
             > /tmp/boot-output.log 2>&1 || true
           
           echo "=== Boot Output ==="
-          cat /tmp/boot-output.log | grep -a 'KarteOS\|init\|timer' | head -30
+          grep -a 'KarteOS\|init\|timer' /tmp/boot-output.log | head -30 || true
           
           # Check that kernel booted successfully
           if grep -qa "KarteOS initialized successfully" /tmp/boot-output.log; then
-            echo "✅ Boot test PASSED"
+            echo "Boot test PASSED"
           else
-            echo "❌ Boot test FAILED"
-            cat /tmp/boot-output.log
+            echo "Boot test FAILED"
+            grep -a '.' /tmp/boot-output.log | head -50 || true
             exit 1
           fi
 
@@ -193,11 +193,12 @@ jobs:
             > /tmp/smp-output.log 2>&1 || true
           
           echo "=== SMP Output ==="
-          cat /tmp/smp-output.log | grep -a 'KarteOS\|smp\|hart' | head -20
+          grep -a 'KarteOS\|smp\|hart' /tmp/smp-output.log | head -20 || true
           
           if grep -qa "KarteOS initialized successfully" /tmp/smp-output.log || grep -qa "KarteOS v0.2.0" /tmp/smp-output.log; then
-            echo "✅ SMP boot test PASSED"
+            echo "SMP boot test PASSED"
           else
-            echo "❌ SMP boot test FAILED"
+            echo "SMP boot test FAILED"
+            grep -a '.' /tmp/smp-output.log | head -50 || true
             exit 1
           fi
