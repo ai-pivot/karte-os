@@ -69,27 +69,28 @@ pub fn init() {
 #[inline(never)]
 pub fn first_enter_user(ctx: &mut TrapContext, user_satp: usize) -> ! {
     unsafe {
-        // Switch to user page table
-        core::arch::asm!("csrw satp, {}", in(reg) user_satp);
-        core::arch::asm!("sfence.vma");
-
-        // Set sscratch = user_sp for future U-mode traps
-        core::arch::asm!("csrw sscratch, {}", in(reg) ctx.sscratch);
-        // Set sstatus: SPP=0 (return to U-mode), SPIE=1 (enable intr after sret)
-        core::arch::asm!("csrw sstatus, {}", in(reg) ctx.sstatus);
-        // Set sepc = user entry point
-        core::arch::asm!("csrw sepc, {}", in(reg) ctx.sepc);
-        // Set user stack pointer (sp will be user_sp after swap)
-        // We use the same trick as trap return: swap sp with sscratch
-        // But we need to also set sscratch = kernel sp for next trap
         let user_sp = ctx.sscratch;
-        let kernel_sp = ctx.x[2]; // kernel stack top
+        let kernel_sp = ctx.x[2];
+        let sstatus_val = ctx.sstatus;
+        let sepc_val = ctx.sepc;
+
+        // Single asm block: switch satp + sfence.vma + CSR setup + sret.
+        // All in one block to prevent compiler from inserting instructions
+        // between csrw satp and sfence.vma (which would use stale TLB).
         core::arch::asm!(
+            "csrw satp, {satp}",
+            "sfence.vma",
+            "csrw sscratch, {usp}",
+            "csrw sstatus, {st}",
+            "csrw sepc, {epc}",
             "csrw sscratch, {ksp}",
             "mv sp, {usp}",
             "sret",
-            ksp = in(reg) kernel_sp,
+            satp = in(reg) user_satp,
             usp = in(reg) user_sp,
+            st = in(reg) sstatus_val,
+            epc = in(reg) sepc_val,
+            ksp = in(reg) kernel_sp,
             options(noreturn)
         );
     }
