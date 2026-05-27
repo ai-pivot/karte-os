@@ -85,9 +85,12 @@ pub fn schedule() {
 
         sched.current = next;
 
-        // Update process module's current process index
+        // Update process module's current process index and page table root
         let next_proc_idx = sched.task_to_process[next];
         crate::process::set_current_index(next_proc_idx);
+        crate::process::set_current_page_table_root(crate::process::get_page_table_root(
+            next_proc_idx,
+        ));
 
         (current, next)
     }; // SpinLock dropped here — safe because interrupts are disabled
@@ -141,6 +144,9 @@ pub fn schedule_exit() {
                 sched.current = n;
                 let next_proc_idx = sched.task_to_process[n];
                 crate::process::set_current_index(next_proc_idx);
+                crate::process::set_current_page_table_root(crate::process::get_page_table_root(
+                    next_proc_idx,
+                ));
                 (true, current, n)
             }
             None => (false, current, 0),

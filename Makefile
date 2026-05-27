@@ -7,14 +7,14 @@ KERNEL_ELF := target/riscv64gc-unknown-none-elf/release/karte-os-kernel
 # QEMU settings
 QEMU := qemu-system-riscv64
 QEMU_FLAGS := \
-	-machine virt \
-	-cpu rv64 \
-	-nographic \
-	-bios default \
-	-m 128M \
-	-smp 1 \
-	-drive id=blk0,file=disk.img,format=raw,if=none \
-	-device virtio-blk-device,drive=blk0
+ -machine virt \
+ -cpu rv64 \
+ -nographic \
+ -bios default \
+ -m 128M \
+ -smp 1 \
+ -drive id=blk0,file=disk.img,format=raw,if=none \
+ -device virtio-blk-device,drive=blk0
 
 # Ensure disk image exists
 disk.img:

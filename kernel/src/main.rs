@@ -61,10 +61,6 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
 
-        crate::console_println!("[init] Enabling timer interrupts...");
-        arch::trap::enable_timer_interrupt();
-        arch::trap::set_next_timer();
-
         crate::console_println!("[init] Initializing PLIC...");
         arch::plic::init(0);
 
@@ -91,11 +87,15 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 );
 
                 // Register process in the global process table
+                // Disable interrupts to prevent timer from triggering while we hold PROCESS_TABLE lock
+                unsafe { riscv::register::sstatus::clear_sie() };
                 let idx = process::add_process(proc).expect("Failed to register process");
                 process::set_current_index(idx);
 
                 // Re-read the process from the table for building trap context
                 let proc = process::current().unwrap();
+                process::set_current_page_table_root(proc.page_table_root);
+                unsafe { riscv::register::sstatus::set_sie() };
 
                 // Build TrapContext on kernel stack for first U-mode entry
                 let trap_ctx_base = proc.kernel_stack_top - 280;
@@ -135,6 +135,13 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 );
                 // Disable interrupts during the critical sret sequence
                 unsafe { riscv::register::sstatus::clear_sie() };
+
+                // NOTE: Timer interrupts will be enabled on the first user ecall
+                // (in syscall handler). This ensures the user program can execute
+                // at least one syscall before being preempted by timer interrupts.
+                // The illegal_instruction exceptions from CSR probing in the Rust
+                // runtime can cause panics if timer interrupts fire too early.
+
                 arch::trap::first_enter_user(
                     unsafe { &mut *(trap_ctx_base as *mut arch::trap::TrapContext) },
                     user_satp,

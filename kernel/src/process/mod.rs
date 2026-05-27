@@ -188,11 +188,26 @@ static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> =
 /// Current running process index
 static CURRENT_PROCESS: AtomicUsize = AtomicUsize::new(0);
 
-/// Get the current process
+/// Current process's page table root PPN (lock-free for trap handler access)
+static CURRENT_PAGE_TABLE_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the current process (cloned, acquires lock).
+/// Do NOT call from trap handler — use `current_page_table_root()` instead.
 pub fn current() -> Option<Process> {
     let table = PROCESS_TABLE.lock();
     let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
     table[idx].clone()
+}
+
+/// Get the current process's page table root PPN.
+/// Safe to call from trap handler — uses AtomicUsize, no lock needed.
+pub fn current_page_table_root() -> usize {
+    CURRENT_PAGE_TABLE_ROOT.load(Ordering::Relaxed)
+}
+
+/// Update the current page table root (called during process switch).
+pub fn set_current_page_table_root(root: usize) {
+    CURRENT_PAGE_TABLE_ROOT.store(root, Ordering::Relaxed);
 }
 
 /// Update the current process
@@ -215,6 +230,13 @@ pub fn add_process(proc: Process) -> Option<usize> {
         }
     }
     None
+}
+
+/// Get page table root for a specific process index (for scheduler use).
+/// Acquires lock — do NOT call from trap handler.
+pub fn get_page_table_root(idx: usize) -> usize {
+    let table = PROCESS_TABLE.lock();
+    table[idx].as_ref().map(|p| p.page_table_root).unwrap_or(0)
 }
 
 /// Set the current process index

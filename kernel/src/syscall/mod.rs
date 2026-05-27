@@ -58,6 +58,18 @@ fn lock_fd_table() -> crate::sync::spinlock::SpinLockGuard<'static, Option<FdTab
 /// `id` = a7 (syscall number), `args` = [a0, a1, a2, a3, a4, a5].
 /// Returns value for a0.
 pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
+    // Enable timer interrupts on the first syscall.
+    // Timer is intentionally delayed until the user program has executed
+    // at least one ecall, to avoid timer interrupts during the critical
+    // sret-to-first-ecall window where CSR probing can cause issues.
+    static TIMER_ENABLED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if !TIMER_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        TIMER_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
+        crate::arch::trap::enable_timer_interrupt();
+        crate::arch::trap::set_next_timer();
+    }
+
     match id {
         SYS_DEBUG_PRINT => sys_debug_print(args[0], args[1]),
         SYS_EXIT => sys_exit(args[0] as i32),
