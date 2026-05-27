@@ -61,13 +61,8 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
 
-        crate::console_println!("[init] Probing network devices...");
-        // TODO: Skip net probe for now
-        // driver::net::test_net();
-
         crate::console_println!("[init] Enabling timer interrupts...");
         arch::trap::enable_timer_interrupt();
-        crate::console_println!("[init] Setting first timer...");
         arch::trap::set_next_timer();
 
         crate::console_println!("[init] Initializing PLIC...");
@@ -95,6 +90,13 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     proc.user_stack_top
                 );
 
+                // Register process in the global process table
+                let idx = process::add_process(proc).expect("Failed to register process");
+                process::set_current_index(idx);
+
+                // Re-read the process from the table for building trap context
+                let proc = process::current().unwrap();
+
                 // Build TrapContext on kernel stack for first U-mode entry
                 let trap_ctx_base = proc.kernel_stack_top - 280;
                 unsafe {
@@ -113,12 +115,30 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     *ctx.add(34) = proc.user_stack_top;
                 }
 
+                // Calculate user satp value (Sv39 mode = 8)
+                // Phase 1: page_table_root is 0, use current kernel satp (shared page table)
+                let user_satp = if proc.page_table_root == 0 {
+                    // Read current satp (already set to kernel page table by vmm::init)
+                    let satp: usize;
+                    unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
+                    satp
+                } else {
+                    (8usize << 60) | (proc.page_table_root)
+                };
+                mm::vmm::set_current_user_satp(user_satp);
+
                 crate::console_println!("[init] Entering user mode...");
+                crate::console_println!(
+                    "[init]   user_satp={:#x}, page_table_ppn={:#x}",
+                    user_satp,
+                    proc.page_table_root
+                );
                 // Disable interrupts during the critical sret sequence
                 unsafe { riscv::register::sstatus::clear_sie() };
-                arch::trap::first_enter_user(unsafe {
-                    &mut *(trap_ctx_base as *mut arch::trap::TrapContext)
-                });
+                arch::trap::first_enter_user(
+                    unsafe { &mut *(trap_ctx_base as *mut arch::trap::TrapContext) },
+                    user_satp,
+                );
             }
             Err(e) => {
                 crate::console_println!("[init] Failed to load user program: {}", e);

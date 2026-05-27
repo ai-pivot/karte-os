@@ -5,7 +5,6 @@ pub mod task;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::mm::pmm;
 use crate::sync::spinlock::SpinLock;
 use task::{TaskContext, TaskControlBlock, TaskState};
 
@@ -13,9 +12,7 @@ use task::{TaskContext, TaskControlBlock, TaskState};
 global_asm!(include_str!("switch.S"));
 
 const MAX_TASKS: usize = 64;
-const NUM_TASKS: usize = 3;
 
-// External assembly function: saves current SP to *current_sp, restores SP from *next_sp
 unsafe extern "C" {
     fn __switch(current_sp: *mut usize, next_sp: *const usize);
 }
@@ -29,125 +26,17 @@ struct Scheduler {
     tasks: [Option<TaskControlBlock>; MAX_TASKS],
     current: usize,
     count: usize,
-    /// Current program break (top of user heap)
-    current_brk: usize,
 }
 
 static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     tasks: [const { None }; MAX_TASKS],
     current: 0,
     count: 0,
-    current_brk: crate::process::USER_HEAP_BASE,
 });
 
-/// Task entry functions
-extern "C" fn task_func_a() {
-    unsafe {
-        riscv::register::sstatus::set_sie();
-    }
-    loop {
-        crate::console_println!("[Task A] running");
-        for _ in 0..100000 {
-            core::hint::spin_loop();
-        }
-    }
-}
-
-extern "C" fn task_func_b() {
-    unsafe {
-        riscv::register::sstatus::set_sie();
-    }
-    loop {
-        crate::console_println!("[Task B] running");
-        for _ in 0..100000 {
-            core::hint::spin_loop();
-        }
-    }
-}
-
-extern "C" fn task_func_c() {
-    unsafe {
-        riscv::register::sstatus::set_sie();
-    }
-    loop {
-        crate::console_println!("[Task C] running");
-        for _ in 0..100000 {
-            core::hint::spin_loop();
-        }
-    }
-}
-
-/// Initialize the scheduler and create kernel tasks
+/// Initialize the scheduler
 pub fn init() {
-    let entries: [usize; NUM_TASKS] = [
-        task_func_a as *const () as usize,
-        task_func_b as *const () as usize,
-        task_func_c as *const () as usize,
-    ];
-
-    {
-        let mut sched = SCHEDULER.lock();
-
-        for (tid, &entry) in entries.iter().enumerate() {
-            // Allocate 4 physical pages for task stack
-            let stack_base = match pmm::alloc_frame() {
-                Some(f) => f,
-                None => {
-                    crate::console_println!(
-                        "[sched] ERROR: failed to allocate stack for task {}",
-                        tid
-                    );
-                    return;
-                }
-            };
-            // Allocate remaining 3 frames (contiguous, PMM allocates sequentially)
-            for _ in 0..3 {
-                if pmm::alloc_frame().is_none() {
-                    crate::console_println!(
-                        "[sched] ERROR: failed to allocate stack for task {}",
-                        tid
-                    );
-                    return;
-                }
-            }
-            let stack_top = stack_base + 4 * pmm::page_size();
-
-            // Push initial callee-saved register frame onto the stack.
-            // Layout must match __switch's expectations:
-            //   offset 0:  ra  (entry point)
-            //   offset 8:  s0  (0)
-            //   ...
-            //   offset 96: s11 (0)
-            // Total: 13 registers × 8 bytes = 104 bytes
-            let saved_sp = stack_top - 13 * 8;
-            unsafe {
-                core::ptr::write(saved_sp as *mut usize, entry); // ra = entry
-                for i in 1..13 {
-                    core::ptr::write((saved_sp + i * 8) as *mut usize, 0); // s0-s11 = 0
-                }
-            }
-
-            // Store the saved stack pointer for __switch
-            TASK_SPS[tid].store(saved_sp, Ordering::Relaxed);
-
-            // Create the TCB
-            let mut tcb = TaskControlBlock::new(tid);
-            tcb.context = TaskContext::goto(entry, stack_top);
-            sched.tasks[tid] = Some(tcb);
-        }
-
-        sched.count = NUM_TASKS;
-        sched.current = 0;
-        // Mark task 0 as Running initially
-        if let Some(ref mut t) = sched.tasks[0] {
-            t.state = TaskState::Running;
-        }
-    }
-
-    crate::console_println!(
-        "[sched] Scheduler initialized with {} tasks (context-switching mode)",
-        NUM_TASKS
-    );
+    crate::console_println!("[sched] Initialized");
 }
 
 /// Called from timer interrupt handler to perform Round-Robin scheduling.
@@ -271,12 +160,12 @@ pub fn add_user_process(
     Some(tid)
 }
 
-/// Get current process brk (program break for heap).
+/// Get current process brk (delegates to process module).
 pub fn current_brk() -> usize {
-    SCHEDULER.lock().current_brk
+    crate::process::current_brk()
 }
 
-/// Set current process brk.
+/// Set current process brk (delegates to process module).
 pub fn set_current_brk(addr: usize) {
-    SCHEDULER.lock().current_brk = addr;
+    crate::process::set_current_brk(addr);
 }

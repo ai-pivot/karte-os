@@ -44,9 +44,9 @@ make test                             # 4. Run tests (must be ALL PASSED)
 
 ## Architecture Overview
 
-S-mode kernel on OpenSBI (M-mode). Identity-mapped Sv39 virtual memory. User programs run in U-mode with dual-path trap handling (trap_entry.S). ELF loader maps user code/data into shared kernel page table (Phase 1 simplification). Round-Robin scheduler with `__switch()` assembly context switch. SMP via SBI `hart_start` for secondary harts.
+S-mode kernel on OpenSBI (M-mode). Identity-mapped Sv39 virtual memory. User programs run in U-mode with dual-path trap handling (trap_entry.S). Each process has its own Sv39 page table with kernel mappings copied in. ELF loader maps user code/data into per-process page tables. Round-Robin scheduler with `__switch()` assembly context switch. SMP via SBI `hart_start` for secondary harts.
 
-Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases → load user ELF → `sret` to U-mode → user `ecall` → trap handler → syscall dispatch.
+Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases → load user ELF → switch satp to user page table → `sret` to U-mode → user `ecall` → trap handler → syscall dispatch. User process exit triggers SBI system shutdown.
 
 ## User Programs
 

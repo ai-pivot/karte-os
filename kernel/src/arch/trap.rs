@@ -60,9 +60,14 @@ pub fn init() {
 
 /// Jump to user mode for the first time.
 /// `ctx` is a TrapContext prepared on the kernel stack.
+/// `user_satp` is the SATP register value for the user page table.
 /// This function never returns.
-pub fn first_enter_user(ctx: &mut TrapContext) -> ! {
+pub fn first_enter_user(ctx: &mut TrapContext, user_satp: usize) -> ! {
     unsafe {
+        // Switch to user page table
+        core::arch::asm!("csrw satp, {}", in(reg) user_satp);
+        core::arch::asm!("sfence.vma");
+
         // Set sscratch = user_sp for future U-mode traps
         core::arch::asm!("csrw sscratch, {}", in(reg) ctx.sscratch);
         // Set sstatus: SPP=0 (return to U-mode), SPIE=1 (enable intr after sret)
@@ -100,6 +105,18 @@ pub fn set_next_timer() {
     let _ = ::sbi::timer::set_timer(next as u64);
 }
 
+/// Get the current process's page table.
+/// Returns the user page table if a process is active, otherwise falls back to the kernel page table.
+pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
+    let ppn = crate::process::current_page_table_ppn();
+    if ppn == 0 {
+        // Phase 1: shared kernel page table (no separate per-process PT yet)
+        crate::mm::vmm::get_kernel_page_table()
+    } else {
+        unsafe { &mut *((ppn << 12) as *mut crate::mm::vmm::PageTable) }
+    }
+}
+
 static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
 
 fn handle_timer() {
@@ -108,10 +125,7 @@ fn handle_timer() {
         crate::console_println!("[timer] tick {} ({}s)", ticks, ticks / 100);
     }
     set_next_timer();
-    // Note: Skip sched::schedule() for now when running user programs
-    // to avoid preempting the user process. Will re-enable when proper
-    // process scheduling is implemented.
-    // crate::sched::schedule();
+    crate::sched::schedule();
 }
 
 /// Trap handler — called from assembly trap_entry.
@@ -182,7 +196,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                     let page_size = crate::mm::pmm::page_size();
                     let page_addr = fault_addr & !(page_size - 1); // Align down
 
-                    let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+                    let kernel_pt = get_current_user_pt();
 
                     // Check if already mapped (shouldn't be, but safety check)
                     if crate::mm::vmm::translate_user(kernel_pt, page_addr).is_none() {
@@ -201,8 +215,8 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                             }
                             // Update brk if needed
                             let new_brk = page_addr + page_size;
-                            if new_brk > crate::sched::current_brk() {
-                                crate::sched::set_current_brk(new_brk);
+                            if new_brk > crate::process::current_brk() {
+                                crate::process::set_current_brk(new_brk);
                             }
                             // Don't advance sepc — retry the faulting instruction
                         }

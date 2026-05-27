@@ -4,6 +4,8 @@ pub mod elf;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use spin::Mutex;
+
 use crate::mm::{pmm, vmm};
 
 /// User address space layout constants
@@ -18,10 +20,23 @@ pub const USER_STACK_PAGES: usize = 64; // 256 KB actual stack
 /// Process identifier allocator
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
+/// Maximum number of processes in the system
+const MAX_PROCESSES: usize = 16;
+
+/// Process state
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProcessState {
+    Ready,
+    Running,
+    Blocked,
+    Exited,
+}
+
 /// Process control block
+#[derive(Clone)]
 pub struct Process {
     pub pid: usize,
-    /// Root page table (physical address of the Sv39 root page table)
+    /// Root page table PPN (physical page number of the Sv39 root page table)
     pub page_table_root: usize,
     /// Kernel stack top (used for trap handling when in U-mode)
     pub kernel_stack_top: usize,
@@ -33,22 +48,56 @@ pub struct Process {
     pub initial_brk: usize,
     /// Entry point (virtual address)
     pub entry: usize,
+    /// Current process state
+    pub state: ProcessState,
+    /// Trap context pointer (saved on kernel stack)
+    pub trap_ctx_ptr: usize,
+}
+
+/// Copy kernel identity mappings into a user page table.
+/// This is needed so that traps from U-mode can still access kernel code/data.
+fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
+    // Identity map kernel (0x80200000 .. 0x80200000 + 128MB)
+    vmm::identity_map(
+        user_pt,
+        0x8020_0000,
+        0x8020_0000 + 128 * 1024 * 1024,
+        vmm::PTEFlags::KRWX,
+    );
+
+    // Map UART MMIO (0x10000000 - 0x10001000)
+    vmm::map(user_pt, 0x1000_0000, 0x1000_0000, vmm::PTEFlags::KRW);
+
+    // Map VirtIO MMIO devices (0x10001000 - 0x10009000)
+    for addr in (0x1000_1000..0x1000_9000).step_by(4096) {
+        vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+    }
+
+    // Map PLIC (0x0C000000 - 0x0C400000)
+    for addr in (0x0C00_0000..0x0C40_0000).step_by(4096) {
+        vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+    }
 }
 
 impl Process {
     /// Create a new user process from an ELF binary embedded in the kernel.
     /// `elf_data` is the raw ELF file bytes (statically linked into the kernel).
     ///
-    /// Phase 1: Maps user code/data/stack into the current kernel page table
-    /// with U flag, so no satp switch is needed.
+    /// Creates an independent page table for the process with:
+    /// - Kernel identity mappings (so traps can access kernel code/data)
+    /// - User code/data segments (URWX)
+    /// - User stack (URW)
     pub fn from_elf(elf_data: &[u8]) -> Result<Self, &'static str> {
         // 1. Parse ELF
         let elf = elf::ElfFile::parse(elf_data)?;
 
-        // 2. Get current kernel page table (Phase 1: shared page table)
-        let kernel_pt = vmm::get_kernel_page_table();
+        // 2. Create independent user page table
+        let user_pt = vmm::create_user_page_table();
 
-        // 3. Load ELF segments — allocate physical frames, map with U flag, copy data
+        // 3. Copy kernel mappings so traps can access kernel code
+        copy_kernel_mappings(user_pt);
+
+        // 4. Load ELF segments into user page table
         let mut max_vaddr = 0usize;
         for segment in &elf.loadable_segments {
             let page_size = pmm::page_size();
@@ -58,8 +107,8 @@ impl Process {
             for page_start in (start_page..end_page).step_by(page_size) {
                 let frame = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
 
-                // Map in kernel page table with URWX flags so U-mode can execute
-                vmm::map(kernel_pt, page_start, frame, vmm::PTEFlags::URWX);
+                // Map in user page table with URWX flags
+                vmm::map_user(user_pt, page_start, frame, vmm::PTEFlags::URWX);
 
                 // Zero the page
                 unsafe {
@@ -87,25 +136,24 @@ impl Process {
             }
         }
 
-        // 4. Map user stack in kernel page table (URW, no execute)
-        // Map from USER_STACK_TOP downward for USER_STACK_PAGES pages
+        // 5. Map user stack in user page table (URW, no execute)
         for i in 0..USER_STACK_PAGES {
             let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
             let vaddr = USER_STACK_TOP - (i + 1) * pmm::page_size();
-            vmm::map(kernel_pt, vaddr, frame, vmm::PTEFlags::URW);
+            vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 
-        // 5. Allocate kernel stack for this process (identity mapped already by vmm::init)
+        // 6. Allocate kernel stack for this process (identity mapped already by vmm::init)
         let kstack_base = pmm::alloc_frame().ok_or("Out of memory for kernel stack")?;
         for _ in 0..3 {
             pmm::alloc_frame().ok_or("Out of memory for kernel stack")?;
         }
         let kernel_stack_top = kstack_base + 4 * pmm::page_size();
 
-        // 5.5 Flush TLB so new user mappings take effect
-        unsafe { core::arch::asm!("sfence.vma") };
+        // 7. Store page_table_root as PPN
+        let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
 
-        // 6. Set up initial brk
+        // 8. Set up initial brk
         let page_size = pmm::page_size();
         let initial_brk = (max_vaddr + page_size - 1) & !(page_size - 1);
         let brk = core::cmp::max(initial_brk, USER_HEAP_BASE);
@@ -114,12 +162,14 @@ impl Process {
 
         Ok(Self {
             pid,
-            page_table_root: 0, // Phase 1: shared kernel page table, no separate PT
+            page_table_root: page_table_ppn,
             kernel_stack_top,
             user_stack_top: USER_STACK_TOP,
             brk,
             initial_brk: brk,
             entry: elf.entry,
+            state: ProcessState::Ready,
+            trap_ctx_ptr: 0,
         })
     }
 }
@@ -127,4 +177,70 @@ impl Process {
 /// Get a mutable reference to the user page table from its PPN
 pub fn get_user_page_table(ppn: usize) -> &'static mut vmm::PageTable {
     unsafe { &mut *((ppn << 12) as *mut vmm::PageTable) }
+}
+
+// ─── Global process table ─────────────────────────────────────────
+
+/// Global process list (simplified for Phase 2)
+static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> =
+    Mutex::new([const { None }; MAX_PROCESSES]);
+
+/// Current running process index
+static CURRENT_PROCESS: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the current process
+pub fn current() -> Option<Process> {
+    let table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    table[idx].clone()
+}
+
+/// Update the current process
+pub fn update_current<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Option<Process>) -> R,
+{
+    let mut table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    f(&mut table[idx])
+}
+
+/// Add a process to the table, returns its index
+pub fn add_process(proc: Process) -> Option<usize> {
+    let mut table = PROCESS_TABLE.lock();
+    for (i, slot) in table.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(proc);
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Set the current process index
+pub fn set_current_index(idx: usize) {
+    CURRENT_PROCESS.store(idx, Ordering::Relaxed);
+}
+
+/// Get current process brk
+pub fn current_brk() -> usize {
+    let table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    table[idx].as_ref().map(|p| p.brk).unwrap_or(USER_HEAP_BASE)
+}
+
+/// Set current process brk
+pub fn set_current_brk(addr: usize) {
+    let mut table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    if let Some(p) = table[idx].as_mut() {
+        p.brk = addr;
+    }
+}
+
+/// Get current process page table root (PPN)
+pub fn current_page_table_ppn() -> usize {
+    let table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    table[idx].as_ref().map(|p| p.page_table_root).unwrap_or(0)
 }

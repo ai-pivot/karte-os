@@ -93,11 +93,14 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 fn sys_exit(code: i32) -> isize {
     crate::console_println!("[process] User process exited with code {}", code);
     crate::sched::mark_current_exited();
-    // TODO: actually clean up the process
-    // For now, just loop forever
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+
+    if code == 0 {
+        crate::console_println!("[kernel] Shutting down (exit code 0)");
+    } else {
+        crate::console_println!("[kernel] Process failed (exit code {})", code);
     }
+
+    crate::sbi::shutdown();
 }
 
 /// Syscall 2: Write to file descriptor.
@@ -205,7 +208,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
 
 /// Syscall 4: Set/get program break (heap pointer).
 fn sys_brk(addr: usize) -> isize {
-    let current = crate::sched::current_brk();
+    let current = crate::process::current_brk();
     if addr == 0 {
         return current as isize;
     }
@@ -222,8 +225,8 @@ fn sys_brk(addr: usize) -> isize {
         return current as isize;
     }
 
-    // Allocate and map pages from current brk to new brk
-    let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+    // Use current process page table
+    let user_pt = crate::arch::trap::get_current_user_pt();
     let page_size = crate::mm::pmm::page_size();
     let start_page = (current + page_size - 1) & !(page_size - 1); // Round up
     let end_page = (addr + page_size - 1) & !(page_size - 1);
@@ -231,7 +234,7 @@ fn sys_brk(addr: usize) -> isize {
     let mut vaddr = start_page;
     while vaddr < end_page {
         // Check if already mapped
-        if crate::mm::vmm::translate_user(kernel_pt, vaddr).is_none() {
+        if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
             let frame = match crate::mm::pmm::alloc_frame() {
                 Some(f) => f,
                 None => return ERR_NOMEM,
@@ -241,7 +244,7 @@ fn sys_brk(addr: usize) -> isize {
                 core::ptr::write_bytes(frame as *mut u8, 0, page_size);
             }
             // Map with URW flags (user readable/writable, no execute)
-            crate::mm::vmm::map(kernel_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
+            crate::mm::vmm::map(user_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
         }
         vaddr += page_size;
     }
@@ -251,7 +254,7 @@ fn sys_brk(addr: usize) -> isize {
         core::arch::asm!("sfence.vma");
     }
 
-    crate::sched::set_current_brk(addr);
+    crate::process::set_current_brk(addr);
     addr as isize
 }
 
@@ -269,13 +272,14 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
         return ERR_INVAL;
     }
 
-    let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+    // Use current process page table
+    let user_pt = crate::arch::trap::get_current_user_pt();
     let page_size = crate::mm::pmm::page_size();
 
     // Determine mapping range
     // If addr is 0, use current brk as base
     let base = if addr == 0 {
-        let current_brk = crate::sched::current_brk();
+        let current_brk = crate::process::current_brk();
         // Align up
         (current_brk + page_size - 1) & !(page_size - 1)
     } else {
@@ -293,7 +297,7 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
     // Allocate and map pages
     let mut vaddr = base;
     while vaddr < end {
-        if crate::mm::vmm::translate_user(kernel_pt, vaddr).is_none() {
+        if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
             let frame = match crate::mm::pmm::alloc_frame() {
                 Some(f) => f,
                 None => return ERR_NOMEM,
@@ -301,7 +305,7 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
             unsafe {
                 core::ptr::write_bytes(frame as *mut u8, 0, page_size);
             }
-            crate::mm::vmm::map(kernel_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
+            crate::mm::vmm::map(user_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
         }
         vaddr += page_size;
     }
@@ -312,7 +316,7 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
 
     // If addr was 0, advance brk
     if addr == 0 {
-        crate::sched::set_current_brk(end);
+        crate::process::set_current_brk(end);
     }
 
     base as isize
