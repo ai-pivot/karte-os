@@ -116,7 +116,6 @@ impl Process {
 
             for page_start in (start_page..end_page).step_by(page_size) {
                 let frame = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
-                crate::console_println!("[elf] map vaddr={:#x} -> paddr={:#x}", page_start, frame);
 
                 // Map in user page table with URWX flags
                 vmm::map_user(user_pt, page_start, frame, vmm::PTEFlags::URWX);
@@ -163,7 +162,6 @@ impl Process {
 
         // 7. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
-        crate::console_println!("[elf] page_table_ppn={:#x}", page_table_ppn);
 
         // 8. Set up initial brk
         let page_size = pmm::page_size();
@@ -201,21 +199,15 @@ pub fn get_user_page_table(ppn: usize) -> &'static mut vmm::PageTable {
 static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> =
     Mutex::new([const { None }; MAX_PROCESSES]);
 
-/// Maximum number of harts (cores) supported
-const MAX_HARTS: usize = 8;
+/// Current running process index — per-hart array for SMP
+static CURRENT_PROCESS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 
-/// Current running process index — per-hart array
-static CURRENT_PROCESS: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
+/// Current process's page table root PPN (lock-free for trap handler access) — per-hart
+static CURRENT_PAGE_TABLE_ROOT: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 
-/// Current process's page table root PPN (lock-free for trap handler access) — per-hart array
-static CURRENT_PAGE_TABLE_ROOT: [AtomicUsize; MAX_HARTS] =
-    [const { AtomicUsize::new(0) }; MAX_HARTS];
-
-/// Helper: get current hart ID for per-hart lookup.
-/// Falls back to hart 0 if tp register is not initialized (e.g., during tests).
 fn hartid() -> usize {
     let h = crate::arch::smp::current_hart();
-    if h >= MAX_HARTS { 0 } else { h }
+    if h >= 8 { 0 } else { h }
 }
 
 /// Get the current process (cloned, acquires lock).

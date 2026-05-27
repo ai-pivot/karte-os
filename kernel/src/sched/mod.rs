@@ -22,29 +22,26 @@ unsafe extern "C" {
 // AtomicUsize is #[repr(transparent)] over usize, so casting to *mut usize is safe.
 static TASK_SPS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
 
-/// Maximum harts (cores) supported for SMP
-const MAX_HARTS: usize = 8;
+// Per-hart current task ID (for SMP). Used by current_task_id().
+static HART_CURRENT_TASK: [AtomicUsize; 8] = [const { AtomicUsize::new(usize::MAX) }; 8];
 
-/// Per-hart current task ID (-1 = no task assigned)
-static HART_CURRENT_TASK: [AtomicUsize; MAX_HARTS] =
-    [const { AtomicUsize::new(usize::MAX) }; MAX_HARTS];
-
-/// Helper: get current hart ID
 fn hartid() -> usize {
     let h = crate::arch::smp::current_hart();
-    if h >= MAX_HARTS { 0 } else { h }
+    if h >= 8 { 0 } else { h }
 }
 
 struct Scheduler {
     tasks: [Option<TaskControlBlock>; MAX_TASKS],
     /// Map task_id → process index in PROCESS_TABLE
     task_to_process: [usize; MAX_TASKS],
+    current: usize,
     count: usize,
 }
 
 static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     tasks: [const { None }; MAX_TASKS],
     task_to_process: [0; MAX_TASKS],
+    current: 0,
     count: 0,
 });
 
@@ -58,32 +55,15 @@ pub fn init() {
 /// This function must be called with interrupts disabled (SIE=0),
 /// which is guaranteed because it's called from the trap handler.
 pub fn schedule() {
-    let h = hartid();
-    let cur = HART_CURRENT_TASK[h].load(Ordering::Relaxed);
-
-    // No task assigned to this hart — nothing to schedule
-    if cur == usize::MAX {
-        // Maybe there are Ready tasks in the global pool? Try to pick one.
-        let _ = pick_next_task(h, None);
-        return;
-    }
-
     // Lock the scheduler to update task states and find the next task
     let (current, next) = {
         let mut sched = SCHEDULER.lock();
-
-        let current = cur;
 
         if sched.count <= 1 {
             return;
         }
 
-        // Mark current as Ready (it's currently Running)
-        if let Some(ref mut t) = sched.tasks[current] {
-            if t.state == TaskState::Running {
-                t.state = TaskState::Ready;
-            }
-        }
+        let current = sched.current;
 
         // Round-Robin: find next Ready task after current
         let mut next = current;
@@ -100,20 +80,18 @@ pub fn schedule() {
 
         // No other ready task — keep running current
         if next == current {
-            // Restore Running state since we set it to Ready above
-            if let Some(ref mut t) = sched.tasks[current] {
-                t.state = TaskState::Running;
-            }
             return;
         }
 
         // Update task states
+        if let Some(ref mut t) = sched.tasks[current] {
+            t.state = TaskState::Ready;
+        }
         if let Some(ref mut t) = sched.tasks[next] {
             t.state = TaskState::Running;
         }
 
-        // Update per-hart tracking
-        HART_CURRENT_TASK[h].store(next, Ordering::Relaxed);
+        sched.current = next;
 
         // Update process module's current process index and page table root
         let next_proc_idx = sched.task_to_process[next];
@@ -126,6 +104,7 @@ pub fn schedule() {
     }; // SpinLock dropped here — safe because interrupts are disabled
 
     // Get raw pointers to the saved stack pointers in TASK_SPS.
+    // AtomicUsize has the same layout as usize, so the cast is valid.
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
 
@@ -135,49 +114,17 @@ pub fn schedule() {
     }
 }
 
-/// Try to pick a Ready task for a hart that has none.
-/// Called from schedule() when hart has no current task.
-/// Returns the picked task ID if found, None otherwise.
-fn pick_next_task(h: usize, _exclude: Option<usize>) -> Option<usize> {
-    let mut sched = SCHEDULER.lock();
-    for i in 0..sched.count {
-        if sched.tasks[i]
-            .as_ref()
-            .map_or(false, |t| t.state == TaskState::Ready)
-        {
-            if let Some(ref mut t) = sched.tasks[i] {
-                t.state = TaskState::Running;
-            }
-            HART_CURRENT_TASK[h].store(i, Ordering::Relaxed);
-            let proc_idx = sched.task_to_process[i];
-            crate::process::set_current_index(proc_idx);
-            crate::process::set_current_page_table_root(crate::process::get_page_table_root(
-                proc_idx,
-            ));
-            return Some(i);
-        }
-    }
-    None
-}
-
 /// Get current task's ID
 pub fn current_task_id() -> usize {
     HART_CURRENT_TASK[hartid()].load(Ordering::Relaxed)
 }
 
 /// Mark the current task as exited and switch to the next ready task.
+/// If no ready tasks remain, shut down the system.
 pub fn schedule_exit() {
-    let h = hartid();
     let (has_next, current, next) = {
         let mut sched = SCHEDULER.lock();
-        let current = HART_CURRENT_TASK[h].load(Ordering::Relaxed);
-
-        if current == usize::MAX {
-            crate::console_println!("[sched] Hart {} no task, parking", h);
-            loop {
-                unsafe { core::arch::asm!("wfi") };
-            }
-        }
+        let current = sched.current;
 
         // Mark current as exited
         if let Some(ref mut t) = sched.tasks[current] {
@@ -202,7 +149,7 @@ pub fn schedule_exit() {
                 if let Some(ref mut t) = sched.tasks[n] {
                     t.state = TaskState::Running;
                 }
-                HART_CURRENT_TASK[h].store(n, Ordering::Relaxed);
+                sched.current = n;
                 let next_proc_idx = sched.task_to_process[n];
                 crate::process::set_current_index(next_proc_idx);
                 crate::process::set_current_page_table_root(crate::process::get_page_table_root(
@@ -215,22 +162,12 @@ pub fn schedule_exit() {
     };
 
     if !has_next {
-        let sched = SCHEDULER.lock();
-        let alive = sched.tasks[..sched.count]
-            .iter()
-            .filter(|t| t.as_ref().map_or(false, |t| t.state != TaskState::Exited))
-            .count();
-        if alive == 0 {
-            crate::console_println!("[sched] All processes exited, shutting down");
-            crate::sbi::shutdown();
-        } else {
-            loop {
-                unsafe { core::arch::asm!("wfi") };
-            }
-        }
+        // No more runnable tasks — shut down
+        crate::console_println!("[sched] All processes exited, shutting down");
+        crate::sbi::shutdown();
     }
 
-    // Perform context switch
+    // Perform context switch to next task
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
     unsafe {
@@ -240,13 +177,9 @@ pub fn schedule_exit() {
 
 /// Mark the current task as exited (without scheduling).
 pub fn mark_current_exited() {
-    let h = hartid();
-    let cur = HART_CURRENT_TASK[h].load(Ordering::Relaxed);
-    if cur == usize::MAX {
-        return;
-    }
     let mut sched = SCHEDULER.lock();
-    if let Some(ref mut t) = sched.tasks[cur] {
+    let current = sched.current;
+    if let Some(ref mut t) = sched.tasks[current] {
         t.state = TaskState::Exited;
     }
 }
@@ -255,15 +188,9 @@ pub fn mark_current_exited() {
 /// Used by sys_waitpid to put the parent to sleep while waiting for a child.
 /// Returns when the task is unblocked (woken up by child's sys_exit).
 pub fn schedule_block() {
-    let h = hartid();
     let (has_next, current, next) = {
         let mut sched = SCHEDULER.lock();
-        let current = HART_CURRENT_TASK[h].load(Ordering::Relaxed);
-
-        if current == usize::MAX {
-            // Shouldn't happen — blocked from a hart with no task
-            return;
-        }
+        let current = sched.current;
 
         // Mark current as Blocked
         if let Some(ref mut t) = sched.tasks[current] {
@@ -288,7 +215,7 @@ pub fn schedule_block() {
                 if let Some(ref mut t) = sched.tasks[n] {
                     t.state = TaskState::Running;
                 }
-                HART_CURRENT_TASK[h].store(n, Ordering::Relaxed);
+                sched.current = n;
                 let next_proc_idx = sched.task_to_process[n];
                 crate::process::set_current_index(next_proc_idx);
                 crate::process::set_current_page_table_root(crate::process::get_page_table_root(
@@ -301,6 +228,8 @@ pub fn schedule_block() {
     };
 
     if !has_next {
+        // No runnable tasks — all blocked or exited. This shouldn't happen
+        // in normal operation, but shut down to avoid a hang.
         crate::console_println!("[sched] No runnable tasks, shutting down");
         crate::sbi::shutdown();
     }
@@ -401,7 +330,7 @@ pub fn add_user_process(
     sched.task_to_process[tid] = process_idx;
     sched.count += 1;
 
-    // If this is the first task being created, assign it to the calling hart
+    // Assign task to calling hart if it has none yet
     let h = hartid();
     if HART_CURRENT_TASK[h].load(Ordering::Relaxed) == usize::MAX {
         HART_CURRENT_TASK[h].store(tid, Ordering::Relaxed);
