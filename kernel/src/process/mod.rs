@@ -116,6 +116,7 @@ impl Process {
 
             for page_start in (start_page..end_page).step_by(page_size) {
                 let frame = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
+                crate::console_println!("[elf] map vaddr={:#x} -> paddr={:#x}", page_start, frame);
 
                 // Map in user page table with URWX flags
                 vmm::map_user(user_pt, page_start, frame, vmm::PTEFlags::URWX);
@@ -162,6 +163,7 @@ impl Process {
 
         // 7. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
+        crate::console_println!("[elf] page_table_ppn={:#x}", page_table_ppn);
 
         // 8. Set up initial brk
         let page_size = pmm::page_size();

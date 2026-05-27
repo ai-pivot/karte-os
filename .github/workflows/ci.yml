@@ -156,8 +156,6 @@ jobs:
           timeout 10 qemu-system-riscv64 \
             -machine virt -cpu rv64 -nographic \
             -bios default -m 128M -smp 1 \
-            -drive id=blk0,file=disk.img,format=raw,if=none \
-            -device virtio-blk-device,drive=blk0 \
             -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
             > /tmp/boot-output.log 2>&1 || true
           
@@ -215,8 +213,6 @@ jobs:
           timeout 10 qemu-system-riscv64 \
             -machine virt -cpu rv64 -nographic \
             -bios default -m 128M -smp 4 \
-            -drive id=blk0,file=disk.img,format=raw,if=none \
-            -device virtio-blk-device,drive=blk0 \
             -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
             > /tmp/smp-output.log 2>&1 || true
           
