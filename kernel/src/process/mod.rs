@@ -16,6 +16,7 @@ pub const USER_HEAP_LIMIT: usize = 0x0080_0000; // 4 MB heap
 pub const USER_STACK_TOP: usize = 0x8000_0000; // Top of user stack
 pub const USER_STACK_BASE: usize = 0x7FC0_0000; // 4 MB stack
 pub const USER_STACK_PAGES: usize = 64; // 256 KB actual stack
+pub const KERNEL_STACK_PAGES: usize = 4; // 16 KB kernel stack
 
 /// Process identifier allocator
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
@@ -54,6 +55,9 @@ pub struct Process {
     pub state: ProcessState,
     /// Exit code (valid when state == Exited)
     pub exit_code: usize,
+    /// Index in PROCESS_TABLE of the child this process is waiting for.
+    /// None if not waiting. Used by sys_exit to wake the parent.
+    pub wait_child_idx: Option<usize>,
     /// Per-process file descriptor table
     pub fd_table: Option<crate::driver::fs::FdTable>,
     /// Trap context pointer (saved on kernel stack)
@@ -178,6 +182,7 @@ impl Process {
             state: ProcessState::Ready,
             exit_code: 0,
             fd_table: Some(crate::driver::fs::FdTable::new()),
+            wait_child_idx: None,
             trap_ctx_ptr: 0,
         })
     }
@@ -332,12 +337,22 @@ pub fn has_children(parent_pid: usize) -> bool {
 /// Returns true if successful.
 /// Acquires lock — do NOT call from trap handler.
 pub fn reclaim_process(idx: usize) -> bool {
-    let mut table = PROCESS_TABLE.lock();
-    if let Some(p) = table[idx].take() {
-        // Note: page table and kernel stack pages are currently not freed.
-        // Full resource reclamation requires walking the page table tree
-        // and freeing each frame — deferred to a future phase.
-        drop(p);
+    let proc = {
+        let mut table = PROCESS_TABLE.lock();
+        table[idx].take()
+    };
+
+    if let Some(p) = proc {
+        // Free user page table (all user-mapped frames + page table frames)
+        if p.page_table_root != 0 {
+            crate::mm::vmm::free_user_page_table(p.page_table_root);
+        }
+        // Free kernel stack frames (KERNEL_STACK_PAGES * PAGE_SIZE)
+        // Kernel stack is allocated from kernel_stack_top down
+        let stack_bottom = p.kernel_stack_top - crate::process::KERNEL_STACK_PAGES * 4096;
+        for offset in (0..crate::process::KERNEL_STACK_PAGES).step_by(4096) {
+            crate::mm::pmm::dealloc_frame(stack_bottom + offset);
+        }
         true
     } else {
         false
@@ -417,4 +432,40 @@ pub fn find_process_by_pid(pid: usize) -> Option<usize> {
 pub fn get_ppid(idx: usize) -> usize {
     let table = PROCESS_TABLE.lock();
     table[idx].as_ref().map(|p| p.ppid).unwrap_or(0)
+}
+
+/// Get current process index.
+pub fn current_index() -> usize {
+    CURRENT_PROCESS.load(Ordering::Relaxed)
+}
+
+/// Set wait_child_idx for a process (marks it as waiting for a specific child).
+pub fn set_wait_child(proc_idx: usize, child_idx: Option<usize>) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table[proc_idx].as_mut() {
+        p.wait_child_idx = child_idx;
+    }
+}
+
+/// Find the parent process that is waiting for a child at the given index.
+/// Returns the parent's process index, or None.
+pub fn find_waiting_parent(child_idx: usize) -> Option<usize> {
+    let table = PROCESS_TABLE.lock();
+    for (idx, p) in table.iter().enumerate() {
+        if let Some(proc) = p {
+            if proc.wait_child_idx == Some(child_idx) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+/// Get process index by process index (validation).
+/// Returns true if the process at this index exists and has the given ppid.
+pub fn is_child_of(proc_idx: usize, parent_pid: usize) -> bool {
+    let table = PROCESS_TABLE.lock();
+    table[proc_idx]
+        .as_ref()
+        .map_or(false, |p| p.ppid == parent_pid)
 }

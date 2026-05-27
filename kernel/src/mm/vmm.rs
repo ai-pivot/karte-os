@@ -215,6 +215,57 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
     Some((l0.ppn() << 12) | (vaddr & 0xFFF))
 }
 
+/// Free all resources associated with a user page table.
+/// Walks the 3-level page table tree and frees:
+/// - All user-mapped physical frames (URWX pages — not kernel identity mappings)
+/// - All page table frames (L2 entries, L1 tables, L0 tables)
+/// - The root page table frame itself
+pub fn free_user_page_table(root_ppn: usize) {
+    let root = unsafe { &mut *((root_ppn << 12) as *mut PageTable) };
+
+    // Walk L2 entries
+    for l2_idx in 0..512 {
+        let l2e = root.entries[l2_idx];
+        if !l2e.is_valid() {
+            continue;
+        }
+        let l1_table = unsafe { &mut *((l2e.ppn() << 12) as *mut PageTable) };
+
+        // Walk L1 entries
+        for l1_idx in 0..512 {
+            let l1e = l1_table.entries[l1_idx];
+            if !l1e.is_valid() {
+                continue;
+            }
+
+            if l1e.is_leaf() {
+                // Mega page — skip (kernel identity mappings are mega pages)
+                continue;
+            }
+
+            let l0_table = unsafe { &mut *((l1e.ppn() << 12) as *mut PageTable) };
+
+            // Walk L0 entries
+            for l0_idx in 0..512 {
+                let l0e = l0_table.entries[l0_idx];
+                if !l0e.is_valid() {
+                    continue;
+                }
+                // Only free user-mapped pages (those with U flag set)
+                if l0e.flags().contains(PTEFlags::U) {
+                    crate::mm::pmm::dealloc_frame(l0e.ppn() << 12);
+                }
+            }
+            // Free L0 page table frame
+            crate::mm::pmm::dealloc_frame(l1e.ppn() << 12);
+        }
+        // Free L1 page table frame
+        crate::mm::pmm::dealloc_frame(l2e.ppn() << 12);
+    }
+    // Free root (L2) page table frame
+    crate::mm::pmm::dealloc_frame(root_ppn << 12);
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(feature = "test_mode")]

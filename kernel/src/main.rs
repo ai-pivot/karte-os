@@ -132,6 +132,17 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     user_satp,
                     proc.page_table_root
                 );
+
+                // Add first process to scheduler so it participates
+                // in context switching (needed for blocking waitpid, etc.)
+                sched::add_user_process(
+                    proc.entry,
+                    proc.user_stack_top,
+                    proc.kernel_stack_top,
+                    user_satp,
+                    idx,
+                );
+
                 // Disable interrupts during the critical sret sequence
                 unsafe { riscv::register::sstatus::clear_sie() };
 

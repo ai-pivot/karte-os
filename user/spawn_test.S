@@ -38,6 +38,9 @@ _start:
     li      a1, 0           # arg = 0
     ecall
 
+    # Save child_pid for waitpid later
+    mv      t1, a0          # child_pid = spawn() return
+
     # Check result
     blt     a0, zero, spawn_failed
 
@@ -48,12 +51,18 @@ _start:
     li      a2, 28
     ecall
 
-    # Yield a few times to let child run
-    li      t1, 5
-yield_loop:
-    # Just waste some time
-    addi    t1, t1, -1
-    bgtz    t1, yield_loop
+    # Wait for child to exit (blocking wait)
+    mv      a0, t1          # child_pid
+    li      a7, 31          # SYS_WAITPID
+    ecall
+
+    # Print exit code
+    mv      t1, a0
+    li      a7, 2
+    li      a0, 1
+    la      a1, exit_msg
+    li      a2, 20
+    ecall
 
     # Print "Parent: done"
     li      a7, 2
@@ -93,3 +102,5 @@ parent_done_msg:
     .string "Parent: exiting now!\n"
 fail_msg:
     .string "Parent: spawn failed!\n"
+exit_msg:
+    .string "Child exit code: xx\n"

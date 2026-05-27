@@ -94,6 +94,16 @@ fn sys_exit(code: i32) -> isize {
     crate::console_println!("[process] User process exited with code {}", code);
     // Save exit code in process table
     crate::process::set_exit_code(code as usize);
+
+    // If a parent is waiting for this process, wake it up
+    let my_idx = crate::process::current_index();
+    if let Some(parent_idx) = crate::process::find_waiting_parent(my_idx) {
+        // Clear the wait flag on parent
+        crate::process::set_wait_child(parent_idx, None);
+        // Wake the parent task so it can be scheduled again
+        crate::sched::wake_task(parent_idx);
+    }
+
     crate::sched::schedule_exit();
     // schedule_exit() never returns if other tasks are running
     // (it either switches to another task or shuts down)
@@ -401,19 +411,25 @@ fn sys_waitpid(pid: usize) -> isize {
         None => return ERR_INVAL,
     };
 
-    // Spin-wait until child has exited.
-    // This is a simple blocking wait — the parent yields by spinning.
-    // A proper implementation would block the parent task and schedule others.
-    loop {
-        if let Some(exit_code) = crate::process::get_exit_code(child_idx) {
-            // Child has exited — reclaim resources
-            crate::process::reclaim_process(child_idx);
-            crate::sched::remove_task(child_idx);
-            return exit_code as isize;
-        }
-        // Child hasn't exited yet — yield CPU by doing nothing
-        // (timer interrupt will eventually switch to the child)
+    // Check if child already exited (fast path — no need to block)
+    if let Some(exit_code) = crate::process::get_exit_code(child_idx) {
+        crate::process::reclaim_process(child_idx);
+        crate::sched::remove_task(child_idx);
+        return exit_code as isize;
     }
+
+    // Child still running — mark parent as waiting for this child, then block.
+    // The parent will be woken up when the child calls sys_exit.
+    let my_idx = crate::process::current_index();
+    crate::process::set_wait_child(my_idx, Some(child_idx));
+    crate::sched::schedule_block();
+
+    // --- We resume here when the child has exited ---
+    // The child's sys_exit woke us up and left the exit code for us.
+    let exit_code = crate::process::get_exit_code(child_idx).unwrap_or(0);
+    crate::process::reclaim_process(child_idx);
+    crate::sched::remove_task(child_idx);
+    exit_code as isize
 }
 
 fn sys_spawn(prog_id: usize, _arg: usize) -> isize {

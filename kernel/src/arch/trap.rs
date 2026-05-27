@@ -157,11 +157,9 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 crate::arch::plic::handle_interrupt(0);
             }
             _ => {
-                crate::console_println!(
-                    "[trap] Unknown interrupt: code={}, sepc={:#x}",
-                    code,
-                    ctx.sepc
-                );
+                // Unknown S-mode interrupt — skip instruction.
+                // Do NOT print — SpinLock in UART can deadlock.
+                skip_trap_instruction(ctx);
             }
         }
     } else {

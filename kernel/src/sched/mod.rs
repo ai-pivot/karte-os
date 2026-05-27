@@ -176,6 +176,81 @@ pub fn mark_current_exited() {
     }
 }
 
+/// Block the current task and switch to the next ready task.
+/// Used by sys_waitpid to put the parent to sleep while waiting for a child.
+/// Returns when the task is unblocked (woken up by child's sys_exit).
+pub fn schedule_block() {
+    let (has_next, current, next) = {
+        let mut sched = SCHEDULER.lock();
+        let current = sched.current;
+
+        // Mark current as Blocked
+        if let Some(ref mut t) = sched.tasks[current] {
+            t.state = TaskState::Blocked;
+        }
+
+        // Find next Ready task
+        let mut next = None;
+        for i in 1..sched.count {
+            let candidate = (current + i) % sched.count;
+            if sched.tasks[candidate]
+                .as_ref()
+                .map_or(false, |t| t.state == TaskState::Ready)
+            {
+                next = Some(candidate);
+                break;
+            }
+        }
+
+        match next {
+            Some(n) => {
+                if let Some(ref mut t) = sched.tasks[n] {
+                    t.state = TaskState::Running;
+                }
+                sched.current = n;
+                let next_proc_idx = sched.task_to_process[n];
+                crate::process::set_current_index(next_proc_idx);
+                crate::process::set_current_page_table_root(crate::process::get_page_table_root(
+                    next_proc_idx,
+                ));
+                (true, current, n)
+            }
+            None => (false, current, 0),
+        }
+    };
+
+    if !has_next {
+        // No runnable tasks — all blocked or exited. This shouldn't happen
+        // in normal operation, but shut down to avoid a hang.
+        crate::console_println!("[sched] No runnable tasks, shutting down");
+        crate::sbi::shutdown();
+    }
+
+    // Perform context switch to next task
+    let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
+    let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+    unsafe {
+        __switch(cur_ptr, nxt_ptr);
+    }
+}
+
+/// Wake up a blocked task by process index.
+/// Sets it back to Ready so it will be scheduled on the next timer tick.
+pub fn wake_task(proc_idx: usize) {
+    let mut sched = SCHEDULER.lock();
+    // Find the task with this process index
+    for i in 0..sched.count {
+        if sched.task_to_process[i] == proc_idx {
+            if let Some(ref mut t) = sched.tasks[i] {
+                if t.state == TaskState::Blocked {
+                    t.state = TaskState::Ready;
+                }
+            }
+            return;
+        }
+    }
+}
+
 /// Remove a task from the scheduler by process index.
 /// Used by sys_waitpid after reclaiming a child process.
 pub fn remove_task(proc_idx: usize) {
