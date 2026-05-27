@@ -97,7 +97,29 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 process::set_current_page_table_root(proc.page_table_root);
                 unsafe { riscv::register::sstatus::set_sie() };
 
+                // Calculate user satp value (Sv39 mode = 8) early — needed by
+                // both add_user_process and first_enter_user.
+                let user_satp = if proc.page_table_root == 0 {
+                    let satp: usize;
+                    unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
+                    satp
+                } else {
+                    (8usize << 60) | (proc.page_table_root)
+                };
+
+                // Register first process with the scheduler so it can
+                // participate in context switching (blocking waitpid,
+                // multi-process, SMP scheduling).
+                sched::add_user_process(
+                    proc.entry,
+                    proc.user_stack_top,
+                    proc.kernel_stack_top,
+                    user_satp,
+                    idx,
+                );
+
                 // Build TrapContext on kernel stack for first U-mode entry
+                // (must be AFTER add_user_process — overwrites its layout)
                 let trap_ctx_base = proc.kernel_stack_top - 280;
                 unsafe {
                     let ctx = trap_ctx_base as *mut usize;
@@ -115,32 +137,11 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     *ctx.add(34) = proc.user_stack_top;
                 }
 
-                // Calculate user satp value (Sv39 mode = 8)
-                // Phase 1: page_table_root is 0, use current kernel satp (shared page table)
-                let user_satp = if proc.page_table_root == 0 {
-                    // Read current satp (already set to kernel page table by vmm::init)
-                    let satp: usize;
-                    unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
-                    satp
-                } else {
-                    (8usize << 60) | (proc.page_table_root)
-                };
-
                 crate::console_println!("[init] Entering user mode...");
                 crate::console_println!(
                     "[init]   user_satp={:#x}, page_table_ppn={:#x}",
                     user_satp,
                     proc.page_table_root
-                );
-
-                // Add first process to scheduler so it participates
-                // in context switching (needed for blocking waitpid, etc.)
-                sched::add_user_process(
-                    proc.entry,
-                    proc.user_stack_top,
-                    proc.kernel_stack_top,
-                    user_satp,
-                    idx,
                 );
 
                 // Disable interrupts during the critical sret sequence

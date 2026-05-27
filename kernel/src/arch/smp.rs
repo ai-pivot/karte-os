@@ -221,8 +221,12 @@ extern "C" fn secondary_hart_entry(hartid: usize) -> ! {
 
     crate::console_println!("[smp] Hart {} online", hartid);
 
-    // Park — timer interrupts will handle scheduling
+    // Enter the scheduling loop — timer interrupts will trigger schedule()
+    // which will find Ready tasks and run them on this hart
     loop {
+        // Try to pick up a Ready task
+        crate::sched::schedule();
+        // If no task was found, wait for next interrupt (timer or IPI)
         unsafe { core::arch::asm!("wfi") };
     }
 }

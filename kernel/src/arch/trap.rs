@@ -284,11 +284,10 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
 /// Skip the faulting instruction by advancing sepc.
 /// Handles both 16-bit (compressed) and 32-bit RISC-V instructions.
 fn skip_trap_instruction(ctx: &mut TrapContext) {
-    // In RISC-V, compressed (16-bit) instructions have bits[1:0] != 0b11.
-    // We need to read the instruction at sepc from the kernel's perspective.
-    // Since sepc points to kernel code (identity mapped), we can read it directly.
-    let pc = ctx.sepc;
-    let instr_half = unsafe { core::ptr::read_volatile(pc as *const u16) };
-    let len = if instr_half & 0x3 != 0x3 { 2 } else { 4 };
-    ctx.sepc += len;
+    // Always advance by 4 bytes. Reading the instruction at sepc to
+    // determine compressed vs standard length (read_volatile) can cause
+    // a page fault if sepc is in unmapped memory (e.g., OpenSBI region
+    // during CSR probing). All our code and the Rust runtime use standard
+    // 32-bit instructions for CSR probes, so 4 is always correct.
+    ctx.sepc += 4;
 }

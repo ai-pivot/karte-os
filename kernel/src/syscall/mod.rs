@@ -273,7 +273,12 @@ fn sys_getpid() -> isize {
         Some(p) => p.pid as isize,
         None => {
             // Fallback for test mode or kernel thread
-            crate::sched::current_task_id() as isize
+            let tid = crate::sched::current_task_id();
+            if tid == usize::MAX {
+                0 // No task assigned yet
+            } else {
+                tid as isize
+            }
         }
     }
 }

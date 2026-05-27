@@ -199,29 +199,40 @@ pub fn get_user_page_table(ppn: usize) -> &'static mut vmm::PageTable {
 static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> =
     Mutex::new([const { None }; MAX_PROCESSES]);
 
-/// Current running process index
-static CURRENT_PROCESS: AtomicUsize = AtomicUsize::new(0);
+/// Maximum number of harts (cores) supported
+const MAX_HARTS: usize = 8;
 
-/// Current process's page table root PPN (lock-free for trap handler access)
-static CURRENT_PAGE_TABLE_ROOT: AtomicUsize = AtomicUsize::new(0);
+/// Current running process index — per-hart array
+static CURRENT_PROCESS: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
+
+/// Current process's page table root PPN (lock-free for trap handler access) — per-hart array
+static CURRENT_PAGE_TABLE_ROOT: [AtomicUsize; MAX_HARTS] =
+    [const { AtomicUsize::new(0) }; MAX_HARTS];
+
+/// Helper: get current hart ID for per-hart lookup.
+/// Falls back to hart 0 if tp register is not initialized (e.g., during tests).
+fn hartid() -> usize {
+    let h = crate::arch::smp::current_hart();
+    if h >= MAX_HARTS { 0 } else { h }
+}
 
 /// Get the current process (cloned, acquires lock).
 /// Do NOT call from trap handler — use `current_page_table_root()` instead.
 pub fn current() -> Option<Process> {
     let table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     table[idx].clone()
 }
 
 /// Get the current process's page table root PPN.
 /// Safe to call from trap handler — uses AtomicUsize, no lock needed.
 pub fn current_page_table_root() -> usize {
-    CURRENT_PAGE_TABLE_ROOT.load(Ordering::Relaxed)
+    CURRENT_PAGE_TABLE_ROOT[hartid()].load(Ordering::Relaxed)
 }
 
 /// Update the current page table root (called during process switch).
 pub fn set_current_page_table_root(root: usize) {
-    CURRENT_PAGE_TABLE_ROOT.store(root, Ordering::Relaxed);
+    CURRENT_PAGE_TABLE_ROOT[hartid()].store(root, Ordering::Relaxed);
 }
 
 /// Update the current process
@@ -230,7 +241,7 @@ where
     F: FnOnce(&mut Option<Process>) -> R,
 {
     let mut table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     f(&mut table[idx])
 }
 
@@ -255,20 +266,20 @@ pub fn get_page_table_root(idx: usize) -> usize {
 
 /// Set the current process index
 pub fn set_current_index(idx: usize) {
-    CURRENT_PROCESS.store(idx, Ordering::Relaxed);
+    CURRENT_PROCESS[hartid()].store(idx, Ordering::Relaxed);
 }
 
 /// Get current process brk
 pub fn current_brk() -> usize {
     let table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     table[idx].as_ref().map(|p| p.brk).unwrap_or(USER_HEAP_BASE)
 }
 
 /// Set current process brk
 pub fn set_current_brk(addr: usize) {
     let mut table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     if let Some(p) = table[idx].as_mut() {
         p.brk = addr;
     }
@@ -277,7 +288,7 @@ pub fn set_current_brk(addr: usize) {
 /// Get current process page table root (PPN)
 pub fn current_page_table_ppn() -> usize {
     let table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     table[idx].as_ref().map(|p| p.page_table_root).unwrap_or(0)
 }
 
@@ -285,7 +296,7 @@ pub fn current_page_table_ppn() -> usize {
 /// Called from sys_exit before schedule_exit().
 pub fn set_exit_code(code: usize) {
     let mut table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     if let Some(p) = table[idx].as_mut() {
         p.exit_code = code;
     }
@@ -362,7 +373,7 @@ pub fn reclaim_process(idx: usize) -> bool {
 /// Get parent pid of current process.
 pub fn current_ppid() -> usize {
     let table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     table[idx].as_ref().map(|p| p.ppid).unwrap_or(0)
 }
 
@@ -377,7 +388,7 @@ pub fn set_ppid(idx: usize, ppid: usize) {
 /// Get current process pid.
 pub fn current_pid() -> usize {
     let table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     table[idx].as_ref().map(|p| p.pid).unwrap_or(0)
 }
 
@@ -392,7 +403,7 @@ where
     F: FnOnce(&mut crate::driver::fs::FdTable) -> R,
 {
     let mut table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     let proc = table[idx].as_mut().expect("No current process");
     let fd_table = proc.fd_table.as_mut().expect("No FD table");
     f(fd_table)
@@ -436,7 +447,7 @@ pub fn get_ppid(idx: usize) -> usize {
 
 /// Get current process index.
 pub fn current_index() -> usize {
-    CURRENT_PROCESS.load(Ordering::Relaxed)
+    CURRENT_PROCESS[hartid()].load(Ordering::Relaxed)
 }
 
 /// Set wait_child_idx for a process (marks it as waiting for a specific child).
