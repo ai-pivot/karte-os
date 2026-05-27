@@ -12,7 +12,7 @@ make test           # Build test kernel + run tests in QEMU
 make build-test     # Build test kernel only
 make boot-test      # Boot test (normal mode, verifies init sequence)
 make clean          # Clean all artifacts
-cd user && make     # Build user programs (hello.elf, heap_test.elf)
+cd user && make     # Build user programs (hello.elf, heap_test.elf, file_test.elf, spawn_test.elf)
 ```
 
 QEMU exit: `Ctrl+A` then `X`.
@@ -44,15 +44,16 @@ make test                             # 4. Run tests (must be ALL PASSED)
 
 ## Architecture Overview
 
-S-mode kernel on OpenSBI (M-mode). Identity-mapped Sv39 virtual memory. User programs run in U-mode with dual-path trap handling (trap_entry.S). Each process has its own Sv39 page table with kernel mappings copied in. ELF loader maps user code/data into per-process page tables. Round-Robin scheduler with `__switch()` assembly context switch. SMP via SBI `hart_start` for secondary harts.
+S-mode kernel on OpenSBI (M-mode). Identity-mapped Sv39 virtual memory. User programs run in U-mode with dual-path trap handling (trap_entry.S). Each process has its own Sv39 page table with kernel mappings copied in. ELF loader maps user code/data into per-process page tables. Round-Robin scheduler with `__switch()` assembly context switch. Multi-process via `sys_spawn` creates independent address spaces. SMP via SBI `hart_start` for secondary harts.
 
-Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases → load user ELF → switch satp to user page table → `sret` to U-mode → user `ecall` → trap handler → syscall dispatch. User process exit triggers SBI system shutdown.
+Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases → load user ELF → switch satp to user page table → `sret` to U-mode → user `ecall` → trap handler → syscall dispatch. Multi-process: `sys_spawn` creates child process with own page table + kernel stack → registered in scheduler → Round-Robin via timer interrupt → `__switch` context switch → satp restored in trap_handler Rust code. Last process exit triggers SBI shutdown.
 
 ## User Programs
 
 - `user/hello.S` — Minimal "Hello from user!" via sys_write + sys_exit
 - `user/heap_test.S` — Tests brk heap allocation (single-page + 8-page) with read/write verification
 - `user/file_test.S` — Tests sys_open/close/read/write file operations with data verification
+- `user/spawn_test.S` — Tests sys_spawn multi-process: parent spawns child (hello), both run concurrently
 - `user/user.ld` — Linker script: entry at 0x1000
 - User programs are embedded into the kernel via `include_bytes!()` at compile time
 - **Build before kernel**: `cd user && make` generates `*.elf` files that the kernel references
@@ -72,6 +73,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 6 | mmap | (addr, len, flags) |
 | 10 | open | (path, path_len, flags) |
 | 11 | close | (fd) |
+| 30 | spawn | (prog_id, arg) — spawn new process (0=hello, 1=heap_test, 2=file_test, 3=spawn_test) |
 
 ## GOTCHAS
 
@@ -83,6 +85,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **sfence.vma** required after mapping new user pages (TLB stale otherwise)
 - **Compressed instructions** — trap skip must check instruction length (16-bit vs 32-bit)
 - **sret timing** — disable SIE before sret sequence to prevent timer interrupt preemption
+- **satp switching in Rust**: satp is restored in trap_handler (Rust), NOT in trap_entry.S — sfence.vma in assembly return path causes timing-sensitive bugs; only switch satp when it actually changed
 - **QEMU boot hart**: With `-smp N`, OpenSBI may boot on hart 1 (not always hart 0)
 - **VirtIO MMIO**: Fixed — stride is 0x1000 (page-sized), not 0x200. Requires `-device virtio-blk-device` in QEMU for block device.
 - **amoswap/lr/sc**: RISC-V atomic extensions NOT available on bare target

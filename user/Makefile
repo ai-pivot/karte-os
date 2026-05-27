@@ -3,7 +3,7 @@ AS = $(CROSS)as
 LD = $(CROSS)ld
 OBJCOPY = $(CROSS)objcopy
 
-TARGETS = hello.elf heap_test.elf file_test.elf
+TARGETS = hello.elf heap_test.elf file_test.elf spawn_test.elf
 
 all: $(TARGETS)
 
@@ -23,6 +23,12 @@ file_test.o: file_test.S
 	$(AS) -march=rv64gc -o $@ $<
 
 file_test.elf: file_test.o
+	$(LD) -T user.ld -o $@ $<
+
+spawn_test.o: spawn_test.S
+	$(AS) -march=rv64gc -o $@ $<
+
+spawn_test.elf: spawn_test.o
 	$(LD) -T user.ld -o $@ $<
 
 clean:

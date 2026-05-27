@@ -24,12 +24,15 @@ static TASK_SPS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_
 
 struct Scheduler {
     tasks: [Option<TaskControlBlock>; MAX_TASKS],
+    /// Map task_id → process index in PROCESS_TABLE
+    task_to_process: [usize; MAX_TASKS],
     current: usize,
     count: usize,
 }
 
 static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     tasks: [const { None }; MAX_TASKS],
+    task_to_process: [0; MAX_TASKS],
     current: 0,
     count: 0,
 });
@@ -82,6 +85,10 @@ pub fn schedule() {
 
         sched.current = next;
 
+        // Update process module's current process index
+        let next_proc_idx = sched.task_to_process[next];
+        crate::process::set_current_index(next_proc_idx);
+
         (current, next)
     }; // SpinLock dropped here — safe because interrupts are disabled
 
@@ -101,7 +108,60 @@ pub fn current_task_id() -> usize {
     SCHEDULER.lock().current
 }
 
-/// Mark the current task as exited.
+/// Mark the current task as exited and switch to the next ready task.
+/// If no ready tasks remain, shut down the system.
+pub fn schedule_exit() {
+    let (has_next, current, next) = {
+        let mut sched = SCHEDULER.lock();
+        let current = sched.current;
+
+        // Mark current as exited
+        if let Some(ref mut t) = sched.tasks[current] {
+            t.state = TaskState::Exited;
+        }
+
+        // Find next Ready task
+        let mut next = None;
+        for i in 1..sched.count {
+            let candidate = (current + i) % sched.count;
+            if sched.tasks[candidate]
+                .as_ref()
+                .map_or(false, |t| t.state == TaskState::Ready)
+            {
+                next = Some(candidate);
+                break;
+            }
+        }
+
+        match next {
+            Some(n) => {
+                if let Some(ref mut t) = sched.tasks[n] {
+                    t.state = TaskState::Running;
+                }
+                sched.current = n;
+                let next_proc_idx = sched.task_to_process[n];
+                crate::process::set_current_index(next_proc_idx);
+                (true, current, n)
+            }
+            None => (false, current, 0),
+        }
+    };
+
+    if !has_next {
+        // No more runnable tasks — shut down
+        crate::console_println!("[sched] All processes exited, shutting down");
+        crate::sbi::shutdown();
+    }
+
+    // Perform context switch to next task
+    let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
+    let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+    unsafe {
+        __switch(cur_ptr, nxt_ptr);
+    }
+}
+
+/// Mark the current task as exited (without scheduling).
 pub fn mark_current_exited() {
     let mut sched = SCHEDULER.lock();
     let current = sched.current;
@@ -111,13 +171,14 @@ pub fn mark_current_exited() {
 }
 
 /// Add a user process to the scheduler.
-/// `process` is the user process created by Process::from_elf().
+/// `process_idx` is the index in PROCESS_TABLE.
 /// Returns the task ID or None on failure.
 pub fn add_user_process(
     entry: usize,
     user_stack_top: usize,
     kernel_stack_top: usize,
-    _page_table_ppn: usize,
+    _user_satp: usize,
+    process_idx: usize,
 ) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
     if sched.count >= MAX_TASKS {
@@ -137,15 +198,16 @@ pub fn add_user_process(
         for i in 0..35 {
             *ctx.add(i) = 0;
         }
-        // x[0] = 0 (zero)
-        // x[2] = kernel_stack_top (will be sp during kernel trap handling)
+        // x[2] = kernel_stack_top (sp during kernel trap handling)
         *ctx.add(2) = kernel_stack_top;
         // sstatus at offset 256/8 = 32: SPP=0, SPIE=1
-        *ctx.add(32) = 0x20; // SPIE bit set
+        *ctx.add(32) = 0x20;
         // sepc at offset 264/8 = 33: entry point
         *ctx.add(33) = entry;
         // sscratch at offset 272/8 = 34: user sp
         *ctx.add(34) = user_stack_top;
+        // Note: satp is NOT stored in TrapContext.
+        // It's restored by trap_handler (in Rust) before returning to assembly.
     }
 
     // The task's saved SP points to the trap context
@@ -155,6 +217,7 @@ pub fn add_user_process(
     let mut tcb = TaskControlBlock::new(tid);
     tcb.context = TaskContext::goto(entry, kernel_stack_top);
     sched.tasks[tid] = Some(tcb);
+    sched.task_to_process[tid] = process_idx;
     sched.count += 1;
 
     Some(tid)

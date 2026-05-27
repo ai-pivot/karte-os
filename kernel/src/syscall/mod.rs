@@ -21,11 +21,8 @@ pub const SYS_MMAP: usize = 6;
 pub const SYS_OPEN: usize = 10;
 pub const SYS_CLOSE: usize = 11;
 
-// Level 4: Network (reserved)
-pub const SYS_SOCKET: usize = 20;
-
-// Level 5: Threading (reserved)
-pub const SYS_CLONE: usize = 30;
+// Level 5: Threading
+pub const SYS_SPAWN: usize = 30;
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -71,6 +68,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_MMAP => sys_mmap(args[0], args[1], args[2]),
         SYS_OPEN => sys_open(args[0], args[1], args[2] as u32),
         SYS_CLOSE => sys_close(args[0] as i32),
+        SYS_SPAWN => sys_spawn(args[0], args[1]),
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
             ERR_INVAL
@@ -92,15 +90,10 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 /// Syscall 1: Exit the current process.
 fn sys_exit(code: i32) -> isize {
     crate::console_println!("[process] User process exited with code {}", code);
-    crate::sched::mark_current_exited();
-
-    if code == 0 {
-        crate::console_println!("[kernel] Shutting down (exit code 0)");
-    } else {
-        crate::console_println!("[kernel] Process failed (exit code {})", code);
-    }
-
-    crate::sbi::shutdown();
+    crate::sched::schedule_exit();
+    // schedule_exit() never returns if other tasks are running
+    // (it either switches to another task or shuts down)
+    0
 }
 
 /// Syscall 2: Write to file descriptor.
@@ -260,7 +253,13 @@ fn sys_brk(addr: usize) -> isize {
 
 /// Syscall 5: Get process ID.
 fn sys_getpid() -> isize {
-    crate::sched::current_task_id() as isize
+    match crate::process::current() {
+        Some(p) => p.pid as isize,
+        None => {
+            // Fallback for test mode or kernel thread
+            crate::sched::current_task_id() as isize
+        }
+    }
 }
 
 /// Syscall 6: Map anonymous memory.
@@ -370,6 +369,71 @@ fn sys_close(fd: i32) -> isize {
         ERR_OK
     } else {
         ERR_INVAL
+    }
+}
+
+/// Syscall 30: Spawn a new process.
+/// `prog_id` identifies which program to spawn (0 = hello, 1 = heap_test, 2 = file_test, 3 = spawn_test).
+/// Returns child PID on success, or negative error code.
+fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
+    // Select ELF binary based on program ID
+    let elf_data: &[u8] = match prog_id {
+        0 => include_bytes!("../../../user/hello.elf"),
+        1 => include_bytes!("../../../user/heap_test.elf"),
+        2 => include_bytes!("../../../user/file_test.elf"),
+        3 => include_bytes!("../../../user/spawn_test.elf"),
+        _ => return ERR_INVAL,
+    };
+
+    // Create a new process from the ELF binary
+    let proc = match crate::process::Process::from_elf(elf_data) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::console_println!("[spawn] Failed to create process: {}", e);
+            return ERR_NOMEM;
+        }
+    };
+
+    let child_pid = proc.pid;
+    let entry = proc.entry;
+    let user_stack_top = proc.user_stack_top;
+    let kernel_stack_top = proc.kernel_stack_top;
+
+    // Calculate user satp value (Sv39 mode = 8)
+    let user_satp = if proc.page_table_root == 0 {
+        // Fallback: read current satp
+        let satp: usize;
+        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
+        satp
+    } else {
+        (8usize << 60) | proc.page_table_root
+    };
+
+    // Register process in the global process table
+    let proc_idx = match crate::process::add_process(proc) {
+        Some(idx) => idx,
+        None => {
+            crate::console_println!("[spawn] Process table full");
+            return ERR_NOMEM;
+        }
+    };
+
+    // Add to scheduler
+    match crate::sched::add_user_process(
+        entry,
+        user_stack_top,
+        kernel_stack_top,
+        user_satp,
+        proc_idx,
+    ) {
+        Some(_tid) => {
+            crate::console_println!("[spawn] Spawned process pid={}", child_pid);
+            child_pid as isize
+        }
+        None => {
+            crate::console_println!("[spawn] Scheduler full");
+            ERR_NOMEM
+        }
     }
 }
 

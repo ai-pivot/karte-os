@@ -30,10 +30,6 @@ pub struct TrapContext {
 
 impl TrapContext {
     /// Create a trap context for first entry into a user process.
-    ///
-    /// - `entry`     — user program entry point (set in sepc)
-    /// - `user_sp`   — user stack pointer (set in sscratch)
-    /// - `kernel_sp` — kernel stack pointer (set in x[2], used during trap handling)
     pub fn new_for_user(entry: usize, user_sp: usize, kernel_sp: usize) -> Self {
         let mut ctx = Self {
             x: [0; 32],
@@ -255,6 +251,21 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
     // Clear SUM if we set it for user-mode trap handling
     if from_user {
         unsafe { riscv::register::sstatus::clear_sum() };
+
+        // For multi-process: ensure satp is set to the current process's page table.
+        // After schedule() -> __switch(), we may be on a different process's kernel stack.
+        // We must restore its page table before sret returns to U-mode.
+        if let Some(proc) = crate::process::current() {
+            let expected_satp = (8usize << 60) | proc.page_table_root;
+            let current_satp: usize;
+            unsafe { core::arch::asm!("csrr {}, satp", out(reg) current_satp) };
+            if current_satp != expected_satp {
+                unsafe {
+                    core::arch::asm!("csrw satp, {}", in(reg) expected_satp);
+                    core::arch::asm!("sfence.vma");
+                }
+            }
+        }
     }
 
     ctx

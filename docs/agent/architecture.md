@@ -10,8 +10,9 @@ QEMU (virt machine, rv64)
       → Set SP = _boot_stack_top
       → call kmain(hartid, dtb_ptr)
         → 10-phase init (see main.rs)
-        → Enable S-mode interrupts (sstatus.SIE)
-        → wfi loop (scheduler runs via timer interrupts)
+        → Load user ELF → create process → first_enter_user
+        → User runs in U-mode, traps handled by trap_handler
+        → sys_exit → schedule_exit → shutdown if last process
 ```
 
 ## Memory Layout
@@ -23,7 +24,40 @@ QEMU (virt machine, rv64)
 0x1000_1000 .. 0x1000_3000  — VirtIO MMIO devices (identity mapped, KRW)
 0x8020_0000 .. _ekernel     — Kernel code + data + BSS + boot stack (KRWX)
 _ekernel      .. 0x8020_0000+128M — Managed physical memory (via PMM)
+0x0000_1000              — User ELF load address (entry point)
+0x7FF0_0000 .. 0x8000_0000 — User stack (grows down, ~1MB)
 ```
+
+## Multi-Process Architecture
+
+Each process has:
+- **Independent Sv39 page table** with kernel mappings copied in via `copy_kernel_mappings()`
+- **Kernel stack** (4 pages = 16KB) allocated from PMM
+- **User stack** (mapped at 0x7FF00000..0x80000000)
+- **TrapContext** (280 bytes) on kernel stack for U-mode trap entry/exit
+- **Process struct** (pid, entry, brk, page_table_root, stack pointers)
+
+### Process Lifecycle
+
+```
+sys_spawn(prog_id) → Process::from_elf() → add_process() → add_user_process()
+  → Child gets Ready state in scheduler
+  → Parent gets child PID as return value
+
+Timer interrupt → schedule() → __switch() → Round-Robin to next Ready task
+  → trap_handler restores child's satp (in Rust, not assembly)
+  → sret to child's U-mode entry point
+
+sys_exit(code) → schedule_exit() → mark Exited → switch to next Ready task
+  → If no Ready tasks remain → SBI shutdown
+```
+
+### satp Switching Strategy
+
+**Critical design decision**: satp (user page table) is restored in Rust `trap_handler`,
+NOT in `trap_entry.S`. The assembly return path stays simple and fast (no sfence.vma).
+Only when satp actually changed (context switch) does the Rust code write satp + sfence.vma.
+For single-process, this is a no-op — no sfence.vma overhead.
 
 ## 10-Phase Init Sequence
 
@@ -37,8 +71,8 @@ _ekernel      .. 0x8020_0000+128M — Managed physical memory (via PMM)
 | 6 | Heap | `heap::init()` — 1MB buddy allocator |
 | 7 | VirtIO | `virtio::probe_virtio_devices()` — scan MMIO |
 | 8 | FS | `fs::init()` — in-memory filesystem |
-| 9 | Net | `net::test_net()` — probe VirtIO Net |
-| 10 | Timer+PLIC+Sched | `enable_timer_interrupt()`, `plic::init()`, `smp::start_secondary_harts()`, `sched::init()` |
+| 9 | Timer+PLIC | `enable_timer_interrupt()`, `plic::init()` |
+| 10 | Scheduler+User | `sched::init()`, load user ELF, `first_enter_user()` |
 
 ## Subsystem Dependencies
 
@@ -48,10 +82,9 @@ sbi.rs (console output)
 
 driver/uart.rs (serial console)
 driver/virtio.rs → depends on mm/pmm (DMA buffers), mm/vmm (MMIO mapping)
-driver/net.rs    → depends on mm/pmm (VirtQueue buffers)
 driver/fs.rs     → depends on mm/heap (Vec, String via alloc)
 
-arch/trap.rs     → depends on sbi.rs, sched/ (timer → schedule)
+arch/trap.rs     → depends on sbi.rs, sched/ (timer → schedule), process/ (satp switch)
 arch/plic.rs     → depends on driver/uart (interrupt handler)
 arch/smp.rs      → depends on mm/pmm (stack alloc), arch/trap, arch/plic
 
@@ -59,8 +92,9 @@ mm/pmm.rs        → standalone (uses linker symbols _ekernel)
 mm/vmm.rs        → depends on mm/pmm (page table allocation)
 mm/heap.rs       → depends on mm/pmm (heap pages)
 
-sched/           → depends on mm/pmm (task stacks), sync/spinlock
-syscall/         → depends on sched (getpid, exit), sbi (write)
+process/         → depends on mm/pmm (page tables + stacks), mm/vmm (user mapping)
+sched/           → depends on mm/pmm (task stacks), process/ (task→process mapping), sync/spinlock
+syscall/         → depends on sched (getpid, exit, spawn), process/ (current, from_elf), sbi (write)
 
 main.rs          → orchestrates all subsystems in correct order
 ```
@@ -68,11 +102,10 @@ main.rs          → orchestrates all subsystems in correct order
 ## Crate Dependencies
 
 ```toml
-riscv = "0.12"                    # CSR access, register structs
-riscv-rt = "0.13"                 # (minimal use — custom entry.S)
-sbi-rt = { version = "0.0.4", features = ["legacy"] }  # SBI ecall wrappers
-buddy_system_allocator = "0.11"   # Kernel heap
+riscv = "0.16"                     # CSR access, register structs
+sbi = "0.3.0"                      # SBI timer, system_reset, hsm
+buddy_system_allocator = "0.11"    # Kernel heap
 virtio-drivers = { version = "0.13.0", features = ["alloc"] }  # VirtIO
-spin = "0.9"                      # SpinLock
-bitflags = "2.0"                  # PTE flags
+spin = "0.9"                       # SpinLock
+bitflags = "2.0"                   # PTE flags
 ```
