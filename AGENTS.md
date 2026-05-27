@@ -46,7 +46,7 @@ make test                             # 4. Run tests (must be ALL PASSED)
 
 S-mode kernel on OpenSBI (M-mode). Identity-mapped Sv39 virtual memory. User programs run in U-mode with dual-path trap handling (trap_entry.S). Each process has its own Sv39 page table with kernel mappings copied in. ELF loader maps user code/data into per-process page tables. Round-Robin scheduler with `__switch()` assembly context switch. Multi-process via `sys_spawn` creates independent address spaces. SMP via SBI `hart_start` for secondary harts.
 
-Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases → load user ELF → switch satp to user page table → `sret` to U-mode → user `ecall` → trap handler → syscall dispatch. Multi-process: `sys_spawn` creates child process with own page table + kernel stack → registered in scheduler → Round-Robin via timer interrupt → `__switch` context switch → satp restored in trap_handler Rust code. Last process exit triggers SBI shutdown.
+Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases → load user ELF → switch satp to user page table → `sret` to U-mode → user `ecall` → trap handler → syscall dispatch. Multi-process: `sys_spawn` creates child process with own page table + kernel stack → registered in scheduler → Round-Robin via timer interrupt → `__switch` context switch → satp restored in trap_handler (per-process address space isolation). New tasks enter via `trap_return_user` assembly label. Last process exit triggers SBI shutdown.
 
 ## User Programs
 
@@ -85,7 +85,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **sfence.vma** required after mapping new user pages (TLB stale otherwise)
 - **Compressed instructions** — trap skip must check instruction length (16-bit vs 32-bit)
 - **sret timing** — disable SIE before sret sequence to prevent timer interrupt preemption
-- **satp switching in Rust**: satp is restored in trap_handler (Rust), NOT in trap_entry.S — sfence.vma in assembly return path causes timing-sensitive bugs; only switch satp when it actually changed
+- **satp switching**: satp is restored in trap_handler (Rust) after schedule()/__switch(), NOT in trap_entry.S. Conditional write + sfence.vma only when PPN actually changed. New tasks enter via `trap_return_user` label with __switch frame below TrapContext on kernel stack.
 - **QEMU boot hart**: With `-smp N`, OpenSBI may boot on hart 1 (not always hart 0)
 - **VirtIO MMIO**: Fixed — stride is 0x1000 (page-sized), not 0x200. Requires `-device virtio-blk-device` in QEMU for block device.
 - **amoswap/lr/sc**: RISC-V atomic extensions NOT available on bare target
