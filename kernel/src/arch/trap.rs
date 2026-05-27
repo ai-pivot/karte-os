@@ -248,12 +248,9 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 }
             }
             _ => {
-                crate::console_println!(
-                    "[trap] Exception code={} sepc={:#x} stval={:#x}",
-                    code,
-                    ctx.sepc,
-                    stval
-                );
+                // Unknown exception — silently skip.
+                // This handles CSR probing and other spurious exceptions
+                // that may occur during runtime initialization.
                 skip_trap_instruction(ctx);
             }
         }

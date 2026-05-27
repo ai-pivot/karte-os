@@ -134,6 +134,7 @@ pub const O_CREAT: u32 = 0x100;
 pub const O_TRUNC: u32 = 0x200;
 
 /// A file descriptor entry — wraps an in-memory file with seek position
+#[derive(Clone)]
 pub struct FileDescriptor {
     /// Name of the file in the in-memory filesystem
     pub name: String,
@@ -146,6 +147,7 @@ pub struct FileDescriptor {
 }
 
 /// Per-process file descriptor table
+#[derive(Clone)]
 pub struct FdTable {
     fds: [Option<FileDescriptor>; MAX_FDS],
 }

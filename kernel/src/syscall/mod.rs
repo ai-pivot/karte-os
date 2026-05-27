@@ -40,18 +40,6 @@ extern crate alloc;
 use crate::driver::fs::{FdTable, MAX_FDS, O_CREAT};
 #[cfg(feature = "test_mode")]
 use crate::driver::fs::{O_RDONLY, O_RDWR, O_WRONLY};
-use crate::sync::spinlock::SpinLock;
-
-static FD_TABLE: SpinLock<Option<FdTable>> = SpinLock::new(None);
-
-/// Lock the global FD table (initializing if needed).
-fn lock_fd_table() -> crate::sync::spinlock::SpinLockGuard<'static, Option<FdTable>> {
-    let mut guard = FD_TABLE.lock();
-    if guard.is_none() {
-        *guard = Some(FdTable::new());
-    }
-    guard
-}
 
 /// Dispatch a syscall.
 ///
@@ -127,14 +115,16 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             len as isize
         }
         _ => {
-            // File fd: get name and position
+            // File fd: get name and position from current process's FD table
             let (name, pos) = {
-                let table = lock_fd_table();
-                match table.as_ref().unwrap().get(fd as usize) {
+                crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
                     Some(f) => (f.name.clone(), f.pos),
-                    None => return ERR_INVAL,
-                }
+                    None => (alloc::string::String::new(), 0),
+                })
             };
+            if name.is_empty() {
+                return ERR_INVAL;
+            }
 
             // Read current file data, modify at pos, write back
             {
@@ -154,12 +144,11 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             }
 
             // Update seek position
-            {
-                let mut table = lock_fd_table();
-                if let Some(f) = table.as_mut().unwrap().get_mut(fd as usize) {
+            crate::process::with_fd_table(|fd_table| {
+                if let Some(f) = fd_table.get_mut(fd as usize) {
                     f.pos += len;
                 }
-            }
+            });
 
             len as isize
         }
@@ -177,14 +166,16 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    // Get file info from fd table
+    // Get file info from current process's FD table
     let (name, pos) = {
-        let table = lock_fd_table();
-        match table.as_ref().unwrap().get(fd as usize) {
+        crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
             Some(f) => (f.name.clone(), f.pos),
-            None => return ERR_INVAL,
-        }
+            None => (alloc::string::String::new(), 0),
+        })
     };
+    if name.is_empty() {
+        return ERR_INVAL;
+    }
 
     // Read from in-memory FS
     let data = {
@@ -205,12 +196,11 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
     }
 
     // Update seek position
-    {
-        let mut table = lock_fd_table();
-        if let Some(f) = table.as_mut().unwrap().get_mut(fd as usize) {
+    crate::process::with_fd_table(|fd_table| {
+        if let Some(f) = fd_table.get_mut(fd as usize) {
             f.pos += to_read;
         }
-    }
+    });
 
     to_read as isize
 }
@@ -367,12 +357,11 @@ fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         }
     }
 
-    // Allocate fd
-    let mut table = lock_fd_table();
-    match table.as_mut().unwrap().alloc(name, flags) {
+    // Allocate fd from current process's FD table
+    crate::process::with_fd_table(|fd_table| match fd_table.alloc(name, flags) {
         Some(fd) => fd as isize,
         None => ERR_NOMEM,
-    }
+    })
 }
 
 /// Syscall 11: Close a file descriptor.
@@ -380,12 +369,13 @@ fn sys_close(fd: i32) -> isize {
     if fd < 0 || fd as usize >= MAX_FDS {
         return ERR_INVAL;
     }
-    let mut table = lock_fd_table();
-    if table.as_mut().unwrap().close(fd as usize) {
-        ERR_OK
-    } else {
-        ERR_INVAL
-    }
+    crate::process::with_fd_table(|fd_table| {
+        if fd_table.close(fd as usize) {
+            ERR_OK
+        } else {
+            ERR_INVAL
+        }
+    })
 }
 
 /// Syscall 30: Spawn a new process.

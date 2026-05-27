@@ -54,6 +54,8 @@ pub struct Process {
     pub state: ProcessState,
     /// Exit code (valid when state == Exited)
     pub exit_code: usize,
+    /// Per-process file descriptor table
+    pub fd_table: Option<crate::driver::fs::FdTable>,
     /// Trap context pointer (saved on kernel stack)
     pub trap_ctx_ptr: usize,
 }
@@ -175,6 +177,7 @@ impl Process {
             entry: elf.entry,
             state: ProcessState::Ready,
             exit_code: 0,
+            fd_table: Some(crate::driver::fs::FdTable::new()),
             trap_ctx_ptr: 0,
         })
     }
@@ -361,6 +364,42 @@ pub fn current_pid() -> usize {
     let table = PROCESS_TABLE.lock();
     let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
     table[idx].as_ref().map(|p| p.pid).unwrap_or(0)
+}
+
+/// Get the current process's FD table as a mutable reference.
+/// This is used by syscall handlers for file operations.
+///
+/// # Safety
+/// Caller must ensure no nested lock acquisition on PROCESS_TABLE.
+#[cfg(not(feature = "test_mode"))]
+pub fn with_fd_table<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut crate::driver::fs::FdTable) -> R,
+{
+    let mut table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    let proc = table[idx].as_mut().expect("No current process");
+    let fd_table = proc.fd_table.as_mut().expect("No FD table");
+    f(fd_table)
+}
+
+/// Test mode fallback — uses a global static FD table.
+#[cfg(feature = "test_mode")]
+use crate::sync::spinlock::SpinLock;
+
+#[cfg(feature = "test_mode")]
+static TEST_FD_TABLE: SpinLock<Option<crate::driver::fs::FdTable>> = SpinLock::new(None);
+
+#[cfg(feature = "test_mode")]
+pub fn with_fd_table<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut crate::driver::fs::FdTable) -> R,
+{
+    let mut guard = TEST_FD_TABLE.lock();
+    if guard.is_none() {
+        *guard = Some(crate::driver::fs::FdTable::new());
+    }
+    f(guard.as_mut().unwrap())
 }
 
 /// Find process index by PID.
