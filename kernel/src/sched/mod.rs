@@ -176,6 +176,19 @@ pub fn mark_current_exited() {
     }
 }
 
+/// Remove a task from the scheduler by process index.
+/// Used by sys_waitpid after reclaiming a child process.
+pub fn remove_task(proc_idx: usize) {
+    let mut sched = SCHEDULER.lock();
+    // Find the task with this process index
+    for i in 0..sched.count {
+        if sched.task_to_process[i] == proc_idx {
+            sched.tasks[i] = None;
+            return;
+        }
+    }
+}
+
 /// Add a user process to the scheduler.
 /// `process_idx` is the index in PROCESS_TABLE.
 /// Returns the task ID or None on failure.

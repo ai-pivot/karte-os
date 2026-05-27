@@ -23,6 +23,7 @@ pub const SYS_CLOSE: usize = 11;
 
 // Level 5: Threading
 pub const SYS_SPAWN: usize = 30;
+pub const SYS_WAITPID: usize = 31;
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -81,6 +82,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_OPEN => sys_open(args[0], args[1], args[2] as u32),
         SYS_CLOSE => sys_close(args[0] as i32),
         SYS_SPAWN => sys_spawn(args[0], args[1]),
+        SYS_WAITPID => sys_waitpid(args[0]),
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
             ERR_INVAL
@@ -102,6 +104,8 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 /// Syscall 1: Exit the current process.
 fn sys_exit(code: i32) -> isize {
     crate::console_println!("[process] User process exited with code {}", code);
+    // Save exit code in process table
+    crate::process::set_exit_code(code as usize);
     crate::sched::schedule_exit();
     // schedule_exit() never returns if other tasks are running
     // (it either switches to another task or shuts down)
@@ -387,6 +391,41 @@ fn sys_close(fd: i32) -> isize {
 /// Syscall 30: Spawn a new process.
 /// `prog_id` identifies which program to spawn (0 = hello, 1 = heap_test, 2 = file_test, 3 = spawn_test).
 /// Returns child PID on success, or negative error code.
+/// Syscall 31: Wait for a child process to exit.
+/// `pid` = child process ID to wait for.
+/// Returns child's exit code, or error if no such child.
+fn sys_waitpid(pid: usize) -> isize {
+    let my_pid = crate::process::current_pid();
+
+    // Find the child process by pid
+    let child_idx = crate::process::find_process_by_pid(pid);
+
+    let child_idx = match child_idx {
+        Some(idx) => {
+            // Verify it's actually our child
+            if crate::process::get_ppid(idx) != my_pid {
+                return ERR_INVAL;
+            }
+            idx
+        }
+        None => return ERR_INVAL,
+    };
+
+    // Spin-wait until child has exited.
+    // This is a simple blocking wait — the parent yields by spinning.
+    // A proper implementation would block the parent task and schedule others.
+    loop {
+        if let Some(exit_code) = crate::process::get_exit_code(child_idx) {
+            // Child has exited — reclaim resources
+            crate::process::reclaim_process(child_idx);
+            crate::sched::remove_task(child_idx);
+            return exit_code as isize;
+        }
+        // Child hasn't exited yet — yield CPU by doing nothing
+        // (timer interrupt will eventually switch to the child)
+    }
+}
+
 fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
     // Select ELF binary based on program ID
     let elf_data: &[u8] = match prog_id {
@@ -429,6 +468,10 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
             return ERR_NOMEM;
         }
     };
+
+    // Set parent pid for the child process
+    let parent_pid = crate::process::current_pid();
+    crate::process::set_ppid(proc_idx, parent_pid);
 
     // Add to scheduler
     match crate::sched::add_user_process(

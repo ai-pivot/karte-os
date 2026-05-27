@@ -179,8 +179,11 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 ctx.sepc += 4; // skip ecall instruction
             }
             2 => {
-                // Illegal instruction
-                crate::console_println!("[trap] Illegal instruction at sepc={:#x}", ctx.sepc);
+                // Illegal instruction — silently skip.
+                // This handles CSR probing by the Rust runtime (sstateen0, senvcfg,
+                // stimecmp, etc.) which are not supported by QEMU -cpu rv64.
+                // We must NOT print here as console_println acquires a SpinLock
+                // which can deadlock if a timer interrupt fires during the lock hold.
                 skip_trap_instruction(ctx);
             }
             5 | 7 => {

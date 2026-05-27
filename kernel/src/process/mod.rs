@@ -36,6 +36,8 @@ pub enum ProcessState {
 #[derive(Clone)]
 pub struct Process {
     pub pid: usize,
+    /// Parent process ID (0 for init process)
+    pub ppid: usize,
     /// Root page table PPN (physical page number of the Sv39 root page table)
     pub page_table_root: usize,
     /// Kernel stack top (used for trap handling when in U-mode)
@@ -50,6 +52,8 @@ pub struct Process {
     pub entry: usize,
     /// Current process state
     pub state: ProcessState,
+    /// Exit code (valid when state == Exited)
+    pub exit_code: usize,
     /// Trap context pointer (saved on kernel stack)
     pub trap_ctx_ptr: usize,
 }
@@ -162,6 +166,7 @@ impl Process {
 
         Ok(Self {
             pid,
+            ppid: 0, // Set by caller (kmain sets 0 for init, sys_spawn sets parent pid)
             page_table_root: page_table_ppn,
             kernel_stack_top,
             user_stack_top: USER_STACK_TOP,
@@ -169,6 +174,7 @@ impl Process {
             initial_brk: brk,
             entry: elf.entry,
             state: ProcessState::Ready,
+            exit_code: 0,
             trap_ctx_ptr: 0,
         })
     }
@@ -265,4 +271,111 @@ pub fn current_page_table_ppn() -> usize {
     let table = PROCESS_TABLE.lock();
     let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
     table[idx].as_ref().map(|p| p.page_table_root).unwrap_or(0)
+}
+
+/// Set exit code for the current process.
+/// Called from sys_exit before schedule_exit().
+pub fn set_exit_code(code: usize) {
+    let mut table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    if let Some(p) = table[idx].as_mut() {
+        p.exit_code = code;
+    }
+}
+
+/// Get process state by process index.
+/// Returns None if process doesn't exist.
+pub fn get_state(idx: usize) -> Option<ProcessState> {
+    let table = PROCESS_TABLE.lock();
+    table[idx].as_ref().map(|p| p.state)
+}
+
+/// Get exit code of a process by index.
+/// Returns None if process doesn't exist or hasn't exited.
+pub fn get_exit_code(idx: usize) -> Option<usize> {
+    let table = PROCESS_TABLE.lock();
+    table[idx].as_ref().and_then(|p| {
+        if p.state == ProcessState::Exited {
+            Some(p.exit_code)
+        } else {
+            None
+        }
+    })
+}
+
+/// Find a child process of the given parent that has exited.
+/// Returns (process_index, exit_code) or None.
+pub fn find_exited_child(parent_pid: usize) -> Option<(usize, usize)> {
+    let table = PROCESS_TABLE.lock();
+    for (idx, proc) in table.iter().enumerate() {
+        if let Some(p) = proc {
+            if p.ppid == parent_pid && p.state == ProcessState::Exited {
+                return Some((idx, p.exit_code));
+            }
+        }
+    }
+    None
+}
+
+/// Check if the given process has any children.
+pub fn has_children(parent_pid: usize) -> bool {
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .any(|p| p.as_ref().map_or(false, |proc| proc.ppid == parent_pid))
+}
+
+/// Reclaim a process's resources and remove it from the table.
+/// Returns true if successful.
+/// Acquires lock — do NOT call from trap handler.
+pub fn reclaim_process(idx: usize) -> bool {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table[idx].take() {
+        // Note: page table and kernel stack pages are currently not freed.
+        // Full resource reclamation requires walking the page table tree
+        // and freeing each frame — deferred to a future phase.
+        drop(p);
+        true
+    } else {
+        false
+    }
+}
+
+/// Get parent pid of current process.
+pub fn current_ppid() -> usize {
+    let table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    table[idx].as_ref().map(|p| p.ppid).unwrap_or(0)
+}
+
+/// Set ppid for a process by index.
+pub fn set_ppid(idx: usize, ppid: usize) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table[idx].as_mut() {
+        p.ppid = ppid;
+    }
+}
+
+/// Get current process pid.
+pub fn current_pid() -> usize {
+    let table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS.load(Ordering::Relaxed);
+    table[idx].as_ref().map(|p| p.pid).unwrap_or(0)
+}
+
+/// Find process index by PID.
+pub fn find_process_by_pid(pid: usize) -> Option<usize> {
+    let table = PROCESS_TABLE.lock();
+    for (idx, p) in table.iter().enumerate() {
+        if p.as_ref().map_or(false, |proc| proc.pid == pid) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Get ppid of a process by index.
+pub fn get_ppid(idx: usize) -> usize {
+    let table = PROCESS_TABLE.lock();
+    table[idx].as_ref().map(|p| p.ppid).unwrap_or(0)
 }

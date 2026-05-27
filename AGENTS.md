@@ -74,6 +74,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 10 | open | (path, path_len, flags) |
 | 11 | close | (fd) |
 | 30 | spawn | (prog_id, arg) — spawn new process (0=hello, 1=heap_test, 2=file_test, 3=spawn_test) |
+| 31 | waitpid | (pid) — wait for child process, returns exit code |
 
 ## GOTCHAS
 
@@ -90,6 +91,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **VirtIO MMIO**: Fixed — stride is 0x1000 (page-sized), not 0x200. Requires `-device virtio-blk-device` in QEMU for block device.
 - **amoswap/lr/sc**: RISC-V atomic extensions NOT available on bare target
 - **sys_write**: Use byte-by-byte `read_volatile` + `console_putchar`, NOT `from_raw_parts` + `from_utf8` (causes bounds panic in S-mode trap context)
+- **illegal_instruction handler**: Must NOT use console_println! — the SpinLock in UART output can deadlock when timer interrupts fire during CSR probing. Silently skip_trap_instruction instead.
 
 ## Knowledge Files
 
