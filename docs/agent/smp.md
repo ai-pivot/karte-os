@@ -62,3 +62,37 @@ pub fn current_hart() -> usize {
 - Secondary hart startup via SBI may fail (returns SbiRet error)
 - No hart hotplug/hot-unplug
 - No IPI (Inter-Processor Interrupts) yet
+
+## SMP Scheduling (2026-05-27)
+
+### Per-hart State
+
+Each hart has its own local state stored in per-hart atomic arrays:
+- `CURRENT_PROCESS[hartid]`: process index in PROCESS_TABLE
+- `CURRENT_PAGE_TABLE_ROOT[hartid]`: PPN for satp restore in trap_handler
+- `HART_CURRENT_TASK[hartid]`: task ID for current_task_id()
+
+`hartid()` reads from `tp` register (set by `init_bsp` / trampoline assembly).
+Has bounds check — falls back to 0 if tp is uninitialized (test mode safety).
+
+### Secondary Hart Entry
+
+`secondary_hart_entry(hartid)`:
+1. Verify stack allocated
+2. `trap::init()` — set stvec for this hart
+3. Enable timer interrupt + set 10ms timer
+4. Init PLIC context for this hart
+5. Mark HartState::Running, increment ACTIVE_HARTS
+6. Set SIE (enable interrupts)
+7. Enter scheduling loop: `loop { schedule(); wfi; }`
+
+### Scheduler Design
+
+Global `SCHEDULER.lock()` protects the shared task pool. `sched.current` (in Scheduler struct) is the global current task, protected by the lock. Each hart calls `schedule()` from its timer interrupt handler, which:
+1. Acquires SCHEDULER lock
+2. Finds next Ready task (Round-Robin)
+3. Updates task states + CURRENT_PAGE_TABLE_ROOT
+4. Drops lock
+5. Calls `__switch()`
+
+Only one hart executes `__switch` at a time (lock-protected).
