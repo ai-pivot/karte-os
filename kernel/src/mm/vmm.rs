@@ -195,7 +195,7 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
     if !l2.is_valid() {
         return None;
     }
-    let l1_table = unsafe { &mut *((l2.ppn() << 12) as *mut PageTable) };
+    let l1_table = unsafe { &*((l2.ppn() << 12) as *const PageTable) };
     let l1 = &l1_table.entries[vpn1];
     if !l1.is_valid() {
         return None;
@@ -206,7 +206,7 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
         return Some((l1.ppn() << 12) | (vaddr & 0x1FFFFF));
     }
 
-    let l0_table = unsafe { &mut *((l1.ppn() << 12) as *mut PageTable) };
+    let l0_table = unsafe { &*((l1.ppn() << 12) as *const PageTable) };
     let l0 = &l0_table.entries[vpn0];
     if !l0.is_valid() {
         return None;
