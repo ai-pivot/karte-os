@@ -120,28 +120,6 @@ pub fn identity_map(root: &mut PageTable, start: usize, end: usize, flags: PTEFl
 /// The kernel page table root (set during init)
 static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
 
-/// Current user process SATP register value.
-/// Updated when entering/exiting a user process.
-static CURRENT_USER_SATP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Set the current user process SATP value.
-pub fn set_current_user_satp(satp: usize) {
-    CURRENT_USER_SATP.store(satp, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Get a mutable reference to the current user process page table.
-/// Returns the kernel page table if no user process is active.
-pub fn get_current_user_pt() -> &'static mut PageTable {
-    let satp = CURRENT_USER_SATP.load(core::sync::atomic::Ordering::Relaxed);
-    if satp == 0 {
-        // No user process active, return kernel page table
-        unsafe { &mut *KERNEL_PAGE_TABLE }
-    } else {
-        let ppn = satp & ((1 << 44) - 1);
-        unsafe { &mut *((ppn << 12) as *mut PageTable) }
-    }
-}
-
 /// Get a reference to the kernel page table.
 /// Safe to call after vmm::init().
 pub fn get_kernel_page_table() -> &'static mut PageTable {

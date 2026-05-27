@@ -72,26 +72,27 @@ Trap occurs in U-mode → trap_entry (assembly)
 
 ## satp Switching (Multi-Process)
 
-**Design**: satp is restored in Rust `trap_handler`, NOT in `trap_entry.S`.
+**Current state**: satp is NOT restored in `trap_handler` or `trap_entry.S`.
 
-Rationale: `sfence.vma` in the assembly return path causes timing-sensitive bugs
-(expensive TLB flush between sstatus restore and sret). Instead, the Rust
-trap_handler checks if satp changed and only writes satp + sfence.vma when
-necessary (after a context switch). For single-process, this is a no-op.
+The `TrapContext` struct does NOT contain a satp field. The `__switch` assembly
+does NOT touch satp. After a context switch via timer interrupt → schedule() →
+`__switch`, the new task resumes in Rust code still running on the OLD process's
+page table. satp only gets switched at two points:
+1. `first_enter_user()` — sets satp + sfence.vma before the initial sret to U-mode
+2. `sys_spawn()` — prepares the new process but does NOT switch satp (the first
+   U-mode trap return from `__switch` resumes on whatever satp was active)
 
-```rust
-// In trap_handler, before returning:
-if from_user {
-    if let Some(proc) = process::current() {
-        let expected_satp = (8usize << 60) | proc.page_table_root;
-        let current_satp = read_csr!(satp);
-        if current_satp != expected_satp {
-            write_csr!(satp, expected_satp);
-            sfence.vma();
-        }
-    }
-}
-```
+The scheduler updates `CURRENT_PAGE_TABLE_ROOT` (AtomicUsize) in `schedule()`
+and `schedule_exit()` via `process::set_current_page_table_root()`, but this
+value is only consumed by `get_current_user_pt()` for page table lookup, NOT
+for restoring the hardware satp register.
+
+**Known gap**: After `__switch` in `schedule()`, the kernel runs on the previous
+process's page table until the next U-mode return or a new satp write. This
+works because all user page tables include identical kernel identity mappings
+(see `copy_kernel_mappings()` in process/mod.rs), so kernel code/data access
+is unaffected. However, any kernel code that reads U-mode pages via the wrong
+page table will see the wrong process's memory.
 
 ## Timer Interrupt
 

@@ -10,6 +10,7 @@ global_asm!(include_str!("trap_entry.S"));
 
 unsafe extern "C" {
     fn trap_entry();
+    fn trap_return_user();
 }
 
 /// Trap context: complete register state saved on trap entry.
@@ -42,6 +43,13 @@ impl TrapContext {
         ctx.x[2] = kernel_sp; // kernel sp (used during trap handling)
         ctx
     }
+}
+
+/// Get the address of the trap_return_user assembly label.
+/// Used by the scheduler to set up the return address for new tasks
+/// so that __switch's ret jumps into the U-mode return path.
+pub fn trap_return_user_addr() -> usize {
+    unsafe { trap_return_user as *const () as usize }
 }
 
 /// Set up the trap vector.
@@ -251,6 +259,25 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
     // Clear SUM if we set it for user-mode trap handling
     if from_user {
         unsafe { riscv::register::sstatus::clear_sum() };
+    }
+
+    // Restore the correct page table for the current process.
+    // After schedule()/__switch, we may be running on a different process
+    // with a different user page table. CURRENT_PAGE_TABLE_ROOT was updated
+    // by the scheduler before __switch.
+    if from_user {
+        let target_ppn = crate::process::current_page_table_root();
+        if target_ppn != 0 {
+            let current_satp = riscv::register::satp::read().bits();
+            let current_ppn = current_satp & ((1usize << 44) - 1);
+            if target_ppn != current_ppn {
+                let new_satp = (8usize << 60) | target_ppn;
+                unsafe {
+                    core::arch::asm!("csrw satp, {}", in(reg) new_satp);
+                    core::arch::asm!("sfence.vma");
+                }
+            }
+        }
     }
 
     ctx

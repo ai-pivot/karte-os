@@ -173,6 +173,8 @@ trap_entry:
     call    trap_handler
 
     # ── Return to U-mode ──
+    .globl trap_return_user
+trap_return_user:
 
     # Restore CSRs
     ld      t1, 264(sp)

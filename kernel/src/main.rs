@@ -125,7 +125,6 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 } else {
                     (8usize << 60) | (proc.page_table_root)
                 };
-                mm::vmm::set_current_user_satp(user_satp);
 
                 crate::console_println!("[init] Entering user mode...");
                 crate::console_println!(

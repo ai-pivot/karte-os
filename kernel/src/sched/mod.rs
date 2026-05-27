@@ -193,17 +193,27 @@ pub fn add_user_process(
 
     let tid = sched.count;
 
-    // Set up the kernel stack with a TrapContext for the first U-mode entry
-    // TrapContext layout: x[32] + sstatus + sepc + sscratch = 280 bytes
-    let trap_ctx_top = kernel_stack_top;
-    let trap_ctx_base = trap_ctx_top - 280;
+    // Set up the kernel stack with a TrapContext for the first U-mode entry.
+    // Stack layout (high → low):
+    //   kernel_stack_top
+    //     TrapContext (280 bytes): x[0..31], sstatus, sepc, sscratch
+    //     __switch frame (104 bytes): ra, s0-s11 for __switch to restore
+    //     TASK_SPS[tid] points here ←
+    let trap_ctx_base = kernel_stack_top - 280;
+    let switch_sp = trap_ctx_base - 104;
 
     unsafe {
+        // Zero both regions
+        core::ptr::write_bytes(switch_sp as *mut u8, 0, 280 + 104);
+
+        // Set up __switch callee-saved frame (104 bytes at switch_sp):
+        // offset 0 = ra → trap_return_user
+        let sw = switch_sp as *mut usize;
+        *sw.add(0) = crate::arch::trap::trap_return_user_addr();
+        // s0-s11 (offset 8..96) = 0 (already zeroed)
+
+        // Set up TrapContext (280 bytes at trap_ctx_base):
         let ctx = trap_ctx_base as *mut usize;
-        // Zero everything
-        for i in 0..35 {
-            *ctx.add(i) = 0;
-        }
         // x[2] = kernel_stack_top (sp during kernel trap handling)
         *ctx.add(2) = kernel_stack_top;
         // sstatus at offset 256/8 = 32: SPP=0, SPIE=1
@@ -212,12 +222,10 @@ pub fn add_user_process(
         *ctx.add(33) = entry;
         // sscratch at offset 272/8 = 34: user sp
         *ctx.add(34) = user_stack_top;
-        // Note: satp is NOT stored in TrapContext.
-        // It's restored by trap_handler (in Rust) before returning to assembly.
     }
 
     // The task's saved SP points to the trap context
-    TASK_SPS[tid].store(trap_ctx_base, Ordering::Relaxed);
+    TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
 
     // Create TCB
     let mut tcb = TaskControlBlock::new(tid);
