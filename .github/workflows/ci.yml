@@ -153,26 +153,19 @@ jobs:
 
       - name: Boot test
         run: |
+          dd if=/dev/zero of=disk.img bs=1M count=1 2>/dev/null
           timeout 10 qemu-system-riscv64 \
             -machine virt -cpu rv64 -nographic \
             -bios default -m 128M -smp 1 \
+            -d int \
             -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
             > /tmp/boot-output.log 2>&1 || true
-          
-          echo "=== Boot Output ==="
-          grep -a 'KarteOS\|init\|user\|Hello\|virtio\|process\|Loading\|exited\|Entering\|page_table\|kstack\|ustack' /tmp/boot-output.log | head -50 || true
-          
+          grep -a 'riscv_cpu_do_interrupt' /tmp/boot-output.log | tail -15 || true
+          echo "=== PASS/FAIL ==="
           if grep -qa "Hello from user" /tmp/boot-output.log; then
             echo "Boot test PASSED"
           else
             echo "Boot test FAILED"
-            echo "=== First 80 lines of raw output ==="
-            grep -a '.' /tmp/boot-output.log | head -80 || true
-            echo ""
-            echo "=== Last 30 lines of raw output ==="
-            tail -30 /tmp/boot-output.log || true
-            echo "=== QEMU interrupt log (last 20 exceptions) ==="
-            grep -a 'riscv_cpu_do_interrupt' /tmp/boot-output.log | tail -20 || true
             exit 1
           fi
 

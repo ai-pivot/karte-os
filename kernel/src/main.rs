@@ -148,10 +148,6 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 unsafe { riscv::register::sstatus::clear_sie() };
 
                 // NOTE: Timer interrupts will be enabled on the first user ecall
-                // (in syscall handler). This ensures the user program can execute
-                // at least one syscall before being preempted by timer interrupts.
-                // The illegal_instruction exceptions from CSR probing in the Rust
-                // runtime can cause panics if timer interrupts fire too early.
 
                 arch::trap::first_enter_user(
                     unsafe { &mut *(trap_ctx_base as *mut arch::trap::TrapContext) },

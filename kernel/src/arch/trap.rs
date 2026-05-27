@@ -66,6 +66,7 @@ pub fn init() {
 /// `ctx` is a TrapContext prepared on the kernel stack.
 /// `user_satp` is the SATP register value for the user page table.
 /// This function never returns.
+#[inline(never)]
 pub fn first_enter_user(ctx: &mut TrapContext, user_satp: usize) -> ! {
     unsafe {
         // Switch to user page table
