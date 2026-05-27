@@ -168,6 +168,9 @@ jobs:
             echo "Boot test FAILED"
             echo "=== First 80 lines of raw output ==="
             grep -a '.' /tmp/boot-output.log | head -80 || true
+            echo ""
+            echo "=== Last 30 lines of raw output ==="
+            tail -30 /tmp/boot-output.log || true
             echo "=== QEMU interrupt log (last 20 exceptions) ==="
             grep -a 'riscv_cpu_do_interrupt' /tmp/boot-output.log | tail -20 || true
             exit 1
