@@ -1,4 +1,4 @@
-.PHONY: build run debug clean doc check build-test test boot-test smp-test test-run disk.img
+.PHONY: build run debug clean doc check build-test test boot-test smp-test test-run disk.img shell
 
 # Project settings
 KERNEL_BIN := target/riscv64gc-unknown-none-elf/release/karte-os-kernel
@@ -20,8 +20,13 @@ QEMU_FLAGS := \
 disk.img:
 	dd if=/dev/zero of=disk.img bs=1M count=1 2>/dev/null
 
-# Build the kernel
+# Build the kernel (force rebuild to avoid stale test_mode binary)
+# We delete the binary + fingerprint because cargo's incremental cache doesn't
+# distinguish between different --features flags — 'make test' builds with
+# test_mode, which would otherwise be reused by 'make build'.
 build:
+	@rm -f target/riscv64gc-unknown-none-elf/release/karte-os-kernel
+	@rm -rf target/riscv64gc-unknown-none-elf/release/.fingerprint/karte-os-kernel-*
 	cargo build --release -p karte-os-kernel
 
 # Run in QEMU
@@ -48,13 +53,18 @@ doc:
 check:
 	cargo check --release -p karte-os-kernel
 
-# Build test kernel
+# Build test kernel (outputs to same path, use 'make build' after to restore)
 build-test:
 	cargo build --release -p karte-os-kernel --features test_mode
 
-# Run tests in QEMU
+# Run tests in QEMU (test_mode kernel), then restore normal build
 test: build-test
 	bash scripts/run-tests.sh
+	@echo ""
+	@echo "Restoring normal kernel build..."
+	@rm -f target/riscv64gc-unknown-none-elf/release/karte-os-kernel
+	@rm -rf target/riscv64gc-unknown-none-elf/release/.fingerprint/karte-os-kernel-*
+	@cargo build --release -p karte-os-kernel
 
 # Run boot test (normal mode)
 boot-test: build disk.img
@@ -66,7 +76,10 @@ boot-test: build disk.img
 		-kernel $(KERNEL_ELF) 2>&1 | grep -qa "KarteOS Shell" \
 		&& echo "Boot test passed" || echo "Boot test failed"
 
-shell: build disk.img
+# Build shell + kernel and run
+shell: disk.img
 	cd user && rustc --edition 2024 --target riscv64gc-unknown-none-elf -C panic=abort -C opt-level=2 -C link-arg=-Tuser.ld --crate-type bin -o shell.elf shell.rs
+	@rm -f target/riscv64gc-unknown-none-elf/release/karte-os-kernel
+	@rm -rf target/riscv64gc-unknown-none-elf/release/.fingerprint/karte-os-kernel-*
 	cargo build --release -p karte-os-kernel
 	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF)
