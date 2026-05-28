@@ -69,10 +69,9 @@ pub fn handle_interrupt(hart_id: usize) {
     if irq > 0 {
         match irq {
             10 => {
-                // UART interrupt — read and echo
-                if let Some(c) = crate::driver::uart::Uart::new(0x1000_0000).getc() {
-                    crate::console_println!("[uart] received: {:02x}", c);
-                }
+                // UART interrupt — drain RX FIFO into TTY ring buffer.
+                // The TTY line editor handles echo and line editing.
+                crate::driver::tty::poll_uart();
             }
             _ => {
                 crate::console_println!("[plic] Unhandled IRQ {}", irq);

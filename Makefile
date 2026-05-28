@@ -63,5 +63,10 @@ boot-test: build disk.img
 		-bios default -m 128M -smp 1 \
 		-drive id=blk0,file=disk.img,format=raw,if=none \
 		-device virtio-blk-device,drive=blk0 \
-		-kernel $(KERNEL_ELF) 2>&1 | grep -qa "Hello from user" \
+		-kernel $(KERNEL_ELF) 2>&1 | grep -qa "KarteOS Shell" \
 		&& echo "Boot test passed" || echo "Boot test failed"
+
+shell: build disk.img
+	cd user && rustc --edition 2024 --target riscv64gc-unknown-none-elf -C panic=abort -C opt-level=2 -C link-arg=-Tuser.ld --crate-type bin -o shell.elf shell.rs
+	cargo build --release -p karte-os-kernel
+	$(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF)

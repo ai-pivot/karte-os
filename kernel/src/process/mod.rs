@@ -111,36 +111,43 @@ impl Process {
         let mut max_vaddr = 0usize;
         for segment in &elf.loadable_segments {
             let page_size = pmm::page_size();
-            let start_page = segment.vaddr & !(page_size - 1);
-            let end_page = (segment.vaddr + segment.mem_size + page_size - 1) & !(page_size - 1);
+            let seg_vaddr_start = segment.vaddr;
+            let seg_vaddr_end = segment.vaddr + segment.mem_size;
+            let page_start = seg_vaddr_start & !(page_size - 1);
+            let page_end = (seg_vaddr_end + page_size - 1) & !(page_size - 1);
 
-            for page_start in (start_page..end_page).step_by(page_size) {
-                let frame = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
+            for vaddr in (page_start..page_end).step_by(page_size) {
+                // Check if already mapped (multiple segments may share a page)
+                let frame = match vmm::translate_user(user_pt, vaddr) {
+                    Some(f) => f,
+                    None => {
+                        let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
+                        vmm::map_user(user_pt, vaddr, f, vmm::PTEFlags::URWX);
+                        unsafe {
+                            core::ptr::write_bytes(f as *mut u8, 0, page_size);
+                        }
+                        f
+                    }
+                };
 
-                // Map in user page table with URWX flags
-                vmm::map_user(user_pt, page_start, frame, vmm::PTEFlags::URWX);
-
-                // Zero the page
-                unsafe {
-                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                }
-
-                // Copy segment data into this page
-                let page_offset_in_seg = page_start - segment.vaddr;
+                // Copy segment data that falls within this page
                 let seg_data = &elf_data[segment.offset..segment.offset + segment.file_size];
-                let src_start = page_offset_in_seg;
-                let src_end = core::cmp::min(src_start + page_size, seg_data.len());
-                if src_start < src_end {
+                let copy_start = core::cmp::max(vaddr, seg_vaddr_start);
+                let copy_end =
+                    core::cmp::min(vaddr + page_size, seg_vaddr_start + segment.file_size);
+                if copy_start < copy_end {
+                    let src_offset = copy_start - seg_vaddr_start;
+                    let dst_offset = copy_start & (page_size - 1);
+                    let len = copy_end - copy_start;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
-                            seg_data[src_start..src_end].as_ptr(),
-                            (frame + src_start) as *mut u8,
-                            src_end - src_start,
+                            seg_data[src_offset..src_offset + len].as_ptr(),
+                            (frame + dst_offset) as *mut u8,
+                            len,
                         );
                     }
                 }
             }
-
             if segment.vaddr + segment.mem_size > max_vaddr {
                 max_vaddr = segment.vaddr + segment.mem_size;
             }

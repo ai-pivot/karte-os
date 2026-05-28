@@ -64,6 +64,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::console_println!("[init] Initializing PLIC...");
         arch::plic::init(0);
 
+        crate::console_println!("[init] Initializing TTY...");
+        driver::tty::init();
+
         crate::console_println!("[init] Starting secondary harts...");
         arch::smp::start_secondary_harts(4);
 
@@ -72,8 +75,26 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
         // ── Load user program ──
         crate::console_println!("[init] Loading user program...");
-        let elf_data = include_bytes!("../../user/hello.elf");
-        match process::Process::from_elf(elf_data) {
+        // Load /init from filesystem. Hold the FS lock during from_elf so the
+        // borrowed &[u8] remains valid. from_elf copies what it needs, then
+        // we can release the lock.
+        let init_result = {
+            let fs = driver::fs::global_fs();
+            match fs.read("init") {
+                Some(data) => {
+                    crate::console_println!(
+                        "[init] Loaded /init from filesystem ({} bytes)",
+                        data.len()
+                    );
+                    process::Process::from_elf(data)
+                }
+                None => {
+                    crate::console_println!("[init] WARNING: /init not found, using hello");
+                    process::Process::from_elf(include_bytes!("../../user/hello.elf"))
+                }
+            }
+        };
+        match init_result {
             Ok(proc) => {
                 crate::console_println!(
                     "[init] User process loaded: pid={}, entry={:#x}",
@@ -87,7 +108,6 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 );
 
                 // Register process in the global process table
-                // Disable interrupts to prevent timer from triggering while we hold PROCESS_TABLE lock
                 unsafe { riscv::register::sstatus::clear_sie() };
                 let idx = process::add_process(proc).expect("Failed to register process");
                 process::set_current_index(idx);
@@ -97,43 +117,29 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 process::set_current_page_table_root(proc.page_table_root);
                 unsafe { riscv::register::sstatus::set_sie() };
 
-                // Calculate user satp value (Sv39 mode = 8) early — needed by
-                // both add_user_process and first_enter_user.
+                // Calculate user satp (Sv39 mode = 8)
                 let user_satp = if proc.page_table_root == 0 {
                     let satp: usize;
                     unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
                     satp
                 } else {
-                    (8usize << 60) | (proc.page_table_root)
+                    (8usize << 60) | proc.page_table_root
                 };
 
-                // Register first process with the scheduler so it can
-                // participate in context switching (blocking waitpid,
-                // multi-process, SMP scheduling).
-                sched::add_user_process(
-                    proc.entry,
-                    proc.user_stack_top,
-                    proc.kernel_stack_top,
-                    user_satp,
-                    idx,
-                );
+                // NOTE: Init is NOT registered in the scheduler.
+                // Timer returns directly to init when only init exists.
+                // schedule() detects child tasks and switches to them.
 
                 // Build TrapContext on kernel stack for first U-mode entry
-                // (must be AFTER add_user_process — overwrites its layout)
                 let trap_ctx_base = proc.kernel_stack_top - 280;
                 unsafe {
                     let ctx = trap_ctx_base as *mut usize;
-                    // Zero everything
                     for i in 0..35 {
                         *ctx.add(i) = 0;
                     }
-                    // x[2] = kernel sp
                     *ctx.add(2) = proc.kernel_stack_top;
-                    // sstatus at offset 32 (256/8): SPP=0, SPIE=1
                     *ctx.add(32) = 0x20;
-                    // sepc at offset 33 (264/8): user entry
                     *ctx.add(33) = proc.entry;
-                    // sscratch at offset 34 (272/8): user sp
                     *ctx.add(34) = proc.user_stack_top;
                 }
 
@@ -144,11 +150,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     proc.page_table_root
                 );
 
-                // Disable interrupts during the critical sret sequence
                 unsafe { riscv::register::sstatus::clear_sie() };
-
-                // NOTE: Timer interrupts will be enabled on the first user ecall
-
                 arch::trap::first_enter_user(
                     unsafe { &mut *(trap_ctx_base as *mut arch::trap::TrapContext) },
                     user_satp,

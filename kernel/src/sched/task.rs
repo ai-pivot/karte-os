@@ -43,6 +43,9 @@ pub struct TaskControlBlock {
     pub context: TaskContext,
     pub tid: usize,
     pub state: TaskState,
+    /// Idle tasks are only scheduled when all other tasks are blocked/exited.
+    /// Prevents unnecessary context switches during normal operation.
+    pub is_idle: bool,
 }
 
 impl TaskControlBlock {
@@ -51,6 +54,17 @@ impl TaskControlBlock {
             context: TaskContext::new(),
             tid,
             state: TaskState::Ready,
+            is_idle: false,
+        }
+    }
+
+    /// Create an idle task TCB.
+    pub fn new_idle(tid: usize) -> Self {
+        Self {
+            context: TaskContext::new(),
+            tid,
+            state: TaskState::Ready,
+            is_idle: true,
         }
     }
 }

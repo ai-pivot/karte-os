@@ -4,3 +4,4 @@
 *.elf
 .xbot/
 disk.img
+mcp-go-debugger.log

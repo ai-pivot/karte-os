@@ -1,4 +1,11 @@
-// kernel/src/sched/mod.rs — Round-Robin task scheduler with context switching
+// kernel/src/sched/mod.rs — Simple Round-Robin scheduler.
+//
+// Design:
+//   - No idle task. Init is NOT in the scheduler.
+//   - Children (tid=0+) are created by sys_spawn.
+//   - schedule() saves init's sp to INIT_TASK_SP when switching away.
+//   - schedule_exit() restores init via __switch back.
+//   - When only init exists, schedule() is a no-op.
 
 pub mod task;
 
@@ -6,33 +13,33 @@ use core::arch::global_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::spinlock::SpinLock;
-use task::{TaskContext, TaskControlBlock, TaskState};
+use task::{TaskControlBlock, TaskState};
 
-// Embed the context-switch assembly
 global_asm!(include_str!("switch.S"));
+
+// Shim for first task entry via __switch
+global_asm!(
+    ".globl first_task_shim",
+    "first_task_shim:",
+    "addi sp, sp, 104",   // Skip __switch frame → sp points to TrapContext
+    "j trap_return_user", // Restore U-mode context and sret
+);
 
 const MAX_TASKS: usize = 64;
 
 unsafe extern "C" {
     fn __switch(current_sp: *mut usize, next_sp: *const usize);
+    fn first_task_shim();
 }
 
-// Per-task saved stack pointers, accessible without locking the scheduler.
-// Written by __switch (assembly) and during task creation (Rust).
-// AtomicUsize is #[repr(transparent)] over usize, so casting to *mut usize is safe.
 static TASK_SPS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
 
-// Per-hart current task ID (for SMP). Used by current_task_id().
-static HART_CURRENT_TASK: [AtomicUsize; 8] = [const { AtomicUsize::new(usize::MAX) }; 8];
-
-fn hartid() -> usize {
-    let h = crate::arch::smp::current_hart();
-    if h >= 8 { 0 } else { h }
-}
+/// Saved kernel sp for init. When schedule() switches from init to a child,
+/// __switch saves init's sp here. schedule_exit() uses it to switch back.
+static INIT_TASK_SP: AtomicUsize = AtomicUsize::new(0);
 
 struct Scheduler {
     tasks: [Option<TaskControlBlock>; MAX_TASKS],
-    /// Map task_id → process index in PROCESS_TABLE
     task_to_process: [usize; MAX_TASKS],
     current: usize,
     count: usize,
@@ -45,196 +52,169 @@ static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     count: 0,
 });
 
-/// Initialize the scheduler
 pub fn init() {
     crate::console_println!("[sched] Initialized");
 }
 
-/// Called from timer interrupt handler to perform Round-Robin scheduling.
-///
-/// This function must be called with interrupts disabled (SIE=0),
-/// which is guaranteed because it's called from the trap handler.
+/// Round-Robin among child tasks. When init is running (current==0),
+/// __switch saves init's sp to INIT_TASK_SP then switches to child.
 pub fn schedule() {
-    // Lock the scheduler to update task states and find the next task
-    let (current, next) = {
+    let (switch_from_init, current, next) = {
         let mut sched = SCHEDULER.lock();
-
-        if sched.count <= 1 {
+        if sched.count == 0 {
             return;
         }
-
         let current = sched.current;
 
-        // Round-Robin: find next Ready task after current
-        let mut next = current;
+        // Find next Ready child
+        let mut next: usize = current;
         for i in 1..sched.count {
             let candidate = (current + i) % sched.count;
-            if sched.tasks[candidate]
-                .as_ref()
-                .map_or(false, |t| t.state == TaskState::Ready)
-            {
-                next = candidate;
-                break;
+            if let Some(ref t) = sched.tasks[candidate] {
+                if t.state == TaskState::Ready {
+                    next = candidate;
+                    break;
+                }
             }
         }
-
-        // No other ready task — keep running current
         if next == current {
             return;
         }
 
-        // Update task states
-        if let Some(ref mut t) = sched.tasks[current] {
-            t.state = TaskState::Ready;
+        // Mark states
+        if current != 0 {
+            if let Some(ref mut t) = sched.tasks[current] {
+                if t.state == TaskState::Running {
+                    t.state = TaskState::Ready;
+                }
+            }
         }
         if let Some(ref mut t) = sched.tasks[next] {
             t.state = TaskState::Running;
         }
-
         sched.current = next;
-
-        // Update process module's current process index and page table root
         let next_proc_idx = sched.task_to_process[next];
         crate::process::set_current_index(next_proc_idx);
         crate::process::set_current_page_table_root(crate::process::get_page_table_root(
             next_proc_idx,
         ));
+        (current == 0, current, next)
+    };
 
-        (current, next)
-    }; // SpinLock dropped here — safe because interrupts are disabled
-
-    // Get raw pointers to the saved stack pointers in TASK_SPS.
-    // AtomicUsize has the same layout as usize, so the cast is valid.
-    let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
-    let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
-
-    // Perform context switch
-    unsafe {
-        __switch(cur_ptr, nxt_ptr);
+    if switch_from_init {
+        // Save init's sp to INIT_TASK_SP, switch to child
+        let init_sp_ptr = INIT_TASK_SP.as_ptr() as *mut usize;
+        let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+        unsafe {
+            __switch(init_sp_ptr, nxt_ptr);
+        }
+    } else {
+        let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
+        let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+        unsafe {
+            __switch(cur_ptr, nxt_ptr);
+        }
     }
 }
 
-/// Get current task's ID
-pub fn current_task_id() -> usize {
-    HART_CURRENT_TASK[hartid()].load(Ordering::Relaxed)
-}
-
-/// Mark the current task as exited and switch to the next ready task.
-/// If no ready tasks remain, shut down the system.
+/// Child exits → switch to next child or back to init.
 pub fn schedule_exit() {
     let (has_next, current, next) = {
         let mut sched = SCHEDULER.lock();
         let current = sched.current;
-
-        // Mark current as exited
         if let Some(ref mut t) = sched.tasks[current] {
             t.state = TaskState::Exited;
         }
 
-        // Find next Ready task
-        let mut next = None;
+        let mut next: usize = 0; // 0 means "init"
         for i in 1..sched.count {
             let candidate = (current + i) % sched.count;
-            if sched.tasks[candidate]
-                .as_ref()
-                .map_or(false, |t| t.state == TaskState::Ready)
-            {
-                next = Some(candidate);
-                break;
+            if let Some(ref t) = sched.tasks[candidate] {
+                if t.state == TaskState::Ready {
+                    next = candidate;
+                    break;
+                }
             }
         }
 
-        match next {
-            Some(n) => {
-                if let Some(ref mut t) = sched.tasks[n] {
-                    t.state = TaskState::Running;
-                }
-                sched.current = n;
-                let next_proc_idx = sched.task_to_process[n];
-                crate::process::set_current_index(next_proc_idx);
-                crate::process::set_current_page_table_root(crate::process::get_page_table_root(
-                    next_proc_idx,
-                ));
-                (true, current, n)
+        let switch_to_init = next == 0;
+        if !switch_to_init {
+            if let Some(ref mut t) = sched.tasks[next] {
+                t.state = TaskState::Running;
             }
-            None => (false, current, 0),
+            let next_proc_idx = sched.task_to_process[next];
+            crate::process::set_current_index(next_proc_idx);
+            crate::process::set_current_page_table_root(crate::process::get_page_table_root(
+                next_proc_idx,
+            ));
+        } else {
+            crate::process::set_current_index(0);
+            crate::process::set_current_page_table_root(crate::process::get_page_table_root(0));
         }
+        sched.current = 0; // Reset to init
+
+        (switch_to_init, current, next)
     };
 
-    if !has_next {
-        // No more runnable tasks — shut down
-        crate::console_println!("[sched] All processes exited, shutting down");
-        crate::sbi::shutdown();
-    }
-
-    // Perform context switch to next task
-    let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
-    let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
-    unsafe {
-        __switch(cur_ptr, nxt_ptr);
+    if has_next {
+        // Switch to another child
+        let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
+        let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+        unsafe {
+            __switch(cur_ptr, nxt_ptr);
+        }
+    } else {
+        // Switch back to init
+        let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
+        let init_sp_ptr = INIT_TASK_SP.as_ptr() as *const usize;
+        unsafe {
+            __switch(cur_ptr, init_sp_ptr);
+        }
     }
 }
 
-/// Mark the current task as exited (without scheduling).
 pub fn mark_current_exited() {
     let mut sched = SCHEDULER.lock();
-    let current = sched.current;
-    if let Some(ref mut t) = sched.tasks[current] {
+    let cur = sched.current;
+    if let Some(ref mut t) = sched.tasks[cur] {
         t.state = TaskState::Exited;
     }
 }
 
-/// Block the current task and switch to the next ready task.
-/// Used by sys_waitpid to put the parent to sleep while waiting for a child.
-/// Returns when the task is unblocked (woken up by child's sys_exit).
 pub fn schedule_block() {
-    let (has_next, current, next) = {
+    let (current, next) = {
         let mut sched = SCHEDULER.lock();
         let current = sched.current;
-
-        // Mark current as Blocked
         if let Some(ref mut t) = sched.tasks[current] {
             t.state = TaskState::Blocked;
         }
 
-        // Find next Ready task
-        let mut next = None;
+        let mut next: usize = current;
         for i in 1..sched.count {
             let candidate = (current + i) % sched.count;
-            if sched.tasks[candidate]
-                .as_ref()
-                .map_or(false, |t| t.state == TaskState::Ready)
-            {
-                next = Some(candidate);
-                break;
+            if let Some(ref t) = sched.tasks[candidate] {
+                if t.state == TaskState::Ready {
+                    next = candidate;
+                    break;
+                }
             }
+        }
+        if next == current {
+            return;
         }
 
-        match next {
-            Some(n) => {
-                if let Some(ref mut t) = sched.tasks[n] {
-                    t.state = TaskState::Running;
-                }
-                sched.current = n;
-                let next_proc_idx = sched.task_to_process[n];
-                crate::process::set_current_index(next_proc_idx);
-                crate::process::set_current_page_table_root(crate::process::get_page_table_root(
-                    next_proc_idx,
-                ));
-                (true, current, n)
-            }
-            None => (false, current, 0),
+        if let Some(ref mut t) = sched.tasks[next] {
+            t.state = TaskState::Running;
         }
+        sched.current = next;
+        let next_proc_idx = sched.task_to_process[next];
+        crate::process::set_current_index(next_proc_idx);
+        crate::process::set_current_page_table_root(crate::process::get_page_table_root(
+            next_proc_idx,
+        ));
+        (current, next)
     };
 
-    if !has_next {
-        // No runnable tasks — all blocked or exited. This shouldn't happen
-        // in normal operation, but shut down to avoid a hang.
-        crate::console_println!("[sched] No runnable tasks, shutting down");
-        crate::sbi::shutdown();
-    }
-
-    // Perform context switch to next task
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
     unsafe {
@@ -242,11 +222,8 @@ pub fn schedule_block() {
     }
 }
 
-/// Wake up a blocked task by process index.
-/// Sets it back to Ready so it will be scheduled on the next timer tick.
 pub fn wake_task(proc_idx: usize) {
     let mut sched = SCHEDULER.lock();
-    // Find the task with this process index
     for i in 0..sched.count {
         if sched.task_to_process[i] == proc_idx {
             if let Some(ref mut t) = sched.tasks[i] {
@@ -259,11 +236,8 @@ pub fn wake_task(proc_idx: usize) {
     }
 }
 
-/// Remove a task from the scheduler by process index.
-/// Used by sys_waitpid after reclaiming a child process.
 pub fn remove_task(proc_idx: usize) {
     let mut sched = SCHEDULER.lock();
-    // Find the task with this process index
     for i in 0..sched.count {
         if sched.task_to_process[i] == proc_idx {
             sched.tasks[i] = None;
@@ -272,9 +246,6 @@ pub fn remove_task(proc_idx: usize) {
     }
 }
 
-/// Add a user process to the scheduler.
-/// `process_idx` is the index in PROCESS_TABLE.
-/// Returns the task ID or None on failure.
 pub fn add_user_process(
     entry: usize,
     user_stack_top: usize,
@@ -286,65 +257,38 @@ pub fn add_user_process(
     if sched.count >= MAX_TASKS {
         return None;
     }
-
     let tid = sched.count;
 
-    // Set up the kernel stack with a TrapContext for the first U-mode entry.
-    // Stack layout (high → low):
-    //   kernel_stack_top
-    //     TrapContext (280 bytes): x[0..31], sstatus, sepc, sscratch
-    //     __switch frame (104 bytes): ra, s0-s11 for __switch to restore
-    //     TASK_SPS[tid] points here ←
     let trap_ctx_base = kernel_stack_top - 280;
     let switch_sp = trap_ctx_base - 104;
-
     unsafe {
-        // Zero both regions
+        // Write __switch frame + TrapContext (safe: child's kernel stack is fresh)
         core::ptr::write_bytes(switch_sp as *mut u8, 0, 280 + 104);
-
-        // Set up __switch callee-saved frame (104 bytes at switch_sp):
-        // offset 0 = ra → trap_return_user
         let sw = switch_sp as *mut usize;
-        *sw.add(0) = crate::arch::trap::trap_return_user_addr();
-        // s0-s11 (offset 8..96) = 0 (already zeroed)
-
-        // Set up TrapContext (280 bytes at trap_ctx_base):
+        *sw.add(0) = first_task_shim as *const () as usize;
         let ctx = trap_ctx_base as *mut usize;
-        // x[2] = kernel_stack_top (sp during kernel trap handling)
         *ctx.add(2) = kernel_stack_top;
-        // sstatus at offset 256/8 = 32: SPP=0, SPIE=1
         *ctx.add(32) = 0x20;
-        // sepc at offset 264/8 = 33: entry point
         *ctx.add(33) = entry;
-        // sscratch at offset 272/8 = 34: user sp
         *ctx.add(34) = user_stack_top;
     }
-
-    // The task's saved SP points to the trap context
     TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
 
-    // Create TCB
-    let mut tcb = TaskControlBlock::new(tid);
-    tcb.context = TaskContext::goto(entry, kernel_stack_top);
+    let tcb = TaskControlBlock::new(tid);
     sched.tasks[tid] = Some(tcb);
     sched.task_to_process[tid] = process_idx;
     sched.count += 1;
-
-    // Assign task to calling hart if it has none yet
-    let h = hartid();
-    if HART_CURRENT_TASK[h].load(Ordering::Relaxed) == usize::MAX {
-        HART_CURRENT_TASK[h].store(tid, Ordering::Relaxed);
-    }
-
     Some(tid)
 }
 
-/// Get current process brk (delegates to process module).
+pub fn current_task_id() -> usize {
+    0
+}
+
 pub fn current_brk() -> usize {
     crate::process::current_brk()
 }
 
-/// Set current process brk (delegates to process module).
 pub fn set_current_brk(addr: usize) {
     crate::process::set_current_brk(addr);
 }

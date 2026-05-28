@@ -25,6 +25,9 @@ pub const SYS_CLOSE: usize = 11;
 pub const SYS_SPAWN: usize = 30;
 pub const SYS_WAITPID: usize = 31;
 
+// Level 6: Extended
+pub const SYS_LS: usize = 40;
+
 // ─── Error codes ──────────────────────────────────────────────────
 
 pub const ERR_OK: isize = 0;
@@ -37,7 +40,7 @@ pub const ERR_IO: isize = -4;
 
 extern crate alloc;
 
-use crate::driver::fs::{FdTable, MAX_FDS, O_CREAT};
+use crate::driver::fs::{MAX_FDS, O_CREAT};
 #[cfg(feature = "test_mode")]
 use crate::driver::fs::{O_RDONLY, O_RDWR, O_WRONLY};
 
@@ -71,6 +74,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_CLOSE => sys_close(args[0] as i32),
         SYS_SPAWN => sys_spawn(args[0], args[1]),
         SYS_WAITPID => sys_waitpid(args[0]),
+        SYS_LS => sys_ls(args[0], args[1]),
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
             ERR_INVAL
@@ -92,21 +96,21 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 /// Syscall 1: Exit the current process.
 fn sys_exit(code: i32) -> isize {
     crate::console_println!("[process] User process exited with code {}", code);
-    // Save exit code in process table
     crate::process::set_exit_code(code as usize);
 
-    // If a parent is waiting for this process, wake it up
+    // Wake parent if waiting
     let my_idx = crate::process::current_index();
     if let Some(parent_idx) = crate::process::find_waiting_parent(my_idx) {
-        // Clear the wait flag on parent
         crate::process::set_wait_child(parent_idx, None);
-        // Wake the parent task so it can be scheduled again
         crate::sched::wake_task(parent_idx);
     }
 
+    // Mark this child task as exited in the scheduler
+    crate::sched::mark_current_exited();
+
+    // Try to switch to another ready child task.
     crate::sched::schedule_exit();
-    // schedule_exit() never returns if other tasks are running
-    // (it either switches to another task or shuts down)
+
     0
 }
 
@@ -171,9 +175,11 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    // stdin not implemented
+    // stdin: blocking read from TTY subsystem.
+    // If no data is available, the current task blocks until the user
+    // presses Enter (the TTY line editor commits a line to the ring buffer).
     if fd == 0 {
-        return ERR_INVAL;
+        return crate::driver::tty::read(buf, len);
     }
 
     // Get file info from current process's FD table
@@ -397,17 +403,16 @@ fn sys_close(fd: i32) -> isize {
 /// `prog_id` identifies which program to spawn (0 = hello, 1 = heap_test, 2 = file_test, 3 = spawn_test).
 /// Returns child PID on success, or negative error code.
 /// Syscall 31: Wait for a child process to exit.
-/// `pid` = child process ID to wait for.
-/// Returns child's exit code, or error if no such child.
+///
+/// Non-blocking: returns exit code if child has exited, or 0 if still running.
+/// The caller should retry (poll) until a non-zero result is returned.
+/// This avoids the need for schedule_block() which is incompatible with
+/// the init process (not in the scheduler).
 fn sys_waitpid(pid: usize) -> isize {
     let my_pid = crate::process::current_pid();
 
-    // Find the child process by pid
-    let child_idx = crate::process::find_process_by_pid(pid);
-
-    let child_idx = match child_idx {
+    let child_idx = match crate::process::find_process_by_pid(pid) {
         Some(idx) => {
-            // Verify it's actually our child
             if crate::process::get_ppid(idx) != my_pid {
                 return ERR_INVAL;
             }
@@ -416,43 +421,105 @@ fn sys_waitpid(pid: usize) -> isize {
         None => return ERR_INVAL,
     };
 
-    // Check if child already exited (fast path — no need to block)
-    if let Some(exit_code) = crate::process::get_exit_code(child_idx) {
-        crate::process::reclaim_process(child_idx);
-        crate::sched::remove_task(child_idx);
-        return exit_code as isize;
+    match crate::process::get_exit_code(child_idx) {
+        Some(exit_code) => {
+            crate::process::reclaim_process(child_idx);
+            crate::sched::remove_task(child_idx);
+            exit_code as isize
+        }
+        None => 0, // Child still running
+    }
+}
+
+/// Syscall 40: List filesystem contents.
+/// Writes a formatted listing to the user buffer (name + size per line).
+/// Returns total bytes written, or error.
+fn sys_ls(buf: usize, len: usize) -> isize {
+    if buf == 0 || len == 0 {
+        return ERR_INVAL;
     }
 
-    // Child still running — mark parent as waiting for this child, then block.
-    // The parent will be woken up when the child calls sys_exit.
-    let my_idx = crate::process::current_index();
-    crate::process::set_wait_child(my_idx, Some(child_idx));
-    crate::sched::schedule_block();
+    let fs = crate::driver::fs::global_fs();
+    let files = fs.list();
 
-    // --- We resume here when the child has exited ---
-    // The child's sys_exit woke us up and left the exit code for us.
-    let exit_code = crate::process::get_exit_code(child_idx).unwrap_or(0);
-    crate::process::reclaim_process(child_idx);
-    crate::sched::remove_task(child_idx);
-    exit_code as isize
+    let mut written: usize = 0;
+    for file in files {
+        // Format: "name\tsize\n"
+
+        // Write name
+        for &b in file.name.as_bytes() {
+            if written >= len {
+                break;
+            }
+            unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b) };
+            written += 1;
+        }
+        // Tab
+        if written < len {
+            unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b'\t') };
+            written += 1;
+        }
+        // Size (write digits directly)
+        let mut size = file.data.len();
+        if size == 0 {
+            if written < len {
+                unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b'0') };
+                written += 1;
+            }
+        } else {
+            // Count digits
+            let mut tmp = [0u8; 20];
+            let mut i = 0;
+            let mut n = size;
+            while n > 0 {
+                tmp[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                i += 1;
+            }
+            // Write in reverse (most significant first)
+            for j in (0..i).rev() {
+                if written >= len {
+                    break;
+                }
+                unsafe { core::ptr::write_volatile((buf + written) as *mut u8, tmp[j]) };
+                written += 1;
+            }
+        }
+        // Newline
+        if written < len {
+            unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b'\n') };
+            written += 1;
+        }
+    }
+
+    written as isize
 }
 
 fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
-    // Select ELF binary based on program ID
-    let elf_data: &[u8] = match prog_id {
-        0 => include_bytes!("../../../user/hello.elf"),
-        1 => include_bytes!("../../../user/heap_test.elf"),
-        2 => include_bytes!("../../../user/file_test.elf"),
-        3 => include_bytes!("../../../user/spawn_test.elf"),
+    // Load ELF from filesystem by program ID
+    let file_name = match prog_id {
+        0 => "hello",
+        1 => "heap_test",
+        2 => "file_test",
+        3 => "spawn_test",
         _ => return ERR_INVAL,
     };
 
-    // Create a new process from the ELF binary
-    let proc = match crate::process::Process::from_elf(elf_data) {
-        Ok(p) => p,
-        Err(e) => {
-            crate::console_println!("[spawn] Failed to create process: {}", e);
-            return ERR_NOMEM;
+    // Load ELF data from filesystem and create process (within FS lock scope)
+    let proc = {
+        let fs = crate::driver::fs::global_fs();
+        match fs.read(file_name) {
+            Some(data) => match crate::process::Process::from_elf(data) {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::console_println!("[spawn] Failed to create process: {}", e);
+                    return ERR_NOMEM;
+                }
+            },
+            None => {
+                crate::console_println!("[spawn] Program '{}' not found in filesystem", file_name);
+                return ERR_NOENT;
+            }
         }
     };
 

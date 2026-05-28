@@ -1,7 +1,6 @@
 //! Trap handling: U-mode ↔ S-mode transitions, exception dispatch, timer interrupts.
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use riscv::register::stvec;
 
@@ -123,13 +122,11 @@ pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
     }
 }
 
-static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
-
+/// Handle timer interrupt: poll UART, advance scheduler.
 fn handle_timer() {
-    let ticks = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if ticks % 100 == 0 {
-        crate::console_println!("[timer] tick {} ({}s)", ticks, ticks / 100);
-    }
+    // Poll UART RX and feed characters into TTY ring buffer.
+    crate::driver::tty::poll_uart();
+
     set_next_timer();
     crate::sched::schedule();
 }
@@ -153,7 +150,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
 
     if is_interrupt {
         match code {
-            5 => handle_timer(), // Supervisor Timer
+            5 => handle_timer(),
             9 => {
                 // Supervisor External (PLIC)
                 crate::arch::plic::handle_interrupt(0);

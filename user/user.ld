@@ -5,11 +5,8 @@ SECTIONS
     . = 0x00001000;
 
     .text : {
-        *(.text)
-    }
-
-    .rodata : {
-        *(.rodata)
+        *(.text .text.*)
+        *(.rodata .rodata.*)
     }
 
     .data : {

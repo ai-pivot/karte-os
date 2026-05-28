@@ -7,11 +7,32 @@ use alloc::vec::Vec;
 
 use crate::sync::spinlock::SpinLock;
 
+/// File data storage: either a static reference (for embedded binaries)
+/// or heap-allocated (for runtime-created files).
+#[derive(Clone)]
+pub enum FileData {
+    Static(&'static [u8]),
+    Owned(Vec<u8>),
+}
+
+impl FileData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            FileData::Static(s) => s,
+            FileData::Owned(v) => v,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
 /// A single file with a name and binary data.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct File {
     pub name: String,
-    pub data: Vec<u8>,
+    pub data: FileData,
 }
 
 /// A simple in-memory file system.
@@ -46,33 +67,49 @@ impl FileSystem {
         }
         self.files.push(File {
             name: String::from(name),
-            data: Vec::new(),
+            data: FileData::Owned(Vec::new()),
         });
         Ok(())
+    }
+
+    /// Write static data to a file (no heap allocation). Creates file if needed.
+    pub fn write_static(&mut self, name: &str, data: &'static [u8]) -> Result<(), ()> {
+        if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
+            file.data = FileData::Static(data);
+            Ok(())
+        } else {
+            self.files.push(File {
+                name: String::from(name),
+                data: FileData::Static(data),
+            });
+            Ok(())
+        }
     }
 
     /// Write data to a file. If the file does not exist, it is created.
     pub fn write(&mut self, name: &str, data: &[u8]) -> Result<(), ()> {
         if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
-            file.data.clear();
-            file.data.extend_from_slice(data);
+            file.data = FileData::Owned(data.to_vec());
             Ok(())
         } else {
             self.files.push(File {
                 name: String::from(name),
-                data: Vec::from(data),
+                data: FileData::Owned(data.to_vec()),
             });
             Ok(())
         }
     }
 
     /// Append data to an existing file.
-    ///
-    /// Returns `Ok(())` if the file exists and data was appended,
-    /// or `Err(())` if the file does not exist.
     pub fn append(&mut self, name: &str, data: &[u8]) -> Result<(), ()> {
         if let Some(file) = self.files.iter_mut().find(|f| f.name == name) {
-            file.data.extend_from_slice(data);
+            // Convert to Owned if currently Static, then append
+            let mut owned = match &file.data {
+                FileData::Static(s) => s.to_vec(),
+                FileData::Owned(v) => v.clone(),
+            };
+            owned.extend_from_slice(data);
+            file.data = FileData::Owned(owned);
             Ok(())
         } else {
             Err(())
@@ -116,9 +153,31 @@ pub fn global_fs() -> crate::sync::spinlock::SpinLockGuard<'static, FileSystem> 
     FS.lock()
 }
 
-/// Initialize the file system.
+/// Initialize the file system and populate with embedded binaries.
 pub fn init() {
-    crate::console_println!("[fs] In-memory file system initialized");
+    // Pre-populate filesystem with embedded user programs.
+    // Uses write_static() — no heap allocation, just stores &'static [u8] references
+    // to the include_bytes! data embedded in the kernel binary.
+    let mut fs = FS.lock();
+
+    fs.write_static("hello", include_bytes!("../../../user/hello.elf"))
+        .unwrap();
+    fs.write_static("heap_test", include_bytes!("../../../user/heap_test.elf"))
+        .unwrap();
+    fs.write_static("file_test", include_bytes!("../../../user/file_test.elf"))
+        .unwrap();
+    fs.write_static("spawn_test", include_bytes!("../../../user/spawn_test.elf"))
+        .unwrap();
+    fs.write_static("shell", include_bytes!("../../../user/shell.elf"))
+        .unwrap();
+
+    // Default init program: shell
+    fs.write_static("init", include_bytes!("../../../user/shell.elf"))
+        .unwrap();
+
+    let count = fs.file_count();
+    drop(fs);
+    crate::console_println!("[fs] In-memory file system initialized ({} files)", count);
 }
 
 // ─── VFS Abstraction ────────────────────────────────────────────────
