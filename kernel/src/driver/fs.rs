@@ -182,37 +182,56 @@ pub fn init() {
 
     crate::console_println!("[fs] RamFS initialized ({} files)", ram_count);
 
-    // Try to initialize FAT32 on the VirtIO block device
-    match crate::driver::fat32::init() {
+    // Try ext4 first (preferred over FAT32 for modern features),
+    // then fall back to FAT32, then RamFS only.
+    //
+    // NOTE: ext4 file injection is NOT done at boot time. Ext4 metadata
+    // operations (inode allocation, bitmap updates, directory entry writes)
+    // require dozens of block I/O round-trips, which is too slow for the
+    // boot path. Instead, user programs are pre-loaded into the ext4 disk
+    // image on the host via `tools/mkdisk.sh put <file>` before booting.
+    match crate::driver::ext4::init() {
         Ok(()) => {
-            crate::console_println!("[fs] FAT32 filesystem mounted");
-            // Inject RamFS files into FAT32 (skip if already present on disk)
-            let files_to_inject = [
-                ("hello", include_bytes!("../../../user/hello.elf") as &[u8]),
-                ("heap_test", include_bytes!("../../../user/heap_test.elf")),
-                ("file_test", include_bytes!("../../../user/file_test.elf")),
-                ("spawn_test", include_bytes!("../../../user/spawn_test.elf")),
-                ("shell", include_bytes!("../../../user/shell.elf")),
-                ("init", include_bytes!("../../../user/shell.elf")),
-            ];
-            let mut injected = 0;
-            for (name, data) in &files_to_inject {
-                match crate::driver::fat32::inject_file(name, data) {
-                    Ok(()) => injected += 1,
-                    Err(e) => {
-                        crate::console_println!("[fs] Warning: failed to inject {}: {}", name, e)
-                    }
-                }
-            }
-            crate::console_println!(
-                "[fs] Injected {}/{} files into FAT32",
-                injected,
-                files_to_inject.len()
-            );
-            FAT32_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+            crate::console_println!("[fs] ext4 filesystem mounted");
         }
         Err(e) => {
-            crate::console_println!("[fs] FAT32 unavailable ({}), using RamFS only", e);
+            crate::console_println!("[fs] ext4 unavailable ({})", e);
+            // Fall back to FAT32
+            match crate::driver::fat32::init() {
+                Ok(()) => {
+                    crate::console_println!("[fs] FAT32 filesystem mounted");
+                    let files_to_inject = [
+                        ("hello", include_bytes!("../../../user/hello.elf") as &[u8]),
+                        ("heap_test", include_bytes!("../../../user/heap_test.elf")),
+                        ("file_test", include_bytes!("../../../user/file_test.elf")),
+                        ("spawn_test", include_bytes!("../../../user/spawn_test.elf")),
+                        ("shell", include_bytes!("../../../user/shell.elf")),
+                        ("init", include_bytes!("../../../user/shell.elf")),
+                    ];
+                    let mut injected = 0;
+                    for (name, data) in &files_to_inject {
+                        match crate::driver::fat32::inject_file(name, data) {
+                            Ok(()) => injected += 1,
+                            Err(e) => {
+                                crate::console_println!(
+                                    "[fs] Warning: failed to inject {}: {}",
+                                    name,
+                                    e
+                                )
+                            }
+                        }
+                    }
+                    crate::console_println!(
+                        "[fs] Injected {}/{} files into FAT32",
+                        injected,
+                        files_to_inject.len()
+                    );
+                    FAT32_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e2) => {
+                    crate::console_println!("[fs] FAT32 unavailable ({}), using RamFS only", e2);
+                }
+            }
         }
     }
 }
@@ -226,9 +245,15 @@ pub fn has_fat32() -> bool {
 }
 
 /// Read file data as an owned Vec.
-/// Tries FAT32 first (persistent), then falls back to RamFS (embedded).
+/// Tries ext4 first, then FAT32, then falls back to RamFS (embedded).
 pub fn read_file_owned(name: &str) -> Option<Vec<u8>> {
-    // Try FAT32 first
+    // Try ext4 first
+    if crate::driver::ext4::has_ext4() {
+        if let Some(data) = crate::driver::ext4::read_file(name) {
+            return Some(data);
+        }
+    }
+    // Try FAT32
     if has_fat32() {
         if let Some(data) = crate::driver::fat32::read_file(name) {
             return Some(data);
@@ -240,9 +265,11 @@ pub fn read_file_owned(name: &str) -> Option<Vec<u8>> {
 }
 
 /// Write file data (creates or overwrites).
-/// Writes to FAT32 (persistent) if available, otherwise RamFS.
+/// Writes to ext4 if available, else FAT32, else RamFS.
 pub fn write_file_owned(name: &str, data: &[u8]) -> Result<(), ()> {
-    if has_fat32() {
+    if crate::driver::ext4::has_ext4() {
+        crate::driver::ext4::write_file(name, data).map_err(|_| ())
+    } else if has_fat32() {
         crate::driver::fat32::write_file(name, data).map_err(|_| ())
     } else {
         let mut fs = FS.lock();
@@ -250,18 +277,27 @@ pub fn write_file_owned(name: &str, data: &[u8]) -> Result<(), ()> {
     }
 }
 
-/// List all files from both FAT32 and RamFS, deduplicated.
+/// List all files from ext4/FAT32 and RamFS, deduplicated.
 pub fn list_all_files() -> Vec<(String, usize)> {
     let mut result = Vec::new();
 
-    // FAT32 files first
-    if has_fat32() {
-        for (name, size) in crate::driver::fat32::list_root() {
+    // ext4 files first
+    if crate::driver::ext4::has_ext4() {
+        for (name, size) in crate::driver::ext4::list_root() {
             result.push((name, size));
         }
     }
 
-    // RamFS files (skip duplicates already in FAT32)
+    // FAT32 files next
+    if has_fat32() {
+        for (name, size) in crate::driver::fat32::list_root() {
+            if !result.iter().any(|(n, _)| n == &name) {
+                result.push((name, size));
+            }
+        }
+    }
+
+    // RamFS files (skip duplicates)
     let fs = FS.lock();
     for file in fs.list() {
         if !result.iter().any(|(n, _)| n == &file.name) {
@@ -273,9 +309,11 @@ pub fn list_all_files() -> Vec<(String, usize)> {
 }
 
 /// Create a new empty file.
-/// Creates in FAT32 if available, otherwise RamFS.
+/// Creates in ext4 if available, else FAT32, else RamFS.
 pub fn create_file(name: &str) -> Result<(), ()> {
-    if has_fat32() {
+    if crate::driver::ext4::has_ext4() {
+        crate::driver::ext4::write_file(name, &[]).map_err(|_| ())
+    } else if has_fat32() {
         crate::driver::fat32::write_file(name, &[]).map_err(|_| ())
     } else {
         let mut fs = FS.lock();
@@ -283,20 +321,22 @@ pub fn create_file(name: &str) -> Result<(), ()> {
     }
 }
 
-/// Delete a file from both FAT32 and RamFS.
+/// Delete a file from ext4/FAT32 and RamFS.
 pub fn delete_file(name: &str) -> Result<(), ()> {
-    let mut fat32_ok = true;
-    let mut ram_ok = true;
+    let mut any_ok = false;
 
+    if crate::driver::ext4::has_ext4() {
+        any_ok |= crate::driver::ext4::delete_file(name).is_ok();
+    }
     if has_fat32() {
-        fat32_ok = crate::driver::fat32::delete_file(name).is_ok();
+        any_ok |= crate::driver::fat32::delete_file(name).is_ok();
     }
     {
         let mut fs = FS.lock();
-        ram_ok = fs.delete(name).is_ok();
+        any_ok |= fs.delete(name).is_ok();
     }
 
-    if fat32_ok || ram_ok { Ok(()) } else { Err(()) }
+    if any_ok { Ok(()) } else { Err(()) }
 }
 
 // ─── VFS Abstraction ────────────────────────────────────────────────

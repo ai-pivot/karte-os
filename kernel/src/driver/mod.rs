@@ -1,4 +1,5 @@
 pub mod block;
+pub mod ext4;
 pub mod fat32;
 pub mod fs;
 pub mod net;

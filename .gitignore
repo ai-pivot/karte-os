@@ -5,3 +5,4 @@
 .xbot/
 disk.img
 mcp-go-debugger.log
+disk_fat32.img

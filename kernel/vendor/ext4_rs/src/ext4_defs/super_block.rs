@@ -239,6 +239,16 @@ impl Ext4Superblock {
 }
 
 impl Ext4Superblock {
+    /// Validate that the superblock represents a valid ext4 filesystem.
+    ///
+    /// Returns `true` if the magic number matches and critical fields
+    /// are non-zero (preventing division-by-zero in block_group_count).
+    pub fn is_valid(&self) -> bool {
+        self.magic == EXT4_SUPERBLOCK_MAGIC
+            && self.blocks_per_group != 0
+            && self.inodes_per_group != 0
+    }
+
     /// Returns the checksum of the block bitmap
     pub fn ext4_balloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
         let mut csum = 0;

@@ -53,12 +53,19 @@ impl Ext4 {
         zones
     }
     /// Opens and loads an Ext4 from the `block_device`.
-    pub fn open(block_device: Arc<dyn BlockDevice>) -> Self {
+    ///
+    /// Returns `Ok(Ext4)` if a valid ext4 filesystem was found, or
+    /// `Err(Errno::EINVAL)` if the superblock magic number is missing
+    /// or other critical fields are invalid.
+    pub fn try_open(block_device: Arc<dyn BlockDevice>) -> Result<Self> {
         // Load the superblock
         let block = Block::load(&block_device, SUPERBLOCK_OFFSET);
         let super_block: Ext4Superblock = block.read_as();
 
-        // drop(block);
+        // Validate magic number and critical fields
+        if !super_block.is_valid() {
+            return_errno_with_message!(Errno::EINVAL, "Not a valid ext4 filesystem");
+        }
 
         let ext4_tmp = Ext4 {
             block_device,
@@ -67,10 +74,15 @@ impl Ext4 {
         };
         let zones = ext4_tmp.get_system_zone();
 
-        Ext4 {
+        Ok(Ext4 {
             system_zone_cache: Some(zones),
             ..ext4_tmp
-        }
+        })
+    }
+
+    /// Opens and loads an Ext4 from the `block_device` (legacy, panics on invalid fs).
+    pub fn open(block_device: Arc<dyn BlockDevice>) -> Self {
+        Self::try_open(block_device).expect("Failed to open ext4 filesystem")
     }
 
     // with dir result search path offset
