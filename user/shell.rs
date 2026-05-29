@@ -145,7 +145,10 @@ fn builtin_cd(arg: &[u8]) {
         for &b in cwd {
             if pos < 255 { new_path[pos] = b; pos += 1; }
         }
-        if pos > 0 && pos < 255 { new_path[pos] = b'/'; pos += 1; }
+        if pos > 0 && pos < 255 && new_path[pos - 1] != b'/' {
+            new_path[pos] = b'/';
+            pos += 1;
+        }
         for &b in arg {
             if pos < 255 { new_path[pos] = b; pos += 1; }
         }
