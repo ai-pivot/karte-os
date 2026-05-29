@@ -262,7 +262,6 @@ impl FileSystem for Ext4Fs {
     fn create_dir(&mut self, dir: u64, name: &str) -> Result<u64, VfsError> {
         let ext4 = self.ext4.lock();
         match ext4.create(dir as u32, name, 0x4000) {
-            // 0x4000 = EXT4_INODE_MODE_DIR
             Ok(inode_ref) => Ok(inode_ref.inode_num as u64),
             Err(_) => Err(VfsError::IoError),
         }

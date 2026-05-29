@@ -73,10 +73,10 @@ pub fn get_args() -> [u8; 512] {
     args
 }
 
-/// Trim trailing \n, \r, spaces
+/// Trim trailing \n, \r, spaces, nulls
 pub fn trim(s: &[u8]) -> &[u8] {
     let mut end = s.len();
-    while end > 0 && (s[end - 1] == b'\n' || s[end - 1] == b'\r' || s[end - 1] == b' ') {
+    while end > 0 && (s[end - 1] == b'\n' || s[end - 1] == b'\r' || s[end - 1] == b' ' || s[end - 1] == 0) {
         end -= 1;
     }
     let mut start = 0;
