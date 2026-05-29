@@ -22,6 +22,10 @@ use crate::sync::mutex::YieldMutex;
 const SECTOR_SIZE: usize = 512;
 const SECTORS_PER_BLOCK: usize = BLOCK_SIZE / SECTOR_SIZE; // 8
 
+/// I/O operation counters for debugging ext4 performance.
+static READ_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static WRITE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 // ─── KarteBlockDevice ──────────────────────────────────────────────────────
 
 /// Adapter implementing `ext4_rs::BlockDevice` over the VirtIO block device.
@@ -41,52 +45,79 @@ impl Ext4BlockDevice for KarteBlockDevice {
     ///
     /// The offset is aligned to `BLOCK_SIZE` (4096). Internally we read
     /// `SECTORS_PER_BLOCK` (8) consecutive 512-byte sectors and concatenate.
+    /// Read a 4KB block starting at the given byte offset.
+    ///
+    /// ext4_rs expects `read_offset(offset)` to return BLOCK_SIZE bytes
+    /// starting from `offset` (not from the containing block's start).
     fn read_offset(&self, offset: usize) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; BLOCK_SIZE];
         let base_sector = offset / SECTOR_SIZE;
-        for i in 0..SECTORS_PER_BLOCK {
+        let skip = offset % SECTOR_SIZE;
+
+        // Build the buffer by reading the necessary sectors
+        // The first sector may need partial data (skip leading bytes)
+        let mut buf_pos = 0;
+        let mut sector_idx = 0;
+        while buf_pos < BLOCK_SIZE {
             let mut sector = [0u8; SECTOR_SIZE];
-            match crate::driver::virtio::read_block(base_sector + i, &mut sector) {
+            match crate::driver::virtio::read_block(base_sector + sector_idx, &mut sector) {
                 Ok(()) => {
-                    let start = i * SECTOR_SIZE;
-                    buf[start..start + SECTOR_SIZE].copy_from_slice(&sector);
+                    let src_start = if sector_idx == 0 { skip } else { 0 };
+                    let src_end = SECTOR_SIZE;
+                    let remaining = BLOCK_SIZE - buf_pos;
+                    let copy_len = core::cmp::min(src_end - src_start, remaining);
+                    buf[buf_pos..buf_pos + copy_len]
+                        .copy_from_slice(&sector[src_start..src_start + copy_len]);
+                    buf_pos += copy_len;
                 }
-                Err(_) => {
-                    // On real hardware, an unreadable sector returns undefined
-                    // data. We return zeros for the remaining sectors, which
-                    // is equivalent to a hardware read returning all-zeros.
-                    // ext4_rs will interpret zeroed bitmaps as "no free slots"
-                    // and return an allocation error, which callers handle.
-                    break;
-                }
+                Err(_) => break,
             }
+            sector_idx += 1;
         }
         buf
     }
 
-    /// Write a block at the given byte offset.
+    /// Write data at the given byte offset on the block device.
     ///
-    /// If `data` is shorter than `BLOCK_SIZE`, the remainder is padded with
-    /// zeros. This matches the standard block device write contract where
-    /// callers may provide less than a full block for the last block of a file.
+    /// ext4_rs may call this with arbitrary (non-block-aligned) offsets and
+    /// data shorter than BLOCK_SIZE (e.g., writing a 64-byte block group
+    /// descriptor into the middle of a 4KB block). We must perform a
+    /// read-modify-write to avoid clobbering surrounding data.
     fn write_offset(&self, offset: usize, data: &[u8]) {
-        let base_sector = offset / SECTOR_SIZE;
-        for i in 0..SECTORS_PER_BLOCK {
-            let start = i * SECTOR_SIZE;
-            let end = core::cmp::min(start + SECTOR_SIZE, data.len());
+        // Write to the disk by doing read-modify-write on affected sectors
+        let mut data_pos = 0;
+        let mut current_offset = offset;
+
+        while data_pos < data.len() {
+            // Determine which sector this falls in
+            let sector_idx = current_offset / SECTOR_SIZE;
+            let sector_offset = current_offset % SECTOR_SIZE;
+            let bytes_in_sector =
+                core::cmp::min(SECTOR_SIZE - sector_offset, data.len() - data_pos);
+
+            // Read the current sector
             let mut sector = [0u8; SECTOR_SIZE];
-            if start < data.len() {
-                sector[..end - start].copy_from_slice(&data[start..end]);
+            if crate::driver::virtio::read_block(sector_idx, &mut sector).is_err() {
+                crate::console_println!("[ext4] write_offset: read sector {} failed", sector_idx);
+                return;
             }
-            // remainder stays zero-padded
-            if let Err(e) = crate::driver::virtio::write_block(base_sector + i, &sector) {
+
+            // Merge new data into the sector
+            sector[sector_offset..sector_offset + bytes_in_sector]
+                .copy_from_slice(&data[data_pos..data_pos + bytes_in_sector]);
+
+            // Write the sector back
+            if let Err(e) = crate::driver::virtio::write_block(sector_idx, &sector) {
                 crate::console_println!(
-                    "[ext4] write_offset: sector {} failed: {}",
-                    base_sector + i,
+                    "[ext4] write_offset: write sector {} failed: {}",
+                    sector_idx,
                     e
                 );
                 return;
             }
+
+            data_pos += bytes_in_sector;
+            current_offset += bytes_in_sector;
         }
     }
 }

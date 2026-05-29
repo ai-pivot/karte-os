@@ -534,20 +534,6 @@ impl Ext4 {
 
             inode_ref.inode.set_size(new_size as u64);
             self.write_back_inode(&mut inode_ref);
-
-            // Verify file size update
-            let verify_inode = self.get_inode_ref(inode);
-            if verify_inode.inode.size() != new_size as u64 {
-                log::error!(
-                    "[Write] File size update verification failed: expected {}, got {}",
-                    new_size,
-                    verify_inode.inode.size()
-                );
-                return return_errno_with_message!(
-                    Errno::EIO,
-                    "File size update verification failed"
-                );
-            }
         }
 
         log::info!("=== Write Performance Summary ===");

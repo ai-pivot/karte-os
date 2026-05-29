@@ -8,11 +8,13 @@ impl Ext4 {
         let mut bgid = 0;
         let bg_count = self.super_block.block_group_count();
         let mut super_block = self.super_block;
+        let mut iterations = 0u32;
+        let max_iterations = bg_count * 2 + 1;
 
-        while bgid <= bg_count {
-            if bgid == bg_count {
-                bgid = 0;
-                continue;
+        while bgid < bg_count {
+            iterations += 1;
+            if iterations > max_iterations {
+                return_errno_with_message!(Errno::ENOSPC, "ialloc: no free inode after full scan");
             }
 
             let mut bg = Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
@@ -32,7 +34,7 @@ impl Ext4 {
 
                 let mut idx_in_bg = 0;
 
-                ext4_bmap_bit_find_clr(bitmap_data, 0, inodes_in_bg, &mut idx_in_bg);
+                let found = ext4_bmap_bit_find_clr(bitmap_data, 0, inodes_in_bg, &mut idx_in_bg);
                 ext4_bmap_bit_set(bitmap_data, idx_in_bg);
 
                 // update bitmap in disk

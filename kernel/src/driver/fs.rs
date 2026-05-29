@@ -265,12 +265,10 @@ pub fn read_file_owned(name: &str) -> Option<Vec<u8>> {
 }
 
 /// Write file data (creates or overwrites).
-/// Writes to ext4 if available, else FAT32, else RamFS.
+/// Tries ext4 first (persistent), else RamFS.
 pub fn write_file_owned(name: &str, data: &[u8]) -> Result<(), ()> {
     if crate::driver::ext4::has_ext4() {
         crate::driver::ext4::write_file(name, data).map_err(|_| ())
-    } else if has_fat32() {
-        crate::driver::fat32::write_file(name, data).map_err(|_| ())
     } else {
         let mut fs = FS.lock();
         fs.write(name, data)
@@ -309,33 +307,26 @@ pub fn list_all_files() -> Vec<(String, usize)> {
 }
 
 /// Create a new empty file.
-/// Creates in ext4 if available, else FAT32, else RamFS.
+/// Creates in ext4 if available, else RamFS.
 pub fn create_file(name: &str) -> Result<(), ()> {
     if crate::driver::ext4::has_ext4() {
         crate::driver::ext4::write_file(name, &[]).map_err(|_| ())
-    } else if has_fat32() {
-        crate::driver::fat32::write_file(name, &[]).map_err(|_| ())
     } else {
         let mut fs = FS.lock();
         fs.create(name)
     }
 }
 
-/// Delete a file from ext4/FAT32 and RamFS.
+/// Delete a file from ext4 and RamFS.
 pub fn delete_file(name: &str) -> Result<(), ()> {
     let mut any_ok = false;
-
     if crate::driver::ext4::has_ext4() {
         any_ok |= crate::driver::ext4::delete_file(name).is_ok();
-    }
-    if has_fat32() {
-        any_ok |= crate::driver::fat32::delete_file(name).is_ok();
     }
     {
         let mut fs = FS.lock();
         any_ok |= fs.delete(name).is_ok();
     }
-
     if any_ok { Ok(()) } else { Err(()) }
 }
 

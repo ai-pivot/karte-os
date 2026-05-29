@@ -416,7 +416,7 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     if flags & O_CREAT != 0 {
         let _ = crate::driver::fs::create_file(&name);
     }
-    // Verify file exists (try FAT32 + RamFS)
+    // Verify file exists
     if crate::driver::fs::read_file_owned(&name).is_none() && (flags & O_CREAT == 0) {
         return ERR_NOENT;
     }

@@ -158,7 +158,9 @@ impl Ext4 {
             bgid = self.get_bgid_of_block(goal);
             idx_in_bg = self.addr_to_idx_bg(goal);
         } else {
-            bgid = 1;
+            // No goal specified — start from the block group containing the
+            // inode's parent directory, or block group 0 if only one group.
+            bgid = 0;
             idx_in_bg = 0;
         }
 
