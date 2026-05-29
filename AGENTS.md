@@ -92,6 +92,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 42 | unlink | (path, path_len) — delete a file or directory |
 | 50 | setenv | (key, key_len, val, val_len) — set environment variable |
 | 51 | getenv | (key, key_len, buf, buf_len) — get environment variable, returns value length or -1 |
+| 52 | chdir | (path, path_len) — change directory, validates dir exists, updates CWD env var |
 
 ## GOTCHAS
 
@@ -124,6 +125,9 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **`user/syscall.rs` `trim()`**: strips trailing \\0 in addition to \\n/\\r/spaces. Why: `get_args()` reads CMD_ARGS into a 512-byte buffer with trailing nulls. Without \\0 trimming, path.len() = 512 which exceeds syscall path_len=256 limit.
 - **ext4 `lookup`**: now supports multi-level paths (e.g., "bin/ls") by splitting on '/' and traversing directory tree. Required for PATH-based binary loading from subdirectories.
 - **Binary deployment**: ELF files on ext4 disk MUST have `.elf` extension stripped (e.g., `mkdir.elf` → `mkdir`). Shell searches for bare command names via PATH.
+- **CWD path resolution**: Kernel `resolve_path()` in `syscall/mod.rs` prepends CWD env var to relative paths for `sys_open`, `sys_mkdir`, `sys_unlink`, `sys_chdir`. `sys_ls` reads CWD directly. CWD is stored as a global env var (`CWD=/test123`), set by `sys_chdir` (called from shell's `builtin_cd`). User programs do NOT need to handle path resolution themselves.
+- **ext4 multi-level paths**: `create_directory`, `delete_file`, `write_file` in `ext4.rs` all use `split_last_component()` to support paths like `parent/child`. The parent is resolved via `lookup()`, then the operation targets the last component.
+- **`cd` validation**: Shell's `builtin_cd` calls `SYS_CHDIR` which validates the target exists in ext4 via `lookup_path()` + `metadata_of().is_dir()`. Non-existent directories produce "cd: no such directory" error.
 
 ## Knowledge Files
 
