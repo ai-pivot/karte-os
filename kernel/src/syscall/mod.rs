@@ -356,11 +356,14 @@ fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         return ERR_INVAL;
     }
 
-    // Read path from user memory
+    // Read path from user memory, stripping trailing NUL bytes (C-style strings)
     let mut path_buf = alloc::vec::Vec::new();
     for i in 0..path_len {
         let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
         path_buf.push(byte);
+    }
+    while path_buf.last() == Some(&0) {
+        path_buf.pop();
     }
     let name = alloc::string::String::from_utf8(path_buf).unwrap_or_default();
     if name.is_empty() {
