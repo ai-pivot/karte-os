@@ -317,6 +317,16 @@ pub fn create_file(name: &str) -> Result<(), ()> {
     }
 }
 
+/// Create a directory. Tries ext4 first, else RamFS.
+pub fn create_dir(name: &str) -> Result<(), ()> {
+    if crate::driver::ext4::has_ext4() {
+        crate::driver::ext4::create_directory(name).map_err(|_| ())
+    } else {
+        let mut fs = FS.lock();
+        fs.create(name) // RamFS fallback: create as regular file entry
+    }
+}
+
 /// Delete a file from ext4 and RamFS.
 pub fn delete_file(name: &str) -> Result<(), ()> {
     let mut any_ok = false;

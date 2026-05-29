@@ -11,6 +11,7 @@ global_asm!(include_str!("entry.S"));
 
 pub mod arch;
 pub mod driver;
+pub mod env;
 pub mod kernel_log;
 pub mod lang_items;
 pub mod mm;
@@ -69,6 +70,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
+
+        crate::console_println!("[init] Initializing environment...");
+        env::init();
 
         // Enable Linux RISC-V syscall compatibility layer.
         // Zero overhead for native KarteOS syscalls — the translation table

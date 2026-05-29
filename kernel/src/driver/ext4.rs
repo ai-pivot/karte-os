@@ -246,25 +246,11 @@ impl FileSystem for Ext4Fs {
         }
     }
 
-    fn create_dir(&mut self, _dir: u64, name: &str) -> Result<u64, VfsError> {
+    fn create_dir(&mut self, dir: u64, name: &str) -> Result<u64, VfsError> {
         let ext4 = self.ext4.lock();
-        // Build a path like "/<name>" for dir_mk
-        let path = {
-            let mut p = String::from("/");
-            p.push_str(name);
-            p
-        };
-        match ext4.dir_mk(&path) {
-            Ok(_) => {
-                // dir_mk returns Result<usize>, not the inode number.
-                // Look up the newly created directory to get its inode.
-                let mut parent_inode: u32 = ROOT_INODE;
-                let mut name_off: u32 = 0;
-                match ext4.generic_open(&path, &mut parent_inode, false, 0x4000, &mut name_off) {
-                    Ok(inode_num) => Ok(inode_num as u64),
-                    Err(_) => Err(VfsError::IoError),
-                }
-            }
+        match ext4.create(dir as u32, name, 0x4000) {
+            // 0x4000 = EXT4_INODE_MODE_DIR
+            Ok(inode_ref) => Ok(inode_ref.inode_num as u64),
             Err(_) => Err(VfsError::IoError),
         }
     }
@@ -403,8 +389,21 @@ pub fn list_root() -> Vec<(String, usize)> {
     loop {
         match fs.readdir(ROOT_INODE as u64, idx) {
             Ok(Some(entry)) => {
-                if entry.file_type == VfsFileType::File {
-                    result.push((entry.name, entry.size));
+                match entry.file_type {
+                    VfsFileType::Directory => {
+                        // Skip . and .. entries
+                        if entry.name == "." || entry.name == ".." {
+                            idx += 1;
+                            continue;
+                        }
+                        let mut dname = entry.name;
+                        dname.push('/');
+                        result.push((dname, entry.size));
+                    }
+                    VfsFileType::File => {
+                        result.push((entry.name, entry.size));
+                    }
+                    _ => {}
                 }
                 idx += 1;
             }
@@ -454,6 +453,20 @@ pub fn delete_file(name: &str) -> Result<(), &'static str> {
     let fs = guard.as_mut().ok_or("ext4 not initialized")?;
     fs.unlink(ROOT_INODE as u64, name)
         .map_err(|_| "ext4 unlink failed")
+}
+
+/// Create a directory in the ext4 root directory.
+pub fn create_directory(name: &str) -> Result<(), &'static str> {
+    if !has_ext4() {
+        return Err("ext4 not initialized");
+    }
+
+    let mut guard = EXT4_FS.lock();
+    let fs = guard.as_mut().ok_or("ext4 not initialized")?;
+
+    fs.create_dir(ROOT_INODE as u64, name)
+        .map_err(|_| "ext4 create_dir failed")?;
+    Ok(())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

@@ -30,6 +30,12 @@ pub const SYS_EXEC: usize = 32; // spawn by file path
 
 // Level 6: Extended
 pub const SYS_LS: usize = 40;
+pub const SYS_MKDIR: usize = 41;
+pub const SYS_UNLINK: usize = 42;
+
+// Level 7: Environment
+pub const SYS_SETENV: usize = 50;
+pub const SYS_GETENV: usize = 51;
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -87,6 +93,10 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_EXEC => sys_exec(args[0], args[1]),
         SYS_WAITPID => sys_waitpid(args[0]),
         SYS_LS => sys_ls(args[0], args[1]),
+        SYS_MKDIR => sys_mkdir(args[0], args[1]),
+        SYS_UNLINK => sys_unlink(args[0], args[1]),
+        SYS_SETENV => sys_setenv(args[0], args[1], args[2], args[3]),
+        SYS_GETENV => sys_getenv(args[0], args[1], args[2], args[3]),
 
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
@@ -538,6 +548,110 @@ fn sys_ls(buf: usize, len: usize) -> isize {
     }
 
     written as isize
+}
+
+/// Syscall 41: Create a directory.
+fn sys_mkdir(path: usize, path_len: usize) -> isize {
+    if path == 0 || path_len == 0 || path_len > 256 {
+        return ERR_INVAL;
+    }
+    let mut path_buf = alloc::vec::Vec::new();
+    for i in 0..path_len {
+        let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
+        path_buf.push(byte);
+    }
+    while path_buf.last() == Some(&0) {
+        path_buf.pop();
+    }
+    let name = alloc::string::String::from_utf8(path_buf).unwrap_or_default();
+    if name.is_empty() {
+        return ERR_INVAL;
+    }
+    match crate::driver::fs::create_dir(&name) {
+        Ok(()) => 0,
+        Err(()) => ERR_IO,
+    }
+}
+
+/// Syscall 42: Delete a file or directory.
+fn sys_unlink(path: usize, path_len: usize) -> isize {
+    if path == 0 || path_len == 0 || path_len > 256 {
+        return ERR_INVAL;
+    }
+    let mut path_buf = alloc::vec::Vec::new();
+    for i in 0..path_len {
+        let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
+        path_buf.push(byte);
+    }
+    while path_buf.last() == Some(&0) {
+        path_buf.pop();
+    }
+    let name = alloc::string::String::from_utf8(path_buf).unwrap_or_default();
+    if name.is_empty() {
+        return ERR_INVAL;
+    }
+    match crate::driver::fs::delete_file(&name) {
+        Ok(()) => 0,
+        Err(()) => ERR_NOENT,
+    }
+}
+
+/// Syscall 50: Set an environment variable.
+fn sys_setenv(key: usize, key_len: usize, val: usize, val_len: usize) -> isize {
+    if key == 0 || key_len == 0 || key_len > 128 || val == 0 || val_len > 4096 {
+        return ERR_INVAL;
+    }
+    let mut kbuf = alloc::vec::Vec::new();
+    for i in 0..key_len {
+        kbuf.push(unsafe { core::ptr::read_volatile((key + i) as *const u8) });
+    }
+    while kbuf.last() == Some(&0) {
+        kbuf.pop();
+    }
+    let key_str = alloc::string::String::from_utf8(kbuf).unwrap_or_default();
+
+    let mut vbuf = alloc::vec::Vec::new();
+    for i in 0..val_len {
+        vbuf.push(unsafe { core::ptr::read_volatile((val + i) as *const u8) });
+    }
+    while vbuf.last() == Some(&0) {
+        vbuf.pop();
+    }
+    let val_str = alloc::string::String::from_utf8(vbuf).unwrap_or_default();
+
+    crate::env::set(&key_str, &val_str);
+    0
+}
+
+/// Syscall 51: Get an environment variable.
+/// Returns the length of the value, or -1 if not found.
+fn sys_getenv(key: usize, key_len: usize, buf: usize, buf_len: usize) -> isize {
+    if key == 0 || key_len == 0 || key_len > 128 {
+        return ERR_INVAL;
+    }
+    let mut kbuf = alloc::vec::Vec::new();
+    for i in 0..key_len {
+        kbuf.push(unsafe { core::ptr::read_volatile((key + i) as *const u8) });
+    }
+    while kbuf.last() == Some(&0) {
+        kbuf.pop();
+    }
+    let key_str = alloc::string::String::from_utf8(kbuf).unwrap_or_default();
+
+    match crate::env::get(&key_str) {
+        Some(val) => {
+            if buf != 0 && buf_len > 0 {
+                let copy_len = core::cmp::min(val.len(), buf_len);
+                for i in 0..copy_len {
+                    unsafe { core::ptr::write_volatile((buf + i) as *mut u8, val.as_bytes()[i]) };
+                }
+                copy_len as isize
+            } else {
+                val.len() as isize
+            }
+        }
+        None => -1,
+    }
 }
 
 fn sys_spawn(prog_id: usize, _arg: usize) -> isize {

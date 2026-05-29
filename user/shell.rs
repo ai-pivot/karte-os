@@ -21,10 +21,16 @@ const SYS_EXIT: usize = 1;
 const SYS_WRITE: usize = 2;
 const SYS_READ: usize = 3;
 const SYS_GETPID: usize = 5;
+const SYS_OPEN: usize = 10;
+const SYS_CLOSE: usize = 11;
 const SYS_SPAWN: usize = 30;
 const SYS_WAITPID: usize = 31;
 const SYS_EXEC: usize = 32;
 const SYS_LS: usize = 40;
+const SYS_MKDIR: usize = 41;
+const SYS_UNLINK: usize = 42;
+const SYS_SETENV: usize = 50;
+const SYS_GETENV: usize = 51;
 
 /// sys_waitpid sentinel: child still running, poll again. Matches the kernel.
 const WAIT_AGAIN: isize = -1;
@@ -63,6 +69,20 @@ unsafe fn syscall3(id: usize, a0: usize, a1: usize, a2: usize) -> isize {
         inlateout("a0") a0 => ret,
         in("a1") a1,
         in("a2") a2,
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall4(id: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "ecall",
+        in("a7") id,
+        inlateout("a0") a0 => ret,
+        in("a1") a1,
+        in("a2") a2,
+        in("a3") a3,
     );
     ret
 }
@@ -156,6 +176,43 @@ fn trim(s: &[u8]) -> &[u8] {
 
 // ─── Built-in commands ──────────────────────────────────────────────
 
+/// Current working directory (shell state).
+static mut CWD: [u8; 256] = [b'/'; 256];
+static mut CWD_LEN: usize = 1; // "/"
+
+fn get_cwd() -> &'static [u8] {
+    unsafe { &CWD[..CWD_LEN] }
+}
+
+fn set_cwd(path: &[u8]) {
+    unsafe {
+        let len = if path.len() < 256 { path.len() } else { 255 };
+        CWD[..len].copy_from_slice(&path[..len]);
+        CWD_LEN = len;
+    }
+}
+
+/// Resolve a path against CWD. If path starts with '/', use as-is.
+fn resolve_path<'a>(path: &'a [u8], resolved: &'a mut [u8]) -> &'a [u8] {
+    if path.starts_with(b"/") {
+        // Strip leading '/'
+        let p = if path.len() > 1 { &path[1..] } else { path };
+        return p;
+    }
+    // Relative path: prepend CWD (without leading /)
+    let cwd = get_cwd();
+    let cwd_stripped = if cwd.starts_with(b"/") { &cwd[1..] } else { cwd };
+    let mut pos = 0;
+    for &b in cwd_stripped {
+        if pos < 255 { resolved[pos] = b; pos += 1; }
+    }
+    if pos > 0 && pos < 255 { resolved[pos] = b'/'; pos += 1; }
+    for &b in path {
+        if pos < 255 { resolved[pos] = b; pos += 1; }
+    }
+    &resolved[..pos]
+}
+
 fn cmd_help() {
     println(b"KarteOS Shell v0.2");
     println(b"");
@@ -164,13 +221,15 @@ fn cmd_help() {
     println(b"  ls            - list filesystem");
     println(b"  cat <file>    - show file contents");
     println(b"  echo <text>   - print text");
-    println(b"  run <prog>    - run embedded program");
+    println(b"  cd  <dir>     - change directory");
+    println(b"  mkdir <dir>   - create directory");
+    println(b"  rm   <file>   - remove file/directory");
+    println(b"  run  <prog>   - run program (from PATH)");
     println(b"  spawn <n>     - spawn program by number");
     println(b"  pid           - show process ID");
+    println(b"  env           - show environment");
     println(b"  clear         - clear screen");
     println(b"  exit          - exit shell");
-    println(b"");
-    println(b"Line editing: Backspace, Ctrl+C supported by kernel TTY");
 }
 
 fn cmd_ls() {
@@ -211,14 +270,12 @@ fn cmd_run(path: &[u8]) {
         return;
     }
 
-    // Try sys_exec (spawn by file path) first — works for any file in FAT32/RamFS
-    let pid = unsafe { syscall2(SYS_EXEC, path.as_ptr() as usize, path.len()) };
+    let mut resolved = [0u8; 256];
+    let p = resolve_path(path, &mut resolved);
+    let pid = cmd_exec(p);
 
     if pid >= 0 {
-        println(b"[spawn] Spawned process");
-        // Busy-wait for child to exit. We poll waitpid directly in the loop
-        // to avoid any potential stack corruption from passing pid across
-        // function call boundaries.
+        // Wait for child
         loop {
             let code = unsafe { syscall1(SYS_WAITPID, pid as usize) };
             if code == WAIT_AGAIN {
@@ -235,7 +292,7 @@ fn cmd_run(path: &[u8]) {
         }
     }
 
-    // Fallback: try legacy sys_spawn by program ID
+    // Legacy fallback: try known program IDs
     let prog_id: usize = match path {
         b"/hello" | b"hello" => 0,
         b"/heap_test" | b"heap_test" => 1,
@@ -247,15 +304,12 @@ fn cmd_run(path: &[u8]) {
             return;
         }
     };
-    let pid = unsafe { syscall2(SYS_SPAWN, prog_id, 0) };
-    if pid < 0 {
+    let pid2 = unsafe { syscall2(SYS_SPAWN, prog_id, 0) };
+    if pid2 < 0 {
         println(b"run: failed to spawn");
         return;
     }
-    print(b"spawned pid=");
-    print_u64(pid as u64);
-    println(b"");
-    wait_and_report(pid);
+    wait_and_report(pid2);
 }
 
 /// Wait for a child process and report its exit status.
@@ -331,6 +385,133 @@ fn cmd_clear() {
     print(b"\x1b[2J\x1b[H");
 }
 
+fn cmd_cd(path: &[u8]) {
+    if path.is_empty() {
+        // cd with no args: show current directory
+        print(get_cwd());
+        print(b"\r\n");
+        return;
+    }
+    // Simple cd: if path starts with letter (not /), treat as relative to cwd
+    if path.starts_with(b"/") {
+        set_cwd(path);
+    } else {
+        let mut resolved = [0u8; 256];
+        let p = resolve_path(path, &mut resolved);
+        let mut c = [0u8; 256];
+        c[0] = b'/';
+        let len = p.len().min(255);
+        c[1..1+len].copy_from_slice(&p[..len]);
+        set_cwd(&c[..1+len]);
+    }
+}
+
+fn cmd_mkdir(path: &[u8]) {
+    if path.is_empty() {
+        println(b"Usage: mkdir <dir>");
+        return;
+    }
+    let mut resolved = [0u8; 256];
+    let p = resolve_path(path, &mut resolved);
+    let r = unsafe { syscall2(SYS_MKDIR, p.as_ptr() as usize, p.len()) };
+    if r < 0 {
+        print(b"mkdir: failed: ");
+        println(p);
+    }
+}
+
+fn cmd_rm(path: &[u8]) {
+    if path.is_empty() {
+        println(b"Usage: rm <file>");
+        return;
+    }
+    let mut resolved = [0u8; 256];
+    let p = resolve_path(path, &mut resolved);
+    let r = unsafe { syscall2(SYS_UNLINK, p.as_ptr() as usize, p.len()) };
+    if r < 0 {
+        print(b"rm: failed: ");
+        println(p);
+    }
+}
+
+fn cmd_env() {
+    // Read PATH env var
+    let mut buf = [0u8; 256];
+    let n = unsafe { syscall4(SYS_GETENV, b"PATH".as_ptr() as usize, 4, buf.as_ptr() as usize, buf.len()) };
+    if n > 0 {
+        print(b"PATH=");
+        print(&buf[..n as usize]);
+        println(b"");
+    } else {
+        println(b"PATH=/");
+    }
+    let n2 = unsafe { syscall4(SYS_GETENV, b"USER".as_ptr() as usize, 4, buf.as_ptr() as usize, buf.len()) };
+    if n2 > 0 {
+        print(b"USER=");
+        print(&buf[..n2 as usize]);
+        println(b"");
+    }
+    // Show CWD
+    print(b"CWD=");
+    print(get_cwd());
+    println(b"");
+}
+
+/// Append two byte slices.
+fn append_slice(dst: &mut [u8], pos: &mut usize, src: &[u8]) {
+    for &b in src {
+        if *pos < dst.len() {
+            dst[*pos] = b;
+            *pos += 1;
+        }
+    }
+}
+
+/// Try to run a binary by name, searching PATH directories.
+fn cmd_exec(name: &[u8]) -> isize {
+    if name.is_empty() {
+        return -1;
+    }
+    // Try exact name first (sys_exec handles absolute/relative paths)
+    let pid = unsafe { syscall2(SYS_EXEC, name.as_ptr() as usize, name.len()) };
+    if pid >= 0 {
+        return pid;
+    }
+    // If name doesn't start with /, search PATH
+    if !name.starts_with(b"/") {
+        let mut path_buf = [0u8; 512];
+        let n = unsafe { syscall4(SYS_GETENV, b"PATH".as_ptr() as usize, 4, path_buf.as_ptr() as usize, path_buf.len()) };
+        if n > 0 {
+            let path_str = &path_buf[..n as usize];
+            // Split PATH by ':'
+            let mut start = 0;
+            loop {
+                if start >= path_str.len() {
+                    break;
+                }
+                let mut end = start;
+                while end < path_str.len() && path_str[end] != b':' {
+                    end += 1;
+                }
+                let dir = &path_str[start..end];
+                // Build: <dir>/<name>
+                let mut full = [0u8; 512];
+                let mut pos = 0;
+                append_slice(&mut full, &mut pos, dir);
+                if pos > 0 && pos < 511 { full[pos] = b'/'; pos += 1; }
+                append_slice(&mut full, &mut pos, name);
+                let full_path = &full[..pos];
+                let pid2 = unsafe { syscall2(SYS_EXEC, full_path.as_ptr() as usize, full_path.len()) };
+                if pid2 >= 0 {
+                    return pid2;
+                }
+                start = end + 1;
+            }
+        }
+    }
+    -1
+}
+
 // ─── Entry point ────────────────────────────────────────────────────
 
 const LINE_BUF_SIZE: usize = 256;
@@ -371,6 +552,8 @@ unsafe extern "C" fn _start() -> ! {
             cmd_pid();
         } else if str_eq(cmd, b"clear") {
             cmd_clear();
+        } else if str_eq(cmd, b"env") {
+            cmd_env();
         } else if str_eq(cmd, b"exit") || str_eq(cmd, b"quit") {
             println(b"bye!");
             syscall1(SYS_EXIT, 0);
@@ -380,6 +563,12 @@ unsafe extern "C" fn _start() -> ! {
             cmd_echo(text);
         } else if let Some(path) = str_strip_prefix(cmd, b"cat ") {
             cmd_cat(trim(path));
+        } else if let Some(path) = str_strip_prefix(cmd, b"cd ") {
+            cmd_cd(trim(path));
+        } else if let Some(path) = str_strip_prefix(cmd, b"mkdir ") {
+            cmd_mkdir(trim(path));
+        } else if let Some(path) = str_strip_prefix(cmd, b"rm ") {
+            cmd_rm(trim(path));
         } else if let Some(path) = str_strip_prefix(cmd, b"run ") {
             cmd_run(trim(path));
         } else if let Some(id) = str_strip_prefix(cmd, b"spawn ") {
