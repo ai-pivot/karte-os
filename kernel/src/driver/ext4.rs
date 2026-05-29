@@ -163,13 +163,26 @@ impl FileSystem for Ext4Fs {
 
     fn lookup(&self, dir: u64, name: &str) -> Result<u64, VfsError> {
         let ext4 = self.ext4.lock();
-        let entries = ext4.dir_get_entries(dir as u32);
-        for entry in &entries {
-            if entry.get_name() == name {
-                return Ok(entry.inode as u64);
+        let mut current_dir = dir as u32;
+
+        for component in name.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            let entries = ext4.dir_get_entries(current_dir);
+            let mut found = None;
+            for entry in &entries {
+                if entry.get_name() == component {
+                    found = Some(entry.inode);
+                    break;
+                }
+            }
+            match found {
+                Some(inode) => current_dir = inode,
+                None => return Err(VfsError::NotFound),
             }
         }
-        Err(VfsError::NotFound)
+        Ok(current_dir as u64)
     }
 
     fn metadata(&self, inode: u64) -> Result<VfsMetadata, VfsError> {

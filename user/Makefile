@@ -9,12 +9,34 @@ RUSTC = rustc
 RUSTFLAGS_USER = --edition 2024 --target riscv64gc-unknown-none-elf \
 	-C panic=abort -C opt-level=2 -C link-arg=-Tuser.ld --crate-type bin
 
-TARGETS = hello.elf heap_test.elf file_test.elf spawn_test.elf shell.elf
+TARGETS = hello.elf heap_test.elf file_test.elf spawn_test.elf shell.elf \
+	ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf
 
 all: $(TARGETS)
 
-shell.elf: shell.rs user.ld
+shell.elf: shell.rs syscall.rs user.ld
 	$(RUSTC) $(RUSTFLAGS_USER) -o $@ shell.rs
+
+ls.elf: ls.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ ls.rs
+
+cat.elf: cat.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ cat.rs
+
+echo.elf: echo.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ echo.rs
+
+mkdir.elf: mkdir.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ mkdir.rs
+
+rm.elf: rm.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ rm.rs
+
+env.elf: env.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ env.rs
+
+pwd.elf: pwd.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ pwd.rs
 
 hello.o: hello.S
 	$(AS) -march=rv64gc -o $@ $<
