@@ -402,23 +402,29 @@ fn sys_close(fd: i32) -> isize {
 /// Syscall 30: Spawn a new process.
 /// `prog_id` identifies which program to spawn (0 = hello, 1 = heap_test, 2 = file_test, 3 = spawn_test).
 /// Returns child PID on success, or negative error code.
+/// Sentinel returned by sys_waitpid when the child is still running.
+/// Distinct from a real exit code (>= 0) and from errors so that an exit
+/// code of 0 is not confused with "still running". The caller should poll.
+pub const WAIT_AGAIN: isize = -1;
+/// Returned by sys_waitpid when the pid is not a child of the caller.
+pub const WAIT_ERR: isize = -2;
+
 /// Syscall 31: Wait for a child process to exit.
 ///
-/// Non-blocking: returns exit code if child has exited, or 0 if still running.
-/// The caller should retry (poll) until a non-zero result is returned.
-/// This avoids the need for schedule_block() which is incompatible with
-/// the init process (not in the scheduler).
+/// Non-blocking. Returns the exit code (>= 0) when the child has exited (and
+/// reaps it), `WAIT_AGAIN` while it is still running (caller should poll), or
+/// `WAIT_ERR` when the pid is not a child of the caller (or already reaped).
 fn sys_waitpid(pid: usize) -> isize {
     let my_pid = crate::process::current_pid();
 
     let child_idx = match crate::process::find_process_by_pid(pid) {
         Some(idx) => {
             if crate::process::get_ppid(idx) != my_pid {
-                return ERR_INVAL;
+                return WAIT_ERR;
             }
             idx
         }
-        None => return ERR_INVAL,
+        None => return WAIT_ERR,
     };
 
     match crate::process::get_exit_code(child_idx) {
@@ -427,7 +433,7 @@ fn sys_waitpid(pid: usize) -> isize {
             crate::sched::remove_task(child_idx);
             exit_code as isize
         }
-        None => 0, // Child still running
+        None => WAIT_AGAIN, // Child still running
     }
 }
 

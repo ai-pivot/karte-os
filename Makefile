@@ -78,7 +78,7 @@ boot-test: build disk.img
 
 # Build shell + kernel and run
 shell: disk.img
-	cd user && rustc --edition 2024 --target riscv64gc-unknown-none-elf -C panic=abort -C opt-level=2 -C link-arg=-Tuser.ld --crate-type bin -o shell.elf shell.rs
+	cd user && $(MAKE)
 	@rm -f target/riscv64gc-unknown-none-elf/release/karte-os-kernel
 	@rm -rf target/riscv64gc-unknown-none-elf/release/.fingerprint/karte-os-kernel-*
 	cargo build --release -p karte-os-kernel

@@ -293,13 +293,15 @@ pub fn current_page_table_ppn() -> usize {
     table[idx].as_ref().map(|p| p.page_table_root).unwrap_or(0)
 }
 
-/// Set exit code for the current process.
-/// Called from sys_exit before schedule_exit().
+/// Set exit code for the current process and mark it Exited.
+/// Called from sys_exit before schedule_exit(). Marking the state here is what
+/// lets a waiting parent observe the child's exit via get_exit_code()/waitpid.
 pub fn set_exit_code(code: usize) {
     let mut table = PROCESS_TABLE.lock();
     let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
     if let Some(p) = table[idx].as_mut() {
         p.exit_code = code;
+        p.state = ProcessState::Exited;
     }
 }
 

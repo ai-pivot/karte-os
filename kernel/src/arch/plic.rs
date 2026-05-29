@@ -17,6 +17,10 @@ const THRESHOLD_OFFSET: usize = 0;
 /// Sets threshold to 0 (accept all priorities) and enables the UART IRQ.
 pub fn init(hart_id: usize) {
     set_threshold(hart_id, 0);
+    // A PLIC source only fires when its priority is greater than the hart
+    // threshold (0). Without this, UART RX interrupts are never delivered and
+    // input would depend solely on timer polling.
+    set_priority(10, 1);
     // Enable UART interrupt (IRQ 10 on QEMU virt)
     enable(hart_id, 10, true);
 }

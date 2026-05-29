@@ -25,6 +25,9 @@ const SYS_SPAWN: usize = 30;
 const SYS_WAITPID: usize = 31;
 const SYS_LS: usize = 40;
 
+/// sys_waitpid sentinel: child still running, poll again. Matches the kernel.
+const WAIT_AGAIN: isize = -1;
+
 // ─── Syscall wrapper (ecall) ───────────────────────────────────────
 
 #[inline(always)]
@@ -227,22 +230,28 @@ fn cmd_run(path: &[u8]) {
     print_u64(pid as u64);
     println(b"");
 
-    // Wait for child to finish (polling waitpid)
-    // waitpid returns exit code (>0) when child has exited, 0 if still running
+    // Wait for child to finish (polling waitpid).
+    //   WAIT_AGAIN (-1) → still running, poll again
+    //   < -1            → error (not our child)
+    //   >= 0            → exited with this code
     loop {
         let code = unsafe { syscall1(SYS_WAITPID, pid as usize) };
-        if code > 0 {
-            print(b"[run] process ");
-            print_u64(pid as u64);
-            print(b" exited with code ");
-            print_u64(code as u64);
-            println(b"");
+        if code == WAIT_AGAIN {
+            for _ in 0..100 {
+                core::hint::spin_loop();
+            }
+            continue;
+        }
+        if code < 0 {
+            println(b"run: waitpid failed");
             return;
         }
-        // Yield — spin briefly
-        for _ in 0..100 {
-            core::hint::spin_loop();
-        }
+        print(b"[run] process ");
+        print_u64(pid as u64);
+        print(b" exited with code ");
+        print_u64(code as u64);
+        println(b"");
+        return;
     }
 }
 
@@ -265,15 +274,20 @@ fn cmd_spawn(id: &[u8]) {
     print(b"spawned pid=");
     print_u64(pid as u64);
     println(b"");
-    // Poll-wait (non-blocking waitpid)
+    // Poll-wait (non-blocking waitpid); see cmd_run for the return convention.
     let exit_code = loop {
         let code = unsafe { syscall1(SYS_WAITPID, pid as usize) };
-        if code != 0 {
-            break code;
+        if code == WAIT_AGAIN {
+            for _ in 0..1000 {
+                core::hint::spin_loop();
+            }
+            continue;
         }
-        for _ in 0..1000 {
-            core::hint::spin_loop();
+        if code < 0 {
+            println(b"spawn: waitpid failed");
+            return;
         }
+        break code;
     };
     print(b"child exited with code ");
     print_u64(exit_code as u64);

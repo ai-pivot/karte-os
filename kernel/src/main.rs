@@ -130,11 +130,15 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 // Timer returns directly to init when only init exists.
                 // schedule() detects child tasks and switches to them.
 
-                // Build TrapContext on kernel stack for first U-mode entry
-                let trap_ctx_base = proc.kernel_stack_top - 280;
+                // Build TrapContext on kernel stack for first U-mode entry.
+                // Init enters via first_enter_user (which switches satp itself),
+                // so user_satp (ctx[35]) stays 0 — the zeroing loop handles that.
+                let ctx_words = core::mem::size_of::<arch::trap::TrapContext>() / 8;
+                let trap_ctx_base =
+                    proc.kernel_stack_top - core::mem::size_of::<arch::trap::TrapContext>();
                 unsafe {
                     let ctx = trap_ctx_base as *mut usize;
-                    for i in 0..35 {
+                    for i in 0..ctx_words {
                         *ctx.add(i) = 0;
                     }
                     *ctx.add(2) = proc.kernel_stack_top;

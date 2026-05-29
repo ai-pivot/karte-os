@@ -3,9 +3,18 @@ AS = $(CROSS)as
 LD = $(CROSS)ld
 OBJCOPY = $(CROSS)objcopy
 
-TARGETS = hello.elf heap_test.elf file_test.elf spawn_test.elf
+# The kernel embeds shell.elf via include_bytes!, so it must be built here too
+# (otherwise `make build` / CI fails after `make clean`).
+RUSTC = rustc
+RUSTFLAGS_USER = --edition 2024 --target riscv64gc-unknown-none-elf \
+	-C panic=abort -C opt-level=2 -C link-arg=-Tuser.ld --crate-type bin
+
+TARGETS = hello.elf heap_test.elf file_test.elf spawn_test.elf shell.elf
 
 all: $(TARGETS)
+
+shell.elf: shell.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ shell.rs
 
 hello.o: hello.S
 	$(AS) -march=rv64gc -o $@ $<

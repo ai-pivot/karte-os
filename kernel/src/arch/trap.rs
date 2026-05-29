@@ -14,18 +14,24 @@ unsafe extern "C" {
 
 /// Trap context: complete register state saved on trap entry.
 ///
-/// Layout (280 bytes on stack):
+/// Layout (288 bytes on stack):
 ///   x[0..32]  @ offset 0..256   — 32 general-purpose registers (x0 unused, x2 = sp)
 ///   sstatus   @ offset 256
 ///   sepc      @ offset 264
 ///   sscratch  @ offset 272      — saved sscratch (user sp if from U-mode)
+///   user_satp @ offset 280      — page table to switch to before sret (0 = no switch)
+///
+/// `user_satp` is non-zero ONLY for a task's very first entry into U-mode (via
+/// `first_task_shim`, which bypasses `trap_handler`). For all normal trap
+/// returns it is 0, and the satp is managed by `trap_handler`'s tail instead.
 #[repr(C)]
 #[derive(Debug)]
 pub struct TrapContext {
     pub x: [usize; 32],
     pub sstatus: usize,
     pub sepc: usize,
-    pub sscratch: usize, // If from U-mode: contains user sp; else 0
+    pub sscratch: usize,  // If from U-mode: contains user sp; else 0
+    pub user_satp: usize, // Page table SATP to switch to before sret (0 = don't switch)
 }
 
 impl TrapContext {
@@ -36,6 +42,7 @@ impl TrapContext {
             sstatus: 0,
             sepc: entry,
             sscratch: user_sp,
+            user_satp: 0,
         };
         // Set sstatus: SPP=0 (return to U-mode), SPIE=1 (enable interrupts after sret)
         ctx.sstatus = 0x20; // SPIE bit

@@ -162,7 +162,8 @@ jobs:
             > /tmp/boot-output.log 2>&1 || true
           grep -a 'riscv_cpu_do_interrupt' /tmp/boot-output.log | tail -15 || true
           echo "=== PASS/FAIL ==="
-          if grep -qa "Hello from user" /tmp/boot-output.log; then
+          # init is the interactive shell; a clean boot reaches its banner/prompt.
+          if grep -qa "KarteOS Shell" /tmp/boot-output.log; then
             echo "Boot test PASSED"
           else
             echo "Boot test FAILED"
@@ -213,9 +214,10 @@ jobs:
             > /tmp/smp-output.log 2>&1 || true
           
           echo "=== SMP Output ==="
-          grep -a 'KarteOS\|smp\|hart\|user\|Hello\|virtio' /tmp/smp-output.log | head -20 || true
+          grep -a 'KarteOS\|smp\|hart\|user\|Shell\|virtio' /tmp/smp-output.log | head -20 || true
           
-          if grep -qa "Hello from user" /tmp/smp-output.log; then
+          # init is the interactive shell; a clean boot reaches its banner/prompt.
+          if grep -qa "KarteOS Shell" /tmp/smp-output.log; then
             echo "SMP boot test PASSED"
           else
             echo "SMP boot test FAILED"

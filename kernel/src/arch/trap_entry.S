@@ -5,15 +5,22 @@
 //   - S-mode traps: sscratch=0, normal kernel trap handling
 //   - U-mode traps: sscratch=kernel_sp, swap stacks and save user context
 //
-// TrapContext layout (280 bytes):
+// TrapContext layout (288 bytes):
 //   x[0..32]  @ offset 0..256   — 32 general-purpose registers
 //   sstatus   @ offset 256
 //   sepc      @ offset 264
 //   sscratch  @ offset 272      — user sp if from U-mode, else 0
+//   user_satp @ offset 280      — satp to switch to before sret (0 = no switch)
 
     .section .text
     .globl trap_entry
 
+    # stvec requires the trap vector base to be 4-byte aligned: its low two
+    # bits encode the MODE field. Without this, when preceding (compressed)
+    # code leaves trap_entry on a 2-byte boundary, stvec truncates the base
+    # and misinterprets the low bits as MODE, vectoring traps into the middle
+    # of an instruction → infinite illegal-instruction loop.
+    .p2align 2
 trap_entry:
     # ── Step 1: Swap sp with sscratch ──
     # After csrrw: sp = old_sscratch, sscratch = old_sp
@@ -31,7 +38,7 @@ trap_entry:
     csrr    sp, sscratch           # restore S-mode sp
     csrw    sscratch, zero         # clear sscratch for next trap
 
-    addi    sp, sp, -280
+    addi    sp, sp, -288
 
     # Save general-purpose registers
     sd      x1,  8(sp)
@@ -71,6 +78,7 @@ trap_entry:
     csrr    t1, sepc
     sd      t1, 264(sp)
     sd      zero, 272(sp)          # sscratch field = 0 (S-mode)
+    sd      zero, 280(sp)          # user_satp = 0 (no satp switch on S-mode return)
 
     # Call trap_handler(&mut TrapContext)
     mv      a0, sp
@@ -114,7 +122,7 @@ trap_entry:
     ld      x30, 240(sp)
     ld      x31, 248(sp)
 
-    addi    sp, sp, 280
+    addi    sp, sp, 288
     sret
 
     # ═══════════════════════════════════════════════════════════════
@@ -126,7 +134,7 @@ trap_entry:
     csrr    t0, sscratch           # t0 = user_sp
     csrw    sscratch, zero         # clear sscratch
 
-    addi    sp, sp, -280
+    addi    sp, sp, -288
 
     # Save general-purpose registers
     sd      x1,  8(sp)
@@ -167,6 +175,7 @@ trap_entry:
     csrr    t1, sepc
     sd      t1, 264(sp)
     sd      t0,  272(sp)           # sscratch field = user_sp
+    sd      zero, 280(sp)          # user_satp = 0: satp handled by trap_handler tail
 
     # Call trap_handler(&mut TrapContext)
     mv      a0, sp
@@ -181,6 +190,18 @@ trap_return_user:
     csrw    sepc, t1
     ld      t1, 256(sp)
     csrw    sstatus, t1
+
+    # Switch page table if user_satp is non-zero. This is set ONLY for a task's
+    # first entry into U-mode (via first_task_shim, which bypasses trap_handler).
+    # Normal returns leave it 0 so satp is untouched here (trap_handler already
+    # selected the correct page table). Kernel mappings are identical across all
+    # page tables, so the following kernel instructions remain valid after the
+    # switch; a plain sfence.vma is sufficient.
+    ld      t1, 280(sp)            # t1 = user_satp
+    beqz    t1, .Lno_satp_switch
+    csrw    satp, t1
+    sfence.vma
+.Lno_satp_switch:
 
     # Stash user_sp in sscratch before restoring GP registers
     # (restoring x5 would clobber t0, so we use the CSR as temporary storage)
@@ -224,7 +245,7 @@ trap_return_user:
     # sscratch holds user_sp.
 
     # Pop the TrapContext frame
-    addi    sp, sp, 280            # sp = kernel_stack_top
+    addi    sp, sp, 288            # sp = kernel_stack_top
 
     # Swap sp and sscratch via csrrw:
     #   tmp = sscratch (user_sp)   → returned to sp
