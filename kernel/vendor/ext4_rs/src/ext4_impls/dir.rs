@@ -35,6 +35,8 @@ impl Ext4 {
         let total_blocks: u64 = inode_size / BLOCK_SIZE as u64;
 
         // iterate all blocks
+        // iterate all blocks
+        let mut iblock = 0;
         while iblock < total_blocks {
             let search_path = self.find_extent(&parent, iblock as u32);
 
@@ -187,6 +189,12 @@ impl Ext4 {
         let block_size = self.super_block.block_size();
         let total_blocks: u64 = inode_size / block_size as u64;
 
+        let dir_de_type = if child.inode.is_dir() {
+            DirEntryType::EXT4_DE_DIR
+        } else {
+            DirEntryType::EXT4_DE_REG_FILE
+        };
+
         // iterate all blocks
         let mut iblock = 0;
         while iblock < total_blocks {
@@ -196,7 +204,12 @@ impl Ext4 {
             // load physical block
             let mut ext4block = Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);
 
-            let result = self.try_insert_to_existing_block(&mut ext4block, name, child.inode_num);
+            let result = self.try_insert_to_existing_block(
+                &mut ext4block,
+                name,
+                child.inode_num,
+                dir_de_type,
+            );
 
             if result.is_ok() {
                 // set checksum
@@ -218,8 +231,7 @@ impl Ext4 {
 
         // write new entry to the new block
         // must succeed, as we just allocated the block
-        let de_type = DirEntryType::EXT4_DE_DIR;
-        self.insert_to_new_block(&mut new_ext4block, child.inode_num, name, de_type);
+        self.insert_to_new_block(&mut new_ext4block, child.inode_num, name, dir_de_type);
 
         // set checksum
         self.dir_set_csum(&mut new_ext4block, parent.inode.generation());
@@ -242,6 +254,7 @@ impl Ext4 {
         block: &mut Block,
         name: &str,
         child_inode: u32,
+        de_type: DirEntryType,
     ) -> Result<usize> {
         // required length aligned to 4 bytes
         let required_len = {
@@ -281,7 +294,6 @@ impl Ext4 {
                 // Update existing entry length and copy both entries back to block data
                 de.entry_len = sz as u16;
 
-                let de_type = DirEntryType::EXT4_DE_DIR;
                 new_entry.write_entry(free_space as u16, child_inode, name, de_type);
 
                 // update parent_de and new_de to blk_data
