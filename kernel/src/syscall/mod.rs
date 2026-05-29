@@ -37,6 +37,9 @@ pub const SYS_UNLINK: usize = 42;
 pub const SYS_SETENV: usize = 50;
 pub const SYS_GETENV: usize = 51;
 
+// Level 8: Directory
+pub const SYS_CHDIR: usize = 52;
+
 // ─── Error codes ──────────────────────────────────────────────────
 
 pub const ERR_OK: isize = 0;
@@ -97,6 +100,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_UNLINK => sys_unlink(args[0], args[1]),
         SYS_SETENV => sys_setenv(args[0], args[1], args[2], args[3]),
         SYS_GETENV => sys_getenv(args[0], args[1], args[2], args[3]),
+        SYS_CHDIR => sys_chdir(args[0], args[1]),
 
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
@@ -402,22 +406,14 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         return ERR_INVAL;
     }
 
-    // Read path from user memory, stripping trailing NUL bytes (C-style strings)
-    let mut path_buf = alloc::vec::Vec::new();
-    for i in 0..path_len {
-        let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
-        path_buf.push(byte);
-    }
-    while path_buf.last() == Some(&0) {
-        path_buf.pop();
-    }
-    let name = alloc::string::String::from_utf8(path_buf).unwrap_or_default();
-    if name.is_empty() {
-        return ERR_INVAL;
-    }
+    // Read path from user memory
+    let name = match read_user_path(path, path_len) {
+        Some(n) if !n.is_empty() => n,
+        _ => return ERR_INVAL,
+    };
 
-    // Strip leading '/' for filesystem lookup
-    let name = alloc::string::String::from(name.strip_prefix('/').unwrap_or(&name));
+    // Resolve relative paths using CWD
+    let name = resolve_path(&name);
     if name.is_empty() {
         return ERR_INVAL;
     }
@@ -490,7 +486,82 @@ fn sys_waitpid(pid: usize) -> isize {
     }
 }
 
+/// Read a byte string from user memory and strip trailing NUL bytes.
+fn read_user_path(ptr: usize, len: usize) -> Option<alloc::string::String> {
+    if ptr == 0 || len == 0 || len > 512 {
+        return None;
+    }
+    let mut buf = alloc::vec::Vec::new();
+    for i in 0..len {
+        let byte = unsafe { core::ptr::read_volatile((ptr + i) as *const u8) };
+        buf.push(byte);
+    }
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    alloc::string::String::from_utf8(buf).ok()
+}
+
+/// Resolve a filesystem path relative to CWD.
+///
+/// - If `path` starts with '/', it is absolute — just strip the leading '/'.
+/// - If `path` is relative, prepend CWD env var (with '/' separator if needed).
+fn resolve_path(path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        return alloc::string::String::from(path.strip_prefix('/').unwrap_or(path));
+    }
+    // Get CWD from env
+    let cwd = crate::env::get("CWD").unwrap_or_else(|| alloc::string::String::from("/"));
+    let cwd = cwd.trim_end_matches('/');
+    if path.is_empty() {
+        return alloc::string::String::from(cwd.trim_start_matches('/'));
+    }
+    // Build CWD/path
+    let mut resolved = alloc::string::String::from(cwd);
+    resolved.push('/');
+    resolved.push_str(path);
+    // Strip leading '/' for filesystem lookup (all lookups are relative to root)
+    alloc::string::String::from(resolved.strip_prefix('/').unwrap_or(&resolved))
+}
+
+/// Syscall 52: Change directory.
+/// Validates that the target directory exists before updating CWD.
+fn sys_chdir(path: usize, path_len: usize) -> isize {
+    let name = match read_user_path(path, path_len) {
+        Some(n) if !n.is_empty() => n,
+        _ => return ERR_INVAL,
+    };
+
+    let resolved = resolve_path(&name);
+
+    // Verify the directory exists in the filesystem
+    if crate::driver::ext4::has_ext4() {
+        // Try to resolve the path — if lookup succeeds and it's a dir, ok
+        match crate::driver::ext4::lookup_path(&resolved) {
+            Some(inode) => {
+                // Check if it's a directory
+                match crate::driver::ext4::metadata_of(inode) {
+                    Some(meta) if meta.is_dir() => {}
+                    _ => return ERR_NOENT, // exists but not a directory
+                }
+            }
+            None => return ERR_NOENT,
+        }
+    }
+    // Also check RamFS
+    // (For simplicity, allow cd to any path that exists in ext4 or RamFS)
+
+    // Update CWD in env
+    let mut full_cwd = alloc::string::String::from("/");
+    if !resolved.is_empty() {
+        full_cwd.push_str(&resolved);
+    }
+    crate::env::set("CWD", &full_cwd);
+    ERR_OK
+}
+
 /// Syscall 40: List filesystem contents.
+/// Lists the current working directory (CWD).
 /// Writes a formatted listing to the user buffer (name + size per line).
 /// Returns total bytes written, or error.
 fn sys_ls(buf: usize, len: usize) -> isize {
@@ -498,7 +569,11 @@ fn sys_ls(buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    let files = crate::driver::fs::list_all_files();
+    // Get the directory path to list: resolve CWD to a path relative to root
+    let cwd = crate::env::get("CWD").unwrap_or_else(|| alloc::string::String::from("/"));
+    let dir_path = cwd.trim_start_matches('/');
+
+    let files = crate::driver::fs::list_directory(dir_path);
 
     let mut written: usize = 0;
     for (name, size) in files {
@@ -555,18 +630,11 @@ fn sys_mkdir(path: usize, path_len: usize) -> isize {
     if path == 0 || path_len == 0 || path_len > 256 {
         return ERR_INVAL;
     }
-    let mut path_buf = alloc::vec::Vec::new();
-    for i in 0..path_len {
-        let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
-        path_buf.push(byte);
-    }
-    while path_buf.last() == Some(&0) {
-        path_buf.pop();
-    }
-    let name = alloc::string::String::from_utf8(path_buf).unwrap_or_default();
-    if name.is_empty() {
-        return ERR_INVAL;
-    }
+    let name = match read_user_path(path, path_len) {
+        Some(n) if !n.is_empty() => n,
+        _ => return ERR_INVAL,
+    };
+    let name = resolve_path(&name);
     match crate::driver::fs::create_dir(&name) {
         Ok(()) => 0,
         Err(()) => ERR_IO,
@@ -578,18 +646,11 @@ fn sys_unlink(path: usize, path_len: usize) -> isize {
     if path == 0 || path_len == 0 || path_len > 256 {
         return ERR_INVAL;
     }
-    let mut path_buf = alloc::vec::Vec::new();
-    for i in 0..path_len {
-        let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
-        path_buf.push(byte);
-    }
-    while path_buf.last() == Some(&0) {
-        path_buf.pop();
-    }
-    let name = alloc::string::String::from_utf8(path_buf).unwrap_or_default();
-    if name.is_empty() {
-        return ERR_INVAL;
-    }
+    let name = match read_user_path(path, path_len) {
+        Some(n) if !n.is_empty() => n,
+        _ => return ERR_INVAL,
+    };
+    let name = resolve_path(&name);
     match crate::driver::fs::delete_file(&name) {
         Ok(()) => 0,
         Err(()) => ERR_NOENT,

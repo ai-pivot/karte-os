@@ -277,16 +277,26 @@ pub fn write_file_owned(name: &str, data: &[u8]) -> Result<(), ()> {
 
 /// List all files from ext4/FAT32 and RamFS, deduplicated.
 pub fn list_all_files() -> Vec<(String, usize)> {
+    list_directory("")
+}
+
+/// List files in a directory specified by path (relative to root).
+/// Falls back to list_all_files (root) for non-ext4 filesystems.
+pub fn list_directory(path: &str) -> Vec<(String, usize)> {
     let mut result = Vec::new();
 
-    // ext4 files first
+    // ext4 files
     if crate::driver::ext4::has_ext4() {
-        for (name, size) in crate::driver::ext4::list_root() {
+        for (name, size) in crate::driver::ext4::list_directory(path) {
             result.push((name, size));
+        }
+        // For non-root paths, skip FAT32/RamFS (only ext4 supports subdirs)
+        if !path.is_empty() {
+            return result;
         }
     }
 
-    // FAT32 files next
+    // FAT32 files next (only for root listing)
     if has_fat32() {
         for (name, size) in crate::driver::fat32::list_root() {
             if !result.iter().any(|(n, _)| n == &name) {
@@ -295,7 +305,7 @@ pub fn list_all_files() -> Vec<(String, usize)> {
         }
     }
 
-    // RamFS files (skip duplicates)
+    // RamFS files (skip duplicates, only for root listing)
     let fs = FS.lock();
     for file in fs.list() {
         if !result.iter().any(|(n, _)| n == &file.name) {

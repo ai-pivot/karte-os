@@ -13,6 +13,7 @@ pub const SYS_MKDIR: usize = 41;
 pub const SYS_UNLINK: usize = 42;
 pub const SYS_SETENV: usize = 50;
 pub const SYS_GETENV: usize = 51;
+pub const SYS_CHDIR: usize = 52;
 
 #[inline(always)]
 pub unsafe fn syscall1(id: usize, a0: usize) -> isize {

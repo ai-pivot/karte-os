@@ -136,24 +136,37 @@ fn builtin_cd(arg: &[u8]) {
         print(b"/\r\n");
         return;
     }
-    if arg.starts_with(b"/") {
-        update_cwd(arg);
+    // Build full target path
+    let mut target = [0u8; 256];
+    let target = if arg.starts_with(b"/") {
+        let t = &mut target[..arg.len().min(255)];
+        t.copy_from_slice(&arg[..arg.len().min(255)]);
+        t
     } else {
         let cwd = get_cwd();
-        let mut new_path = [0u8; 256];
         let mut pos = 0;
         for &b in cwd {
-            if pos < 255 { new_path[pos] = b; pos += 1; }
+            if pos < 255 { target[pos] = b; pos += 1; }
         }
-        if pos > 0 && pos < 255 && new_path[pos - 1] != b'/' {
-            new_path[pos] = b'/';
+        if pos > 0 && pos < 255 && target[pos - 1] != b'/' {
+            target[pos] = b'/';
             pos += 1;
         }
         for &b in arg {
-            if pos < 255 { new_path[pos] = b; pos += 1; }
+            if pos < 255 { target[pos] = b; pos += 1; }
         }
-        update_cwd(&new_path[..pos]);
+        &target[..pos]
+    };
+
+    // Validate via SYS_CHDIR — kernel checks the directory exists
+    let r = unsafe { syscall2(SYS_CHDIR, target.as_ptr() as usize, target.len()) };
+    if r < 0 {
+        print(b"cd: no such directory: ");
+        println(arg);
+        return;
     }
+    // Update local CWD cache
+    update_cwd(target);
 }
 
 // ── Built-in: export ──

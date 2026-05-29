@@ -356,7 +356,30 @@ pub fn read_file(name: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Write (create or overwrite) a file in the ext4 root directory.
+/// Look up a path (relative to root) and return the inode number.
+///
+/// Supports multi-level paths (e.g., "subdir/file.txt").
+/// Returns `None` if ext4 is not initialized or the path does not exist.
+pub fn lookup_path(name: &str) -> Option<u64> {
+    if !has_ext4() {
+        return None;
+    }
+    let guard = EXT4_FS.lock();
+    let fs = guard.as_ref()?;
+    fs.lookup(ROOT_INODE as u64, name).ok()
+}
+
+/// Get metadata for an inode. Returns `None` on failure.
+pub fn metadata_of(inode: u64) -> Option<VfsMetadata> {
+    if !has_ext4() {
+        return None;
+    }
+    let guard = EXT4_FS.lock();
+    let fs = guard.as_ref()?;
+    fs.metadata(inode).ok()
+}
+
+/// Write (create or overwrite) a file at the given path (supports multi-level paths).
 pub fn write_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
     if !has_ext4() {
         return Err("ext4 not initialized");
@@ -373,9 +396,16 @@ pub fn write_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
         fs.write_file(inode, 0, data)
             .map_err(|_| "ext4 write failed")?;
     } else {
-        // Create new file
+        // Create new file in the correct parent directory
+        let (parent_path, file_name) = split_last_component(name);
+        let parent_inode = if parent_path.is_empty() {
+            ROOT_INODE as u64
+        } else {
+            fs.lookup(ROOT_INODE as u64, parent_path)
+                .map_err(|_| "ext4: parent directory not found")?
+        };
         let inode = fs
-            .create_file(ROOT_INODE as u64, name)
+            .create_file(parent_inode, file_name)
             .map_err(|_| "ext4 create failed")?;
         fs.write_file(inode, 0, data)
             .map_err(|_| "ext4 write failed")?;
@@ -387,6 +417,14 @@ pub fn write_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
 ///
 /// Returns a vector of `(file_name, size_in_bytes)` pairs.
 pub fn list_root() -> Vec<(String, usize)> {
+    list_directory("")
+}
+
+/// List files in a directory specified by path.
+///
+/// `path` is relative to root (e.g., "" for root, "subdir" for a subdirectory).
+/// Returns a vector of `(file_name, size_in_bytes)` pairs.
+pub fn list_directory(path: &str) -> Vec<(String, usize)> {
     let mut result = Vec::new();
     if !has_ext4() {
         return result;
@@ -397,9 +435,19 @@ pub fn list_root() -> Vec<(String, usize)> {
         return result;
     };
 
+    // Resolve the directory inode
+    let dir_inode = if path.is_empty() {
+        ROOT_INODE as u64
+    } else {
+        match fs.lookup(ROOT_INODE as u64, path) {
+            Ok(inode) => inode,
+            Err(_) => return result,
+        }
+    };
+
     let mut idx = 0;
     loop {
-        match fs.readdir(ROOT_INODE as u64, idx) {
+        match fs.readdir(dir_inode, idx) {
             Ok(Some(entry)) => {
                 match entry.file_type {
                     VfsFileType::Directory => {
@@ -455,19 +503,10 @@ pub fn inject_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Delete a file from the ext4 root directory.
-pub fn delete_file(name: &str) -> Result<(), &'static str> {
-    if !has_ext4() {
-        return Err("ext4 not initialized");
-    }
-
-    let mut guard = EXT4_FS.lock();
-    let fs = guard.as_mut().ok_or("ext4 not initialized")?;
-    fs.unlink(ROOT_INODE as u64, name)
-        .map_err(|_| "ext4 unlink failed")
-}
-
-/// Create a directory in the ext4 root directory.
+/// Create a directory at the given path (supports multi-level paths like "parent/child").
+///
+/// The last component is the new directory name; all preceding components
+/// must already exist.
 pub fn create_directory(name: &str) -> Result<(), &'static str> {
     if !has_ext4() {
         return Err("ext4 not initialized");
@@ -476,14 +515,58 @@ pub fn create_directory(name: &str) -> Result<(), &'static str> {
     let mut guard = EXT4_FS.lock();
     let fs = guard.as_mut().ok_or("ext4 not initialized")?;
 
-    fs.create_dir(ROOT_INODE as u64, name)
+    // Split path: parent dir + new directory name
+    let (parent_path, dir_name) = split_last_component(name);
+
+    let parent_inode = if parent_path.is_empty() {
+        ROOT_INODE as u64
+    } else {
+        fs.lookup(ROOT_INODE as u64, parent_path)
+            .map_err(|_| "ext4: parent directory not found")?
+    };
+
+    fs.create_dir(parent_inode, dir_name)
         .map_err(|_| "ext4 create_dir failed")?;
     Ok(())
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
+/// Delete a file or directory at the given path (supports multi-level paths).
+pub fn delete_file(name: &str) -> Result<(), &'static str> {
+    if !has_ext4() {
+        return Err("ext4 not initialized");
+    }
 
-#[cfg(feature = "test_mode")]
+    let mut guard = EXT4_FS.lock();
+    let fs = guard.as_mut().ok_or("ext4 not initialized")?;
+
+    // Split path: parent dir + entry name
+    let (parent_path, entry_name) = split_last_component(name);
+
+    let parent_inode = if parent_path.is_empty() {
+        ROOT_INODE as u64
+    } else {
+        fs.lookup(ROOT_INODE as u64, parent_path)
+            .map_err(|_| "ext4: parent directory not found")?
+    };
+
+    fs.unlink(parent_inode, entry_name)
+        .map_err(|_| "ext4 unlink failed")?;
+    Ok(())
+}
+
+/// Split a path "a/b/c" into ("a/b", "c").
+/// For simple names without '/', returns ("", "name").
+fn split_last_component(path: &str) -> (&str, &str) {
+    if let Some(pos) = path.rfind('/') {
+        if pos == 0 {
+            (&path[1..], &path[pos + 1..])
+        } else {
+            (&path[..pos], &path[pos + 1..])
+        }
+    } else {
+        ("", path)
+    }
+}
 pub fn run_tests() {
     crate::console_println!("");
     crate::console_println!("── ext4 Tests ──");

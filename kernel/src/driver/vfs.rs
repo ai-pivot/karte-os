@@ -40,6 +40,12 @@ pub struct VfsMetadata {
     pub name: String,
 }
 
+impl VfsMetadata {
+    pub fn is_dir(&self) -> bool {
+        self.file_type == VfsFileType::Directory
+    }
+}
+
 /// Directory entry (returned by readdir)
 #[derive(Debug, Clone)]
 pub struct VfsDirEntry {
