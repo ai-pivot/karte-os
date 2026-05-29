@@ -29,7 +29,7 @@
 
 - **File**: `kernel/src/driver/virtio.rs`
 - **Base address**: `0x1000_1000` (first VirtIO MMIO slot)
-- **Stride**: 0x200 between devices
+- **Stride**: 0x1000 (page-sized) between devices
 - **Max devices**: 8
 
 ### MMIO Register Layout
@@ -90,8 +90,8 @@
 | Device | Address | Size |
 |--------|---------|------|
 | UART0 | 0x10000000 | 0x1000 |
-| VirtIO MMIO[0] | 0x10001000 | 0x200 |
-| VirtIO MMIO[1] | 0x10001200 | 0x200 |
-| ... | +0x200 each | ... |
-| VirtIO MMIO[7] | 0x10001E00 | 0x200 |
+| VirtIO MMIO[0] | 0x10001000 | 0x1000 |
+| VirtIO MMIO[1] | 0x10002000 | 0x1000 |
+| ... | +0x1000 each | ... |
+| VirtIO MMIO[7] | 0x10008000 | 0x1000 |
 | PLIC | 0x0C000000 | 0x400000 |
