@@ -96,6 +96,14 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 /// Syscall 1: Exit the current process.
 fn sys_exit(code: i32) -> isize {
     crate::console_println!("[process] User process exited with code {}", code);
+
+    // If init (the shell) exits, no process remains → shut down the system.
+    if crate::sched::is_init_running() {
+        crate::console_println!("[init] Shell exited, shutting down...");
+        crate::sbi::shutdown();
+        unreachable!();
+    }
+
     crate::process::set_exit_code(code as usize);
 
     // Wake parent if waiting
@@ -108,7 +116,7 @@ fn sys_exit(code: i32) -> isize {
     // Mark this child task as exited in the scheduler
     crate::sched::mark_current_exited();
 
-    // Try to switch to another ready child task.
+    // Try to switch to another ready child task (or back to init).
     crate::sched::schedule_exit();
 
     0

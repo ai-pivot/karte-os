@@ -174,11 +174,19 @@ fn on_char(c: u8) {
     let line = unsafe { &mut *TTY_LINE.inner.get() };
 
     match c {
-        // Ctrl+C — send SIGINT, discard current line
+        // Ctrl+C — send SIGINT, discard current line, push empty line
         0x03 => {
             echo(b"^C\r\n");
             line.clear();
-            // TODO: deliver SIGINT to foreground process group
+            // Push a bare newline so sys_read returns immediately with an
+            // empty line.  The shell will trim it, see an empty command,
+            // and re-print the prompt.
+            TTY_INPUT.push(b'\n');
+            // Wake blocked reader (same as Enter handling)
+            let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
+            if waiting != usize::MAX {
+                crate::sched::wake_task(waiting);
+            }
         }
         // Backspace (BS) or Delete (DEL)
         0x08 | 0x7F => {

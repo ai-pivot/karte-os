@@ -194,6 +194,12 @@ pub fn schedule_exit() {
     }
 }
 
+/// Returns true if the init process (shell) is currently running.
+pub fn is_init_running() -> bool {
+    let sched = SCHEDULER.lock();
+    sched.current == INIT_SENTINEL
+}
+
 pub fn mark_current_exited() {
     let mut sched = SCHEDULER.lock();
     let cur = sched.current;
