@@ -62,9 +62,12 @@ Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, 
 - `user/file_test.S` — Tests sys_open/close/read/write file operations with data verification
 - `user/spawn_test.S` — Tests sys_spawn multi-process: parent spawns child (hello), both run concurrently
 - `user/user.ld` — Linker script: entry at 0x1000
+- `user/shell.rs` — Interactive shell (v0.3): launches binaries from PATH, built-ins: cd/exit/export
+- `user/syscall.rs` — Shared syscall wrapper module for all Rust binaries
+- `user/ls.rs`, `cat.rs`, `echo.rs`, `mkdir.rs`, `rm.rs`, `env.rs`, `pwd.rs` — Independent command binaries
 - User programs are embedded into the kernel via `include_bytes!()` at compile time
 - **Build before kernel**: `cd user && make` generates `*.elf` files that the kernel references
-- **FAT32 persistence**: External files can be added via `tools/mkdisk.sh put <file>` and loaded with `run /<file>`
+- **ext4 deployment**: Copy ELF files to ext4 root without `.elf` extension (e.g., `ls.elf` → `ls`)
 
 ## Syscall ABI
 
@@ -118,6 +121,9 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **Scheduler**: `current == MAX_TASKS` is the sentinel meaning "init (shell) is running" (init has no TCB; its sp lives in INIT_TASK_SP). Children occupy real slots 0+. `schedule_exit` returns to init when no Ready child remains.
 - **sys_waitpid ABI**: returns exit code (>=0) when child exited, `WAIT_AGAIN` (-1) while still running, `WAIT_ERR` (-2) on error. Exit code 0 must NOT be confused with "still running".
 - **shell.elf**: built by `user/Makefile` (via rustc) since the kernel embeds it with `include_bytes!`. `cd user && make` builds it alongside the .S programs.
+- **`user/syscall.rs` `trim()`**: strips trailing \\0 in addition to \\n/\\r/spaces. Why: `get_args()` reads CMD_ARGS into a 512-byte buffer with trailing nulls. Without \\0 trimming, path.len() = 512 which exceeds syscall path_len=256 limit.
+- **ext4 `lookup`**: now supports multi-level paths (e.g., "bin/ls") by splitting on '/' and traversing directory tree. Required for PATH-based binary loading from subdirectories.
+- **Binary deployment**: ELF files on ext4 disk MUST have `.elf` extension stripped (e.g., `mkdir.elf` → `mkdir`). Shell searches for bare command names via PATH.
 
 ## Knowledge Files
 
