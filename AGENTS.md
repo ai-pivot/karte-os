@@ -83,7 +83,12 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 11 | close | (fd) |
 | 30 | spawn | (prog_id, arg) — spawn new process (0=hello, 1=heap_test, 2=file_test, 3=spawn_test) |
 | 31 | waitpid | (pid) — wait for child process, returns exit code |
-| 32 | exec | (path, path_len) — spawn process from file path (FAT32/RamFS) |
+| 32 | exec | (path, path_len) — spawn process from file path (ext4/FAT32/RamFS), searches PATH |
+| 40 | ls | (buf, len) — list filesystem contents |
+| 41 | mkdir | (path, path_len) — create a directory |
+| 42 | unlink | (path, path_len) — delete a file or directory |
+| 50 | setenv | (key, key_len, val, val_len) — set environment variable |
+| 51 | getenv | (key, key_len, buf, buf_len) — get environment variable, returns value length or -1 |
 
 ## GOTCHAS
 
