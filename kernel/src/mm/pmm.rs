@@ -84,6 +84,40 @@ impl FrameAllocator {
         None
     }
 
+    fn alloc_contiguous(&mut self, count: usize) -> Option<usize> {
+        // Scan bitmap for `count` consecutive free frames.
+        // This is O(total_frames) in the worst case, which is acceptable
+        // for a 128MB memory pool (~32K frames).
+        if count == 0 {
+            return None;
+        }
+        let mut run_start = 0;
+        let mut run_length = 0usize;
+        for i in 0..self.total_frames {
+            let word = i / 64;
+            let bit = i % 64;
+            if self.bitmap[word] & (1u64 << bit) == 0 {
+                if run_length == 0 {
+                    run_start = i;
+                }
+                run_length += 1;
+                if run_length == count {
+                    // Mark all frames in the run as allocated
+                    for j in run_start..run_start + count {
+                        let w = j / 64;
+                        let b = j % 64;
+                        self.bitmap[w] |= 1u64 << b;
+                    }
+                    self.next_free = run_start + count;
+                    return Some(self.start + run_start * PAGE_SIZE);
+                }
+            } else {
+                run_length = 0;
+            }
+        }
+        None
+    }
+
     fn dealloc(&mut self, frame: usize) {
         let idx = (frame - self.start) / PAGE_SIZE;
         if idx < self.total_frames {
@@ -112,6 +146,10 @@ pub fn dealloc_frame(frame: usize) {
     if let Some(ref mut alloc) = *FRAME_ALLOCATOR.lock() {
         alloc.dealloc(frame);
     }
+}
+
+pub fn alloc_contiguous_frames(count: usize) -> Option<usize> {
+    FRAME_ALLOCATOR.lock().as_mut()?.alloc_contiguous(count)
 }
 
 pub const fn page_size() -> usize {

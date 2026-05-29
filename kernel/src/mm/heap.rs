@@ -7,11 +7,17 @@ use super::pmm;
 #[global_allocator]
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
 
-const HEAP_PAGES: usize = 256; // 256 * 4KB = 1MB heap
+// 4MB heap — ext4 filesystem metadata (superblock, block group descriptors,
+// inode tables, extent trees) requires significantly more memory than the
+// previous 1MB allocation.
+const HEAP_PAGES: usize = 1024; // 1024 * 4KB = 4MB heap
 
 pub fn init() {
-    // Allocate contiguous heap memory
-    let heap_start = allocate_contiguous_pages(HEAP_PAGES);
+    // Allocate contiguous physical pages for the buddy allocator.
+    // We use the PMM's contiguous allocator to guarantee physical continuity,
+    // which is required for correct identity-mapped DMA operations.
+    let heap_start = pmm::alloc_contiguous_frames(HEAP_PAGES)
+        .expect("Failed to allocate contiguous heap memory");
 
     unsafe {
         HEAP_ALLOCATOR
@@ -24,29 +30,6 @@ pub fn init() {
         HEAP_PAGES * pmm::page_size() / 1024,
         heap_start
     );
-}
-
-/// Allocate contiguous physical pages
-fn allocate_contiguous_pages(count: usize) -> usize {
-    // Simple approach: try to allocate count consecutive frames.
-    // The buddy allocator doesn't require contiguous physical memory
-    // since it manages its own virtual address space.
-    let mut first_frame: Option<usize> = None;
-
-    for _ in 0..count {
-        match pmm::alloc_frame() {
-            Some(f) => {
-                if first_frame.is_none() {
-                    first_frame = Some(f);
-                }
-            }
-            None => {
-                panic!("Failed to allocate heap memory");
-            }
-        }
-    }
-
-    first_frame.expect("heap allocation returned no frames")
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

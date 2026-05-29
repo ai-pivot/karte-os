@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 extern crate alloc;
+// ext4_rs depends on the `log` crate; the macro is available via this import.
+#[macro_use]
+extern crate log;
 
 use core::arch::global_asm;
 
@@ -8,6 +11,7 @@ global_asm!(include_str!("entry.S"));
 
 pub mod arch;
 pub mod driver;
+pub mod kernel_log;
 pub mod lang_items;
 pub mod mm;
 pub mod process;
@@ -23,6 +27,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     driver::uart::Uart::new(0x1000_0000).init();
     crate::console_println!("=== KarteOS v0.2.0 ===");
     crate::console_println!("  Booting on hart {}", hartid);
+
+    // Initialize kernel logger before any subsystem that uses `log::`
+    crate::kernel_log::init();
 
     arch::trap::init();
     mm::pmm::init();

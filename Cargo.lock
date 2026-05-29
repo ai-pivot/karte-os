@@ -47,11 +47,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext4_rs"
+version = "1.3.3"
+dependencies = [
+ "bitflags",
+ "log",
+]
+
+[[package]]
 name = "karte-os-kernel"
 version = "0.1.0"
 dependencies = [
  "bitflags",
  "buddy_system_allocator",
+ "ext4_rs",
+ "log",
  "riscv",
  "riscv-rt",
  "sbi",
