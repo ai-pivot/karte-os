@@ -389,9 +389,13 @@ pub fn set_ppid(idx: usize, ppid: usize) {
 }
 
 /// Get current process pid.
+/// Init (shell) has a fixed PID of 1 since it's not in the process table.
 pub fn current_pid() -> usize {
-    let table = PROCESS_TABLE.lock();
     let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
+    if idx >= crate::sched::MAX_TASKS {
+        return 1; // init process
+    }
+    let table = PROCESS_TABLE.lock();
     table[idx].as_ref().map(|p| p.pid).unwrap_or(0)
 }
 

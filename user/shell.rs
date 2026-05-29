@@ -215,11 +215,24 @@ fn cmd_run(path: &[u8]) {
     let pid = unsafe { syscall2(SYS_EXEC, path.as_ptr() as usize, path.len()) };
 
     if pid >= 0 {
-        print(b"[spawn] Spawned process pid=");
-        print_u64(pid as u64);
-        println(b"");
-        wait_and_report(pid);
-        return;
+        println(b"[spawn] Spawned process");
+        // Busy-wait for child to exit. We poll waitpid directly in the loop
+        // to avoid any potential stack corruption from passing pid across
+        // function call boundaries.
+        loop {
+            let code = unsafe { syscall1(SYS_WAITPID, pid as usize) };
+            if code == WAIT_AGAIN {
+                for _ in 0..1000 {
+                    core::hint::spin_loop();
+                }
+                continue;
+            }
+            if code < 0 {
+                println(b"run: waitpid failed");
+                return;
+            }
+            return;
+        }
     }
 
     // Fallback: try legacy sys_spawn by program ID

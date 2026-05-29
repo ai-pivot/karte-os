@@ -27,7 +27,7 @@ global_asm!(
     "j trap_return_user",
 );
 
-const MAX_TASKS: usize = 64;
+pub const MAX_TASKS: usize = 64;
 
 /// Sentinel value for `Scheduler::current` meaning "init (the shell) is running".
 /// Init is NOT a TaskControlBlock; its saved kernel sp lives in INIT_TASK_SP.

@@ -6,6 +6,8 @@
 //!   a0-a5 = arguments (up to 6)
 //!   a0 = return value (>= 0 success, < 0 error)
 
+pub mod linux;
+
 // ─── Syscall numbers ──────────────────────────────────────────────
 
 // Level 1: Core
@@ -63,6 +65,16 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         crate::arch::trap::set_next_timer();
     }
 
+    // Try Linux compat layer first. If the ELF was loaded via sys_exec,
+    // the compat layer is enabled and will translate Linux syscall numbers
+    // to KarteOS equivalents (with argument adaptation).
+    if let Some(translation) = linux::translate(id, args) {
+        return match translation {
+            linux::Translation::Dispatch { karte_nr, args } => dispatch(karte_nr, args),
+            linux::Translation::Handled(retval) => retval,
+        };
+    }
+
     match id {
         SYS_DEBUG_PRINT => sys_debug_print(args[0], args[1]),
         SYS_EXIT => sys_exit(args[0] as i32),
@@ -77,6 +89,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_EXEC => sys_exec(args[0], args[1]),
         SYS_WAITPID => sys_waitpid(args[0]),
         SYS_LS => sys_ls(args[0], args[1]),
+
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
             ERR_INVAL
@@ -353,7 +366,7 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
 /// Syscall 10: Open a file.
 /// `path` = pointer to file path string, `path_len` = length, `flags` = open flags.
 /// Returns the file descriptor number, or a negative error code.
-fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
+pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     if path == 0 || path_len == 0 || path_len > 256 {
         return ERR_INVAL;
     }

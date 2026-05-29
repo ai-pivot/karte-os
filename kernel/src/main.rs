@@ -61,6 +61,11 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
 
+        // Enable Linux RISC-V syscall compatibility layer.
+        // Zero overhead for native KarteOS syscalls — the translation table
+        // is only consulted when a Linux syscall number is encountered.
+        crate::syscall::linux::enable();
+
         crate::console_println!("[init] Initializing PLIC...");
         arch::plic::init(0);
 

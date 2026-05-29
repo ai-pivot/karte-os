@@ -49,13 +49,20 @@ pub fn is_enabled() -> bool {
 
 // ─── Syscall number constants (Linux RISC-V) ────────────────────────
 
+const L_CLOSE: usize = 57;
+const L_LSEEK: usize = 62;
 const L_READ: usize = 63;
 const L_WRITE: usize = 64;
+const L_FSTAT: usize = 80;
 const L_EXIT: usize = 93;
 const L_EXIT_GROUP: usize = 94;
+const L_OPENAT: usize = 56;
 const L_GETPID: usize = 172;
 const L_BRK: usize = 214;
+const L_MUNMAP: usize = 215;
 const L_MMAP: usize = 222;
+const L_IOCTL: usize = 29;
+const L_SET_TID_ADDR: usize = 96;
 
 // ─── Translation table ──────────────────────────────────────────────
 
@@ -67,13 +74,62 @@ struct Entry {
 
 /// Sorted by `linux_nr` for binary search.
 const TABLE: &[Entry] = &[
-    Entry { linux_nr: L_READ, karte_nr: 3 },      // 63 → SYS_READ
-    Entry { linux_nr: L_WRITE, karte_nr: 2 },      // 64 → SYS_WRITE
-    Entry { linux_nr: L_EXIT, karte_nr: 1 },       // 93 → SYS_EXIT
-    Entry { linux_nr: L_EXIT_GROUP, karte_nr: 1 }, // 94 → SYS_EXIT
-    Entry { linux_nr: L_GETPID, karte_nr: 5 },     // 172 → SYS_GETPID
-    Entry { linux_nr: L_BRK, karte_nr: 4 },        // 214 → SYS_BRK
-    Entry { linux_nr: L_MMAP, karte_nr: 6 },       // 222 → SYS_MMAP
+    Entry {
+        linux_nr: L_OPENAT,
+        karte_nr: 10,
+    }, // 56 → SYS_OPEN (simplified)
+    Entry {
+        linux_nr: L_CLOSE,
+        karte_nr: 11,
+    }, // 57 → SYS_CLOSE
+    Entry {
+        linux_nr: L_LSEEK,
+        karte_nr: 3,
+    }, // 62 → stub (read-like, returns 0)
+    Entry {
+        linux_nr: L_READ,
+        karte_nr: 3,
+    }, // 63 → SYS_READ
+    Entry {
+        linux_nr: L_WRITE,
+        karte_nr: 2,
+    }, // 64 → SYS_WRITE
+    Entry {
+        linux_nr: L_FSTAT,
+        karte_nr: 0,
+    }, // 80 → debug_print stub (returns 0)
+    Entry {
+        linux_nr: L_EXIT,
+        karte_nr: 1,
+    }, // 93 → SYS_EXIT
+    Entry {
+        linux_nr: L_EXIT_GROUP,
+        karte_nr: 1,
+    }, // 94 → SYS_EXIT
+    Entry {
+        linux_nr: L_IOCTL,
+        karte_nr: 0,
+    }, // 29 → stub
+    Entry {
+        linux_nr: L_SET_TID_ADDR,
+        karte_nr: 5,
+    }, // 96 → SYS_GETPID (return pid)
+    Entry {
+        linux_nr: L_GETPID,
+        karte_nr: 5,
+    }, // 172 → SYS_GETPID
+    Entry {
+        linux_nr: L_BRK,
+        karte_nr: 4,
+    }, // 214 → SYS_BRK
+    Entry {
+        linux_nr: L_MUNMAP,
+        karte_nr: 0,
+    }, // 215 → stub (no-op, returns 0)
+    Entry {
+        linux_nr: L_MMAP,
+        karte_nr: 6,
+    }, // 222 → SYS_MMAP
 ];
 
 // ─── Argument adaptation ─────────────────────────────────────────────
@@ -88,18 +144,58 @@ fn adapt_args(linux_nr: usize, args: [usize; 6]) -> Option<[usize; 6]> {
             // We pass prot as flags — sufficient for anonymous mappings.
             Some([args[0], args[1], args[2], 0, 0, 0])
         }
+        L_OPENAT => {
+            // Linux openat(dirfd, pathname, flags, mode)
+            // KarteOS open(path, path_len, flags)
+            // dirfd is ignored (AT_FDCWD = -100), pass pathname and flags through
+            // We need the path length — but we don't know it here.
+            // Instead, we route to a dedicated linux_openat handler.
+            None // handled by linux_dispatch fallback
+        }
         _ => None, // 1:1 passthrough
     }
+}
+
+/// Linux syscalls that have no KarteOS equivalent but need a safe stub response.
+/// Returns `Some(retval)` for known stubs, `None` otherwise.
+pub fn stub_dispatch(linux_nr: usize, args: [usize; 6]) -> Option<isize> {
+    match linux_nr {
+        L_FSTAT => Some(0),                       // fake success
+        L_IOCTL => Some(0),                       // fake success
+        L_MUNMAP => Some(0),                      // fake success
+        L_SET_TID_ADDR => Some(args[0] as isize), // return tid
+        L_LSEEK => Some(0),                       // fake success (offset = 0)
+        _ => None,
+    }
+}
+
+/// Handle openat(dirfd, pathname, flags, mode) → KartenOS open(path, path_len, flags)
+fn linux_openat(dirfd: i32, path_ptr: usize, _flags: usize, _mode: usize) -> isize {
+    let _ = dirfd; // ignore AT_FDCWD
+    // Find path length (scan for NUL)
+    let mut path_len = 0usize;
+    while path_len < 256 {
+        let b = unsafe { core::ptr::read_volatile((path_ptr + path_len) as *const u8) };
+        if b == 0 {
+            break;
+        }
+        path_len += 1;
+    }
+    if path_len == 0 {
+        return -1;
+    }
+    // Route to KarteOS sys_open (syscall 10)
+    super::sys_open(path_ptr, path_len, 0)
 }
 
 // ─── Public API ──────────────────────────────────────────────────────
 
 /// Result of a successful syscall translation.
-pub struct Translation {
-    /// The KarteOS syscall number to dispatch.
-    pub karte_nr: usize,
-    /// The (possibly adapted) argument array.
-    pub args: [usize; 6],
+pub enum Translation {
+    /// Translate to a KarteOS syscall number and (possibly adapted) args.
+    Dispatch { karte_nr: usize, args: [usize; 6] },
+    /// Handle entirely within the compat layer (no KarteOS dispatch needed).
+    Handled(isize),
 }
 
 /// Try to translate a syscall number + arguments from Linux to KarteOS.
@@ -115,6 +211,17 @@ pub fn translate(id: usize, args: [usize; 6]) -> Option<Translation> {
         return None;
     }
 
+    // Check stub dispatch first (syscalls with no KarteOS equivalent)
+    if let Some(retval) = stub_dispatch(id, args) {
+        return Some(Translation::Handled(retval));
+    }
+
+    // Handle openat specially (different argument convention)
+    if id == L_OPENAT {
+        let result = linux_openat(args[0] as i32, args[1], args[2], args[3]);
+        return Some(Translation::Handled(result));
+    }
+
     // Binary search over the sorted table
     let idx = TABLE
         .binary_search_by(|entry| entry.linux_nr.cmp(&id))
@@ -123,7 +230,7 @@ pub fn translate(id: usize, args: [usize; 6]) -> Option<Translation> {
     let entry = &TABLE[idx];
     let translated_args = adapt_args(id, args).unwrap_or(args);
 
-    Some(Translation {
+    Some(Translation::Dispatch {
         karte_nr: entry.karte_nr,
         args: translated_args,
     })
