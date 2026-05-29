@@ -12,7 +12,9 @@ use crate::mm::{pmm, vmm};
 pub const USER_CODE_BASE: usize = 0x0000_0000;
 pub const USER_CODE_LIMIT: usize = 0x0040_0000; // 4 MB for code + data
 pub const USER_HEAP_BASE: usize = 0x0040_0000;
-pub const USER_HEAP_LIMIT: usize = 0x0080_0000; // 4 MB heap
+pub const USER_HEAP_LIMIT: usize = 0x0080_0000; // 4 MB heap (brk)
+pub const USER_MMAP_BASE: usize = 0x0100_0000; // 16 MB — start of mmap region
+pub const USER_MMAP_LIMIT: usize = 0x4000_0000; // 1 GB — end of mmap region
 pub const USER_STACK_TOP: usize = 0x8000_0000; // Top of user stack
 pub const USER_STACK_BASE: usize = 0x7FC0_0000; // 4 MB stack
 pub const USER_STACK_PAGES: usize = 64; // 256 KB actual stack

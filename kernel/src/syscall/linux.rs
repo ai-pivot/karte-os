@@ -73,63 +73,23 @@ struct Entry {
 }
 
 /// Sorted by `linux_nr` for binary search.
+/// DO NOT reorder — binary search requires sorted order.
+#[rustfmt::skip]
 const TABLE: &[Entry] = &[
-    Entry {
-        linux_nr: L_OPENAT,
-        karte_nr: 10,
-    }, // 56 → SYS_OPEN (simplified)
-    Entry {
-        linux_nr: L_CLOSE,
-        karte_nr: 11,
-    }, // 57 → SYS_CLOSE
-    Entry {
-        linux_nr: L_LSEEK,
-        karte_nr: 3,
-    }, // 62 → stub (read-like, returns 0)
-    Entry {
-        linux_nr: L_READ,
-        karte_nr: 3,
-    }, // 63 → SYS_READ
-    Entry {
-        linux_nr: L_WRITE,
-        karte_nr: 2,
-    }, // 64 → SYS_WRITE
-    Entry {
-        linux_nr: L_FSTAT,
-        karte_nr: 0,
-    }, // 80 → debug_print stub (returns 0)
-    Entry {
-        linux_nr: L_EXIT,
-        karte_nr: 1,
-    }, // 93 → SYS_EXIT
-    Entry {
-        linux_nr: L_EXIT_GROUP,
-        karte_nr: 1,
-    }, // 94 → SYS_EXIT
-    Entry {
-        linux_nr: L_IOCTL,
-        karte_nr: 0,
-    }, // 29 → stub
-    Entry {
-        linux_nr: L_SET_TID_ADDR,
-        karte_nr: 5,
-    }, // 96 → SYS_GETPID (return pid)
-    Entry {
-        linux_nr: L_GETPID,
-        karte_nr: 5,
-    }, // 172 → SYS_GETPID
-    Entry {
-        linux_nr: L_BRK,
-        karte_nr: 4,
-    }, // 214 → SYS_BRK
-    Entry {
-        linux_nr: L_MUNMAP,
-        karte_nr: 0,
-    }, // 215 → stub (no-op, returns 0)
-    Entry {
-        linux_nr: L_MMAP,
-        karte_nr: 6,
-    }, // 222 → SYS_MMAP
+    Entry { linux_nr: L_IOCTL,        karte_nr: 0 },  // 29 → stub
+    Entry { linux_nr: L_OPENAT,       karte_nr: 10 }, // 56 → SYS_OPEN
+    Entry { linux_nr: L_CLOSE,        karte_nr: 11 }, // 57 → SYS_CLOSE
+    Entry { linux_nr: L_LSEEK,        karte_nr: 3 },  // 62 → stub
+    Entry { linux_nr: L_READ,         karte_nr: 3 },  // 63 → SYS_READ
+    Entry { linux_nr: L_WRITE,        karte_nr: 2 },  // 64 → SYS_WRITE
+    Entry { linux_nr: L_FSTAT,        karte_nr: 0 },  // 80 → stub
+    Entry { linux_nr: L_EXIT,         karte_nr: 1 },  // 93 → SYS_EXIT
+    Entry { linux_nr: L_EXIT_GROUP,   karte_nr: 1 },  // 94 → SYS_EXIT
+    Entry { linux_nr: L_SET_TID_ADDR, karte_nr: 5 },  // 96 → SYS_GETPID
+    Entry { linux_nr: L_GETPID,       karte_nr: 5 },  // 172 → SYS_GETPID
+    Entry { linux_nr: L_BRK,          karte_nr: 4 },  // 214 → SYS_BRK
+    Entry { linux_nr: L_MUNMAP,       karte_nr: 0 },  // 215 → stub
+    Entry { linux_nr: L_MMAP,         karte_nr: 6 },  // 222 → SYS_MMAP
 ];
 
 // ─── Argument adaptation ─────────────────────────────────────────────

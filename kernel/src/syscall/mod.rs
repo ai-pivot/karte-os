@@ -65,9 +65,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         crate::arch::trap::set_next_timer();
     }
 
-    // Try Linux compat layer first. If the ELF was loaded via sys_exec,
-    // the compat layer is enabled and will translate Linux syscall numbers
-    // to KarteOS equivalents (with argument adaptation).
+    // Try Linux compat layer first.
     if let Some(translation) = linux::translate(id, args) {
         return match translation {
             linux::Translation::Dispatch { karte_nr, args } => dispatch(karte_nr, args),
@@ -307,7 +305,10 @@ fn sys_getpid() -> isize {
 /// Syscall 6: Map anonymous memory.
 /// `addr` = hint address (0 = kernel chooses), `len` = size, `flags` = prot flags
 /// Returns the mapped virtual address, or error.
-/// Simple implementation: always maps at the hint address or at brk.
+///
+/// When addr=0, allocates from a per-process mmap region that grows upward
+/// from USER_MMAP_BASE. This matches Linux behavior where mmap returns
+/// addresses in a dedicated region (not overlapping brk).
 fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
     if len == 0 {
         return ERR_INVAL;
@@ -317,21 +318,41 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
     let user_pt = crate::arch::trap::get_current_user_pt();
     let page_size = crate::mm::pmm::page_size();
 
-    // Determine mapping range
-    // If addr is 0, use current brk as base
     let base = if addr == 0 {
-        let current_brk = crate::process::current_brk();
-        // Align up
-        (current_brk + page_size - 1) & !(page_size - 1)
+        // Kernel chooses address: use mmap region, grow from current brk/mmap_top
+        let mmap_base = crate::process::USER_MMAP_BASE;
+        // Find first unmapped region in mmap area
+        let mut candidate = mmap_base;
+        let needed_pages = (len + page_size - 1) / page_size;
+        // Simple linear scan for a free region
+        'outer: loop {
+            let mut all_free = true;
+            for i in 0..needed_pages {
+                let vaddr = candidate + i * page_size;
+                if vaddr >= crate::process::USER_MMAP_LIMIT {
+                    return ERR_NOMEM;
+                }
+                if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
+                    // This page is already mapped, skip past it
+                    candidate = vaddr + page_size;
+                    continue 'outer;
+                }
+            }
+            break 'outer;
+        }
+        candidate
     } else {
-        // Align down
+        // Use hint address (aligned down)
         addr & !(page_size - 1)
     };
 
     let end = (base + len + page_size - 1) & !(page_size - 1);
 
-    // Validate range is within user heap area
-    if base < crate::process::USER_HEAP_BASE || end > crate::process::USER_HEAP_LIMIT {
+    // Validate range — allow mmap region and heap region
+    let valid_start = crate::process::USER_HEAP_BASE;
+    let valid_end = crate::process::USER_MMAP_LIMIT;
+    if base < valid_start || end > valid_end {
+        crate::console_println!("[mmap] range {:#x}-{:#x} out of bounds", base, end);
         return ERR_INVAL;
     }
 
