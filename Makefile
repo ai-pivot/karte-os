@@ -16,9 +16,13 @@ QEMU_FLAGS := \
  -drive id=blk0,file=disk.img,format=raw,if=none \
  -device virtio-blk-device,drive=blk0
 
-# Ensure disk image exists
+# Ensure disk image exists (64MB FAT32 formatted)
 disk.img:
-	dd if=/dev/zero of=disk.img bs=1M count=1 2>/dev/null
+	@if [ ! -f disk.img ]; then \
+		echo "Creating 64MB FAT32 disk image..."; \
+		dd if=/dev/zero of=disk.img bs=1M count=64 2>/dev/null; \
+		mkfs.vfat -F 32 disk.img 2>/dev/null || true; \
+	fi
 
 # Build the kernel (force rebuild to avoid stale test_mode binary)
 # We delete the binary + fingerprint because cargo's incremental cache doesn't

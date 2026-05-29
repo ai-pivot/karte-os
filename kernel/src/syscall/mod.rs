@@ -150,10 +150,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
 
             // Read current file data, modify at pos, write back
             {
-                let mut fs = crate::driver::fs::global_fs();
-                let mut data = fs
-                    .read(&name)
-                    .map(|d| alloc::vec::Vec::from(d))
+                let mut data = crate::driver::fs::read_file_owned(&name)
                     .unwrap_or_default();
                 let end = pos + len;
                 if end > data.len() {
@@ -162,7 +159,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
                 for i in 0..len {
                     data[pos + i] = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
                 }
-                let _ = fs.write(&name, &data);
+                let _ = crate::driver::fs::write_file_owned(&name, &data);
             }
 
             // Update seek position
@@ -201,13 +198,10 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    // Read from in-memory FS
-    let data = {
-        let fs = crate::driver::fs::global_fs();
-        match fs.read(&name) {
-            Some(d) => alloc::vec::Vec::from(d),
-            None => return ERR_NOENT,
-        }
+    // Read from FS (FAT32 + RamFS)
+    let data = match crate::driver::fs::read_file_owned(&name) {
+        Some(d) => d,
+        None => return ERR_NOENT,
     };
 
     // Copy from current position
@@ -378,15 +372,19 @@ fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         return ERR_INVAL;
     }
 
+    // Strip leading '/' for filesystem lookup
+    let name = alloc::string::String::from(name.strip_prefix('/').unwrap_or(&name));
+    if name.is_empty() {
+        return ERR_INVAL;
+    }
+
     // Check/create file in FS
-    {
-        let mut fs = crate::driver::fs::global_fs();
-        if flags & O_CREAT != 0 {
-            let _ = fs.create(&name);
-        }
-        if fs.read(&name).is_none() && (flags & O_CREAT == 0) {
-            return ERR_NOENT;
-        }
+    if flags & O_CREAT != 0 {
+        let _ = crate::driver::fs::create_file(&name);
+    }
+    // Verify file exists (try FAT32 + RamFS)
+    if crate::driver::fs::read_file_owned(&name).is_none() && (flags & O_CREAT == 0) {
+        return ERR_NOENT;
     }
 
     // Allocate fd from current process's FD table
@@ -456,15 +454,14 @@ fn sys_ls(buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    let fs = crate::driver::fs::global_fs();
-    let files = fs.list();
+    let files = crate::driver::fs::list_all_files();
 
     let mut written: usize = 0;
-    for file in files {
+    for (name, size) in files {
         // Format: "name\tsize\n"
 
         // Write name
-        for &b in file.name.as_bytes() {
+        for &b in name.as_bytes() {
             if written >= len {
                 break;
             }
@@ -477,14 +474,12 @@ fn sys_ls(buf: usize, len: usize) -> isize {
             written += 1;
         }
         // Size (write digits directly)
-        let mut size = file.data.len();
         if size == 0 {
             if written < len {
                 unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b'0') };
                 written += 1;
             }
         } else {
-            // Count digits
             let mut tmp = [0u8; 20];
             let mut i = 0;
             let mut n = size;
@@ -493,7 +488,6 @@ fn sys_ls(buf: usize, len: usize) -> isize {
                 n /= 10;
                 i += 1;
             }
-            // Write in reverse (most significant first)
             for j in (0..i).rev() {
                 if written >= len {
                     break;
@@ -513,7 +507,7 @@ fn sys_ls(buf: usize, len: usize) -> isize {
 }
 
 fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
-    // Load ELF from filesystem by program ID
+    // Map prog_id to file name (backward compatible)
     let file_name = match prog_id {
         0 => "hello",
         1 => "heap_test",
@@ -522,21 +516,18 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
         _ => return ERR_INVAL,
     };
 
-    // Load ELF data from filesystem and create process (within FS lock scope)
-    let proc = {
-        let fs = crate::driver::fs::global_fs();
-        match fs.read(file_name) {
-            Some(data) => match crate::process::Process::from_elf(data) {
-                Ok(p) => p,
-                Err(e) => {
-                    crate::console_println!("[spawn] Failed to create process: {}", e);
-                    return ERR_NOMEM;
-                }
-            },
-            None => {
-                crate::console_println!("[spawn] Program '{}' not found in filesystem", file_name);
-                return ERR_NOENT;
+    // Load ELF data from filesystem (FAT32 first, then RamFS)
+    let proc = match crate::driver::fs::read_file_owned(file_name) {
+        Some(data) => match crate::process::Process::from_elf(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::console_println!("[spawn] Failed to create process: {}", e);
+                return ERR_NOMEM;
             }
+        },
+        None => {
+            crate::console_println!("[spawn] Program '{}' not found in filesystem", file_name);
+            return ERR_NOENT;
         }
     };
 

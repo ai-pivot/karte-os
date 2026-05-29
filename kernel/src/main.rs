@@ -75,25 +75,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
         // ── Load user program ──
         crate::console_println!("[init] Loading user program...");
-        // Load /init from filesystem. Hold the FS lock during from_elf so the
-        // borrowed &[u8] remains valid. from_elf copies what it needs, then
-        // we can release the lock.
-        let init_result = {
-            let fs = driver::fs::global_fs();
-            match fs.read("init") {
-                Some(data) => {
-                    crate::console_println!(
-                        "[init] Loaded /init from filesystem ({} bytes)",
-                        data.len()
-                    );
-                    process::Process::from_elf(data)
-                }
-                None => {
-                    crate::console_println!("[init] WARNING: /init not found, using hello");
-                    process::Process::from_elf(include_bytes!("../../user/hello.elf"))
-                }
-            }
-        };
+        // init (shell) is always loaded from embedded bytes (703KB, no heap allocation).
+        // External programs loaded via `run` will use FAT32/RamFS.
+        let init_result = process::Process::from_elf(include_bytes!("../../user/shell.elf"));
         match init_result {
             Ok(proc) => {
                 crate::console_println!(
