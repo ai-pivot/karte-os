@@ -12,7 +12,10 @@ make test           # Build test kernel + run tests in QEMU
 make build-test     # Build test kernel only
 make boot-test      # Boot test (normal mode, verifies init sequence)
 make clean          # Clean all artifacts
-cd user && make     # Build user programs (hello.elf, heap_test.elf, file_test.elf, spawn_test.elf)
+cd user && make     # Build user programs (hello.elf, heap_test.elf, file_test.elf, spawn_test.elf, shell.elf)
+tools/mkdisk.sh init  # Create 64MB FAT32 disk.img
+tools/mkdisk.sh put <file>  # Copy host file to disk (accessible in OS)
+tools/mkdisk.sh list   # List files on disk
 ```
 
 QEMU exit: `Ctrl+A` then `X`.
@@ -57,6 +60,7 @@ Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases �
 - `user/user.ld` — Linker script: entry at 0x1000
 - User programs are embedded into the kernel via `include_bytes!()` at compile time
 - **Build before kernel**: `cd user && make` generates `*.elf` files that the kernel references
+- **FAT32 persistence**: External files can be added via `tools/mkdisk.sh put <file>` and loaded with `run /<file>`
 
 ## Syscall ABI
 
@@ -75,6 +79,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 11 | close | (fd) |
 | 30 | spawn | (prog_id, arg) — spawn new process (0=hello, 1=heap_test, 2=file_test, 3=spawn_test) |
 | 31 | waitpid | (pid) — wait for child process, returns exit code |
+| 32 | exec | (path, path_len) — spawn process from file path (FAT32/RamFS) |
 
 ## GOTCHAS
 

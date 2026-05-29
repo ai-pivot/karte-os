@@ -2,7 +2,6 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -200,10 +199,16 @@ pub fn init() {
             for (name, data) in &files_to_inject {
                 match crate::driver::fat32::inject_file(name, data) {
                     Ok(()) => injected += 1,
-                    Err(e) => crate::console_println!("[fs] Warning: failed to inject {}: {}", name, e),
+                    Err(e) => {
+                        crate::console_println!("[fs] Warning: failed to inject {}: {}", name, e)
+                    }
                 }
             }
-            crate::console_println!("[fs] Injected {}/{} files into FAT32", injected, files_to_inject.len());
+            crate::console_println!(
+                "[fs] Injected {}/{} files into FAT32",
+                injected,
+                files_to_inject.len()
+            );
             FAT32_AVAILABLE.store(true, core::sync::atomic::Ordering::Relaxed);
         }
         Err(e) => {
@@ -248,20 +253,18 @@ pub fn write_file_owned(name: &str, data: &[u8]) -> Result<(), ()> {
 /// List all files from both FAT32 and RamFS, deduplicated.
 pub fn list_all_files() -> Vec<(String, usize)> {
     let mut result = Vec::new();
-    let mut seen = alloc::collections::BTreeSet::new();
 
     // FAT32 files first
     if has_fat32() {
         for (name, size) in crate::driver::fat32::list_root() {
-            seen.insert(name.clone());
             result.push((name, size));
         }
     }
 
-    // RamFS files (skip duplicates)
+    // RamFS files (skip duplicates already in FAT32)
     let fs = FS.lock();
     for file in fs.list() {
-        if !seen.contains(&file.name) {
+        if !result.iter().any(|(n, _)| n == &file.name) {
             result.push((file.name.clone(), file.data.len()));
         }
     }
@@ -293,11 +296,7 @@ pub fn delete_file(name: &str) -> Result<(), ()> {
         ram_ok = fs.delete(name).is_ok();
     }
 
-    if fat32_ok || ram_ok {
-        Ok(())
-    } else {
-        Err(())
-    }
+    if fat32_ok || ram_ok { Ok(()) } else { Err(()) }
 }
 
 // ─── VFS Abstraction ────────────────────────────────────────────────

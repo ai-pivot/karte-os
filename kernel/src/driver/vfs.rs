@@ -2,10 +2,10 @@
 
 extern crate alloc;
 
+use crate::sync::spinlock::SpinLock;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::sync::spinlock::SpinLock;
 
 // ─── Error Types ──────────────────────────────────────────────────────────
 
@@ -117,9 +117,7 @@ pub struct OpenFileTable {
 
 impl OpenFileTable {
     pub fn new() -> Self {
-        Self {
-            files: Vec::new(),
-        }
+        Self { files: Vec::new() }
     }
 
     /// Allocate a new fd, returns the fd number
@@ -196,9 +194,7 @@ impl VfsState {
     const fn new_internal() -> Self {
         Self {
             mounts: Vec::new(),
-            open_files: OpenFileTable {
-                files: Vec::new(),
-            },
+            open_files: OpenFileTable { files: Vec::new() },
         }
     }
 }
@@ -432,7 +428,10 @@ fn resolve_path_locked(vfs: &VfsState, path: &str) -> Result<(usize, String), Vf
             if remainder.is_empty() || remainder.starts_with('/') {
                 let rel = remainder.strip_prefix('/').unwrap_or(remainder);
                 // Prefer the longest match
-                if best_mount.as_ref().map_or(true, |(_, prefix, _)| prefix.len() < mount_prefix.len()) {
+                if best_mount
+                    .as_ref()
+                    .map_or(true, |(_, prefix, _)| prefix.len() < mount_prefix.len())
+                {
                     best_mount = Some((i, mount_prefix, rel));
                 }
             }

@@ -24,6 +24,7 @@ pub const SYS_CLOSE: usize = 11;
 // Level 5: Threading
 pub const SYS_SPAWN: usize = 30;
 pub const SYS_WAITPID: usize = 31;
+pub const SYS_EXEC: usize = 32; // spawn by file path
 
 // Level 6: Extended
 pub const SYS_LS: usize = 40;
@@ -73,6 +74,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_OPEN => sys_open(args[0], args[1], args[2] as u32),
         SYS_CLOSE => sys_close(args[0] as i32),
         SYS_SPAWN => sys_spawn(args[0], args[1]),
+        SYS_EXEC => sys_exec(args[0], args[1]),
         SYS_WAITPID => sys_waitpid(args[0]),
         SYS_LS => sys_ls(args[0], args[1]),
         _ => {
@@ -101,7 +103,6 @@ fn sys_exit(code: i32) -> isize {
     if crate::sched::is_init_running() {
         crate::console_println!("[init] Shell exited, shutting down...");
         crate::sbi::shutdown();
-        unreachable!();
     }
 
     crate::process::set_exit_code(code as usize);
@@ -150,8 +151,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
 
             // Read current file data, modify at pos, write back
             {
-                let mut data = crate::driver::fs::read_file_owned(&name)
-                    .unwrap_or_default();
+                let mut data = crate::driver::fs::read_file_owned(&name).unwrap_or_default();
                 let end = pos + len;
                 if end > data.len() {
                     data.resize(end, 0);
@@ -573,6 +573,92 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
         }
         None => {
             crate::console_println!("[spawn] Scheduler full");
+            ERR_NOMEM
+        }
+    }
+}
+
+/// Syscall 32: Execute (spawn) a program by file path.
+/// `path` = pointer to file path string, `path_len` = length.
+/// Returns child PID on success, or negative error code.
+fn sys_exec(path: usize, path_len: usize) -> isize {
+    if path == 0 || path_len == 0 || path_len > 256 {
+        return ERR_INVAL;
+    }
+
+    // Read path from user memory
+    let mut path_buf = alloc::vec::Vec::new();
+    for i in 0..path_len {
+        let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
+        path_buf.push(byte);
+    }
+    // Strip trailing NUL
+    while path_buf.last() == Some(&0) {
+        path_buf.pop();
+    }
+    // Strip leading '/'
+    if path_buf.starts_with(b"/") {
+        path_buf.remove(0);
+    }
+    let name = alloc::string::String::from_utf8(path_buf).unwrap_or_default();
+    if name.is_empty() {
+        return ERR_INVAL;
+    }
+
+    crate::console_println!("[exec] Loading '{}'...", name);
+
+    // Load ELF data from filesystem (FAT32 + RamFS)
+    let proc = match crate::driver::fs::read_file_owned(&name) {
+        Some(data) => match crate::process::Process::from_elf(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::console_println!("[exec] Failed to create process: {}", e);
+                return ERR_NOMEM;
+            }
+        },
+        None => {
+            crate::console_println!("[exec] Program '{}' not found", name);
+            return ERR_NOENT;
+        }
+    };
+
+    let child_pid = proc.pid;
+    let entry = proc.entry;
+    let user_stack_top = proc.user_stack_top;
+    let kernel_stack_top = proc.kernel_stack_top;
+
+    let user_satp = if proc.page_table_root == 0 {
+        let satp: usize;
+        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
+        satp
+    } else {
+        (8usize << 60) | proc.page_table_root
+    };
+
+    let proc_idx = match crate::process::add_process(proc) {
+        Some(idx) => idx,
+        None => {
+            crate::console_println!("[exec] Process table full");
+            return ERR_NOMEM;
+        }
+    };
+
+    let parent_pid = crate::process::current_pid();
+    crate::process::set_ppid(proc_idx, parent_pid);
+
+    match crate::sched::add_user_process(
+        entry,
+        user_stack_top,
+        kernel_stack_top,
+        user_satp,
+        proc_idx,
+    ) {
+        Some(_tid) => {
+            crate::console_println!("[exec] Spawned '{}' pid={}", name, child_pid);
+            child_pid as isize
+        }
+        None => {
+            crate::console_println!("[exec] Scheduler full");
             ERR_NOMEM
         }
     }

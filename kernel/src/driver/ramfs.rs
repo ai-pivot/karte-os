@@ -6,7 +6,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::driver::vfs::{FileSystem, VfsError, VfsFileType, VfsMetadata, VfsDirEntry};
+use crate::driver::vfs::{FileSystem, VfsDirEntry, VfsError, VfsFileType, VfsMetadata};
 
 // ─── RamFS File Node ──────────────────────────────────────────────────────
 
@@ -57,12 +57,15 @@ impl RamFileSystem {
             next_inode: 2, // inode 1 is root
         };
         // Create root directory node
-        fs.nodes.insert(ROOT_INODE, RamFsNode {
-            name: String::from("/"),
-            data: RamFileData::Owned(Vec::new()),
-            is_dir: true,
-            children: Vec::new(),
-        });
+        fs.nodes.insert(
+            ROOT_INODE,
+            RamFsNode {
+                name: String::from("/"),
+                data: RamFileData::Owned(Vec::new()),
+                is_dir: true,
+                children: Vec::new(),
+            },
+        );
         fs
     }
 
@@ -166,14 +169,17 @@ impl FileSystem for RamFileSystem {
     }
 
     fn lookup(&self, dir: u64, name: &str) -> Result<u64, VfsError> {
-        self.find_child_by_name(dir, name)
-            .ok_or(VfsError::NotFound)
+        self.find_child_by_name(dir, name).ok_or(VfsError::NotFound)
     }
 
     fn metadata(&self, inode: u64) -> Result<VfsMetadata, VfsError> {
         let node = self.nodes.get(&inode).ok_or(VfsError::NotFound)?;
         Ok(VfsMetadata {
-            file_type: if node.is_dir { VfsFileType::Directory } else { VfsFileType::File },
+            file_type: if node.is_dir {
+                VfsFileType::Directory
+            } else {
+                VfsFileType::File
+            },
             size: node.data.len(),
             name: node.name.clone(),
         })
@@ -191,7 +197,11 @@ impl FileSystem for RamFileSystem {
         let child = self.nodes.get(&child_inode).ok_or(VfsError::NotFound)?;
         Ok(Some(VfsDirEntry {
             name: child.name.clone(),
-            file_type: if child.is_dir { VfsFileType::Directory } else { VfsFileType::File },
+            file_type: if child.is_dir {
+                VfsFileType::Directory
+            } else {
+                VfsFileType::File
+            },
             size: child.data.len(),
         }))
     }
@@ -275,7 +285,9 @@ impl FileSystem for RamFileSystem {
     }
 
     fn unlink(&mut self, dir: u64, name: &str) -> Result<(), VfsError> {
-        let inode = self.find_child_by_name(dir, name).ok_or(VfsError::NotFound)?;
+        let inode = self
+            .find_child_by_name(dir, name)
+            .ok_or(VfsError::NotFound)?;
         // Check directory is empty before removing
         let node = self.nodes.get(&inode).ok_or(VfsError::NotFound)?;
         if node.is_dir && !node.children.is_empty() {

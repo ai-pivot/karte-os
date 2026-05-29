@@ -23,6 +23,7 @@ const SYS_READ: usize = 3;
 const SYS_GETPID: usize = 5;
 const SYS_SPAWN: usize = 30;
 const SYS_WAITPID: usize = 31;
+const SYS_EXEC: usize = 32;
 const SYS_LS: usize = 40;
 
 /// sys_waitpid sentinel: child still running, poll again. Matches the kernel.
@@ -209,15 +210,27 @@ fn cmd_run(path: &[u8]) {
         println(b"Usage: run <file>");
         return;
     }
+
+    // Try sys_exec (spawn by file path) first — works for any file in FAT32/RamFS
+    let pid = unsafe { syscall2(SYS_EXEC, path.as_ptr() as usize, path.len()) };
+
+    if pid >= 0 {
+        print(b"[spawn] Spawned process pid=");
+        print_u64(pid as u64);
+        println(b"");
+        wait_and_report(pid);
+        return;
+    }
+
+    // Fallback: try legacy sys_spawn by program ID
     let prog_id: usize = match path {
         b"/hello" | b"hello" => 0,
         b"/heap_test" | b"heap_test" => 1,
         b"/file_test" | b"file_test" => 2,
         b"/spawn_test" | b"spawn_test" => 3,
         _ => {
-            print(b"run: unknown program: ");
+            print(b"run: file not found: ");
             println(path);
-            println(b"  available: hello, heap_test, file_test, spawn_test");
             return;
         }
     };
@@ -229,11 +242,11 @@ fn cmd_run(path: &[u8]) {
     print(b"spawned pid=");
     print_u64(pid as u64);
     println(b"");
+    wait_and_report(pid);
+}
 
-    // Wait for child to finish (polling waitpid).
-    //   WAIT_AGAIN (-1) → still running, poll again
-    //   < -1            → error (not our child)
-    //   >= 0            → exited with this code
+/// Wait for a child process and report its exit status.
+fn wait_and_report(pid: isize) {
     loop {
         let code = unsafe { syscall1(SYS_WAITPID, pid as usize) };
         if code == WAIT_AGAIN {

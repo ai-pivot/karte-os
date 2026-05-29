@@ -183,10 +183,13 @@ pub fn init() -> Result<(), &'static str> {
         }
     }
 
-    // Format then mount
+    // Format then mount (force FAT32, not FAT16)
     let mut storage = Fat32Storage::new();
-    fatfs::format_volume(&mut storage, FormatVolumeOptions::new())
-        .map_err(|_| "Failed to format FAT32 volume")?;
+    fatfs::format_volume(
+        &mut storage,
+        FormatVolumeOptions::new().fat_type(fatfs::FatType::Fat32),
+    )
+    .map_err(|_| "Failed to format FAT32 volume")?;
 
     match FileSystem::new(storage, FsOptions::new()) {
         Ok(fs) => {
