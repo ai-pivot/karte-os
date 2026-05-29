@@ -47,6 +47,8 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::mm::heap::run_tests();
         crate::driver::fs::run_tests();
         crate::sync::spinlock::run_tests();
+        crate::sync::int_spinlock::run_tests();
+        crate::sync::mutex::run_tests();
         crate::sched::task::run_tests();
         crate::syscall::run_tests();
 

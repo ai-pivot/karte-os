@@ -22,7 +22,7 @@ QEMU exit: `Ctrl+A` then `X`.
 
 ## ⚠️ Pre-Commit Checklist — MUST follow before every git commit
 
-**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (59 tests), boot-test, smp-test.**
+**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (70 tests), boot-test, smp-test.**
 ALL 5 must pass. Before committing, run:
 
 ```bash
@@ -50,6 +50,10 @@ make test                             # 4. Run tests (must be ALL PASSED)
 S-mode kernel on OpenSBI (M-mode). Identity-mapped Sv39 virtual memory. User programs run in U-mode with dual-path trap handling (trap_entry.S). Each process has its own Sv39 page table with kernel mappings copied in. ELF loader maps user code/data into per-process page tables. Round-Robin scheduler with `__switch()` assembly context switch. Multi-process via `sys_spawn` creates independent address spaces. SMP via SBI `hart_start` for secondary harts.
 
 Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases → load user ELF → switch satp to user page table → `sret` to U-mode → user `ecall` → trap handler → syscall dispatch. Multi-process: `sys_spawn` creates child process with own page table + kernel stack → registered in scheduler → Round-Robin via timer interrupt → `__switch` context switch → satp restored in trap_handler (per-process address space isolation). New tasks enter via `trap_return_user` assembly label. Last process exit triggers SBI shutdown.
+
+Synchronization: Three levels of kernel locks. (1) `SpinLock` — for short critical sections (a few instructions, e.g., run queue manipulation). (2) `IntSpinLock` — like SpinLock but also saves/restores `sstatus.SIE` to prevent interrupt-induced deadlocks. (3) `YieldMutex` / `BlockingMutex` — for I/O-bound operations (filesystem, block device); contention yields to the scheduler instead of spinning. **Rule: never hold a SpinLock across block I/O.**
+
+Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, via `starry-fatfs`) → RamFS (embedded ELF files). Boot priority: try ext4 mount, on failure try FAT32, finally RamFS-only. ext4 files are pre-loaded on the host via `tools/mkdisk.sh put`; no boot-time injection (too many I/O round-trips).
 
 ## User Programs
 
@@ -97,6 +101,9 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **amoswap/lr/sc**: RISC-V atomic extensions NOT available on bare target
 - **sys_write**: Use byte-by-byte `read_volatile` + `console_putchar`, NOT `from_raw_parts` + `from_utf8` (causes bounds panic in S-mode trap context)
 - **illegal_instruction handler**: Must NOT use console_println! — the SpinLock in UART output can deadlock when timer interrupts fire during CSR probing. Silently skip_trap_instruction instead.
+- **ext4_rs vendored**: patched to add `try_open()` (returns Err on non-ext4 disks instead of panicking) and `Ext4Superblock::is_valid()`. Do NOT upgrade to upstream without these patches.
+- **ext4 boot-time injection**: NEVER inject files into ext4 at boot. ext4 metadata ops (inode alloc, bitmap update, dir entry write) require ~30+ block I/O round-trips per file, causing kernel to appear hung. Use `tools/mkdisk.sh put` on the host instead.
+- **ext4_rs `write_offset`**: expects exactly BLOCK_SIZE (4096) bytes. Shorter writes need zero-padding to fill the block. The `KarteBlockDevice` adapter handles this.
 - **stvec alignment**: `trap_entry` MUST be 4-byte aligned (`.p2align 2` in trap_entry.S). stvec's low 2 bits are the MODE field; if the label lands on a 2-byte boundary the base is truncated and traps vector mid-instruction → infinite illegal-instruction loop.
 - **TrapContext = 288 bytes** (36 usizes): x[0..32], sstatus(256), sepc(264), sscratch(272), user_satp(280). `user_satp` is non-zero ONLY for a task's first U-mode entry (via `first_task_shim`, which bypasses trap_handler); trap_return_user switches satp when it's set. Keep trap_entry.S offsets, main.rs, and sched add_user_process in sync (use `size_of::<TrapContext>()`).
 - **Scheduler**: `current == MAX_TASKS` is the sentinel meaning "init (shell) is running" (init has no TCB; its sp lives in INIT_TASK_SP). Children occupy real slots 0+. `schedule_exit` returns to init when no Ready child remains.
@@ -122,4 +129,4 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **Test framework**: `kernel/src/test.rs` — TAP-style `run_test(name, || bool)` API
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`
 - **CI**: GitHub Actions runs build + lint + test + boot-test + smp-test on every push
-- **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), Task (6), Syscall (15) = **59 tests**
+- **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), IntSpinLock (5), Mutex (6), Task (6), Syscall (15) = **70 tests**
