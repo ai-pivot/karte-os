@@ -13,10 +13,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use ext4_rs::{BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_INODE_MODE_FILE, Ext4, ROOT_INODE};
-use spin::Mutex;
 
 use crate::driver::vfs::{FileSystem, VfsDirEntry, VfsError, VfsFileType, VfsMetadata};
-use crate::sync::spinlock::SpinLock;
+use crate::sync::mutex::YieldMutex;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -100,10 +99,12 @@ unsafe impl Sync for KarteBlockDevice {}
 
 /// ext4 filesystem wrapper implementing the VFS `FileSystem` trait.
 ///
-/// Uses `spin::Mutex<Ext4>` for interior mutability because ext4_rs methods
-/// take `&self` while VFS write operations require `&mut self`.
+/// Uses `YieldMutex<Ext4>` for interior mutability. ext4_rs methods take
+/// `&self` while VFS write operations require `&mut self`. The YieldMutex
+/// yields to the scheduler on contention instead of spinning, which is
+/// appropriate for I/O-bound filesystem operations.
 pub struct Ext4Fs {
-    ext4: Mutex<Ext4>,
+    ext4: YieldMutex<Ext4>,
 }
 
 impl Ext4Fs {
@@ -115,7 +116,7 @@ impl Ext4Fs {
         let ext4 =
             Ext4::try_open(bd).map_err(|_| "no valid ext4 filesystem found on block device")?;
         Ok(Self {
-            ext4: Mutex::new(ext4),
+            ext4: YieldMutex::new(ext4),
         })
     }
 }
@@ -262,8 +263,13 @@ impl FileSystem for Ext4Fs {
 
 // ─── Global State ───────────────────────────────────────────────────────────
 
-/// Global ext4 filesystem instance, protected by SpinLock.
-static EXT4_FS: SpinLock<Option<Ext4Fs>> = SpinLock::new(None);
+/// Global ext4 filesystem instance.
+///
+/// Protected by `YieldMutex`: on contention, the caller yields to the
+/// scheduler instead of burning CPU spinning. This is the correct behavior
+/// for a filesystem mutex that may be held across multiple block I/O
+/// operations lasting many milliseconds.
+static EXT4_FS: YieldMutex<Option<Ext4Fs>> = YieldMutex::new(None);
 
 /// Whether the ext4 filesystem has been successfully initialized.
 static EXT4_AVAILABLE: AtomicBool = AtomicBool::new(false);
