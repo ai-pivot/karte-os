@@ -210,17 +210,12 @@ jobs:
           timeout 10 qemu-system-x86_64 \
             -machine pc -cpu qemu64 -nographic -m 128M \
             -cdrom karte-os-x86_64.iso -no-reboot \
-            -d int \
             > /tmp/boot-x86.log 2>&1 || true
-          # Show last 200 lines of serial output
-          echo "=== Serial output (last 200 lines) ==="
-          grep -v "^vcpu\|^Check\|^Trying\|^info\|^pci\|^Ignoring\|^timer\|^ Shut" /tmp/boot-x86.log | tail -200
           if grep -qa "KarteOS Shell" /tmp/boot-x86.log; then
             echo "✅ x86_64 boot test PASSED"
           else
             echo "❌ x86_64 boot test FAILED"
-            echo "=== Exception log (last 50 lines) ==="
-            grep "exception\|double\|interrupt\|Triple" /tmp/boot-x86.log | tail -50
+            cat /tmp/boot-x86.log
             exit 1
           fi
 
