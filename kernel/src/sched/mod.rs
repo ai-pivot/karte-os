@@ -44,17 +44,25 @@ unsafe extern "C" {
     fn first_task_shim();
 }
 
-/// First task shim for x86_64: __switch returns here, which jumps to
-/// trap_return_user to restore user registers and iretq.
+/// First task shim for x86_64: __switch `ret`s here.
+/// After __switch, rsp points at the TrapContext.
+/// We pass rsp as argument to trap_return_user, which pops GP regs and iretqs.
+/// MUST be naked — any compiler prologue would corrupt rsp.
 #[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
 unsafe extern "C" fn first_task_shim() -> ! {
-    // Jump to trap_return_user — this naked function restores GP regs and iretqs
-    unsafe extern "C" {
-        fn trap_return_user();
-    }
     unsafe {
-        core::arch::asm!("jmp {}", in(reg) trap_return_user as usize, options(noreturn));
+        core::arch::naked_asm!(
+            "mov rdi, rsp",
+            "jmp {handler}",
+            handler = sym trap_return_user,
+        );
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn trap_return_user(ctx: *mut crate::arch::trap::TrapContext) -> !;
 }
 
 pub const MAX_TASKS: usize = 64;
@@ -351,24 +359,34 @@ pub fn add_user_process(
 
     #[cfg(target_arch = "x86_64")]
     {
+        // x86_64 stack layout (from high to low):
+        //   kernel_stack_top
+        //     └─ TrapContext (ctx_size bytes)
+        //        └─ __switch frame:
+        //           +48: return address (→ first_task_shim)
+        //           +40: rbp
+        //           +32: rbx
+        //           +24: r12
+        //           +16: r13
+        //           +8:  r14
+        //           +0:  r15   ← switch_sp (TASK_SPS[tid])
+        //
+        // __switch pops r15..rbp then `ret` pops return address → first_task_shim
+        // first_task_shim jumps to trap_return_user which pops GP regs and iretqs
         let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
-        // x86_64 __switch frame: 6 callee-saved regs × 8 bytes + return address = 56 bytes
-        let switch_frame_size = 7 * 8;
+        let switch_frame_size: usize = 7 * 8; // 6 callee-saved + ret addr
         let trap_ctx_base = kernel_stack_top - ctx_size;
         let switch_sp = trap_ctx_base - switch_frame_size;
         unsafe {
-            // Zero out the entire area
             core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + switch_frame_size);
-            // __switch frame: return address = first_task_shim
-            // On x86_64, `call __switch` pushes the return address.
-            // When we pop callee-saved regs and `ret`, it jumps to first_task_shim.
+            // __switch frame: ret address at highest slot (offset +48)
             let sw = switch_sp as *mut usize;
-            *sw.add(0) = first_task_shim as *const () as usize;
-            // Build TrapContext for the task's first U-mode entry via trap_return_user.
+            *sw.add(6) = first_task_shim as *const () as usize; // ret addr at top of frame
+            // Build TrapContext
             let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
             (*ctx).rip = entry as u64;
             (*ctx).cs = crate::arch::gdt::USER_CODE_SEL.load(Ordering::Relaxed) as u64;
-            (*ctx).rflags = 0x202; // IF + reserved bit
+            (*ctx).rflags = 0x202;
             (*ctx).rsp = user_stack_top as u64;
             (*ctx).ss = crate::arch::gdt::USER_DATA_SEL.load(Ordering::Relaxed) as u64;
             (*ctx).kernel_sp = kernel_stack_top as u64;

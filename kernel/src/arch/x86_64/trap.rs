@@ -159,21 +159,8 @@ pub unsafe extern "C" fn trap_return_user() {
     unsafe {
         core::arch::naked_asm!(
             // ── Restore general-purpose registers ──
-            "pop rax",
-            "pop rbx",
-            "pop rcx",
-            "pop rdx",
-            "pop rbp",
-            "pop rsi",
-            "pop rdi",
-            "pop r8",
-            "pop r9",
-            "pop r10",
-            "pop r11",
-            "pop r12",
-            "pop r13",
-            "pop r14",
-            "pop r15",
+            "pop rax", "pop rbx", "pop rcx", "pop rdx", "pop rbp", "pop rsi", "pop rdi", "pop r8",
+            "pop r9", "pop r10", "pop r11", "pop r12", "pop r13", "pop r14", "pop r15",
             // After 15 pops, rsp now points to the iretq frame (rip field).
             // Layout from rsp:
             //   +0:  rip      (+0x00)
@@ -183,12 +170,14 @@ pub unsafe extern "C" fn trap_return_user() {
             //   +32: ss       (+0x20)
             //   +40: kernel_sp  (+0x28)
             //   +48: user_cr3   (+0x30) ← check this for page table switch
-            "mov r11, [rsp + 48]", // r11 = user_cr3
-            "test r11, r11",
-            "jz 2f",
-            // Switch page table
-            "mov cr3, r11",
-            "2:",
+            //
+            // NOTE: We skip CR3 switching for now. All tasks share the kernel
+            // page table. User code is mapped into kernel page table.
+            // This avoids the complexity of per-process page tables while still
+            // allowing user mode to execute.
+            //
+            // TODO: Implement proper CR3 switching with kernel trampoline page.
+
             // ── Return to Ring 3 ──
             "iretq",
         );
@@ -201,6 +190,9 @@ pub fn init() {
     super::gdt::init();
     super::idt::init();
     super::lapic::init();
+    // NOTE: Timer interrupts disabled temporarily — context switching from
+    // interrupt context not yet implemented. Shell uses polling via sys_read.
+    // super::lapic::enable_timer();
 }
 
 /// Enable timer interrupts via LAPIC.

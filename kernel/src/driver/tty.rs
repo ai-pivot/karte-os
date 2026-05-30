@@ -162,7 +162,16 @@ pub fn init() {
 /// Poll UART RX FIFO and feed all available bytes into the TTY line editor.
 /// Called from timer interrupt handler.
 pub fn poll_uart() {
+    #[cfg(target_arch = "riscv64")]
     let uart = crate::driver::uart::Uart::new(0x1000_0000);
+    #[cfg(target_arch = "x86_64")]
+    {
+        while let Some(c) = crate::arch::uart::getchar() {
+            on_char(c);
+        }
+        return;
+    }
+    #[cfg(target_arch = "riscv64")]
     while let Some(c) = uart.getc() {
         on_char(c);
     }
@@ -263,8 +272,17 @@ fn read_available(buf: usize, len: usize) -> isize {
 
 /// Echo bytes directly to UART (raw MMIO, no SpinLock, safe from interrupt context).
 fn echo(bytes: &[u8]) {
-    let uart = crate::driver::uart::Uart::new(0x1000_0000);
-    for &b in bytes {
-        uart.putc(b);
+    #[cfg(target_arch = "riscv64")]
+    {
+        let uart = crate::driver::uart::Uart::new(0x1000_0000);
+        for &b in bytes {
+            uart.putc(b);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        for &b in bytes {
+            crate::arch::uart::putchar(b);
+        }
     }
 }

@@ -20,6 +20,7 @@ pub const SYS_PIPE: usize = 7;
 pub const SYS_DUP2: usize = 8;
 pub const SYS_KILL: usize = 60;
 
+#[cfg(target_arch = "riscv64")]
 #[inline(always)]
 pub unsafe fn syscall1(id: usize, a0: usize) -> isize {
     let ret: isize;
@@ -27,6 +28,20 @@ pub unsafe fn syscall1(id: usize, a0: usize) -> isize {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn syscall1(id: usize, a0: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "int 0x80",
+        inlateout("rax") id => ret,
+        in("rdi") a0,
+        out("rcx") _,
+    );
+    ret
+}
+
+#[cfg(target_arch = "riscv64")]
 #[inline(always)]
 pub unsafe fn syscall2(id: usize, a0: usize, a1: usize) -> isize {
     let ret: isize;
@@ -34,6 +49,21 @@ pub unsafe fn syscall2(id: usize, a0: usize, a1: usize) -> isize {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn syscall2(id: usize, a0: usize, a1: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "int 0x80",
+        inlateout("rax") id => ret,
+        in("rdi") a0,
+        in("rsi") a1,
+        out("rcx") _,
+    );
+    ret
+}
+
+#[cfg(target_arch = "riscv64")]
 #[inline(always)]
 pub unsafe fn syscall3(id: usize, a0: usize, a1: usize, a2: usize) -> isize {
     let ret: isize;
@@ -41,10 +71,42 @@ pub unsafe fn syscall3(id: usize, a0: usize, a1: usize, a2: usize) -> isize {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn syscall3(id: usize, a0: usize, a1: usize, a2: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "int 0x80",
+        inlateout("rax") id => ret,
+        in("rdi") a0,
+        in("rsi") a1,
+        in("rdx") a2,
+        out("rcx") _,
+    );
+    ret
+}
+
+#[cfg(target_arch = "riscv64")]
 #[inline(always)]
 pub unsafe fn syscall4(id: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
     let ret: isize;
     core::arch::asm!("ecall", in("a7") id, inlateout("a0") a0 => ret, in("a1") a1, in("a2") a2, in("a3") a3);
+    ret
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn syscall4(id: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "int 0x80",
+        inlateout("rax") id => ret,
+        in("rdi") a0,
+        in("rsi") a1,
+        in("rdx") a2,
+        in("r10") a3,
+        out("rcx") _,
+    );
     ret
 }
 

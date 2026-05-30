@@ -15,6 +15,7 @@ pub mod gdt;
 pub mod idt;
 pub mod lapic;
 pub mod paging;
+pub mod pci;
 pub mod platform;
 pub mod smp;
 pub mod switch;

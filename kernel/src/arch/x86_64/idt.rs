@@ -1,86 +1,63 @@
-//! IDT (Interrupt Descriptor Table) setup using the `x86_64` crate.
+//! IDT setup using the `x86_64` crate.
 //!
-//! The `x86_64` crate provides `extern "x86-interrupt"` ABI support:
-//! the compiler automatically generates prologue/epilogue that saves and
-//! restores all registers, so most handlers can be pure Rust.
-//!
-//! For syscalls and context switching we need custom ISR stubs that
-//! save additional register state (TrapContext).
+//! CPU exceptions and hardware interrupts use `extern "x86-interrupt"` handlers.
+//! Syscall (int 0x80) uses a custom naked ISR stub for full register control.
 
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
-/// Hardware interrupt vector base (IRQ0 = vector 32, remapped by PIC).
 pub const IRQ_BASE: u8 = 32;
-
-/// System call interrupt vector (int 0x80, Linux-compatible).
 pub const SYSCALL_VECTOR: u8 = 0x80;
-
-/// Timer interrupt vector (IRQ0 remapped to 32).
 pub const TIMER_VECTOR: u8 = IRQ_BASE + 0;
-
-/// Keyboard interrupt vector (IRQ1 remapped to 33).
 pub const KEYBOARD_VECTOR: u8 = IRQ_BASE + 1;
-
-/// COM1 UART interrupt vector (IRQ4 remapped to 36).
 pub const COM1_VECTOR: u8 = IRQ_BASE + 4;
-
-/// Spurious interrupt vector (IRQ7, spurious in PIC).
 pub const SPURIOUS_VECTOR: u8 = IRQ_BASE + 7;
 
-/// Initialize the IDT and load it.
 pub fn init() {
     IDT.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
 
-        // CPU exception handlers
-        idt.divide_error.set_handler_fn(divide_error_handler);
-        idt.debug.set_handler_fn(debug_handler);
-        idt.non_maskable_interrupt.set_handler_fn(nmi_handler);
+        // CPU exceptions
         idt.breakpoint.set_handler_fn(breakpoint_handler);
-        idt.overflow.set_handler_fn(overflow_handler);
-        idt.bound_range_exceeded.set_handler_fn(bound_range_handler);
-        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
-        idt.device_not_available
-            .set_handler_fn(device_not_available_handler);
-        // Double fault uses IST[0] for a dedicated stack
         unsafe {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(super::gdt::DOUBLE_FAULT_IST_INDEX);
         }
-        idt.invalid_tss.set_handler_fn(invalid_tss_handler);
-        idt.segment_not_present
-            .set_handler_fn(segment_not_present_handler);
-        idt.stack_segment_fault
-            .set_handler_fn(stack_segment_fault_handler);
         idt.general_protection_fault
             .set_handler_fn(gp_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
-        idt.x87_floating_point
-            .set_handler_fn(x87_floating_point_handler);
-        idt.alignment_check.set_handler_fn(alignment_check_handler);
-        idt.machine_check.set_handler_fn(machine_check_handler);
-        idt.simd_floating_point
-            .set_handler_fn(simd_floating_point_handler);
-        idt.virtualization.set_handler_fn(virtualization_handler);
-        idt.security_exception
-            .set_handler_fn(security_exception_handler);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
-        // Hardware interrupt handlers
+        // Hardware interrupts
         idt[TIMER_VECTOR].set_handler_fn(timer_handler);
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_handler);
         idt[COM1_VECTOR].set_handler_fn(com1_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
-        // Syscall via int 0x80
-        // Note: `extern "x86-interrupt"` doesn't give us access to all GP regs.
-        // For full syscall dispatch we need a custom ISR stub (see trap.rs).
-        // This is a placeholder; the real syscall path goes through a naked
-        // function wrapper defined in trap.rs.
-        idt[SYSCALL_VECTOR].set_handler_fn(syscall_int_handler);
+        // Syscall via int 0x80 — custom naked stub for full register control
+        // We cannot use set_handler_fn with a naked function directly.
+        // Instead, we construct the IDT entry manually.
+        {
+            let handler_addr = syscall_isr_stub as usize as u64;
+            let entry_ptr = &mut idt[SYSCALL_VECTOR] as *mut _ as *mut u64;
+            // IDT entry 16 bytes:
+            //   lo (8 bytes): offset_lo[15:0] | selector[31:16] | ist_attr[47:32] | offset_mid[63:48]
+            //   hi (8 bytes): offset_hi[31:0] | reserved[63:32]
+            let selector: u64 = 0x0008; // kernel code segment
+            let attr: u64 = 0xEE00; // Present | DPL3 | Interrupt Gate 64-bit | IST=0
+            let lo = ((handler_addr & 0xFFFF) << 0)
+                | (selector << 16)
+                | (attr << 32)
+                | (((handler_addr >> 16) & 0xFFFF) << 48);
+            let hi = (handler_addr >> 32) & 0xFFFFFFFF;
+            unsafe {
+                *entry_ptr = lo;
+                *entry_ptr.add(1) = hi;
+            }
+        }
 
         idt
     });
@@ -88,206 +65,165 @@ pub fn init() {
     IDT.get().unwrap().load();
 }
 
-// ─── CPU Exception Handlers ─────────────────────────────────
-
-extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
-    crate::console_println!(
-        "[EXCEPTION] Divide Error at {:#x}",
-        frame.instruction_pointer.as_u64(),
-    );
-}
-
-extern "x86-interrupt" fn debug_handler(frame: InterruptStackFrame) {
-    crate::console_println!(
-        "[EXCEPTION] Debug at {:#x}",
-        frame.instruction_pointer.as_u64(),
-    );
-}
-
-extern "x86-interrupt" fn nmi_handler(frame: InterruptStackFrame) {
-    crate::console_println!(
-        "[EXCEPTION] NMI at {:#x}",
-        frame.instruction_pointer.as_u64(),
-    );
-}
+// ─── CPU Exceptions ──────────────────────────────────────────
 
 extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
     crate::console_println!(
-        "[EXCEPTION] Breakpoint at {:#x}",
-        frame.instruction_pointer.as_u64(),
+        "[EXCEPTION] BP at {:#x}",
+        frame.instruction_pointer.as_u64()
     );
 }
 
-extern "x86-interrupt" fn overflow_handler(frame: InterruptStackFrame) {
-    crate::console_println!(
-        "[EXCEPTION] Overflow at {:#x}",
-        frame.instruction_pointer.as_u64(),
+extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _err: u64) -> ! {
+    panic!(
+        "[EXCEPTION] Double Fault at {:#x}",
+        frame.instruction_pointer.as_u64()
     );
 }
 
-extern "x86-interrupt" fn bound_range_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64) {
+    // On x86_64, GP faults during early bringup can be caused by many things.
+    // Don't use console_println here — it can cause nested faults if the
+    // UART lock is held. Just skip the instruction and continue.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Skip the faulting instruction (int 0x80 is 2 bytes, others vary)
+        // For now, just loop — this shouldn't happen in normal operation
+        let _ = frame;
+        let _ = err;
+        loop {}
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::console_println!(
+            "[EXCEPTION] GP Fault at {:#x}, err={:#x}",
+            frame.instruction_pointer.as_u64(),
+            err
+        );
+    }
+}
+
+extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: PageFaultErrorCode) {
+    let fault_addr = x86_64::registers::control::Cr2::read();
+    let cr3 = unsafe {
+        x86_64::registers::control::Cr3::read()
+            .0
+            .start_address()
+            .as_u64()
+    };
     crate::console_println!(
-        "[EXCEPTION] Bound Range Exceeded at {:#x}",
+        "[EXCEPTION] Page Fault at {:#x}, accessing {:#x}, CR3={:#x}",
         frame.instruction_pointer.as_u64(),
+        fault_addr.map(|a| a.as_u64()).unwrap_or(0),
+        cr3,
     );
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Invalid Opcode at {:#x}",
-        frame.instruction_pointer.as_u64(),
+        frame.instruction_pointer.as_u64()
     );
 }
 
-extern "x86-interrupt" fn device_not_available_handler(frame: InterruptStackFrame) {
-    crate::console_println!(
-        "[EXCEPTION] Device Not Available at {:#x}",
-        frame.instruction_pointer.as_u64(),
-    );
-}
-
-extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
-    panic!(
-        "[EXCEPTION] Double Fault at {:#x}, error code={:#x}",
-        frame.instruction_pointer.as_u64(),
-        error_code,
-    );
-}
-
-extern "x86-interrupt" fn invalid_tss_handler(frame: InterruptStackFrame, error_code: u64) {
-    crate::console_println!(
-        "[EXCEPTION] Invalid TSS at {:#x}, error code={:#x}",
-        frame.instruction_pointer.as_u64(),
-        error_code,
-    );
-}
-
-extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame, error_code: u64) {
-    crate::console_println!(
-        "[EXCEPTION] Segment Not Present at {:#x}, error code={:#x}",
-        frame.instruction_pointer.as_u64(),
-        error_code,
-    );
-}
-
-extern "x86-interrupt" fn stack_segment_fault_handler(frame: InterruptStackFrame, error_code: u64) {
-    crate::console_println!(
-        "[EXCEPTION] Stack Segment Fault at {:#x}, error code={:#x}",
-        frame.instruction_pointer.as_u64(),
-        error_code,
-    );
-}
-
-extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, error_code: u64) {
-    crate::console_println!(
-        "[EXCEPTION] General Protection Fault at {:#x}, error code={:#x}",
-        frame.instruction_pointer.as_u64(),
-        error_code,
-    );
-}
-
-extern "x86-interrupt" fn page_fault_handler(
-    frame: InterruptStackFrame,
-    error_code: PageFaultErrorCode,
-) {
-    let fault_addr = x86_64::registers::control::Cr2::read();
-    crate::console_println!(
-        "[EXCEPTION] Page Fault at {:#x}, accessing {:#x}, error={:?}",
-        frame.instruction_pointer.as_u64(),
-        fault_addr.expect("valid virtual address").as_u64(),
-        error_code,
-    );
-    // TODO: forward to the kernel's page fault handler for lazy allocation
-}
-
-extern "x86-interrupt" fn x87_floating_point_handler(frame: InterruptStackFrame) {
-    crate::console_println!(
-        "[EXCEPTION] x87 Floating Point at {:#x}",
-        frame.instruction_pointer.as_u64(),
-    );
-}
-
-extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error_code: u64) {
-    crate::console_println!(
-        "[EXCEPTION] Alignment Check at {:#x}, error code={:#x}",
-        frame.instruction_pointer.as_u64(),
-        error_code,
-    );
-}
-
-extern "x86-interrupt" fn machine_check_handler(frame: InterruptStackFrame) -> ! {
-    panic!(
-        "[EXCEPTION] Machine Check at {:#x}",
-        frame.instruction_pointer.as_u64(),
-    );
-}
-
-extern "x86-interrupt" fn simd_floating_point_handler(frame: InterruptStackFrame) {
-    crate::console_println!(
-        "[EXCEPTION] SIMD Floating Point at {:#x}",
-        frame.instruction_pointer.as_u64(),
-    );
-}
-
-extern "x86-interrupt" fn virtualization_handler(frame: InterruptStackFrame) {
-    crate::console_println!(
-        "[EXCEPTION] Virtualization at {:#x}",
-        frame.instruction_pointer.as_u64(),
-    );
-}
-
-extern "x86-interrupt" fn security_exception_handler(frame: InterruptStackFrame, error_code: u64) {
-    crate::console_println!(
-        "[EXCEPTION] Security Exception at {:#x}, error code={:#x}",
-        frame.instruction_pointer.as_u64(),
-        error_code,
-    );
-}
-
-// ─── Hardware Interrupt Handlers ─────────────────────────────
+// ─── Hardware Interrupts ─────────────────────────────────────
 
 extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
-    // LAPIC timer tick — drive the scheduler
-    crate::arch::lapic::local_eoi();
-    // Poll UART (like RISC-V timer handler)
+    super::lapic::local_eoi();
     crate::driver::tty::poll_uart();
-    // Set next timer tick
     super::lapic::set_next_timer();
-    // Invoke round-robin scheduler
-    crate::sched::schedule();
+    // Don't call schedule() for now — context switching from interrupt
+    // context requires full TrapContext save/restore which isn't set up yet.
+    // TODO: Implement proper context switching from interrupt context.
 }
 
 extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
-    // Read scan code from keyboard controller
     let _scancode: u8 = unsafe { x86_64::instructions::port::Port::new(0x60).read() };
-    // TODO: keyboard input handling
     super::lapic::local_eoi();
 }
 
 extern "x86-interrupt" fn com1_handler(_frame: InterruptStackFrame) {
-    // COM1 UART interrupt — drain RX FIFO into TTY ring buffer
     crate::driver::tty::poll_uart();
     super::lapic::local_eoi();
 }
 
 extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {
-    // Spurious interrupt — ignore (don't send EOI for PIC spurious)
+    // Spurious — don't EOI
 }
 
-// ─── Syscall Handler (int 0x80) ──────────────────────────────
+// ─── Syscall ISR Stub (custom naked) ────────────────────────
+//
+// We use a custom naked ISR stub because we need to know the exact register
+// save order to extract syscall args. The IDT entry points here.
+//
+// Stack on entry (CPU pushes): SS, RSP, RFLAGS, CS, RIP  (iretq frame)
+// We push all GP regs in a known order, call the handler, restore, iretq.
 
-extern "x86-interrupt" fn syscall_int_handler(frame: InterruptStackFrame) {
-    // NOTE: `extern "x86-interrupt"` only gives us the InterruptStackFrame,
-    // not the full register state. For a real syscall dispatch we need a
-    // custom ISR stub that saves all GP registers into a TrapContext.
-    // This is a placeholder. The actual syscall path uses a naked wrapper
-    // defined in trap.rs that builds a full TrapContext before calling
-    // the Rust trap_handler.
-    //
-    // For now, read syscall number from rax via the frame (not available
-    // in InterruptStackFrame — need custom approach).
-    crate::console_println!(
-        "[SYSCALL] int 0x80 at {:#x} (custom ISR stub needed for register access)",
-        frame.instruction_pointer.as_u64(),
-    );
+/// Rust syscall handler called from assembly.
+unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
+    unsafe {
+        // Register save order from assembly (push order, reversed for array):
+        // push rdi [0], rsi [1], rdx [2], rcx [3], r8 [4], r9 [5],
+        //       r10 [6], r11 [7], rax [8]
+        let s = state_ptr;
+        let rdi = *s.add(0) as usize;
+        let rsi = *s.add(1) as usize;
+        let rdx = *s.add(2) as usize;
+        let r10 = *s.add(6) as usize;
+        let r8 = *s.add(4) as usize;
+        let r9 = *s.add(5) as usize;
+        let rax = *s.add(8) as usize;
+
+        let syscall_id = rax;
+        let args = [rdi, rsi, rdx, r10, r8, r9];
+
+        let result = crate::syscall::dispatch(syscall_id, args);
+        result as u64
+    }
+}
+
+/// Naked ISR stub for int 0x80. Saves all GP regs, calls handler, restores, iretqs.
+/// Referenced by the manually-constructed IDT entry.
+#[unsafe(naked)]
+unsafe extern "C" fn syscall_isr_stub() {
+    unsafe {
+        core::arch::naked_asm!(
+            // Disable interrupts — we don't want timer interrupt during syscall
+            "cli",
+
+            // Save all GP registers in known order
+            "push rax",          // [8]
+            "push r11",          // [7]
+            "push r10",          // [6]
+            "push r9",           // [5]
+            "push r8",           // [4]
+            "push rcx",          // [3]
+            "push rdx",          // [2]
+            "push rsi",          // [1]
+            "push rdi",          // [0]
+
+            // Call Rust handler with pointer to saved state
+            "mov rdi, rsp",
+            "call {}",
+
+            // Result is in rax. Write it to the saved rax slot (rsp + 8*8 = rsp + 64).
+            "mov [rsp + 64], rax",
+
+            // Restore all GP registers
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop rcx",
+            "pop r8",
+            "pop r9",
+            "pop r10",
+            "pop r11",
+            "pop rax",
+
+            // Re-enable interrupts and return
+            "sti",
+            "iretq",
+            sym syscall_handler_impl,
+        );
+    }
 }

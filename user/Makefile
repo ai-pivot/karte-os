@@ -18,11 +18,19 @@ OBJCOPY = $(CROSS)objcopy
 # (otherwise `make build` / CI fails after `make clean`).
 RUSTC = rustc
 RUSTFLAGS_USER = --edition 2024 --target $(RUSTC_TARGET) \
-	-C panic=abort -C opt-level=2 -C link-arg=-T$(LD_SCRIPT) --crate-type bin
+	-C panic=abort -C opt-level=2 -C relocation-model=static -C link-arg=-T$(LD_SCRIPT) --crate-type bin
 
-TARGETS = hello.elf heap_test.elf file_test.elf spawn_test.elf shell.elf \
-	ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf \
-	grep.elf sed.elf wc.elf head.elf tail.elf
+# Assembly programs (RISC-V only)
+ifeq ($(ARCH),riscv64)
+ASM_TARGETS = hello.elf heap_test.elf file_test.elf spawn_test.elf
+else
+ASM_TARGETS =
+endif
+
+RUST_TARGETS = shell.elf ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf \
+ grep.elf sed.elf wc.elf head.elf tail.elf
+
+TARGETS = $(ASM_TARGETS) $(RUST_TARGETS)
 
 all: $(TARGETS)
 

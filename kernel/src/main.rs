@@ -86,6 +86,22 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             driver::virtio::probe_virtio_devices();
         }
 
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::console_println!("[init] Probing PCI devices...");
+            arch::pci::init();
+            if let Some(virtio_blk) = arch::pci::find_virtio_blk() {
+                crate::console_println!(
+                    "[pci] Found VirtIO block device at {:02x}:{:02x}.{}",
+                    virtio_blk.bus,
+                    virtio_blk.device,
+                    virtio_blk.function
+                );
+                virtio_blk.enable();
+                // TODO: Initialize VirtIO block device via PCI BAR
+            }
+        }
+
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
 
@@ -206,10 +222,11 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
                 #[cfg(target_arch = "x86_64")]
                 {
+                    // CR3 = physical address of PML4 table (ppn << 12)
                     let user_cr3 = if proc.page_table_root == 0 {
                         0u64
                     } else {
-                        proc.page_table_root as u64
+                        (proc.page_table_root << 12) as u64
                     };
 
                     crate::console_println!("[init] Entering user mode...");

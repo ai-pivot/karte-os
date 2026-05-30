@@ -95,13 +95,18 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Identity map kernel (2MB .. 2MB + 128MB)
+        // Map kernel code/data (1MB..8MB) — skip 0x0..1MB to avoid
+        // conflicting with user code at 0x1000+
+        // Note: must cover trap_return_user and all kernel code that runs
+        // after CR3 switch to user page table
         vmm::identity_map(
             user_pt,
-            0x0020_0000,
-            0x0020_0000 + 128 * 1024 * 1024,
+            0x10_0000,   // 1MB — start of kernel
+            0x0800_0000, // 8MB
             vmm::PTEFlags::KRWX,
         );
+        // Map LAPIC MMIO at 0xFEE00000
+        vmm::map(user_pt, 0xFEE0_0000, 0xFEE0_0000, vmm::PTEFlags::KRW);
     }
 }
 
@@ -139,6 +144,9 @@ impl Process {
                     None => {
                         let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
                         vmm::map_user(user_pt, vaddr, f, vmm::PTEFlags::URWX);
+                        // Also map into kernel page table (x86_64: no CR3 switch)
+                        #[cfg(target_arch = "x86_64")]
+                        vmm::map(vmm::get_kernel_page_table(), vaddr, f, vmm::PTEFlags::URWX);
                         unsafe {
                             core::ptr::write_bytes(f as *mut u8, 0, page_size);
                         }
@@ -174,6 +182,13 @@ impl Process {
             let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
             let vaddr = USER_STACK_TOP - (i + 1) * pmm::page_size();
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
+            #[cfg(target_arch = "x86_64")]
+            vmm::map(
+                vmm::get_kernel_page_table(),
+                vaddr,
+                frame,
+                vmm::PTEFlags::URW,
+            );
         }
 
         // 6. Allocate kernel stack for this process (identity mapped already by vmm::init)

@@ -244,10 +244,22 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
     }
 
     // stdin: blocking read from TTY subsystem.
-    // If no data is available, the current task blocks until the user
-    // presses Enter (the TTY line editor commits a line to the ring buffer).
     if fd == 0 {
-        return crate::driver::tty::read(buf, len);
+        // On x86_64 without timer interrupts, poll UART in a loop until data arrives.
+        // On RISC-V, timer interrupts poll UART periodically, but we also poll
+        // here for responsiveness.
+        loop {
+            crate::driver::tty::poll_uart();
+            let result = crate::driver::tty::read(buf, len);
+            if result > 0 {
+                return result;
+            }
+            // Brief pause to avoid burning CPU (hlt until next interrupt)
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::asm!("pause")
+            };
+        }
     }
 
     // Get file info from current process's FD table
@@ -1369,11 +1381,16 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
     let proc =
         crate::process::get_process_by_index(proc_idx).expect("Process disappeared after add");
 
+    #[cfg(target_arch = "riscv64")]
+    let user_satp = (8usize << 60) | proc.page_table_root;
+    #[cfg(target_arch = "x86_64")]
+    let user_satp = proc.page_table_root << 12; // CR3 = physical address of PML4
+
     match crate::sched::add_user_process(
         proc.entry,
         proc.user_stack_top,
         proc.kernel_stack_top,
-        (8usize << 60) | proc.page_table_root,
+        user_satp,
         proc_idx,
     ) {
         Some(_tid) => {
@@ -1509,11 +1526,16 @@ fn sys_fork() -> isize {
     let child_proc =
         crate::process::get_process_by_index(child_idx).expect("Child disappeared after add");
 
+    #[cfg(target_arch = "riscv64")]
+    let user_satp = (8usize << 60) | child_proc.page_table_root;
+    #[cfg(target_arch = "x86_64")]
+    let user_satp = child_proc.page_table_root << 12;
+
     match crate::sched::add_user_process(
         child_proc.entry,
         child_proc.user_stack_top,
         child_proc.kernel_stack_top,
-        (8usize << 60) | child_proc.page_table_root,
+        user_satp,
         child_idx,
     ) {
         Some(_tid) => {

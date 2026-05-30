@@ -164,14 +164,20 @@ pub fn init() {
     // Pre-populate filesystem with embedded user programs.
     let mut fs = FS.lock();
 
-    fs.write_static("hello", include_bytes!("../../../user/hello.elf"))
-        .unwrap();
-    fs.write_static("heap_test", include_bytes!("../../../user/heap_test.elf"))
-        .unwrap();
-    fs.write_static("file_test", include_bytes!("../../../user/file_test.elf"))
-        .unwrap();
-    fs.write_static("spawn_test", include_bytes!("../../../user/spawn_test.elf"))
-        .unwrap();
+    // Assembly test programs are RISC-V only
+    #[cfg(target_arch = "riscv64")]
+    {
+        fs.write_static("hello", include_bytes!("../../../user/hello.elf"))
+            .unwrap();
+        fs.write_static("heap_test", include_bytes!("../../../user/heap_test.elf"))
+            .unwrap();
+        fs.write_static("file_test", include_bytes!("../../../user/file_test.elf"))
+            .unwrap();
+        fs.write_static("spawn_test", include_bytes!("../../../user/spawn_test.elf"))
+            .unwrap();
+    }
+
+    // Shell and init are available on all architectures
     fs.write_static("shell", include_bytes!("../../../user/shell.elf"))
         .unwrap();
     fs.write_static("init", include_bytes!("../../../user/shell.elf"))
@@ -200,16 +206,22 @@ pub fn init() {
             match crate::driver::fat32::init() {
                 Ok(()) => {
                     crate::console_println!("[fs] FAT32 filesystem mounted");
-                    let files_to_inject = [
-                        ("hello", include_bytes!("../../../user/hello.elf") as &[u8]),
+                    #[cfg(target_arch = "riscv64")]
+                    let files_to_inject: &[(&str, &[u8])] = &[
+                        ("hello", include_bytes!("../../../user/hello.elf")),
                         ("heap_test", include_bytes!("../../../user/heap_test.elf")),
                         ("file_test", include_bytes!("../../../user/file_test.elf")),
                         ("spawn_test", include_bytes!("../../../user/spawn_test.elf")),
                         ("shell", include_bytes!("../../../user/shell.elf")),
                         ("init", include_bytes!("../../../user/shell.elf")),
                     ];
+                    #[cfg(target_arch = "x86_64")]
+                    let files_to_inject: &[(&str, &[u8])] = &[
+                        ("shell", include_bytes!("../../../user/shell.elf")),
+                        ("init", include_bytes!("../../../user/shell.elf")),
+                    ];
                     let mut injected = 0;
-                    for (name, data) in &files_to_inject {
+                    for (name, data) in files_to_inject.iter() {
                         match crate::driver::fat32::inject_file(name, data) {
                             Ok(()) => injected += 1,
                             Err(e) => {
