@@ -5,7 +5,7 @@
 ```
 QEMU (virt machine, rv64)
   → OpenSBI (M-mode firmware, QEMU bundled)
-    → _start @ 0x80200000 (entry.S)
+    → _start @ 0x80200000 (arch/riscv64/entry.S)
       → Clear BSS (_sbss .. _ebss)
       → Set SP = _boot_stack_top
       → call kmain(hartid, dtb_ptr)
@@ -77,16 +77,16 @@ For single-process, this is a no-op — no sfence.vma overhead.
 ## Subsystem Dependencies
 
 ```
-sbi.rs (console output)
-  ↑ used by all other modules
+arch/riscv64/sbi.rs (console output, SBI calls)
+  ↑ used by all other modules via crate::arch::sbi
 
 driver/uart.rs (serial console)
 driver/virtio.rs → depends on mm/pmm (DMA buffers), mm/vmm (MMIO mapping)
 driver/fs.rs     → depends on mm/heap (Vec, String via alloc)
 
-arch/trap.rs     → depends on sbi.rs, sched/ (timer → schedule), process/ (satp switch)
-arch/plic.rs     → depends on driver/uart (interrupt handler)
-arch/smp.rs      → depends on mm/pmm (stack alloc), arch/trap, arch/plic
+arch/riscv64/trap.rs     → depends on arch::sbi, sched/ (timer → schedule), process/ (satp switch)
+arch/riscv64/plic.rs     → depends on driver/uart (interrupt handler)
+arch/riscv64/smp.rs      → depends on mm/pmm (stack alloc), arch::trap, arch::plic
 
 mm/pmm.rs        → standalone (uses linker symbols _ekernel)
 mm/vmm.rs        → depends on mm/pmm (page table allocation)
@@ -94,18 +94,28 @@ mm/heap.rs       → depends on mm/pmm (heap pages)
 
 process/         → depends on mm/pmm (page tables + stacks), mm/vmm (user mapping)
 sched/           → depends on mm/pmm (task stacks), process/ (task→process mapping), sync/spinlock
-syscall/         → depends on sched (getpid, exit, spawn), process/ (current, from_elf), sbi (write)
+syscall/         → depends on sched (getpid, exit, spawn), process/ (current, from_elf), arch::sbi (write)
 
 main.rs          → orchestrates all subsystems in correct order
+platform.rs      → architecture-specific constants (MMIO bases, memory layout)
 ```
 
 ## Crate Dependencies
 
+RISC-V specific dependencies are gated by target architecture in `kernel/Cargo.toml`:
+
 ```toml
+[dependencies]
+buddy_system_allocator = "0.13"
+spin = "0.12"
+bitflags = "2.11"
+virtio-drivers = { version = "0.13.0", features = ["alloc"] }
+starry-fatfs = { version = "0.4.1-preview.2", default-features = false, features = ["alloc", "lfn"] }
+log = { version = "0.4", default-features = false }
+ext4_rs = { path = "vendor/ext4_rs" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
 riscv = "0.16"                     # CSR access, register structs
+riscv-rt = "0.17"
 sbi = "0.3.0"                      # SBI timer, system_reset, hsm
-buddy_system_allocator = "0.11"    # Kernel heap
-virtio-drivers = { version = "0.13.0", features = ["alloc"] }  # VirtIO
-spin = "0.9"                       # SpinLock
-bitflags = "2.0"                   # PTE flags
 ```
