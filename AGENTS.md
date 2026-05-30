@@ -1,9 +1,10 @@
 # KarteOS — AGENTS.md
 
-> A modern RISC-V 64-bit operating system written in Rust 2024 Edition.
+> A modern dual-architecture (RISC-V 64 + x86_64) operating system written in Rust 2024 Edition.
 
 ## Quick Start
 
+### RISC-V 64 (primary)
 ```bash
 make build          # Build kernel (cargo build --release)
 make run            # Run in QEMU (single core)
@@ -16,6 +17,28 @@ cd user && make     # Build user programs (hello.elf, shell.elf, ls/cat/echo/mkd
 tools/mkdisk.sh init  # Create 64MB FAT32 disk.img
 tools/mkdisk.sh put <file>  # Copy host file to disk (accessible in OS)
 tools/mkdisk.sh list   # List files on disk
+```
+
+### x86_64 (secondary)
+```bash
+cd user && make ARCH=x86_64 clean && make ARCH=x86_64  # Build user programs for x86_64
+touch user/hello.elf user/heap_test.elf user/file_test.elf user/spawn_test.elf  # Stubs for cfg-gated includes
+cargo +nightly build --release --target x86_64-unknown-none -p karte-os-kernel -Z build-std=core,alloc
+mkdir -p target/x86_64-iso/boot/grub
+cp target/x86_64-unknown-none/release/karte-os-kernel target/x86_64-iso/boot/karte-os-kernel
+cat > target/x86_64-iso/boot/grub/grub.cfg << 'EOF'
+set timeout=0
+set default=0
+menuentry "KarteOS" {
+    multiboot2 /boot/karte-os-kernel
+    boot
+}
+EOF
+grub-mkrescue -o target/karte-os-x86_64.iso target/x86_64-iso
+qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot
+# With VirtIO block device:
+qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot \
+    -drive file=disk.img,format=raw,if=none,id=hd0 -device virtio-blk-pci,drive=hd0
 ```
 
 QEMU exit: `Ctrl+A` then `X`.
@@ -40,14 +63,23 @@ make test                             # 4. Run tests (must be ALL PASSED)
 
 ## Build Requirements
 
+### RISC-V 64 (primary)
 - Rust stable (1.93+), target `riscv64gc-unknown-none-elf`
 - `qemu-system-riscv64` (8.2+)
 - `gcc-riscv64-linux-gnu` (for user programs, objdump, nm)
 - Dependencies: `riscv` 0.16, `sbi` 0.3.0, `buddy_system_allocator`, `virtio-drivers` (alloc feature), `spin`, `bitflags`
 
+### x86_64 (secondary)
+- Rust nightly (required for `abi_x86_interrupt` and `#[unsafe(naked)]`), target `x86_64-unknown-none`
+- `qemu-system-x86_64` (8.2+)
+- `grub-mkrescue` (from `grub-common` / `xorriso`)
+- Dependencies: `x86_64` crate, `uart_16550`, plus shared deps above
+
 ## Architecture Overview
 
-**Multi-arch structure**: Architecture-specific code lives under `arch/<arch>/` with `#[cfg(target_arch)]` conditional compilation. Currently only `riscv64` is implemented; `x86_64` is a stub. RISC-V dependencies (`riscv`, `sbi`, `riscv-rt`) are gated by `[target.'cfg(target_arch = "riscv64")'.dependencies]` in `kernel/Cargo.toml`. Platform constants are in `platform.rs`.
+**Dual-architecture**: Architecture-specific code lives under `arch/<arch>/` with `#[cfg(target_arch)]` conditional compilation. `riscv64` is the primary (stable); `x86_64` is secondary (nightly required). Platform constants are in `platform.rs`. RISC-V dependencies (`riscv`, `sbi`, `riscv-rt`) are gated by `[target.'cfg(target_arch = "riscv64")'.dependencies]` in `kernel/Cargo.toml`. x86_64 dependencies (`x86_64`, `uart_16550`) are gated by `[target.'cfg(target_arch = "x86_64")'.dependencies]`.
+
+**x86_64 boot flow**: GRUB ISO → `_start` (32-bit) → disable GRUB paging → set P4/P3/P2 tables → enable PAE → load CR3 → enable long mode → lgdt → enable paging → lretl to `_start64` → `call kmain`. Page tables: P2 with 64×2MB pages (128MB identity map) + P3 with 3×1GB huge pages (1-4GB for MMIO). Build: `cargo +nightly build --release --target x86_64-unknown-none -Z build-std=core,alloc`. Run: `grub-mkrescue` → ISO → `qemu-system-x86_64 -cdrom target/karte-os-x86_64.iso -serial stdio`. PCI enumeration via I/O ports (0xCF8/0xCFC). VirtIO block device discovered via PCI vendor ID 0x1AF4. Syscall via `int 0x80` with custom naked ISR stub (DPL=3 for Ring 3 access). User programs compiled with `-C relocation-model=static` to avoid PIE/GOT issues.
 
 S-mode kernel on OpenSBI (M-mode). Identity-mapped Sv39 virtual memory. User programs run in U-mode with dual-path trap handling (trap_entry.S). Each process has its own Sv39 page table with kernel mappings copied in. ELF loader maps user code/data into per-process page tables. Round-Robin scheduler with `__switch()` assembly context switch. Multi-process via `sys_spawn` creates independent address spaces. SMP via SBI `hart_start` for secondary harts.
 
@@ -59,13 +91,14 @@ Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, 
 
 ## User Programs
 
-- `user/hello.S` — Minimal "Hello from user!" via sys_write + sys_exit
-- `user/heap_test.S` — Tests brk heap allocation (single-page + 8-page) with read/write verification
-- `user/file_test.S` — Tests sys_open/close/read/write file operations with data verification
-- `user/spawn_test.S` — Tests sys_spawn multi-process: parent spawns child (hello), both run concurrently
-- `user/user.ld` — Linker script: entry at 0x1000
+- `user/hello.S` — Minimal "Hello from user!" via sys_write + sys_exit (RISC-V only)
+- `user/heap_test.S` — Tests brk heap allocation (RISC-V only)
+- `user/file_test.S` — Tests sys_open/close/read/write (RISC-V only)
+- `user/spawn_test.S` — Tests sys_spawn multi-process (RISC-V only)
+- `user/user.ld` — RISC-V linker script: entry at 0x1000
+- `user/user-x86_64.ld` — x86_64 linker script: entry at 0x1000
 - `user/shell.rs` — Interactive shell (v0.5): pipe `|`, redirect `>` `>>` `<`, command history ↑/↓, Tab completion, built-ins: cd/exit/export/help/kill
-- `user/syscall.rs` — Shared syscall wrapper module for all Rust binaries
+- `user/syscall.rs` — Shared syscall wrapper module for all Rust binaries (cfg-gated per arch)
 - `user/ls.rs`, `cat.rs`, `echo.rs`, `mkdir.rs`, `rm.rs`, `env.rs`, `pwd.rs` — Independent command binaries
 - `user/grep.rs` — Text search with pattern matching (stdin or file)
 - `user/sed.rs` — Stream editor with `s/old/new/g` substitution (stdin or file)
@@ -73,7 +106,9 @@ Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, 
 - `user/head.rs` — Output first N lines (stdin or file)
 - `user/tail.rs` — Output last N lines (stdin or file)
 - User programs are embedded into the kernel via `include_bytes!()` at compile time
-- **Build before kernel**: `cd user && make` generates `*.elf` files that the kernel references
+- **Build before kernel**: `cd user && make` (or `make ARCH=x86_64`) generates `*.elf` files that the kernel references
+- **RISC-V assembly programs** (.S files) are cfg-gated and only included on riscv64
+- **x86_64 user programs** use `int 0x80` for syscalls (vs RISC-V `ecall`)
 - **ext4 deployment**: Copy ELF files to ext4 root without `.elf` extension (e.g., `ls.elf` → `ls`)
 
 ## Syscall ABI
@@ -145,6 +180,12 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **FdType routing**: `sys_read`/`sys_write` check `FdType::PipeRead`/`PipeWrite` before falling through to Stdio/TTY/UART. fd=0/1/2 are pre-allocated as `FdType::Stdio` but can be overridden via `sys_dup2` or inherited from parent via `sys_exec_fd`.
 - **O_APPEND**: New flag `O_APPEND=0x400` for `sys_open`. Shell's `>>` redirect uses O_CREAT|O_APPEND. Not yet implemented at kernel write level (appends via write_at_end pattern).
 - **sys_fork**: Deep-copies user page table (no COW). Copies fd table including pipe refs (increments refcount). Child resumes at same sepc — currently always returns parent's PID (child path needs trap_context manipulation to return 0).
+- **x86_64 PTE flags**: x86_64 PTE bit layout is completely different from RISC-V. Present(0), R/W(1), U/S(2), PWT(3), PCD(4), A(5), D(6), PS(7), G(8), NX(63). `PTEFlags` is cfg-gated per architecture. Non-leaf PTEs MUST have User bit set for Ring 3 page walks to work.
+- **x86_64 IDT syscall DPL**: `int 0x80` for syscalls MUST have DPL=3 in the IDT entry, otherwise Ring 3 code triggers GP Fault. Default `set_handler_fn` sets DPL=0; must patch attribute byte (set bits 5-6).
+- **x86_64 user programs**: Must compile with `-C relocation-model=static` to avoid PIE. PIE generates GOT-based indirect calls that jump to address 0 without a dynamic linker.
+- **x86_64 copy_kernel_mappings**: Must NOT identity-map the user address range (0..1MB) into user page tables, or ELF loader's `translate_user` check will find stale mappings and skip frame allocation, writing shell code to wrong physical pages.
+- **x86_64 UART**: COM1 uses I/O ports (`in`/`out`), NOT MMIO. `tty.rs` uses `arch::uart` (port I/O) on x86_64, not `driver::uart` (MMIO). RISC-V UART at 0x10000000 is MMIO.
+- **x86_64 no CR3 switch**: Currently user code runs with kernel CR3 (no page table isolation). User pages are mapped into kernel page table. `trap_return_user` skips `mov cr3`. Timer interrupts disabled (no context switching from interrupt context).
 
 ## Knowledge Files
 
@@ -166,3 +207,4 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`
 - **CI**: GitHub Actions runs build + lint + test + boot-test + smp-test on every push
 - **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), IntSpinLock (5), Mutex (6), Task (6), Syscall (15) = **69 tests**
+- **x86_64**: Tests not yet ported — only RISC-V runs `make test`
