@@ -33,6 +33,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         crate::arch::uart::init_uart();
+        crate::driver::vga::init();
     }
 
     crate::console_println!("=== KarteOS v0.2.0 ===");
@@ -90,45 +91,86 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         {
             crate::console_println!("[init] Probing PCI devices...");
             arch::pci::init();
-            if let Some(virtio_blk) = arch::pci::find_virtio_blk() {
+
+            // Try AHCI (SATA) first, then VirtIO block device
+            if let Some(ahci_dev) = arch::pci::find_ahci() {
                 crate::console_println!(
-                    "[pci] Found VirtIO block device at {:02x}:{:02x}.{} bars=[{:#x},{:#x},{:#x}]",
-                    virtio_blk.bus,
-                    virtio_blk.device,
-                    virtio_blk.function,
-                    virtio_blk.bars[0],
-                    virtio_blk.bars[1],
-                    virtio_blk.bars[2]
+                    "[pci] Found AHCI controller at {:02x}:{:02x}.{} bars=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                    ahci_dev.bus,
+                    ahci_dev.device,
+                    ahci_dev.function,
+                    ahci_dev.bars[0],
+                    ahci_dev.bars[1],
+                    ahci_dev.bars[2],
+                    ahci_dev.bars[3],
+                    ahci_dev.bars[4],
+                    ahci_dev.bars[5]
                 );
 
-                virtio_blk.enable();
+                ahci_dev.enable();
 
-                let bar0 = virtio_blk.bars[0];
-                // BAR0 bit 0 = 1 means I/O space
-                let is_io = (bar0 & 1) == 1;
-                let bar_addr = virtio_blk.bar_address(0) as usize;
-                let bar_size = virtio_blk.bar_size(0) as usize;
+                // AHCI uses BAR5 (Memory-Mapped I/O)
+                let abar = ahci_dev.bar_address(5) as usize;
+                let abar_size = ahci_dev.bar_size(5) as usize;
 
-                crate::console_println!(
-                    "[pci] BAR0: {:#x} ({}), size={:#x}",
-                    bar_addr,
-                    if is_io { "I/O" } else { "MMIO" },
-                    bar_size
-                );
+                crate::console_println!("[pci] ABAR (BAR5): {:#x}, size={:#x}", abar, abar_size);
 
-                if is_io && bar_addr != 0 {
-                    // Legacy VirtIO PCI — I/O port access
-                    let io_base = (bar_addr & 0xFFFC) as u16;
-                    match arch::virtio_blk::init(io_base) {
+                if abar != 0 {
+                    match crate::driver::ahci::init(abar, abar_size) {
                         Ok(()) => {
-                            crate::console_println!("[pci] VirtIO block device initialized");
+                            crate::console_println!("[pci] AHCI controller initialized");
                         }
                         Err(e) => {
-                            crate::console_println!("[pci] VirtIO init failed: {}", e);
+                            crate::console_println!("[pci] AHCI init failed: {}", e);
                         }
                     }
                 }
             }
+
+            if !crate::driver::ahci::is_available() {
+                // Fall back to VirtIO block device if no AHCI
+                if let Some(virtio_blk) = arch::pci::find_virtio_blk() {
+                    crate::console_println!(
+                        "[pci] Found VirtIO block device at {:02x}:{:02x}.{} bars=[{:#x},{:#x},{:#x}]",
+                        virtio_blk.bus,
+                        virtio_blk.device,
+                        virtio_blk.function,
+                        virtio_blk.bars[0],
+                        virtio_blk.bars[1],
+                        virtio_blk.bars[2]
+                    );
+
+                    virtio_blk.enable();
+
+                    let bar0 = virtio_blk.bars[0];
+                    let is_io = (bar0 & 1) == 1;
+                    let bar_addr = virtio_blk.bar_address(0) as usize;
+                    let bar_size = virtio_blk.bar_size(0) as usize;
+
+                    crate::console_println!(
+                        "[pci] BAR0: {:#x} ({}), size={:#x}",
+                        bar_addr,
+                        if is_io { "I/O" } else { "MMIO" },
+                        bar_size
+                    );
+
+                    if is_io && bar_addr != 0 {
+                        let io_base = (bar_addr & 0xFFFC) as u16;
+                        match arch::virtio_blk::init(io_base) {
+                            Ok(()) => {
+                                crate::console_println!("[pci] VirtIO block device initialized");
+                            }
+                            Err(e) => {
+                                crate::console_println!("[pci] VirtIO init failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Initialize PS/2 keyboard
+            crate::console_println!("[init] Initializing PS/2 keyboard...");
+            crate::driver::keyboard::init();
         }
 
         crate::console_println!("[init] Initializing filesystem...");

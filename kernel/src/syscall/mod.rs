@@ -252,11 +252,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             }
             // Poll UART for new input
             crate::driver::tty::poll_uart();
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                core::arch::asm!("pause")
-            };
-            #[cfg(target_arch = "riscv64")]
+            // Yield CPU to other tasks while waiting for input
             crate::sched::schedule();
         }
     }
@@ -344,6 +340,10 @@ fn sys_brk(addr: usize) -> isize {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma");
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::trap::flush_tlb();
     }
 
     crate::process::set_current_brk(addr);
@@ -439,6 +439,10 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma");
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::trap::flush_tlb();
     }
 
     // If addr was 0, advance brk

@@ -1,20 +1,21 @@
 //! Context switch assembly for x86_64.
 //!
 //! This is the ONLY assembly file besides boot.S. It saves/restores
-//! callee-saved registers (rbx, rbp, r12-r15) for cooperative
-//! context switching between kernel tasks.
+//! callee-saved registers (rbx, rbp, r12-r15) and FPU/SSE state
+//! for preemptive context switching between kernel tasks.
 //!
 //! Equivalent to the RISC-V switch.S which saves ra + s0-s11 (13 regs).
 //! x86_64 calling convention callee-saved: rbx, rbp, r12, r13, r14, r15 (6 regs + ra = 7)
 //!
-//! Layout on stack (56 bytes):
-//!   offset 0:  rip (return address, pushed by `call`)
-//!   offset 8:  rbp
-//!   offset 16: rbx
-//!   offset 24: r12
-//!   offset 32: r13
-//!   offset 40: r14
-//!   offset 48: r15
+//! Layout on stack (56 + 512 = 568 bytes):
+//!   offset 0:    rip (return address, pushed by `call`)
+//!   offset 8:    rbp
+//!   offset 16:   rbx
+//!   offset 24:   r12
+//!   offset 32:   r13
+//!   offset 40:   r14
+//!   offset 48:   r15
+//!   offset 56:   fxsave area (512 bytes, aligned to 16 bytes)
 
 .section .text
 .global __switch
@@ -33,11 +34,20 @@ __switch:
     push r14
     push r15
 
+    # Save FPU/SSE state (512 bytes, requires 16-byte alignment)
+    # Allocate 512 bytes on stack (aligned to 16)
+    sub rsp, 512
+    fxsave64 [rsp]
+
     # Save current stack pointer into *current_sp (rdi)
     mov [rdi], rsp
 
     # Load next stack pointer from *next_sp (rsi)
     mov rsp, [rsi]
+
+    # Restore FPU/SSE state
+    fxrstor64 [rsp]
+    add rsp, 512
 
     # Restore callee-saved registers from next stack
     pop r15

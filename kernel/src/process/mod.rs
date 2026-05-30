@@ -488,6 +488,13 @@ pub fn current_index() -> usize {
     CURRENT_PROCESS[hartid()].load(Ordering::Relaxed)
 }
 
+/// Get the kernel stack top for a process (used for TSS.RSP0 on x86_64).
+/// Returns None if the process doesn't exist or has no kernel stack.
+pub fn get_kernel_sp(proc_idx: usize) -> Option<usize> {
+    let table = PROCESS_TABLE.lock();
+    table[proc_idx].as_ref().map(|p| p.kernel_stack_top)
+}
+
 /// Set wait_child_idx for a process (marks it as waiting for a specific child).
 pub fn set_wait_child(proc_idx: usize, child_idx: Option<usize>) {
     let mut table = PROCESS_TABLE.lock();

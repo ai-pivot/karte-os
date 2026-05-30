@@ -39,6 +39,12 @@ qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64
 # With VirtIO block device:
 qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot \
     -drive file=disk.img,format=raw,if=none,id=hd0 -device virtio-blk-pci,drive=hd0
+# With AHCI/SATA (real hardware compatible):
+qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -no-reboot \
+    -drive file=disk.img,format=raw,if=none,id=hd0 -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0
+# With VGA display (shows text on screen instead of -display none):
+qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -no-reboot \
+    -drive file=disk.img,format=raw,if=none,id=hd0 -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0
 ```
 
 QEMU exit: `Ctrl+A` then `X`.
@@ -79,7 +85,7 @@ make test                             # 4. Run tests (must be ALL PASSED)
 
 **Dual-architecture**: Architecture-specific code lives under `arch/<arch>/` with `#[cfg(target_arch)]` conditional compilation. `riscv64` is the primary (stable); `x86_64` is secondary (nightly required). Platform constants are in `platform.rs`. RISC-V dependencies (`riscv`, `sbi`, `riscv-rt`) are gated by `[target.'cfg(target_arch = "riscv64")'.dependencies]` in `kernel/Cargo.toml`. x86_64 dependencies (`x86_64`, `uart_16550`) are gated by `[target.'cfg(target_arch = "x86_64")'.dependencies]`.
 
-**x86_64 boot flow**: GRUB ISO → `_start` (32-bit) → disable GRUB paging → set P4/P3/P2 tables → enable PAE → load CR3 → enable long mode → lgdt → enable paging → lretl to `_start64` → `call kmain`. Page tables: P2 with 64×2MB pages (128MB identity map) + P3 with 3×1GB huge pages (1-4GB for MMIO). Build: `cargo +nightly build --release --target x86_64-unknown-none -Z build-std=core,alloc`. Run: `grub-mkrescue` → ISO → `qemu-system-x86_64 -cdrom target/karte-os-x86_64.iso -serial stdio`. PCI enumeration via I/O ports (0xCF8/0xCFC). VirtIO block device discovered via PCI vendor ID 0x1AF4. Syscall via `int 0x80` with custom naked ISR stub (DPL=3 for Ring 3 access). User programs compiled with `-C relocation-model=static` to avoid PIE/GOT issues.
+**x86_64 boot flow**: GRUB ISO → `_start` (32-bit) → disable GRUB paging → set P4/P3/P2 tables → enable PAE → load CR3 → enable long mode → lgdt → enable paging → lretl to `_start64` → `call kmain`. Page tables: P2 with 64×2MB pages (128MB identity map) + P3 with 3×1GB huge pages (1-4GB for MMIO). Build: `cargo +nightly build --release --target x86_64-unknown-none -Z build-std=core,alloc`. Run: `grub-mkrescue` → ISO → `qemu-system-x86_64 -cdrom target/karte-os-x86_64.iso -serial stdio`. PCI enumeration via I/O ports (0xCF8/0xCFC). **Block devices**: AHCI (SATA, priority) via PCI class 0x01/0x06/0x01 with BAR5 MMIO, or VirtIO block (fallback) via PCI vendor ID 0x1AF4. **Display**: VGA text mode 80×25 at 0xB8000, dual-output to COM1 serial + VGA. **Input**: PS/2 keyboard (IRQ 1, scancode Set 1) with US layout, feeds into TTY subsystem via `tty::feed_byte()`. Syscall via `int 0x80` with custom naked ISR stub (DPL=3 for Ring 3 access). User programs compiled with `-C relocation-model=static` to avoid PIE/GOT issues. ext4 and FAT32 filesystems available on x86_64 via block I/O dispatch (AHCI first, VirtIO fallback).
 
 S-mode kernel on OpenSBI (M-mode). Identity-mapped Sv39 virtual memory. User programs run in U-mode with dual-path trap handling (trap_entry.S). Each process has its own Sv39 page table with kernel mappings copied in. ELF loader maps user code/data into per-process page tables. Round-Robin scheduler with `__switch()` assembly context switch. Multi-process via `sys_spawn` creates independent address spaces. SMP via SBI `hart_start` for secondary harts.
 
@@ -185,7 +191,18 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **x86_64 user programs**: Must compile with `-C relocation-model=static` to avoid PIE. PIE generates GOT-based indirect calls that jump to address 0 without a dynamic linker.
 - **x86_64 copy_kernel_mappings**: Must NOT identity-map the user address range (0..1MB) into user page tables, or ELF loader's `translate_user` check will find stale mappings and skip frame allocation, writing shell code to wrong physical pages.
 - **x86_64 UART**: COM1 uses I/O ports (`in`/`out`), NOT MMIO. `tty.rs` uses `arch::uart` (port I/O) on x86_64, not `driver::uart` (MMIO). RISC-V UART at 0x10000000 is MMIO.
-- **x86_64 no CR3 switch**: Currently user code runs with kernel CR3 (no page table isolation). User pages are mapped into kernel page table. `trap_return_user` skips `mov cr3`. Timer interrupts disabled (no context switching from interrupt context).
+- **x86_64 no CR3 switch**: Currently user code runs with kernel CR3 (no page table isolation). User pages are mapped into kernel page table. `trap_return_user` skips `mov cr3`. All processes share the same kernel page table — no address space isolation between processes.
+- **x86_64 preemptive scheduling**: Timer ISR uses custom naked function (NOT `extern "x86-interrupt"`) that saves complete 15-GP-register TrapContext. Calls `schedule()` → `__switch()` for Round-Robin preemption every ~10ms. IDT entry is manually constructed (same as syscall stub) because naked functions can't use `set_handler_fn`.
+- **x86_64 FPU/SSE save**: `__switch` in `switch.S` uses `fxsave64`/`fxrstor64` (512 bytes) to save/restore FPU/SSE state on context switch. Stack frame size = 6 callee-saved + 1 ret addr + 512 fxsave = 568 bytes. New task initial stack must include zeroed fxsave area.
+- **x86_64 TSS.RSP0 update**: `schedule()` and `schedule_exit()` both call `gdt::set_kernel_rsp0()` after `__switch` to update the kernel stack pointer for Ring 3→Ring 0 interrupt transitions.
+- **x86_64 page fault lazy allocation**: Page fault handler checks if fault address is in user heap area (USER_HEAP_BASE..USER_HEAP_LIMIT). If so, allocates a physical frame, maps it, and retries. Maps into both user PT and kernel PT (since no CR3 switch). Terminates user process on fatal page faults.
+- **x86_64 GP fault handling**: GP fault handler now terminates user processes instead of `loop {}` deadlock. Kernel-mode GP faults still halt.
+- **x86_64 VGA text mode**: `driver/vga.rs` writes directly to 0xB8000 (identity-mapped). `console_putchar` in `platform.rs` outputs to both COM1 and VGA simultaneously. `tty::echo()` also outputs to both. VGA driver uses `AtomicBool` for initialization state; writing before `init()` is a no-op.
+- **x86_64 PS/2 keyboard**: `driver/keyboard.rs` handles Set 1 scancodes from I/O port 0x60 (IRQ 1). `keyboard_handler` in `idt.rs` calls `keyboard::handle_scancode()` which translates to ASCII and feeds `tty::feed_byte()`. Extended keys (E0 prefix) handled. Shift/Caps Lock state tracked via atomics.
+- **x86_64 AHCI/SATA**: `driver/ahci.rs` implements AHCI DMA via BAR5 MMIO. PCI discovery in `pci.rs::find_ahci()` (class 0x01/0x06/0x01). Port memory uses `SafePortMem` wrapper with `UnsafeCell` + manual `Sync` impl (Rust 2024 safe). Block I/O dispatch in ext4/fat32: tries AHCI first, falls back to VirtIO. DMA memory allocated via `pmm::alloc_frame()`.
+- **x86_64 ext4/fat32**: Full implementations (not stubs!) available via block I/O dispatch. ext4 uses `KarteBlockDevice` adapter (same as RISC-V but calling x86_64 block I/O). FAT32 uses `Fat32Storage` with block I/O dispatch. Both support AHCI and VirtIO block devices.
+- **x86_64 TLB flush**: `sys_brk` and `sys_mmap` now call `flush_tlb()` (x86_64: `x86_64::instructions::tlb::flush_all()`) after mapping new pages. Previously missing — could cause stale TLB entries.
+- **x86_64 sys_read schedule**: stdin read loop now calls `schedule()` instead of `pause` spin-loop. Yields CPU to other tasks while waiting for keyboard input.
 
 ## Knowledge Files
 

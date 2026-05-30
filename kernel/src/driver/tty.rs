@@ -177,6 +177,14 @@ pub fn poll_uart() {
     }
 }
 
+/// Feed a single character into the TTY line editor.
+///
+/// Public interface for keyboard and other input drivers to inject characters.
+/// Same processing as UART input (line editing, echo, ring buffer).
+pub fn feed_byte(c: u8) {
+    on_char(c);
+}
+
 /// Process a single character from UART.
 /// Handles canonical-mode line editing: echo, backspace, Ctrl+C, Enter.
 /// Completed lines are pushed into the ring buffer.
@@ -283,6 +291,8 @@ fn echo(bytes: &[u8]) {
     {
         for &b in bytes {
             crate::arch::uart::putchar(b);
+            // Also echo to VGA for local display
+            crate::driver::vga::putchar(b);
         }
     }
 }

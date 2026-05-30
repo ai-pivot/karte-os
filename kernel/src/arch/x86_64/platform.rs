@@ -53,9 +53,11 @@ pub fn shutdown() -> ! {
     }
 }
 
-/// Write a single byte to the COM1 serial port (console output).
-/// This is the x86_64 equivalent of RISC-V's MMIO UART write.
+/// Write a single byte to the console.
+///
+/// On x86_64, output goes to both COM1 serial port and VGA text buffer.
 pub fn console_putchar(c: u8) {
+    // COM1 serial output
     unsafe {
         let mut lsr: x86_64::instructions::port::Port<u8> =
             x86_64::instructions::port::Port::new(0x3FD);
@@ -67,6 +69,9 @@ pub fn console_putchar(c: u8) {
             x86_64::instructions::port::Port::new(0x3F8);
         data.write(c);
     }
+
+    // VGA text mode output (if initialized)
+    crate::driver::vga::putchar(c);
 }
 
 /// Execute the HLT instruction — halt until the next interrupt.

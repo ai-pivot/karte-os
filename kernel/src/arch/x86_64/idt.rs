@@ -32,7 +32,23 @@ pub fn init() {
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
         // Hardware interrupts
-        idt[TIMER_VECTOR].set_handler_fn(timer_handler);
+        // Timer uses naked ISR (needs full TrapContext save for preemptive scheduling).
+        // Manual IDT entry construction, same as syscall stub.
+        {
+            let handler_addr = timer_handler as usize as u64;
+            let entry_ptr = &mut idt[TIMER_VECTOR] as *mut _ as *mut u64;
+            let selector: u64 = 0x0008;
+            let attr: u64 = 0x8E00; // Present | DPL0 | Interrupt Gate 64-bit | IST=0
+            let lo = ((handler_addr & 0xFFFF) << 0)
+                | (selector << 16)
+                | (attr << 32)
+                | (((handler_addr >> 16) & 0xFFFF) << 48);
+            let hi = (handler_addr >> 32) & 0xFFFFFFFF;
+            unsafe {
+                *entry_ptr = lo;
+                *entry_ptr.add(1) = hi;
+            }
+        }
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_handler);
         idt[COM1_VECTOR].set_handler_fn(com1_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
@@ -82,41 +98,79 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _err:
 }
 
 extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64) {
-    // On x86_64, GP faults during early bringup can be caused by many things.
-    // Don't use console_println here — it can cause nested faults if the
-    // UART lock is held. Just skip the instruction and continue.
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Skip the faulting instruction (int 0x80 is 2 bytes, others vary)
-        // For now, just loop — this shouldn't happen in normal operation
-        let _ = frame;
-        let _ = err;
+    let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
+    crate::console_println!(
+        "[EXCEPTION] GP Fault at {:#x}, err={:#x}, from_user={}",
+        frame.instruction_pointer.as_u64(),
+        err,
+        from_user
+    );
+    if from_user {
+        crate::console_println!("[trap] Killing user process");
+        crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]); // sys_exit(1)
+    } else {
         loop {}
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        crate::console_println!(
-            "[EXCEPTION] GP Fault at {:#x}, err={:#x}",
-            frame.instruction_pointer.as_u64(),
-            err
-        );
     }
 }
 
 extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: PageFaultErrorCode) {
     let fault_addr = x86_64::registers::control::Cr2::read();
+    let fault_addr_val = fault_addr.map(|a| a.as_u64()).unwrap_or(0) as usize;
     let cr3 = unsafe {
         x86_64::registers::control::Cr3::read()
             .0
             .start_address()
             .as_u64()
     };
+
+    // Lazy page allocation: check if fault is in user heap area
+    let heap_base = crate::process::USER_HEAP_BASE;
+    let heap_limit = crate::process::USER_HEAP_LIMIT;
+    let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
+
+    if from_user && fault_addr_val >= heap_base && fault_addr_val < heap_limit {
+        let page_size = crate::mm::pmm::page_size();
+        let page_addr = fault_addr_val & !(page_size - 1);
+
+        let user_pt = super::trap::get_current_user_pt();
+
+        if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+            if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                unsafe {
+                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                }
+                crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
+
+                // Also map into kernel page table (x86_64 currently shares kernel PT)
+                let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+                crate::mm::vmm::map(kernel_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
+
+                super::trap::flush_tlb_addr(page_addr);
+
+                let new_brk = page_addr + page_size;
+                if new_brk > crate::process::current_brk() {
+                    crate::process::set_current_brk(new_brk);
+                }
+                return; // Retry the faulting instruction
+            }
+        }
+        // Page already mapped or OOM — still retry
+        return;
+    }
+
+    // Not in heap area — fatal page fault
     crate::console_println!(
         "[EXCEPTION] Page Fault at {:#x}, accessing {:#x}, CR3={:#x}",
         frame.instruction_pointer.as_u64(),
-        fault_addr.map(|a| a.as_u64()).unwrap_or(0),
+        fault_addr_val,
         cr3,
     );
+    if from_user {
+        crate::console_println!("[trap] Killing user process");
+        crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]); // sys_exit(1)
+    } else {
+        loop {}
+    }
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
@@ -128,17 +182,104 @@ extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
 
 // ─── Hardware Interrupts ─────────────────────────────────────
 
-extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
-    super::lapic::local_eoi();
+/// Timer ISR stub — naked function that saves complete TrapContext.
+///
+/// This replaces `extern "x86-interrupt"` with a custom naked ISR because
+/// we need to save ALL 15 GP registers (not just callee-saved) to safely
+/// call `schedule()` → `__switch()` from the timer interrupt.
+///
+/// The CPU automatically pushes the iretq frame (SS, RSP, RFLAGS, CS, RIP)
+/// before entering this handler. We then push all GP regs to build a
+/// complete TrapContext on the kernel stack.
+///
+/// After trap_handler returns (which may call schedule → __switch),
+/// we restore GP regs and iretq back to the interrupted context.
+#[unsafe(naked)]
+unsafe extern "C" fn timer_handler() {
+    unsafe {
+        core::arch::naked_asm!(
+            // ── Save all 15 GP registers ──
+            // Order must match TrapContext field order exactly.
+            "push rax",
+            "push rbx",
+            "push rcx",
+            "push rdx",
+            "push rbp",
+            "push rsi",
+            "push rdi",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+
+            // RSP now points to TrapContext base (rax field).
+            // The iretq frame (RIP, CS, RFLAGS, RSP, SS) is below GP regs
+            // because CPU pushed them before us.
+
+            // ── Call trap_handler with &mut TrapContext ──
+            "mov rdi, rsp",
+            "call {}",
+
+            // ── After trap_handler (may have done schedule/__switch) ──
+            // EOI must happen AFTER schedule returns to this context.
+            "call {}",    // lapic::local_eoi()
+
+            // ── Restore all 15 GP registers ──
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rdi",
+            "pop rsi",
+            "pop rbp",
+            "pop rdx",
+            "pop rcx",
+            "pop rbx",
+            "pop rax",
+
+            // ── Return from interrupt ──
+            "iretq",
+
+            sym timer_trap_handler,
+            sym super::lapic::local_eoi,
+        );
+    }
+}
+
+/// Rust handler for timer interrupt trap.
+/// Called from naked timer ISR with a pointer to TrapContext.
+unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
+    let _ = ctx; // TrapContext is on stack, will be restored by assembly
+
+    // Poll UART for input
     crate::driver::tty::poll_uart();
+
+    // Reset timer (periodic mode — no-op, but call for consistency)
     super::lapic::set_next_timer();
-    // Don't call schedule() for now — context switching from interrupt
-    // context requires full TrapContext save/restore which isn't set up yet.
-    // TODO: Implement proper context switching from interrupt context.
+
+    // ⚠️ EOI is done AFTER schedule returns (in assembly), not here.
+    // This prevents another timer interrupt from firing while we're
+    // still in the middle of context switching.
+
+    // Preemptive scheduling: Round-Robin to next ready task
+    crate::sched::schedule();
+
+    // After schedule() returns (possibly switching back to this task),
+    // we also need to update TSS.RSP0 for the current task.
+    // This is done inside schedule() on x86_64.
 }
 
 extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
-    let _scancode: u8 = unsafe { x86_64::instructions::port::Port::new(0x60).read() };
+    let scancode: u8 = unsafe { x86_64::instructions::port::Port::new(0x60).read() };
+    crate::driver::keyboard::handle_scancode(scancode);
     super::lapic::local_eoi();
 }
 

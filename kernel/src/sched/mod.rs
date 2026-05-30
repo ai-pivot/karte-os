@@ -164,6 +164,18 @@ pub fn schedule() {
             __switch(cur_ptr, nxt_ptr);
         }
     }
+
+    // After __switch returns (possibly on a different task's stack),
+    // update TSS.RSP0 so Ring 3 → Ring 0 interrupts use the correct kernel stack.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let proc_idx = crate::process::current_index();
+        if let Some(kernel_sp) = crate::process::get_kernel_sp(proc_idx) {
+            unsafe {
+                crate::arch::gdt::set_kernel_rsp0(kernel_sp as u64);
+            }
+        }
+    }
 }
 
 /// Current child exits → switch to another Ready child, or back to init if
@@ -223,6 +235,17 @@ pub fn schedule_exit() {
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
         unsafe {
             __switch(cur_ptr, nxt_ptr);
+        }
+    }
+
+    // Update TSS.RSP0 for the new task
+    #[cfg(target_arch = "x86_64")]
+    {
+        let proc_idx = crate::process::current_index();
+        if let Some(kernel_sp) = crate::process::get_kernel_sp(proc_idx) {
+            unsafe {
+                crate::arch::gdt::set_kernel_rsp0(kernel_sp as u64);
+            }
         }
     }
 }
@@ -363,25 +386,27 @@ pub fn add_user_process(
         //   kernel_stack_top
         //     └─ TrapContext (ctx_size bytes)
         //        └─ __switch frame:
-        //           +48: return address (→ first_task_shim)
-        //           +40: rbp
-        //           +32: rbx
-        //           +24: r12
-        //           +16: r13
-        //           +8:  r14
-        //           +0:  r15   ← switch_sp (TASK_SPS[tid])
+        //           +568: return address (→ first_task_shim)
+        //           +560: rbp
+        //           +552: rbx
+        //           +544: r12
+        //           +536: r13
+        //           +528: r14
+        //           +520: r15
+        //           +0..+519: fxsave area (512 bytes)
+        //           +0   ← switch_sp (TASK_SPS[tid])
         //
-        // __switch pops r15..rbp then `ret` pops return address → first_task_shim
-        // first_task_shim jumps to trap_return_user which pops GP regs and iretqs
+        // __switch: fxrstor → pop r15..rbp → ret → first_task_shim
         let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
-        let switch_frame_size: usize = 7 * 8; // 6 callee-saved + ret addr
+        let switch_frame_size: usize = 7 * 8 + 512; // 6 callee-saved + ret addr + fxsave
         let trap_ctx_base = kernel_stack_top - ctx_size;
         let switch_sp = trap_ctx_base - switch_frame_size;
         unsafe {
             core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + switch_frame_size);
-            // __switch frame: ret address at highest slot (offset +48)
+            // __switch frame: fxsave area at bottom (512 bytes, zeroed above),
+            // then callee-saved (also zeroed), then ret addr at top
             let sw = switch_sp as *mut usize;
-            *sw.add(6) = first_task_shim as *const () as usize; // ret addr at top of frame
+            *sw.add(512 / 8 + 6) = first_task_shim as *const () as usize; // ret addr
             // Build TrapContext
             let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
             (*ctx).rip = entry as u64;
