@@ -259,41 +259,59 @@ jobs:
           fi
 
   # ═══════════════════════════════════════════════════════════════
-  #  Disk image (merge to main only)
+  #  Publish release artifacts (main push only)
   # ═══════════════════════════════════════════════════════════════
   disk-image:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     needs: [build-riscv, build-x86]
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Install deps
         run: |
-          rustup target add riscv64gc-unknown-none-elf
-          rustup toolchain install nightly
-          rustup component add rust-src --toolchain nightly
           sudo apt-get update
-          sudo apt-get install -y qemu-system-misc qemu-system-x86 gcc-riscv64-linux-gnu grub-common xorriso dosfstools mtools
+          sudo apt-get install -y gcc-riscv64-linux-gnu dosfstools mtools
 
       - name: Create disk image with user programs
         run: |
-          # Build user programs for both archs
+          # Build user programs
           cd user && make clean && make && cd ..
           # Create and populate disk image
           tools/mkdisk.sh init
-          # Put user programs on disk (without .elf extension)
           for f in user/*.elf; do
             name=$(basename "$f" .elf)
-            # Skip RISC-V assembly programs that don't exist as standalone files
             case "$name" in hello|heap_test|file_test|spawn_test) continue;; esac
             tools/mkdisk.sh put "$f" 2>/dev/null || true
           done
 
-      - name: Upload disk image
-        uses: actions/upload-artifact@v4
-        with:
-          name: disk-image
-          path: disk.img
-          retention-days: 90
-          overwrite: true
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Collect artifacts with short names
+          cp artifacts/kernel-riscv/karte-os-kernel karte-os-riscv64-kernel
+          cp artifacts/karte-os-x86_64/karte-os-x86_64.iso karte-os-x86_64.iso
+
+          TAG="latest"
+          TITLE="Latest Build"
+
+          # Delete existing release+tag if present, then create fresh
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push origin :refs/tags/"$TAG" 2>/dev/null || true
+
+          COMMIT=$(git rev-parse --short HEAD)
+          gh release create "$TAG" \
+            karte-os-riscv64-kernel \
+            karte-os-x86_64.iso \
+            disk.img \
+            --title "$TITLE" \
+            --notes "Automated build from main ($COMMIT)" \
+            --target main
