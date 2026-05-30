@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 extern crate alloc;
 // ext4_rs depends on the `log` crate; the macro is available via this import.
 #[macro_use]
@@ -26,7 +27,14 @@ pub mod test;
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // ── Common init (both normal & test mode) ──
+    #[cfg(target_arch = "riscv64")]
     driver::uart::Uart::new(0x1000_0000).init();
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::uart::init_uart();
+    }
+
     crate::console_println!("=== KarteOS v0.2.0 ===");
     crate::console_println!("  Booting on hart {}", hartid);
 
@@ -55,19 +63,28 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::syscall::run_tests();
 
         crate::test::print_summary();
-        crate::arch::sbi::shutdown()
+
+        #[cfg(target_arch = "riscv64")]
+        crate::arch::sbi::shutdown();
+
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::platform::shutdown();
     }
 
     // ── Normal mode ──
     #[cfg(not(feature = "test_mode"))]
     {
+        #[cfg(target_arch = "riscv64")]
         crate::console_println!("  DTB pointer: {:#x}", dtb_ptr);
 
         crate::console_println!("[init] Initializing SMP...");
         arch::smp::init_bsp(hartid);
 
-        crate::console_println!("[init] Probing VirtIO devices...");
-        driver::virtio::probe_virtio_devices();
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::console_println!("[init] Probing VirtIO devices...");
+            driver::virtio::probe_virtio_devices();
+        }
 
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
@@ -80,14 +97,26 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         // is only consulted when a Linux syscall number is encountered.
         crate::syscall::linux::enable();
 
-        crate::console_println!("[init] Initializing PLIC...");
-        arch::plic::init(0);
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::console_println!("[init] Initializing PLIC...");
+            arch::plic::init(0);
+        }
 
         crate::console_println!("[init] Initializing TTY...");
         driver::tty::init();
 
-        crate::console_println!("[init] Starting secondary harts...");
-        arch::smp::start_secondary_harts(4);
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::console_println!("[init] Starting secondary harts...");
+            arch::smp::start_secondary_harts(4);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::console_println!("[init] Starting secondary harts...");
+            arch::smp::start_secondary_harts(1);
+        }
 
         crate::console_println!("[init] Initializing scheduler...");
         sched::init();
@@ -111,68 +140,116 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 );
 
                 // Register process in the global process table
-                unsafe { riscv::register::sstatus::clear_sie() };
+                #[cfg(target_arch = "riscv64")]
+                unsafe {
+                    riscv::register::sstatus::clear_sie()
+                };
+
+                #[cfg(target_arch = "x86_64")]
+                x86_64::instructions::interrupts::disable();
+
                 let idx = process::add_process(proc).expect("Failed to register process");
                 process::set_current_index(idx);
 
                 // Re-read the process from the table for building trap context
                 let proc = process::current().unwrap();
                 process::set_current_page_table_root(proc.page_table_root);
-                unsafe { riscv::register::sstatus::set_sie() };
 
-                // Calculate user satp (Sv39 mode = 8)
-                let user_satp = if proc.page_table_root == 0 {
-                    let satp: usize;
-                    unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
-                    satp
-                } else {
-                    (8usize << 60) | proc.page_table_root
+                #[cfg(target_arch = "riscv64")]
+                unsafe {
+                    riscv::register::sstatus::set_sie()
                 };
 
-                // NOTE: Init is NOT registered in the scheduler.
-                // Timer returns directly to init when only init exists.
-                // schedule() detects child tasks and switches to them.
+                #[cfg(target_arch = "x86_64")]
+                x86_64::instructions::interrupts::enable();
 
-                // Build TrapContext on kernel stack for first U-mode entry.
-                // Init enters via first_enter_user (which switches satp itself),
-                // so user_satp (ctx[35]) stays 0 — the zeroing loop handles that.
-                let ctx_words = core::mem::size_of::<arch::trap::TrapContext>() / 8;
-                let trap_ctx_base =
-                    proc.kernel_stack_top - core::mem::size_of::<arch::trap::TrapContext>();
-                unsafe {
-                    let ctx = trap_ctx_base as *mut usize;
-                    for i in 0..ctx_words {
-                        *ctx.add(i) = 0;
+                // Architecture-specific first user entry
+                #[cfg(target_arch = "riscv64")]
+                {
+                    // Calculate user satp (Sv39 mode = 8)
+                    let user_satp = if proc.page_table_root == 0 {
+                        let satp: usize;
+                        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
+                        satp
+                    } else {
+                        (8usize << 60) | proc.page_table_root
+                    };
+
+                    // Build TrapContext on kernel stack for first U-mode entry.
+                    let ctx_words = core::mem::size_of::<arch::trap::TrapContext>() / 8;
+                    let trap_ctx_base =
+                        proc.kernel_stack_top - core::mem::size_of::<arch::trap::TrapContext>();
+                    unsafe {
+                        let ctx = trap_ctx_base as *mut usize;
+                        for i in 0..ctx_words {
+                            *ctx.add(i) = 0;
+                        }
+                        *ctx.add(2) = proc.kernel_stack_top;
+                        *ctx.add(32) = 0x20;
+                        *ctx.add(33) = proc.entry;
+                        *ctx.add(34) = proc.user_stack_top;
                     }
-                    *ctx.add(2) = proc.kernel_stack_top;
-                    *ctx.add(32) = 0x20;
-                    *ctx.add(33) = proc.entry;
-                    *ctx.add(34) = proc.user_stack_top;
+
+                    crate::console_println!("[init] Entering user mode...");
+                    crate::console_println!(
+                        "[init]   user_satp={:#x}, page_table_ppn={:#x}",
+                        user_satp,
+                        proc.page_table_root
+                    );
+
+                    unsafe { riscv::register::sstatus::clear_sie() };
+                    arch::trap::first_enter_user(
+                        unsafe { &mut *(trap_ctx_base as *mut arch::trap::TrapContext) },
+                        user_satp,
+                    );
                 }
 
-                crate::console_println!("[init] Entering user mode...");
-                crate::console_println!(
-                    "[init]   user_satp={:#x}, page_table_ppn={:#x}",
-                    user_satp,
-                    proc.page_table_root
-                );
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let user_cr3 = if proc.page_table_root == 0 {
+                        0u64
+                    } else {
+                        proc.page_table_root as u64
+                    };
 
-                unsafe { riscv::register::sstatus::clear_sie() };
-                arch::trap::first_enter_user(
-                    unsafe { &mut *(trap_ctx_base as *mut arch::trap::TrapContext) },
-                    user_satp,
-                );
+                    crate::console_println!("[init] Entering user mode...");
+                    crate::console_println!(
+                        "[init]   user_cr3={:#x}, page_table_ppn={:#x}",
+                        user_cr3,
+                        proc.page_table_root
+                    );
+
+                    arch::trap::first_enter_user(
+                        proc.entry,
+                        proc.user_stack_top,
+                        proc.kernel_stack_top,
+                        user_cr3,
+                    );
+                }
             }
             Err(e) => {
                 crate::console_println!("[init] Failed to load user program: {}", e);
             }
         }
 
-        unsafe { riscv::register::sstatus::set_sie() };
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            riscv::register::sstatus::set_sie()
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        x86_64::instructions::interrupts::enable();
+
         crate::console_println!("=== KarteOS initialized successfully ===");
 
         loop {
-            unsafe { core::arch::asm!("wfi") };
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!("wfi")
+            };
+
+            #[cfg(target_arch = "x86_64")]
+            x86_64::instructions::hlt();
         }
     }
 }

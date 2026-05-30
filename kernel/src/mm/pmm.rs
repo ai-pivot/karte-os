@@ -3,7 +3,17 @@
 use spin::Mutex;
 
 const PAGE_SIZE: usize = 4096;
+
+#[cfg(target_arch = "riscv64")]
 const MEMORY_START: usize = 0x8020_0000;
+
+#[cfg(target_arch = "x86_64")]
+const MEMORY_START: usize = 0x0020_0000; // 2MB — typical x86_64 kernel load address
+
+#[cfg(target_arch = "riscv64")]
+const MEMORY_SIZE: usize = 128 * 1024 * 1024; // 128MB
+
+#[cfg(target_arch = "x86_64")]
 const MEMORY_SIZE: usize = 128 * 1024 * 1024; // 128MB
 
 unsafe extern "C" {

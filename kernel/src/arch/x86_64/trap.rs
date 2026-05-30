@@ -46,7 +46,8 @@
 use core::sync::atomic::Ordering;
 
 use x86_64::registers::control::Cr3;
-use x86_64::{PhysAddr, PhysFrame, VirtAddr};
+use x86_64::structures::paging::PhysFrame;
+use x86_64::{PhysAddr, VirtAddr};
 
 /// Complete register state saved on trap entry.
 ///
@@ -153,9 +154,10 @@ pub fn trap_return_user_addr() -> usize {
 /// This is set only for a task's very first entry into U-mode (via
 /// `add_user_process`). Normal trap returns leave it 0.
 #[unsafe(naked)]
-unsafe extern "C" fn trap_return_user() {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trap_return_user() {
     unsafe {
-        core::arch::asm!(
+        core::arch::naked_asm!(
             // ── Restore general-purpose registers ──
             "pop rax",
             "pop rbx",
@@ -181,20 +183,14 @@ unsafe extern "C" fn trap_return_user() {
             //   +32: ss       (+0x20)
             //   +40: kernel_sp  (+0x28)
             //   +48: user_cr3   (+0x30) ← check this for page table switch
-            "mov r11, [rsp + 48]",   // r11 = user_cr3
+            "mov r11, [rsp + 48]", // r11 = user_cr3
             "test r11, r11",
             "jz 2f",
             // Switch page table
             "mov cr3, r11",
             "2:",
-            // Set TSS.RSP0 from kernel_sp (at rsp + 48)
-            // We need kernel_sp for future Ring 3→Ring 0 stack switches.
-            // Store it using the MSR for GS-based per-CPU data, or
-            // simply in the TSS. For now, skip — set_kernel_rsp0 is
-            // called before first_enter_user.
             // ── Return to Ring 3 ──
             "iretq",
-            options(noreturn),
         );
     }
 }
@@ -229,12 +225,7 @@ pub fn set_next_timer() {
 /// - `user_sp`: User-mode stack pointer
 /// - `kernel_sp`: Kernel stack top (used for TSS.RSP0)
 /// - `user_cr3`: Physical address of user PML4 table
-pub fn first_enter_user(
-    entry: usize,
-    user_sp: usize,
-    kernel_sp: usize,
-    user_cr3: u64,
-) -> ! {
+pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3: u64) -> ! {
     let user_cs = super::gdt::USER_CODE_SEL.load(Ordering::Relaxed) as u64;
     let user_ss = super::gdt::USER_DATA_SEL.load(Ordering::Relaxed) as u64;
 
@@ -335,6 +326,18 @@ unsafe extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
 pub fn read_page_table_root() -> usize {
     let (frame, _) = Cr3::read();
     frame.start_address().as_u64() as usize
+}
+
+/// Get the current process's page table.
+/// Returns a mutable reference to the kernel page table
+/// (x86_64 uses identity-mapped kernel page table as base).
+pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
+    let ppn = crate::process::current_page_table_ppn();
+    if ppn == 0 {
+        crate::mm::vmm::get_kernel_page_table()
+    } else {
+        unsafe { &mut *((ppn << 12) as *mut crate::mm::vmm::PageTable) }
+    }
 }
 
 /// Activate a page table by writing to CR3.

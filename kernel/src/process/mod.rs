@@ -69,25 +69,39 @@ pub struct Process {
 /// Copy kernel identity mappings into a user page table.
 /// This is needed so that traps from U-mode can still access kernel code/data.
 pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
-    // Identity map kernel (0x80200000 .. 0x80200000 + 128MB)
-    vmm::identity_map(
-        user_pt,
-        0x8020_0000,
-        0x8020_0000 + 128 * 1024 * 1024,
-        vmm::PTEFlags::KRWX,
-    );
+    #[cfg(target_arch = "riscv64")]
+    {
+        // Identity map kernel (0x80200000 .. 0x80200000 + 128MB)
+        vmm::identity_map(
+            user_pt,
+            0x8020_0000,
+            0x8020_0000 + 128 * 1024 * 1024,
+            vmm::PTEFlags::KRWX,
+        );
 
-    // Map UART MMIO (0x10000000 - 0x10001000)
-    vmm::map(user_pt, 0x1000_0000, 0x1000_0000, vmm::PTEFlags::KRW);
+        // Map UART MMIO (0x10000000 - 0x10001000)
+        vmm::map(user_pt, 0x1000_0000, 0x1000_0000, vmm::PTEFlags::KRW);
 
-    // Map VirtIO MMIO devices (0x10001000 - 0x10009000)
-    for addr in (0x1000_1000..0x1000_9000).step_by(4096) {
-        vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+        // Map VirtIO MMIO devices (0x10001000 - 0x10009000)
+        for addr in (0x1000_1000..0x1000_9000).step_by(4096) {
+            vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+        }
+
+        // Map PLIC (0x0C000000 - 0x0C400000)
+        for addr in (0x0C00_0000..0x0C40_0000).step_by(4096) {
+            vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+        }
     }
 
-    // Map PLIC (0x0C000000 - 0x0C400000)
-    for addr in (0x0C00_0000..0x0C40_0000).step_by(4096) {
-        vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Identity map kernel (2MB .. 2MB + 128MB)
+        vmm::identity_map(
+            user_pt,
+            0x0020_0000,
+            0x0020_0000 + 128 * 1024 * 1024,
+            vmm::PTEFlags::KRWX,
+        );
     }
 }
 

@@ -1,6 +1,7 @@
 //! RISC-V 64-bit architecture support.
 
 pub mod emergency_stack;
+pub mod platform;
 pub mod plic;
 pub mod sbi;
 pub mod smp;

@@ -10,9 +10,9 @@
 use core::sync::atomic::Ordering;
 
 use spin::Once;
+use x86_64::VirtAddr;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::VirtAddr;
 
 /// IST index for double fault handler (separate stack to avoid corruption).
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
@@ -58,24 +58,23 @@ pub fn init() {
     GDT.call_once(|| {
         // Set up IST[0] for double fault
         unsafe {
-            let stack_top = VirtAddr::new(
-                IST_STACKS[0].as_ptr() as u64 + IST_STACKS[0].len() as u64,
-            );
+            let stack_top =
+                VirtAddr::new(IST_STACKS[0].as_ptr() as u64 + IST_STACKS[0].len() as u64);
             TSS.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_top;
         }
 
         let mut gdt = GlobalDescriptorTable::new();
 
         // Entry 0x08: kernel code (64-bit, DPL=0)
-        let code = gdt.add_entry(Descriptor::kernel_code_segment());
+        let code = gdt.append(Descriptor::kernel_code_segment());
         // Entry 0x10: kernel data (64-bit, DPL=0)
-        let data = gdt.add_entry(Descriptor::kernel_data_segment());
+        let data = gdt.append(Descriptor::kernel_data_segment());
         // Entry 0x28: user code (64-bit, DPL=3)
-        let user_code = gdt.add_entry(Descriptor::user_code_segment());
+        let user_code = gdt.append(Descriptor::user_code_segment());
         // Entry 0x30: user data (64-bit, DPL=3)
-        let user_data = gdt.add_entry(Descriptor::user_data_segment());
+        let user_data = gdt.append(Descriptor::user_data_segment());
         // TSS descriptor (takes two GDT slots on x86_64)
-        let tss = unsafe { gdt.add_entry(Descriptor::tss_segment(&TSS)) };
+        let tss = unsafe { gdt.append(Descriptor::tss_segment(&*core::ptr::addr_of!(TSS))) };
 
         // Cache selector values for use in iretq frames and assembly
         USER_CODE_SEL.store(user_code.0, Ordering::Relaxed);

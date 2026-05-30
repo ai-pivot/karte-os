@@ -1,9 +1,9 @@
 // kernel/src/sync/int_spinlock.rs — Interrupt-safe spinlock for kernel use
 //
 // Unlike the basic SpinLock, this variant saves and restores the interrupt
-// enable state (sstatus.SIE) across the critical section. This prevents
-// deadlocks when a timer interrupt fires while holding a lock that the
-// interrupt handler also tries to acquire.
+// enable state (sstatus.SIE on RISC-V, RFLAGS.IF on x86_64) across the
+// critical section. This prevents deadlocks when a timer interrupt fires
+// while holding a lock that the interrupt handler also tries to acquire.
 //
 // Use this for any lock that may be held during I/O or other long-running
 // operations (e.g., block device access, filesystem operations).
@@ -14,10 +14,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 /// A spinlock that disables interrupts while held.
 ///
-/// On `lock()`, the current S-mode interrupt-enable state (sstatus.SIE) is
-/// saved and interrupts are disabled. On `unlock()` (when the guard drops),
-/// the saved state is restored. This is the standard approach for kernel
-/// spinlocks in SMP-capable operating systems.
+/// On `lock()`, the current interrupt-enable state is saved and interrupts
+/// are disabled. On `unlock()` (when the guard drops), the saved state is
+/// restored. This is the standard approach for kernel spinlocks in
+/// SMP-capable operating systems.
 pub struct IntSpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
@@ -43,8 +43,6 @@ impl<T> IntSpinLock<T> {
     /// Acquire the lock, disabling interrupts until the guard is dropped.
     pub fn lock(&self) -> IntSpinLockGuard<'_, T> {
         // Save interrupt state and disable interrupts before spinning.
-        // This ensures that once we start acquiring, no interrupt can
-        // preempt us and potentially deadlock by re-attempting this lock.
         let sie_enabled = read_sie();
         disable_interrupts();
 
@@ -90,8 +88,6 @@ impl<T> DerefMut for IntSpinLockGuard<'_, T> {
 impl<T> Drop for IntSpinLockGuard<'_, T> {
     fn drop(&mut self) {
         // Release the lock first, then restore interrupt state.
-        // Order matters: if we restored interrupts first, an ISR could
-        // fire and deadlock trying to acquire this lock.
         self.lock.unlock();
         if self.sie_enabled {
             enable_interrupts();
@@ -99,31 +95,40 @@ impl<T> Drop for IntSpinLockGuard<'_, T> {
     }
 }
 
-// ── RISC-V CSR helpers ──────────────────────────────────────────────────
-// Minimal CSR access for interrupt state management.
-// We use inline assembly instead of the `riscv` crate's high-level API
-// to keep this module self-contained and avoid dependency on the crate's
-// sstatus abstraction which may change between versions.
+// ── Architecture-specific interrupt helpers ────────────────────────────
 
 #[cfg(target_arch = "riscv64")]
-/// Read the SIE (Supervisor Interrupt Enable) bit from sstatus.
 fn read_sie() -> bool {
     let sstatus: usize;
     unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) sstatus) };
-    // SIE is bit 1 of sstatus
     (sstatus & (1 << 1)) != 0
 }
 
 #[cfg(target_arch = "riscv64")]
-/// Clear the SIE bit in sstatus (disable S-mode interrupts).
 fn disable_interrupts() {
     unsafe { core::arch::asm!("csrci sstatus, 2") };
 }
 
 #[cfg(target_arch = "riscv64")]
-/// Set the SIE bit in sstatus (enable S-mode interrupts).
 fn enable_interrupts() {
     unsafe { core::arch::asm!("csrsi sstatus, 2") };
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_sie() -> bool {
+    use x86_64::registers::rflags::RFlags;
+    let flags = x86_64::registers::rflags::read();
+    flags.contains(RFlags::INTERRUPT_FLAG)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn disable_interrupts() {
+    x86_64::instructions::interrupts::disable();
+}
+
+#[cfg(target_arch = "x86_64")]
+fn enable_interrupts() {
+    x86_64::instructions::interrupts::enable();
 }
 
 #[cfg(feature = "test_mode")]

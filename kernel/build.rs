@@ -15,15 +15,19 @@ fn main() {
         }
         "x86_64" => {
             let memory_ld = include_bytes!("memory-x86_64.ld");
-            fs::write(out_dir.join("memory-x86_64.ld"), memory_ld).unwrap();
+            let dest = out_dir.join("memory-x86_64.ld");
+            fs::write(&dest, memory_ld).unwrap();
             println!("cargo:rustc-link-search={}", out_dir.display());
-            println!(
-                "cargo:rustc-link-arg=-T{}",
-                out_dir.join("memory-x86_64.ld").display()
-            );
+            println!("cargo:rustc-link-arg=-T{}", dest.display());
+            // Don't page-align sections, keep them in order
+            println!("cargo:rustc-link-arg=--nmagic");
+            // Link as static executable (not PIE/DYN)
+            println!("cargo:rustc-link-arg=-static");
+            // No default libs
+            println!("cargo:rustc-link-arg=-nostdlib");
+            // No PIE
+            println!("cargo:rustc-link-arg=-no-pie");
             println!("cargo:rerun-if-changed=memory-x86_64.ld");
-            // 静态链接，无动态库
-            println!("cargo:rustc-link-arg=-nostartfiles");
         }
         _ => {}
     }

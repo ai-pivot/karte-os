@@ -129,7 +129,7 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
     let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-    crate::arch::sbi::print(core::str::from_utf8(data).unwrap_or("[invalid utf8]"));
+    crate::arch::platform::print(core::str::from_utf8(data).unwrap_or("[invalid utf8]"));
     len as isize
 }
 
@@ -140,7 +140,7 @@ fn sys_exit(code: i32) -> isize {
     // If init (the shell) exits, no process remains → shut down the system.
     if crate::sched::is_init_running() {
         crate::console_println!("[init] Shell exited, shutting down...");
-        crate::arch::sbi::shutdown();
+        crate::arch::platform::shutdown();
     }
 
     crate::process::set_exit_code(code as usize);
@@ -184,7 +184,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             // stdout/stderr: write to console byte by byte
             for i in 0..len {
                 let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
-                crate::arch::sbi::console_putchar(byte);
+                crate::arch::platform::console_putchar(byte);
             }
             len as isize
         }
@@ -811,7 +811,7 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
     let user_stack_top = proc.user_stack_top;
     let kernel_stack_top = proc.kernel_stack_top;
 
-    // Calculate user satp value (Sv39 mode = 8)
+    // Calculate user satp value (Sv39 mode = 8 on RISC-V, CR3 on x86_64)
     #[cfg(target_arch = "riscv64")]
     let user_satp = if proc.page_table_root == 0 {
         // Fallback: read current satp
@@ -821,6 +821,9 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
     } else {
         (8usize << 60) | proc.page_table_root
     };
+
+    #[cfg(target_arch = "x86_64")]
+    let user_satp = proc.page_table_root; // CR3 physical address
 
     // Register process in the global process table
     let proc_idx = match crate::process::add_process(proc) {
@@ -911,6 +914,9 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
     } else {
         (8usize << 60) | proc.page_table_root
     };
+
+    #[cfg(target_arch = "x86_64")]
+    let user_satp = proc.page_table_root;
 
     let proc_idx = match crate::process::add_process(proc) {
         Some(idx) => idx,

@@ -1,148 +1,179 @@
 # boot.S — Multiboot2 boot entry for x86_64 KarteOS
 #
-# This is the ONLY file that requires hand-written assembly.
-# It handles the transition from 32-bit protected mode (loaded by GRUB/Multiboot2)
-# to 64-bit long mode, then calls the Rust kmain.
+# GRUB loads us in 32-bit protected mode with paging ENABLED.
+# We disable paging, set up identity mapping, enable long mode, and jump to 64-bit.
 #
-# Multiboot2 spec requirements:
-#   - Header must be in the first 32768 bytes of the OS image
-#   - Header must be 8-byte aligned
-#   - EAX = 0x36D76289 (magic) and EBX = multiboot2 info struct address on entry
-#
-# Assembler: AT&T syntax for GNU AS (gas)
+# Page table layout:
+#   P4[0] → P3 → P2 (2MB pages, identity map 0..128MB for kernel + MMIO fallback)
+#   P4[511] → P3_mmio → P2_mmio (map 0xFEE00000 area for LAPIC)
+#   All mapped with 2MB huge pages for simplicity.
 
-    .section .multiboot2, "a"
-    .align 8
-multiboot2_header_start:
-    .long 0xE85250D6                                       # magic
-    .long 0                                                 # architecture: 0 (i386 protected mode)
-    .long multiboot2_header_end - multiboot2_header_start   # header length
-    .long -(0xE85250D6 + 0 + (multiboot2_header_end - multiboot2_header_start)) # checksum
+.set MULTIBOOT2_MAGIC, 0xE85250D6
+.set MULTIBOOT2_ARCH,  0
+.set MULTIBOOT2_HDR_SIZE, 24
 
-    # Framebuffer tag (optional — request text mode)
-    .align 8
-    .word 5                    # type = framebuffer
-    .word 0                    # flags
-    .long 20                   # size
-    .long 80                   # width
-    .long 25                   # height
-    .long 0                    # depth (0 = text mode)
+.section .multiboot2, "a"
+.balign 8
+multiboot2_header:
+    .long MULTIBOOT2_MAGIC
+    .long MULTIBOOT2_ARCH
+    .long MULTIBOOT2_HDR_SIZE
+    .long 0xFFFFFFFF - MULTIBOOT2_MAGIC - MULTIBOOT2_ARCH - MULTIBOOT2_HDR_SIZE + 1
+    .short 0
+    .short 0
+    .long 8
 
-    # End tag
-    .align 8
-    .word 0                    # type = end
-    .word 0                    # flags
-    .long 8                    # size
-multiboot2_header_end:
+.section .data.boot, "aw", @progbits
+.balign 4096
+boot_p4_table:  .fill 4096, 1, 0
+boot_p3_table:  .fill 4096, 1, 0
+boot_p2_table:  .fill 4096, 1, 0
+boot_stack:     .fill 4096 * 16, 1, 0
+boot_stack_top:
+.balign 4
+gdt_desc:
+    .short 0
+    .long 0
+far_ptr:
+    .long 0
+    .short 0
 
-# ─────────────────────────────────────────────────────────────
-# 32-bit entry point — loaded by Multiboot2 bootloader
-# EAX = 0x36D76289 (multiboot2 magic), EBX = info struct address
-# ─────────────────────────────────────────────────────────────
-    .section .text.boot
-    .code32
-    .global _start
+.section .text.boot
+.code32
+.global _start
+.type _start, @function
+
+.macro debug_char ch
+    movw $0x3FD, %dx
+1:  inb %dx, %al
+    testb $0x20, %al
+    jz 1b
+    movw $0x3F8, %dx
+    movb $'\ch', %al
+    outb %al, %dx
+.endm
+
 _start:
-    # Save multiboot2 info pointer (EBX) in EDI for later
-    movl %ebx, %edi
+    cli
+    debug_char S
 
-    # ── Step 1: Set up temporary page tables ──
-    # Identity-map the first 128MB using 2MB pages.
-    # PML4[0] → PDPT[0] → PD[0..63] with 2MB pages
+    movl %eax, %edi
+    movl %ebx, %esi
 
-    # Clear PML4 (4096 bytes)
-    movl $pml4_table, %ecx
+    # ── Disable GRUB's paging ──
+    movl %cr0, %eax
+    andl $(~(1 << 31)), %eax
+    movl %eax, %cr0
     xorl %eax, %eax
-    movl $1024, %edx           # 1024 dword iterations = 4096 bytes
-.clear_pml4:
-    movl %eax, (%ecx)
-    addl $4, %ecx
-    decl %edx
-    jnz .clear_pml4
-
-    # Clear PDPT (4096 bytes)
-    movl $pdpt_table, %ecx
-    movl $1024, %edx
-.clear_pdpt:
-    movl %eax, (%ecx)
-    addl $4, %ecx
-    decl %edx
-    jnz .clear_pdpt
-
-    # Clear PD (8192 bytes = 2 pages)
-    movl $pd_table, %ecx
-    movl $2048, %edx
-.clear_pd:
-    movl %eax, (%ecx)
-    addl $4, %ecx
-    decl %edx
-    jnz .clear_pd
-
-    # PML4[0] → PDPT (present + writable)
-    movl $pdpt_table, %eax
-    orl $0x03, %eax            # present + writable
-    movl %eax, pml4_table
-    movl $0, pml4_table + 4    # high 32 bits = 0
-
-    # PDPT[0] → PD (present + writable)
-    movl $pd_table, %eax
-    orl $0x03, %eax            # present + writable
-    movl %eax, pdpt_table
-    movl $0, pdpt_table + 4    # high 32 bits = 0
-
-    # PD entries: 64 entries of 2MB pages (128MB total)
-    # Each entry: flags(0x83) | phys_addr[20:13] in low word, 0 in high word
-    # Entry format: [phys_addr_2M_aligned | flags]
-    # flags = present(1) + writable(2) + page_size(0x80) = 0x83
-    movl $pd_table, %ecx
-    movl $0, %ebx              # physical address counter (increment by 2MB)
-    movl $0, %esi              # entry counter
-.fill_pd:
-    # Low 32 bits: flags + low physical address bits
-    movl %ebx, %eax
-    orl $0x83, %eax            # present + writable + page_size
-    movl %eax, (%ecx)
-    # High 32 bits: high physical address bits (always 0 for <4GB)
-    movl $0, 4(%ecx)
-    addl $8, %ecx              # next PD entry
-    addl $0x200000, %ebx       # next 2MB physical page
-    incl %esi
-    cmpl $64, %esi             # 64 entries × 2MB = 128MB
-    jl .fill_pd
-
-    # ── Step 2: Load PML4 into CR3 ──
-    movl $pml4_table, %eax
     movl %eax, %cr3
 
-    # ── Step 3: Enable PAE (CR4.PAE = bit 5) ──
+    # ── Get PC ──
+    call .Lget_pc
+.Lget_pc:
+    popl %ebp
+
+    # ── Set up identity-mapped page tables (0..128MB) ──
+    # P4[0] → P3
+    leal boot_p3_table - .Lget_pc(%ebp), %ecx
+    orl $0x03, %ecx
+    leal boot_p4_table - .Lget_pc(%ebp), %eax
+    movl %ecx, (%eax)
+
+    # P3[0] → P2
+    leal boot_p2_table - .Lget_pc(%ebp), %ecx
+    orl $0x03, %ecx
+    leal boot_p3_table - .Lget_pc(%ebp), %eax
+    movl %ecx, (%eax)
+
+    # P2: 64 × 2MB huge pages covering 0..128MB
+    leal boot_p2_table - .Lget_pc(%ebp), %edi
+    movl $0, %ecx
+    movl $64, %edx
+.fill_loop:
+    movl %ecx, %eax
+    orl $0x00000083, %eax
+    movl %eax, (%edi)
+    movl $0, 4(%edi)
+    addl $0x200000, %ecx
+    addl $8, %edi
+    decl %edx
+    jnz .fill_loop
+
+    # Also map P3[508..511] → same P2 entries to cover high MMIO area
+    # LAPIC is at 0xFEE00000 = P4[510], P3[508..511], P2 offset
+    # For simplicity, use 1GB page at P3[508] to map 0xFC0000000..0xFFFFFFFFF
+    # But this is > 4GB physical which we don't have.
+    # Instead, map P4[510] → P3 with 1:1 identity for MMIO range
+    # Actually LAPIC 0xFEE00000 is at physical < 4GB, it's virtual 0xFEE00000 = P4[0] area.
+    # 0xFEE00000 / 512GB = 0 → already covered by P4[0] → P3[0] → P2
+    # Wait, 0xFEE00000 = 4,275,898,880 bytes = ~3.98GB
+    # P4[0] covers 0..512GB, P3[0] covers 0..1GB. We need P3 entries for 1..4GB range.
+    # Let's fill ALL 512 P3 entries (each covering 1GB via 512 P2 entries)
+    # Actually, let's just fill P3 entries 1..3 with 1GB pages:
+
+    # P3[1] = 1GB page at 1GB (0x40000000), present + writable + huge (1GB)
+    leal boot_p3_table - .Lget_pc(%ebp), %edi
+    movl $0x40000083, 8(%edi)       # P3[1]: 1GB at 1GB, PS=1
+    movl $0, 12(%edi)
+
+    # P3[2] = 1GB page at 2GB
+    movl $0x80000083, 16(%edi)
+    movl $0, 20(%edi)
+
+    # P3[3] = 1GB page at 3GB (covers LAPIC at 0xFEE00000)
+    movl $0xC0000083, 24(%edi)
+    movl $0, 28(%edi)
+
+    debug_char P
+
+    # ── Enable PAE ──
     movl %cr4, %eax
     orl $(1 << 5), %eax
     movl %eax, %cr4
 
-    # ── Step 4: Enable long mode (IA32_EFER.LME = bit 8) ──
-    movl $0xC0000080, %ecx     # IA32_EFER MSR
+    # ── Load CR3 ──
+    leal boot_p4_table - .Lget_pc(%ebp), %eax
+    movl %eax, %cr3
+
+    # ── Enable long mode ──
+    movl $0xC0000080, %ecx
     rdmsr
     orl $(1 << 8), %eax
     wrmsr
 
-    # ── Step 5: Enable paging (CR0.PG = bit 31) ──
+    # ── Load GDT ──
+    leal trampoline_gdt - .Lget_pc(%ebp), %eax
+    leal gdt_desc - .Lget_pc(%ebp), %edi
+    movw $(trampoline_gdt_end - trampoline_gdt - 1), (%edi)
+    movl %eax, 2(%edi)
+    lgdt (%edi)
+
+    debug_char G
+
+    # ── Enable paging ──
     movl %cr0, %eax
-    orl $(1 << 31), %eax
+    orl $((1 << 31) | (1 << 0)), %eax
     movl %eax, %cr0
 
-    # ── Step 6: Load 64-bit GDT ──
-    lgdt gdt64_pointer
+    # ── Far jump to 64-bit code ──
+    leal _start64 - .Lget_pc(%ebp), %eax
+    leal far_ptr - .Lget_pc(%ebp), %edi
+    movl %eax, (%edi)
+    movw $0x08, 4(%edi)
 
-    # ── Step 7: Far jump to 64-bit code ──
-    ljmpl $0x08, $long_mode_entry
+    debug_char J
 
-# ─────────────────────────────────────────────────────────────
-# 64-bit long mode entry
-# ─────────────────────────────────────────────────────────────
-    .section .text.boot
-    .code64
-long_mode_entry:
-    # Set up segment registers for kernel data segment (selector 0x10)
+    ljmpl *(%edi)
+
+.balign 16
+trampoline_gdt:
+    .quad 0x0000000000000000      # null
+    .quad 0x00209A0000000000      # 64-bit code (0x08)
+    .quad 0x0000920000000000      # data (0x10)
+trampoline_gdt_end:
+
+.code64
+_start64:
     movw $0x10, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -150,57 +181,21 @@ long_mode_entry:
     movw %ax, %gs
     movw %ax, %ss
 
-    # Set up boot stack
-    leaq boot_stack_top(%rip), %rsp
+    movw $0x3FD, %dx
+1:  inb %dx, %al
+    testb $0x20, %al
+    jz 1b
+    movw $0x3F8, %dx
+    movb $'K', %al
+    outb %al, %dx
 
-    # Clear BSS section
-    leaq _sbss(%rip), %rdi
-    leaq _ebss(%rip), %rcx
-    subq %rdi, %rcx           # rcx = number of bytes to clear
-    xorq %rax, %rax
-    rep stosb
+    lea boot_stack_top(%rip), %rsp
 
-    # Call kmain(rdi = multiboot2 info addr, rsi = magic)
-    # RDI already has the multiboot2 info pointer from EBX
-    movl $0x36D76289, %esi     # pass multiboot2 magic as second arg
+    xorl %edi, %edi
+    xorl %esi, %esi
+
     call kmain
 
-    # Halt if kmain returns (it shouldn't)
-.halt:
     cli
-    hlt
-    jmp .halt
-
-# ─────────────────────────────────────────────────────────────
-# 64-bit GDT for long mode bootstrap
-# ─────────────────────────────────────────────────────────────
-    .section .rodata
-    .align 16
-gdt64:
-    .quad 0x0000000000000000    # 0x00: null descriptor
-    .quad 0x00209A0000000000    # 0x08: 64-bit kernel code (L, exec/read, DPL=0)
-    .quad 0x0000920000000000    # 0x10: 64-bit kernel data (read/write, DPL=0)
-    .quad 0x0000000000000000    # 0x18: reserved (TSS low — filled by Rust GDT init)
-    .quad 0x0000000000000000    # 0x20: reserved (TSS high)
-    .quad 0x0020FA0000000000    # 0x28: 64-bit user code (L, exec/read, DPL=3)
-    .quad 0x0000F20000000000    # 0x30: 64-bit user data (read/write, DPL=3)
-gdt64_end:
-
-gdt64_pointer:
-    .word gdt64_end - gdt64 - 1  # GDT limit
-    .quad gdt64                    # GDT base address
-
-# ─────────────────────────────────────────────────────────────
-# BSS: page tables and boot stack
-# ─────────────────────────────────────────────────────────────
-    .section .bss
-    .align 4096
-pml4_table:
-    .skip 4096
-pdpt_table:
-    .skip 4096
-pd_table:
-    .skip 4096 * 2               # 2 PD tables for up to 2GB mapping
-boot_stack_bottom:
-    .skip 4096 * 16              # 64KB boot stack
-boot_stack_top:
+1:  hlt
+    jmp 1b

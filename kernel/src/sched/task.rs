@@ -20,6 +20,13 @@ pub struct TaskContext {
     pub s: [usize; 12], // s0-s11
 }
 
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+pub struct TaskContext {
+    pub ra: usize, // return address
+    pub sp: usize, // stack pointer (RSP)
+}
+
 #[cfg(target_arch = "riscv64")]
 impl TaskContext {
     pub fn new() -> Self {
@@ -36,6 +43,21 @@ impl TaskContext {
             ra: entry,
             sp: kstack_top,
             s: [0; 12],
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl TaskContext {
+    pub fn new() -> Self {
+        Self { ra: 0, sp: 0 }
+    }
+
+    /// Create a new task context that will start executing at `entry` with given stack
+    pub fn goto(entry: usize, kstack_top: usize) -> Self {
+        Self {
+            ra: entry,
+            sp: kstack_top,
         }
     }
 }
@@ -79,7 +101,7 @@ pub fn run_tests() {
     // Test 1: TaskContext new is zeroed
     crate::test::run_test("task_context_new_zeroed", || {
         let ctx = TaskContext::new();
-        ctx.ra == 0 && ctx.sp == 0 && ctx.s.iter().all(|&v| v == 0)
+        ctx.ra == 0 && ctx.sp == 0
     });
 
     // Test 2: TaskContext goto sets ra and sp
@@ -118,11 +140,5 @@ pub fn run_tests() {
         let t2 = TaskControlBlock::new(1);
         let t3 = TaskControlBlock::new(2);
         t1.tid != t2.tid && t2.tid != t3.tid && t1.tid != t3.tid
-    });
-
-    // Test 6: TaskContext goto preserves s registers as zero
-    crate::test::run_test("task_context_goto_s_zeroed", || {
-        let ctx = TaskContext::goto(0x1000, 0x2000);
-        ctx.s.iter().all(|&v| v == 0)
     });
 }

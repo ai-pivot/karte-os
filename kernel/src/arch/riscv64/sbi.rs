@@ -51,6 +51,7 @@ impl core::fmt::Write for Console {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 #[macro_export]
 macro_rules! console_print {
     ($($arg:tt)*) => {
@@ -61,12 +62,14 @@ macro_rules! console_print {
     };
 }
 
+#[cfg(target_arch = "riscv64")]
 #[macro_export]
 macro_rules! console_println {
     () => { $crate::console_print!("\n") };
     ($($arg:tt)*) => {
         {
-            use core::fmt::Write;
+            use core::fmt::Write
+            ;
             let _ = writeln!($crate::arch::sbi::Console, $($arg)*);
         }
     };

@@ -37,7 +37,7 @@ impl ComPort {
             // Enable DLAB (set baud rate divisor)
             line_ctrl.write(0x80);
             // Set divisor to 1 (115200 baud) — QEMU ignores this but we set it
-            data.write(0x01);      // DLL (divisor latch low)
+            data.write(0x01); // DLL (divisor latch low)
             int_enable.write(0x00); // DLH (divisor latch high)
 
             // 8 bits, no parity, one stop bit (8N1), disable DLAB

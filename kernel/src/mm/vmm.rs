@@ -152,24 +152,35 @@ pub fn init() {
         KERNEL_PAGE_TABLE = root;
     }
 
-    // Identity map kernel (0x80200000 .. 0x80200000 + 128MB)
-    let start = 0x8020_0000;
-    let end = start + 128 * 1024 * 1024;
-    identity_map(root, start, end, PTEFlags::KRWX);
+    #[cfg(target_arch = "riscv64")]
+    {
+        // Identity map kernel (0x80200000 .. 0x80200000 + 128MB)
+        let start = 0x8020_0000;
+        let end = start + 128 * 1024 * 1024;
+        identity_map(root, start, end, PTEFlags::KRWX);
 
-    // Map UART MMIO (0x10000000 - 0x10001000)
-    map(root, 0x1000_0000, 0x1000_0000, PTEFlags::KRW);
+        // Map UART MMIO (0x10000000 - 0x10001000)
+        map(root, 0x1000_0000, 0x1000_0000, PTEFlags::KRW);
 
-    // Map VirtIO MMIO devices (0x10001000 - 0x10009000)
-    // 8 devices at 0x1000 stride, each occupying a full page
-    for addr in (0x1000_1000..0x1000_9000).step_by(PAGE_SIZE) {
-        map(root, addr, addr, PTEFlags::KRW);
+        // Map VirtIO MMIO devices (0x10001000 - 0x10009000)
+        // 8 devices at 0x1000 stride, each occupying a full page
+        for addr in (0x1000_1000..0x1000_9000).step_by(PAGE_SIZE) {
+            map(root, addr, addr, PTEFlags::KRW);
+        }
+
+        // Map PLIC (0x0C000000 - 0x0C400000) - needs multiple pages
+        // Priority, enable, pending, threshold, claim/complete registers
+        for addr in (0x0C00_0000..0x0C40_0000).step_by(PAGE_SIZE) {
+            map(root, addr, addr, PTEFlags::KRW);
+        }
     }
 
-    // Map PLIC (0x0C000000 - 0x0C400000) - needs multiple pages
-    // Priority, enable, pending, threshold, claim/complete registers
-    for addr in (0x0C00_0000..0x0C40_0000).step_by(PAGE_SIZE) {
-        map(root, addr, addr, PTEFlags::KRW);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Identity map kernel (2MB .. 2MB + 128MB)
+        let start = 0x0020_0000;
+        let end = start + 128 * 1024 * 1024;
+        identity_map(root, start, end, PTEFlags::KRWX);
     }
 
     // Activate page table
@@ -181,7 +192,13 @@ pub fn init() {
         core::arch::asm!("sfence.vma");
     }
 
-    crate::console_println!("[vmm] Sv39 page table activated at {:#x}", root_addr);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Activate page table via CR3
+        crate::arch::trap::activate_page_table(root_addr);
+    }
+
+    crate::console_println!("[vmm] Page table activated at {:#x}", root_addr);
 }
 
 // ── User address space support ──────────────────────────────────────────

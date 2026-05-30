@@ -29,6 +29,34 @@ global_asm!(
     "j trap_return_user",
 );
 
+// On x86_64, switch.S is included from arch/x86_64/switch.rs via global_asm!
+// and __switch is declared there. first_task_shim is defined below as a
+// Rust naked function that jumps to trap_return_user.
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn __switch(current_sp: *mut usize, next_sp: *const usize);
+}
+
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" {
+    fn __switch(current_sp: *mut usize, next_sp: *const usize);
+    fn first_task_shim();
+}
+
+/// First task shim for x86_64: __switch returns here, which jumps to
+/// trap_return_user to restore user registers and iretq.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn first_task_shim() -> ! {
+    // Jump to trap_return_user — this naked function restores GP regs and iretqs
+    unsafe extern "C" {
+        fn trap_return_user();
+    }
+    unsafe {
+        core::arch::asm!("jmp {}", in(reg) trap_return_user as usize, options(noreturn));
+    }
+}
+
 pub const MAX_TASKS: usize = 64;
 
 /// Sentinel value for `Scheduler::current` meaning "init (the shell) is running".
@@ -37,11 +65,6 @@ const INIT_SENTINEL: usize = MAX_TASKS;
 
 /// PROCESS_TABLE index of the init process (the shell).
 const INIT_PROC_IDX: usize = 0;
-
-unsafe extern "C" {
-    fn __switch(current_sp: *mut usize, next_sp: *const usize);
-    fn first_task_shim();
-}
 
 static TASK_SPS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
 
@@ -281,6 +304,10 @@ pub fn remove_task(proc_idx: usize) {
     }
 }
 
+/// Add a user process to the scheduler.
+///
+/// On RISC-V: builds a TrapContext on the kernel stack with the RISC-V layout.
+/// On x86_64: builds a TrapContext on the kernel stack with the x86_64 layout.
 pub fn add_user_process(
     entry: usize,
     user_stack_top: usize,
@@ -300,24 +327,56 @@ pub fn add_user_process(
         }
     };
 
-    let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
-    let trap_ctx_base = kernel_stack_top - ctx_size;
-    let switch_sp = trap_ctx_base - 104;
-    unsafe {
-        // Write __switch frame + TrapContext (safe: child's kernel stack is fresh)
-        core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + 104);
-        // __switch frame: ra slot (offset 0) = first_task_shim entry.
-        let sw = switch_sp as *mut usize;
-        *sw.add(0) = first_task_shim as *const () as usize;
-        // TrapContext for the task's first U-mode entry.
-        let ctx = trap_ctx_base as *mut usize;
-        *ctx.add(2) = user_stack_top; // x[2]: trap_return_user reads this as user sp
-        *ctx.add(32) = 0x20; // sstatus: SPP=0 (→U-mode), SPIE=1
-        *ctx.add(33) = entry; // sepc: user entry point
-        *ctx.add(34) = user_stack_top; // sscratch field (user sp)
-        *ctx.add(35) = user_satp; // user_satp: switch to this page table before sret
+    #[cfg(target_arch = "riscv64")]
+    {
+        let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
+        let trap_ctx_base = kernel_stack_top - ctx_size;
+        let switch_sp = trap_ctx_base - 104;
+        unsafe {
+            // Write __switch frame + TrapContext (safe: child's kernel stack is fresh)
+            core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + 104);
+            // __switch frame: ra slot (offset 0) = first_task_shim entry.
+            let sw = switch_sp as *mut usize;
+            *sw.add(0) = first_task_shim as *const () as usize;
+            // TrapContext for the task's first U-mode entry.
+            let ctx = trap_ctx_base as *mut usize;
+            *ctx.add(2) = user_stack_top; // x[2]: trap_return_user reads this as user sp
+            *ctx.add(32) = 0x20; // sstatus: SPP=0 (→U-mode), SPIE=1
+            *ctx.add(33) = entry; // sepc: user entry point
+            *ctx.add(34) = user_stack_top; // sscratch field (user sp)
+            *ctx.add(35) = user_satp; // user_satp: switch to this page table before sret
+        }
+        TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
     }
-    TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
+        // x86_64 __switch frame: 6 callee-saved regs × 8 bytes + return address = 56 bytes
+        let switch_frame_size = 7 * 8;
+        let trap_ctx_base = kernel_stack_top - ctx_size;
+        let switch_sp = trap_ctx_base - switch_frame_size;
+        unsafe {
+            // Zero out the entire area
+            core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + switch_frame_size);
+            // __switch frame: return address = first_task_shim
+            // On x86_64, `call __switch` pushes the return address.
+            // When we pop callee-saved regs and `ret`, it jumps to first_task_shim.
+            let sw = switch_sp as *mut usize;
+            *sw.add(0) = first_task_shim as *const () as usize;
+            // Build TrapContext for the task's first U-mode entry via trap_return_user.
+            let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
+            (*ctx).rip = entry as u64;
+            (*ctx).cs = crate::arch::gdt::USER_CODE_SEL.load(Ordering::Relaxed) as u64;
+            (*ctx).rflags = 0x202; // IF + reserved bit
+            (*ctx).rsp = user_stack_top as u64;
+            (*ctx).ss = crate::arch::gdt::USER_DATA_SEL.load(Ordering::Relaxed) as u64;
+            (*ctx).kernel_sp = kernel_stack_top as u64;
+            (*ctx).user_cr3 = user_satp as u64;
+            (*ctx).trap_from_user = 1;
+        }
+        TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
+    }
 
     let tcb = TaskControlBlock::new(tid);
     sched.tasks[tid] = Some(tcb);

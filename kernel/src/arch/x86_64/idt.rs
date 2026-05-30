@@ -8,9 +8,7 @@
 //! save additional register state (TrapContext).
 
 use spin::Once;
-use x86_64::structures::idt::{
-    InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode,
-};
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
@@ -45,13 +43,17 @@ pub fn init() {
         idt.overflow.set_handler_fn(overflow_handler);
         idt.bound_range_exceeded.set_handler_fn(bound_range_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
-        idt.device_not_available.set_handler_fn(device_not_available_handler);
+        idt.device_not_available
+            .set_handler_fn(device_not_available_handler);
         // Double fault uses IST[0] for a dedicated stack
-        idt.double_fault
-            .set_handler_fn(double_fault_handler)
-            .set_stack_index(super::gdt::DOUBLE_FAULT_IST_INDEX);
+        unsafe {
+            idt.double_fault
+                .set_handler_fn(double_fault_handler)
+                .set_stack_index(super::gdt::DOUBLE_FAULT_IST_INDEX);
+        }
         idt.invalid_tss.set_handler_fn(invalid_tss_handler);
-        idt.segment_not_present.set_handler_fn(segment_not_present_handler);
+        idt.segment_not_present
+            .set_handler_fn(segment_not_present_handler);
         idt.stack_segment_fault
             .set_handler_fn(stack_segment_fault_handler);
         idt.general_protection_fault
@@ -68,17 +70,17 @@ pub fn init() {
             .set_handler_fn(security_exception_handler);
 
         // Hardware interrupt handlers
-        idt[TIMER_VECTOR as usize].set_handler_fn(timer_handler);
-        idt[KEYBOARD_VECTOR as usize].set_handler_fn(keyboard_handler);
-        idt[COM1_VECTOR as usize].set_handler_fn(com1_handler);
-        idt[SPURIOUS_VECTOR as usize].set_handler_fn(spurious_handler);
+        idt[TIMER_VECTOR].set_handler_fn(timer_handler);
+        idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_handler);
+        idt[COM1_VECTOR].set_handler_fn(com1_handler);
+        idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
         // Syscall via int 0x80
         // Note: `extern "x86-interrupt"` doesn't give us access to all GP regs.
         // For full syscall dispatch we need a custom ISR stub (see trap.rs).
         // This is a placeholder; the real syscall path goes through a naked
         // function wrapper defined in trap.rs.
-        idt[SYSCALL_VECTOR as usize].set_handler_fn(syscall_int_handler);
+        idt[SYSCALL_VECTOR].set_handler_fn(syscall_int_handler);
 
         idt
     });
@@ -88,66 +90,63 @@ pub fn init() {
 
 // ─── CPU Exception Handlers ─────────────────────────────────
 
-unsafe extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Divide Error at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn debug_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn debug_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Debug at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn nmi_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn nmi_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] NMI at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Breakpoint at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn overflow_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn overflow_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Overflow at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn bound_range_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn bound_range_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Bound Range Exceeded at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Invalid Opcode at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn device_not_available_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn device_not_available_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Device Not Available at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn double_fault_handler(
-    frame: InterruptStackFrame,
-    error_code: u64,
-) -> ! {
+extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
     panic!(
         "[EXCEPTION] Double Fault at {:#x}, error code={:#x}",
         frame.instruction_pointer.as_u64(),
@@ -155,7 +154,7 @@ unsafe extern "x86-interrupt" fn double_fault_handler(
     );
 }
 
-unsafe extern "x86-interrupt" fn invalid_tss_handler(frame: InterruptStackFrame, error_code: u64) {
+extern "x86-interrupt" fn invalid_tss_handler(frame: InterruptStackFrame, error_code: u64) {
     crate::console_println!(
         "[EXCEPTION] Invalid TSS at {:#x}, error code={:#x}",
         frame.instruction_pointer.as_u64(),
@@ -163,10 +162,7 @@ unsafe extern "x86-interrupt" fn invalid_tss_handler(frame: InterruptStackFrame,
     );
 }
 
-unsafe extern "x86-interrupt" fn segment_not_present_handler(
-    frame: InterruptStackFrame,
-    error_code: u64,
-) {
+extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame, error_code: u64) {
     crate::console_println!(
         "[EXCEPTION] Segment Not Present at {:#x}, error code={:#x}",
         frame.instruction_pointer.as_u64(),
@@ -174,10 +170,7 @@ unsafe extern "x86-interrupt" fn segment_not_present_handler(
     );
 }
 
-unsafe extern "x86-interrupt" fn stack_segment_fault_handler(
-    frame: InterruptStackFrame,
-    error_code: u64,
-) {
+extern "x86-interrupt" fn stack_segment_fault_handler(frame: InterruptStackFrame, error_code: u64) {
     crate::console_println!(
         "[EXCEPTION] Stack Segment Fault at {:#x}, error code={:#x}",
         frame.instruction_pointer.as_u64(),
@@ -185,7 +178,7 @@ unsafe extern "x86-interrupt" fn stack_segment_fault_handler(
     );
 }
 
-unsafe extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, error_code: u64) {
+extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, error_code: u64) {
     crate::console_println!(
         "[EXCEPTION] General Protection Fault at {:#x}, error code={:#x}",
         frame.instruction_pointer.as_u64(),
@@ -193,7 +186,7 @@ unsafe extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, er
     );
 }
 
-unsafe extern "x86-interrupt" fn page_fault_handler(
+extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
@@ -201,23 +194,20 @@ unsafe extern "x86-interrupt" fn page_fault_handler(
     crate::console_println!(
         "[EXCEPTION] Page Fault at {:#x}, accessing {:#x}, error={:?}",
         frame.instruction_pointer.as_u64(),
-        fault_addr.as_u64(),
+        fault_addr.expect("valid virtual address").as_u64(),
         error_code,
     );
     // TODO: forward to the kernel's page fault handler for lazy allocation
 }
 
-unsafe extern "x86-interrupt" fn x87_floating_point_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn x87_floating_point_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] x87 Floating Point at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn alignment_check_handler(
-    frame: InterruptStackFrame,
-    error_code: u64,
-) {
+extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error_code: u64) {
     crate::console_println!(
         "[EXCEPTION] Alignment Check at {:#x}, error code={:#x}",
         frame.instruction_pointer.as_u64(),
@@ -225,31 +215,28 @@ unsafe extern "x86-interrupt" fn alignment_check_handler(
     );
 }
 
-unsafe extern "x86-interrupt" fn machine_check_handler(frame: InterruptStackFrame) -> ! {
+extern "x86-interrupt" fn machine_check_handler(frame: InterruptStackFrame) -> ! {
     panic!(
         "[EXCEPTION] Machine Check at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn simd_floating_point_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn simd_floating_point_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] SIMD Floating Point at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn virtualization_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn virtualization_handler(frame: InterruptStackFrame) {
     crate::console_println!(
         "[EXCEPTION] Virtualization at {:#x}",
         frame.instruction_pointer.as_u64(),
     );
 }
 
-unsafe extern "x86-interrupt" fn security_exception_handler(
-    frame: InterruptStackFrame,
-    error_code: u64,
-) {
+extern "x86-interrupt" fn security_exception_handler(frame: InterruptStackFrame, error_code: u64) {
     crate::console_println!(
         "[EXCEPTION] Security Exception at {:#x}, error code={:#x}",
         frame.instruction_pointer.as_u64(),
@@ -259,7 +246,7 @@ unsafe extern "x86-interrupt" fn security_exception_handler(
 
 // ─── Hardware Interrupt Handlers ─────────────────────────────
 
-unsafe extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // LAPIC timer tick — drive the scheduler
     crate::arch::lapic::local_eoi();
     // Poll UART (like RISC-V timer handler)
@@ -270,26 +257,26 @@ unsafe extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     crate::sched::schedule();
 }
 
-unsafe extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
     // Read scan code from keyboard controller
     let _scancode: u8 = unsafe { x86_64::instructions::port::Port::new(0x60).read() };
     // TODO: keyboard input handling
     super::lapic::local_eoi();
 }
 
-unsafe extern "x86-interrupt" fn com1_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn com1_handler(_frame: InterruptStackFrame) {
     // COM1 UART interrupt — drain RX FIFO into TTY ring buffer
     crate::driver::tty::poll_uart();
     super::lapic::local_eoi();
 }
 
-unsafe extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {
     // Spurious interrupt — ignore (don't send EOI for PIC spurious)
 }
 
 // ─── Syscall Handler (int 0x80) ──────────────────────────────
 
-unsafe extern "x86-interrupt" fn syscall_int_handler(frame: InterruptStackFrame) {
+extern "x86-interrupt" fn syscall_int_handler(frame: InterruptStackFrame) {
     // NOTE: `extern "x86-interrupt"` only gives us the InterruptStackFrame,
     // not the full register state. For a real syscall dispatch we need a
     // custom ISR stub that saves all GP registers into a TrapContext.

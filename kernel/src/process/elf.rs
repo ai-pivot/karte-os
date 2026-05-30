@@ -6,7 +6,12 @@
 const ELF_MAGIC: u32 = 0x464c457f;
 
 /// RISC-V 64-bit
-const EM_RISCV: u16 = 243;
+#[cfg(target_arch = "riscv64")]
+const EM_MACHINE: u16 = 243;
+
+/// x86_64
+#[cfg(target_arch = "x86_64")]
+const EM_MACHINE: u16 = 62; // EM_X86_64
 
 /// PT_LOAD segment type
 const PT_LOAD: u32 = 1;
@@ -83,9 +88,9 @@ impl<'a> ElfFile<'a> {
             return Err("ELF: not little-endian");
         }
 
-        // Verify RISC-V machine type
-        if u16::from_le(header.machine) != EM_RISCV {
-            return Err("ELF: not RISC-V");
+        // Verify machine type
+        if u16::from_le(header.machine) != EM_MACHINE {
+            return Err("ELF: wrong machine type");
         }
 
         let entry = u64::from_le(header.entry) as usize;

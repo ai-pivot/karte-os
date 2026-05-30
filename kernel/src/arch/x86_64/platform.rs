@@ -100,3 +100,8 @@ pub fn activate_page_table(root_paddr: usize) {
 pub fn read_page_table_root() -> usize {
     crate::arch::trap::read_page_table_root()
 }
+
+/// Print a string to the console via COM1.
+pub fn print(s: &str) {
+    crate::arch::console::print(s);
+}

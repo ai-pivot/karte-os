@@ -11,8 +11,8 @@
 //! We access the LAPIC via MMIO (memory-mapped I/O), using volatile
 //! reads/writes through the identity-mapped virtual address.
 
-use x86_64::registers::model_specific::Msr;
 use x86_64::VirtAddr;
+use x86_64::registers::model_specific::Msr;
 
 /// IA32_APIC_BASE MSR address.
 const IA32_APIC_BASE_MSR: u32 = 0x1B;
@@ -63,7 +63,7 @@ impl Lapic {
     }
 
     /// Initialize the LAPIC: enable it and set up the spurious interrupt vector.
-    pub fn init(&mut self) {
+    pub fn init(&self) {
         // Enable LAPIC via the spurious interrupt vector register.
         // Bit 8 = APIC software enable, vector = 0xFF (spurious)
         self.write(reg::SPURIOUS_VECTOR, 0x1FF);
@@ -74,7 +74,7 @@ impl Lapic {
     /// - `divide`: divide configuration (e.g., 0x03 = divide by 16)
     /// - `initial_count`: initial count value (determines period)
     /// - `vector`: IDT vector number for the timer interrupt
-    pub fn setup_timer(&mut self, divide: u32, initial_count: u32, vector: u8) {
+    pub fn setup_timer(&self, divide: u32, initial_count: u32, vector: u8) {
         // Set divide value
         self.write(reg::TIMER_DIVIDE, divide);
         // Set initial count

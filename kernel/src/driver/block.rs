@@ -1,7 +1,7 @@
 //! Block device abstraction layer.
 //!
 //! Defines the `BlockDevice` trait as an abstraction between VFS and concrete
-//! block devices, and provides a `VirtIOBlock` adapter.
+//! block devices, and provides a `VirtIOBlock` adapter (RISC-V only).
 
 use crate::sync::spinlock::SpinLock;
 
@@ -35,8 +35,10 @@ pub trait BlockDevice: Send + Sync {
 }
 
 /// VirtIO block device wrapper implementing `BlockDevice`.
+#[cfg(target_arch = "riscv64")]
 pub struct VirtIOBlock;
 
+#[cfg(target_arch = "riscv64")]
 impl BlockDevice for VirtIOBlock {
     fn read_block(&self, block_id: usize, buf: &mut [u8]) -> Result<(), VfsError> {
         crate::driver::virtio::read_block(block_id, buf).map_err(|_| VfsError::IoError)

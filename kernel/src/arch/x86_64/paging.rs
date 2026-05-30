@@ -7,8 +7,7 @@
 
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags,
-    PhysFrame, Size4KiB, Translate,
+    FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -21,7 +20,7 @@ pub mod pte_flags {
 
     pub const PRESENT: Flags = Flags::PRESENT;
     pub const WRITABLE: Flags = Flags::WRITABLE;
-    pub const USER: Flags = Flags::USER; // Ring 3 accessible
+    pub const USER: Flags = Flags::USER_ACCESSIBLE; // Ring 3 accessible
     pub const NO_EXECUTE: Flags = Flags::NO_EXECUTE;
     pub const HUGE: Flags = Flags::HUGE_PAGE;
     pub const GLOBAL: Flags = Flags::GLOBAL;

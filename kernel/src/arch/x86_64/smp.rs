@@ -26,10 +26,7 @@ pub fn init_bsp(_cpu_id: usize) {
     BSP_LAPIC_ID.store(lapic_id as usize, Ordering::Relaxed);
     ACTIVE_CPUS.store(1, Ordering::Relaxed);
 
-    crate::console_println!(
-        "[smp] BSP initialized: lapic_id={}",
-        lapic_id
-    );
+    crate::console_println!("[smp] BSP initialized: lapic_id={}", lapic_id);
 }
 
 /// Start secondary CPUs (APs — Application Processors).
