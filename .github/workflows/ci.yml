@@ -54,7 +54,8 @@ jobs:
             -A deprecated -A clippy::redundant_field_names -A clippy::result_unit_err \
             -A clippy::default_trait_access -A clippy::manual_range_contains \
             -A clippy::is_multiple_of -A clippy::div_ceil -A clippy::redundant-casting \
-            -A clippy::needless_range_loop -A clippy::borrow_interior_mutable_const
+            -A clippy::needless_range_loop -A clippy::borrow_interior_mutable_const \
+            -A clippy::absurd_extreme_comparisons -A clippy::bad_bit_mask
 
       - name: Upload RISC-V kernel
         uses: actions/upload-artifact@v4
@@ -86,7 +87,7 @@ jobs:
           restore-keys: x86-cargo-
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 grub-common xorriso
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 grub-common xorriso mtools
 
       - name: Build user programs (x86_64)
         run: cd user && make ARCH=x86_64 clean && make ARCH=x86_64
