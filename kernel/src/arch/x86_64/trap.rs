@@ -215,7 +215,7 @@ pub fn set_next_timer() {
 /// - `user_sp`: User-mode stack pointer
 /// - `kernel_sp`: Kernel stack top (used for TSS.RSP0)
 /// - `user_cr3`: Physical address of user PML4 table
-pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3: u64) -> ! {
+pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, _user_cr3: u64) -> ! {
     let user_cs = super::gdt::USER_CODE_SEL.load(Ordering::Relaxed) as u64;
     let user_ss = super::gdt::USER_DATA_SEL.load(Ordering::Relaxed) as u64;
 
@@ -226,14 +226,13 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3
 
     unsafe {
         core::arch::asm!(
-            // Disable interrupts during the critical CR3 + iretq sequence.
-            // If a timer interrupt fires between CR3 switch and iretq, the
-            // interrupt handler can corrupt the partially-built iretq frame.
+            // Disable interrupts during the critical iretq sequence.
             // iretq will re-enable interrupts via RFLAGS.IF=1 (0x202).
             "cli",
 
-            // Switch to user page table
-            "mov cr3, {cr3}",
+            // NOTE: No CR3 switch. User code is mapped into the kernel page
+            // table (see Process::from_elf), so we keep using kernel PT.
+            // Per-process page tables are not yet supported on x86_64.
 
             // Use kernel stack to build iretq frame
             "mov rsp, {ksp}",
@@ -266,11 +265,10 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3
             // Atomically restore RIP, CS, RFLAGS, RSP, SS → Ring 3
             "iretq",
 
-            cr3  = in(reg) user_cr3,
-            ksp  = in(reg) kernel_sp as u64,
-            ss   = in(reg) user_ss,
-            usp  = in(reg) user_sp as u64,
-            cs   = in(reg) user_cs,
+            ksp   = in(reg) kernel_sp as u64,
+            ss    = in(reg) user_ss,
+            usp   = in(reg) user_sp as u64,
+            cs    = in(reg) user_cs,
             entry = in(reg) entry as u64,
             options(noreturn),
         );
