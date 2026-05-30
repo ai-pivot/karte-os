@@ -4,9 +4,27 @@ use std::path::PathBuf;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let memory_x = include_bytes!("memory.x");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
-    fs::write(out_dir.join("memory.x"), memory_x).unwrap();
-    println!("cargo:rustc-link-search={}", out_dir.display());
-    println!("cargo:rerun-if-changed=memory.x");
+    match target_arch.as_str() {
+        "riscv64" => {
+            let memory_x = include_bytes!("memory.x");
+            fs::write(out_dir.join("memory.x"), memory_x).unwrap();
+            println!("cargo:rustc-link-search={}", out_dir.display());
+            println!("cargo:rerun-if-changed=memory.x");
+        }
+        "x86_64" => {
+            let memory_ld = include_bytes!("memory-x86_64.ld");
+            fs::write(out_dir.join("memory-x86_64.ld"), memory_ld).unwrap();
+            println!("cargo:rustc-link-search={}", out_dir.display());
+            println!(
+                "cargo:rustc-link-arg=-T{}",
+                out_dir.join("memory-x86_64.ld").display()
+            );
+            println!("cargo:rerun-if-changed=memory-x86_64.ld");
+            // 静态链接，无动态库
+            println!("cargo:rustc-link-arg=-nostartfiles");
+        }
+        _ => {}
+    }
 }

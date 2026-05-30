@@ -1,20 +1,35 @@
 .PHONY: build run debug clean doc check build-test test boot-test smp-test test-run disk.img shell
 
-# Project settings
-KERNEL_BIN := target/riscv64gc-unknown-none-elf/release/karte-os-kernel
-KERNEL_ELF := target/riscv64gc-unknown-none-elf/release/karte-os-kernel
+# 默认架构
+ARCH ?= riscv64
 
-# QEMU settings
-QEMU := qemu-system-riscv64
+# 架构特定配置
+ifeq ($(ARCH),riscv64)
+    QEMU := qemu-system-riscv64
+    QEMU_MACHINE := virt
+    QEMU_CPU := rv64
+    QEMU_BIOS := -bios default
+    TARGET := riscv64gc-unknown-none-elf
+    KERNEL_ELF := target/$(TARGET)/release/karte-os-kernel
+    QEMU_BLOCKDEV := -drive id=blk0,file=disk.img,format=raw,if=none -device virtio-blk-device,drive=blk0
+else ifeq ($(ARCH),x86_64)
+    QEMU := qemu-system-x86_64
+    QEMU_MACHINE := q35
+    QEMU_CPU := qemu64
+    QEMU_BIOS :=
+    TARGET := x86_64-unknown-none
+    KERNEL_ELF := target/$(TARGET)/release/karte-os-kernel
+    QEMU_BLOCKDEV := -drive file=disk.img,format=raw,if=virtio
+endif
+
 QEMU_FLAGS := \
- -machine virt \
- -cpu rv64 \
+ -machine $(QEMU_MACHINE) \
+ -cpu $(QEMU_CPU) \
  -nographic \
- -bios default \
+ $(QEMU_BIOS) \
  -m 128M \
  -smp 1 \
- -drive id=blk0,file=disk.img,format=raw,if=none \
- -device virtio-blk-device,drive=blk0
+ $(QEMU_BLOCKDEV)
 
 # Ensure disk image exists (64MB FAT32 formatted)
 disk.img:
@@ -28,10 +43,16 @@ disk.img:
 # We delete the binary + fingerprint because cargo's incremental cache doesn't
 # distinguish between different --features flags — 'make test' builds with
 # test_mode, which would otherwise be reused by 'make build'.
+ifeq ($(ARCH),riscv64)
 build:
 	@rm -f target/riscv64gc-unknown-none-elf/release/karte-os-kernel
 	@rm -rf target/riscv64gc-unknown-none-elf/release/.fingerprint/karte-os-kernel-*
 	cargo build --release -p karte-os-kernel
+else ifeq ($(ARCH),x86_64)
+build:
+	cd user && $(MAKE) ARCH=x86_64 || true
+	cargo build --release --target kernel/x86_64-karte-os.json -p karte-os-kernel
+endif
 
 # Run in QEMU
 run: build disk.img
@@ -73,11 +94,7 @@ test: build-test
 # Run boot test (normal mode)
 boot-test: build disk.img
 	@echo "Running boot test..."
-	@timeout 10 qemu-system-riscv64 -machine virt -cpu rv64 -nographic \
-		-bios default -m 128M -smp 1 \
-		-drive id=blk0,file=disk.img,format=raw,if=none \
-		-device virtio-blk-device,drive=blk0 \
-		-kernel $(KERNEL_ELF) 2>&1 | grep -qa "KarteOS Shell" \
+	@timeout 10 $(QEMU) $(QEMU_FLAGS) -kernel $(KERNEL_ELF) 2>&1 | grep -qa "KarteOS Shell" \
 		&& echo "Boot test passed" || echo "Boot test failed"
 
 # Build shell + kernel and run
