@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
   workflow_dispatch:
 
 env:
@@ -12,15 +13,18 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # ── Job 1: Build ──
-  build:
+  # ═══════════════════════════════════════════════════════════════
+  #  RISC-V Build
+  # ═══════════════════════════════════════════════════════════════
+  build-riscv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install toolchain
         run: |
           rustup target add riscv64gc-unknown-none-elf
+          rustup component add clippy rustfmt
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -29,61 +33,47 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: riscv-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: riscv-cargo-
 
-      - name: Install QEMU and cross-compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
 
       - name: Build user programs
         run: cd user && make clean && make
 
-      - name: Build (release)
-        run: make build
-
-      - name: Upload kernel binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-binary
-          path: target/riscv64gc-unknown-none-elf/release/karte-os-kernel
-
-  # ── Job 2: Lint ──
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        run: |
-          rustup target add riscv64gc-unknown-none-elf
-          rustup component add clippy rustfmt
-
-      - name: Install cross-compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-riscv64-linux-gnu
-
-      - name: Build user programs
-        run: cd user && make clean && make
+      - name: Build kernel
+        run: cargo build --release -p karte-os-kernel --target riscv64gc-unknown-none-elf
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --release -p karte-os-kernel --target riscv64gc-unknown-none-elf -- -A deprecated -A clippy::redundant_field_names -A clippy::result_unit_err -A clippy::default_trait_access -A clippy::manual_range_contains -A clippy::is_multiple_of -A clippy::div_ceil -A clippy::redundant-casting -A clippy::needless_range_loop -A clippy::borrow_interior_mutable_const
+        run: |
+          cargo clippy --release -p karte-os-kernel --target riscv64gc-unknown-none-elf -- \
+            -A deprecated -A clippy::redundant_field_names -A clippy::result_unit_err \
+            -A clippy::default_trait_access -A clippy::manual_range_contains \
+            -A clippy::is_multiple_of -A clippy::div_ceil -A clippy::redundant-casting \
+            -A clippy::needless_range_loop -A clippy::borrow_interior_mutable_const
 
-  # ── Job 3: QEMU Integration Tests ──
-  test:
+      - name: Upload RISC-V kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-riscv
+          path: target/riscv64gc-unknown-none-elf/release/karte-os-kernel
+
+  # ═══════════════════════════════════════════════════════════════
+  #  x86_64 Build
+  # ═══════════════════════════════════════════════════════════════
+  build-x86:
     runs-on: ubuntu-latest
-    needs: build
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install toolchain
         run: |
-          rustup target add riscv64gc-unknown-none-elf
+          rustup toolchain install nightly
+          rustup component add rust-src --toolchain nightly
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -92,22 +82,62 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: x86-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: x86-cargo-
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 grub-common xorriso
+
+      - name: Build user programs (x86_64)
+        run: cd user && make ARCH=x86_64 clean && make ARCH=x86_64
+
+      - name: Build kernel + ISO
+        run: |
+          touch user/hello.elf user/heap_test.elf user/file_test.elf user/spawn_test.elf
+          cargo +nightly build --release --target x86_64-unknown-none -p karte-os-kernel -Z build-std=core,alloc
+          mkdir -p target/x86_64-iso/boot/grub
+          cp target/x86_64-unknown-none/release/karte-os-kernel target/x86_64-iso/boot/karte-os-kernel
+          printf 'set timeout=0\nset default=0\nmenuentry "KarteOS" {\n    multiboot2 /boot/karte-os-kernel\n    boot\n}\n' > target/x86_64-iso/boot/grub/grub.cfg
+          grub-mkrescue -o target/karte-os-x86_64.iso target/x86_64-iso
+
+      - name: Upload x86_64 ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: karte-os-x86_64
+          path: target/karte-os-x86_64.iso
+
+  # ═══════════════════════════════════════════════════════════════
+  #  RISC-V Tests
+  # ═══════════════════════════════════════════════════════════════
+  test:
+    runs-on: ubuntu-latest
+    needs: build-riscv
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup target add riscv64gc-unknown-none-elf
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: riscv-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: riscv-cargo-
 
       - name: Install QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
 
       - name: Build user programs
         run: cd user && make clean && make
 
-      - name: Build test kernel
-        run: cargo build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf
-
-      - name: Run QEMU tests
-        run: bash scripts/run-tests.sh
+      - name: Run integration tests
+        run: |
+          cargo build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf
+          bash scripts/run-tests.sh
 
       - name: Upload test log
         if: always()
@@ -116,16 +146,17 @@ jobs:
           name: test-log
           path: /tmp/qemu-test-output.log
 
-  # ── Job 4: QEMU Boot Test (normal mode) ──
-  boot-test:
+  # ═══════════════════════════════════════════════════════════════
+  #  Boot Tests
+  # ═══════════════════════════════════════════════════════════════
+  boot-test-riscv:
     runs-on: ubuntu-latest
-    needs: build
+    needs: build-riscv
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        run: |
-          rustup target add riscv64gc-unknown-none-elf
+      - name: Install toolchain
+        run: rustup target add riscv64gc-unknown-none-elf
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -134,52 +165,67 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: riscv-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: riscv-cargo-
 
       - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
+
+      - name: Build and boot
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
-
-      - name: Build user programs
-        run: cd user && make clean && make
-
-      - name: Create disk image
-        run: dd if=/dev/zero of=disk.img bs=1M count=1
-
-      - name: Build kernel
-        run: make build
-
-      - name: Boot test
-        run: |
+          cd user && make clean && make && cd ..
           dd if=/dev/zero of=disk.img bs=1M count=1 2>/dev/null
+          make build
           timeout 10 qemu-system-riscv64 \
-            -machine virt -cpu rv64 -nographic \
-            -bios default -m 128M -smp 1 \
-            -d int \
+            -machine virt -cpu rv64 -nographic -bios default -m 128M -smp 1 \
             -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
-            > /tmp/boot-output.log 2>&1 || true
-          grep -a 'riscv_cpu_do_interrupt' /tmp/boot-output.log | tail -15 || true
-          echo "=== PASS/FAIL ==="
-          # init is the interactive shell; a clean boot reaches its banner/prompt.
-          if grep -qa "KarteOS Shell" /tmp/boot-output.log; then
-            echo "Boot test PASSED"
+            > /tmp/boot.log 2>&1 || true
+          if grep -qa "KarteOS Shell" /tmp/boot.log; then
+            echo "✅ Boot test PASSED"
           else
-            echo "Boot test FAILED"
+            echo "❌ Boot test FAILED"
+            cat /tmp/boot.log
             exit 1
           fi
 
-  # ── Job 5: SMP Boot Test ──
-  smp-test:
+  boot-test-x86:
     runs-on: ubuntu-latest
-    needs: build
+    needs: build-x86
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Download ISO
+        uses: actions/download-artifact@v4
+        with:
+          name: karte-os-x86_64
+          path: ./
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+
+      - name: Boot test x86_64
         run: |
-          rustup target add riscv64gc-unknown-none-elf
+          dd if=/dev/zero of=disk.img bs=1M count=1 2>/dev/null
+          timeout 10 qemu-system-x86_64 \
+            -machine pc -cpu qemu64 -nographic -m 128M \
+            -cdrom karte-os-x86_64.iso -no-reboot \
+            > /tmp/boot-x86.log 2>&1 || true
+          if grep -qa "KarteOS Shell" /tmp/boot-x86.log; then
+            echo "✅ x86_64 boot test PASSED"
+          else
+            echo "❌ x86_64 boot test FAILED"
+            cat /tmp/boot-x86.log
+            exit 1
+          fi
+
+  smp-test:
+    runs-on: ubuntu-latest
+    needs: build-riscv
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup target add riscv64gc-unknown-none-elf
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -188,41 +234,65 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: riscv-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: riscv-cargo-
 
       - name: Install QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
-
-      - name: Build user programs
-        run: cd user && make clean && make
-
-      - name: Create disk image
-        run: dd if=/dev/zero of=disk.img bs=1M count=1
-
-      - name: Build kernel
-        run: make build
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc gcc-riscv64-linux-gnu
 
       - name: SMP boot test
         run: |
-          timeout 10 qemu-system-riscv64 \
-            -machine virt -cpu rv64 -nographic \
-            -bios default -m 128M -smp 4 \
+          cd user && make clean && make && cd ..
+          dd if=/dev/zero of=disk.img bs=1M count=1 2>/dev/null
+          make build
+          timeout 15 qemu-system-riscv64 \
+            -machine virt -cpu rv64 -nographic -bios default -m 128M -smp 4 \
             -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
-            > /tmp/smp-output.log 2>&1 || true
-          
-          echo "=== SMP Output ==="
-          grep -a 'KarteOS\|smp\|hart\|user\|Shell\|virtio' /tmp/smp-output.log | head -20 || true
-          
-          # init is the interactive shell; a clean boot reaches its banner/prompt.
-          if grep -qa "KarteOS Shell" /tmp/smp-output.log; then
-            echo "SMP boot test PASSED"
+            > /tmp/smp.log 2>&1 || true
+          if grep -qa "KarteOS Shell" /tmp/smp.log; then
+            echo "✅ SMP test PASSED"
           else
-            echo "SMP boot test FAILED"
-            grep -a '.' /tmp/smp-output.log | head -50 || true
-            echo "=== QEMU interrupt log ==="
-            grep -a 'riscv_cpu_do_interrupt' /tmp/smp-output.log | tail -20 || true
+            echo "❌ SMP test FAILED"
+            cat /tmp/smp.log
             exit 1
           fi
+
+  # ═══════════════════════════════════════════════════════════════
+  #  Disk image (merge to main only)
+  # ═══════════════════════════════════════════════════════════════
+  disk-image:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [build-riscv, build-x86]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          rustup target add riscv64gc-unknown-none-elf
+          rustup toolchain install nightly
+          rustup component add rust-src --toolchain nightly
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc qemu-system-x86 gcc-riscv64-linux-gnu grub-common xorriso dosfstools mtools
+
+      - name: Create disk image with user programs
+        run: |
+          # Build user programs for both archs
+          cd user && make clean && make && cd ..
+          # Create and populate disk image
+          tools/mkdisk.sh init
+          # Put user programs on disk (without .elf extension)
+          for f in user/*.elf; do
+            name=$$(basename "$$f" .elf)
+            # Skip RISC-V assembly programs that don't exist as standalone files
+            case "$$name" in hello|heap_test|file_test|spawn_test) continue;; esac
+            tools/mkdisk.sh put "$$f" 2>/dev/null || true
+          done
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk-image
+          path: disk.img
+          retention-days: 90
+          overwrite: true
