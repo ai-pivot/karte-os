@@ -1,8 +1,7 @@
 #[cfg(target_arch = "riscv64")]
-pub mod virtio;
-
-#[cfg(target_arch = "riscv64")]
 pub mod net;
+
+pub mod virtio;
 
 pub mod block;
 pub mod ext4;

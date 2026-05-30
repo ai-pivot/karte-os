@@ -92,13 +92,42 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             arch::pci::init();
             if let Some(virtio_blk) = arch::pci::find_virtio_blk() {
                 crate::console_println!(
-                    "[pci] Found VirtIO block device at {:02x}:{:02x}.{}",
+                    "[pci] Found VirtIO block device at {:02x}:{:02x}.{} bars=[{:#x},{:#x},{:#x}]",
                     virtio_blk.bus,
                     virtio_blk.device,
-                    virtio_blk.function
+                    virtio_blk.function,
+                    virtio_blk.bars[0],
+                    virtio_blk.bars[1],
+                    virtio_blk.bars[2]
                 );
+
                 virtio_blk.enable();
-                // TODO: Initialize VirtIO block device via PCI BAR
+
+                let bar0 = virtio_blk.bars[0];
+                // BAR0 bit 0 = 1 means I/O space
+                let is_io = (bar0 & 1) == 1;
+                let bar_addr = virtio_blk.bar_address(0) as usize;
+                let bar_size = virtio_blk.bar_size(0) as usize;
+
+                crate::console_println!(
+                    "[pci] BAR0: {:#x} ({}), size={:#x}",
+                    bar_addr,
+                    if is_io { "I/O" } else { "MMIO" },
+                    bar_size
+                );
+
+                if is_io && bar_addr != 0 {
+                    // Legacy VirtIO PCI — I/O port access
+                    let io_base = (bar_addr & 0xFFFC) as u16;
+                    match arch::virtio_blk::init(io_base) {
+                        Ok(()) => {
+                            crate::console_println!("[pci] VirtIO block device initialized");
+                        }
+                        Err(e) => {
+                            crate::console_println!("[pci] VirtIO init failed: {}", e);
+                        }
+                    }
+                }
             }
         }
 

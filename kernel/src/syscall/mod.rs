@@ -245,20 +245,19 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
 
     // stdin: blocking read from TTY subsystem.
     if fd == 0 {
-        // On x86_64 without timer interrupts, poll UART in a loop until data arrives.
-        // On RISC-V, timer interrupts poll UART periodically, but we also poll
-        // here for responsiveness.
         loop {
-            crate::driver::tty::poll_uart();
             let result = crate::driver::tty::read(buf, len);
             if result > 0 {
                 return result;
             }
-            // Brief pause to avoid burning CPU (hlt until next interrupt)
+            // Poll UART for new input
+            crate::driver::tty::poll_uart();
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm!("pause")
             };
+            #[cfg(target_arch = "riscv64")]
+            crate::sched::schedule();
         }
     }
 

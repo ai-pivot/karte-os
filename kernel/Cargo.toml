@@ -21,8 +21,8 @@ riscv = "0.16"
 riscv-rt = "0.17"
 sbi = "0.3"
 
-# virtio-drivers 仅 RISC-V 需要 (MMIO transport)
-[target.'cfg(target_arch = "riscv64")'.dependencies.virtio-drivers]
+# virtio-drivers: RISC-V uses MMIO transport, x86_64 uses PCI→MMIO via BAR
+[dependencies.virtio-drivers]
 version = "0.13.0"
 features = ["alloc"]
 

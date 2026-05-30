@@ -160,7 +160,7 @@ pub fn probe_virtio_devices() {
 }
 
 /// Initialize a VirtIO block device at the given MMIO address.
-fn init_blk_device(mmio_base: usize, mmio_size: usize) -> Result<(), virtio_drivers::Error> {
+pub fn init_blk_device(mmio_base: usize, mmio_size: usize) -> Result<(), virtio_drivers::Error> {
     let header = NonNull::new(mmio_base as *mut virtio_drivers::transport::mmio::VirtIOHeader)
         .ok_or(virtio_drivers::Error::IoError)?;
 

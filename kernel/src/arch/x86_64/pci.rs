@@ -29,7 +29,7 @@ fn pci_read(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 }
 
 /// Write a 32-bit value to PCI configuration space.
-fn pci_write(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+pub fn pci_write(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     let addr: u32 = (1u32 << 31)
         | ((bus as u32) << 16)
         | (((device as u32) & 0x1F) << 11)

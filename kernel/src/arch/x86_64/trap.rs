@@ -190,9 +190,7 @@ pub fn init() {
     super::gdt::init();
     super::idt::init();
     super::lapic::init();
-    // NOTE: Timer interrupts disabled temporarily — context switching from
-    // interrupt context not yet implemented. Shell uses polling via sys_read.
-    // super::lapic::enable_timer();
+    super::lapic::enable_timer();
 }
 
 /// Enable timer interrupts via LAPIC.

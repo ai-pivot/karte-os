@@ -21,6 +21,7 @@ pub mod smp;
 pub mod switch;
 pub mod trap;
 pub mod uart;
+pub mod virtio_blk;
 
 // Re-export core types used by the rest of the kernel
 pub use trap::TrapContext;
