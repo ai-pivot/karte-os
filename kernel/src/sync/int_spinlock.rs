@@ -105,6 +105,7 @@ impl<T> Drop for IntSpinLockGuard<'_, T> {
 // to keep this module self-contained and avoid dependency on the crate's
 // sstatus abstraction which may change between versions.
 
+#[cfg(target_arch = "riscv64")]
 /// Read the SIE (Supervisor Interrupt Enable) bit from sstatus.
 fn read_sie() -> bool {
     let sstatus: usize;
@@ -113,11 +114,13 @@ fn read_sie() -> bool {
     (sstatus & (1 << 1)) != 0
 }
 
+#[cfg(target_arch = "riscv64")]
 /// Clear the SIE bit in sstatus (disable S-mode interrupts).
 fn disable_interrupts() {
     unsafe { core::arch::asm!("csrci sstatus, 2") };
 }
 
+#[cfg(target_arch = "riscv64")]
 /// Set the SIE bit in sstatus (enable S-mode interrupts).
 fn enable_interrupts() {
     unsafe { core::arch::asm!("csrsi sstatus, 2") };

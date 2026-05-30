@@ -12,6 +12,7 @@ pub enum TaskState {
 /// Task context for context switching (callee-saved registers).
 /// This struct is used for initial task setup. At runtime, the actual
 /// register state is saved on the task's kernel stack by __switch.
+#[cfg(target_arch = "riscv64")]
 #[repr(C)]
 pub struct TaskContext {
     pub ra: usize,
@@ -19,6 +20,7 @@ pub struct TaskContext {
     pub s: [usize; 12], // s0-s11
 }
 
+#[cfg(target_arch = "riscv64")]
 impl TaskContext {
     pub fn new() -> Self {
         Self {

@@ -15,12 +15,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::spinlock::SpinLock;
 use task::{TaskControlBlock, TaskState};
 
-global_asm!(include_str!("switch.S"));
+#[cfg(target_arch = "riscv64")]
+global_asm!(include_str!("../arch/riscv64/switch.S"));
 
 // Shim for first task entry via __switch.
 // __switch already pops its own 104-byte frame before `ret`ing here, so sp
 // already points at the TrapContext. Jump straight into the U-mode return path,
 // which will switch satp (via TrapContext.user_satp) and sret into the task.
+#[cfg(target_arch = "riscv64")]
 global_asm!(
     ".globl first_task_shim",
     "first_task_shim:",

@@ -129,7 +129,7 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
     let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-    crate::sbi::print(core::str::from_utf8(data).unwrap_or("[invalid utf8]"));
+    crate::arch::sbi::print(core::str::from_utf8(data).unwrap_or("[invalid utf8]"));
     len as isize
 }
 
@@ -140,7 +140,7 @@ fn sys_exit(code: i32) -> isize {
     // If init (the shell) exits, no process remains → shut down the system.
     if crate::sched::is_init_running() {
         crate::console_println!("[init] Shell exited, shutting down...");
-        crate::sbi::shutdown();
+        crate::arch::sbi::shutdown();
     }
 
     crate::process::set_exit_code(code as usize);
@@ -184,7 +184,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             // stdout/stderr: write to console byte by byte
             for i in 0..len {
                 let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
-                crate::sbi::console_putchar(byte);
+                crate::arch::sbi::console_putchar(byte);
             }
             len as isize
         }
@@ -330,6 +330,7 @@ fn sys_brk(addr: usize) -> isize {
     }
 
     // Flush TLB
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma");
     }
@@ -424,6 +425,7 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
         vaddr += page_size;
     }
 
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma");
     }
@@ -810,6 +812,7 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
     let kernel_stack_top = proc.kernel_stack_top;
 
     // Calculate user satp value (Sv39 mode = 8)
+    #[cfg(target_arch = "riscv64")]
     let user_satp = if proc.page_table_root == 0 {
         // Fallback: read current satp
         let satp: usize;
@@ -900,6 +903,7 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
     let user_stack_top = proc.user_stack_top;
     let kernel_stack_top = proc.kernel_stack_top;
 
+    #[cfg(target_arch = "riscv64")]
     let user_satp = if proc.page_table_root == 0 {
         let satp: usize;
         unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };

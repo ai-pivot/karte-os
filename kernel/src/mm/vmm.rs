@@ -1,6 +1,7 @@
 // kernel/src/mm/vmm.rs — Sv39 Virtual Memory Manager
 
 use bitflags::bitflags;
+#[cfg(target_arch = "riscv64")]
 use riscv::register::satp;
 
 use super::pmm;
@@ -173,6 +174,7 @@ pub fn init() {
 
     // Activate page table
     let ppn = root_addr >> 12;
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         satp::set(satp::Mode::Sv39, 0, ppn);
         // Flush TLB
