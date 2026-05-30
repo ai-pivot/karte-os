@@ -15,6 +15,7 @@ pub const KEYBOARD_VECTOR: u8 = IRQ_BASE + 1;
 pub const COM1_VECTOR: u8 = IRQ_BASE + 4;
 pub const SPURIOUS_VECTOR: u8 = IRQ_BASE + 7;
 
+/// Build and load the IDT. Called once by BSP during boot.
 pub fn init() {
     IDT.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
@@ -81,6 +82,13 @@ pub fn init() {
     IDT.get().unwrap().load();
 }
 
+/// Load the already-built IDT. Called by APs to load the shared IDT.
+pub fn load() {
+    if let Some(idt) = IDT.get() {
+        idt.load();
+    }
+}
+
 // ─── CPU Exceptions ──────────────────────────────────────────
 
 extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
@@ -140,10 +148,6 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: P
                     core::ptr::write_bytes(frame as *mut u8, 0, page_size);
                 }
                 crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-
-                // Also map into kernel page table (x86_64 currently shares kernel PT)
-                let kernel_pt = crate::mm::vmm::get_kernel_page_table();
-                crate::mm::vmm::map(kernel_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
 
                 super::trap::flush_tlb_addr(page_addr);
 
@@ -272,9 +276,14 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     // Preemptive scheduling: Round-Robin to next ready task
     crate::sched::schedule();
 
-    // After schedule() returns (possibly switching back to this task),
-    // we also need to update TSS.RSP0 for the current task.
-    // This is done inside schedule() on x86_64.
+    // After schedule() returns (possibly on a different task's stack),
+    // restore CR3 to the current process's user page table.
+    // schedule() may have switched to a different process whose CR3 differs.
+    let target_root = crate::process::current_page_table_root();
+    if target_root != 0 {
+        let target_paddr = (target_root << 12) as u64;
+        super::trap::activate_page_table(target_paddr as usize);
+    }
 }
 
 extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {

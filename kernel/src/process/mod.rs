@@ -95,8 +95,7 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Map kernel code/data (1MB..8MB) — skip 0x0..1MB to avoid
-        // conflicting with user code at 0x1000+
+        // Map kernel code/data (1MB..8MB) — covers kernel text, data, heap, PMM bitmap
         // Note: must cover trap_return_user and all kernel code that runs
         // after CR3 switch to user page table
         vmm::identity_map(
@@ -105,8 +104,15 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
             0x0800_0000, // 8MB
             vmm::PTEFlags::KRWX,
         );
+        // Map VGA text buffer at 0xB8000 (needed for console output in trap context)
+        vmm::identity_map(user_pt, 0xB8000, 0xC0000, vmm::PTEFlags::KRW);
         // Map LAPIC MMIO at 0xFEE00000
         vmm::map(user_pt, 0xFEE0_0000, 0xFEE0_0000, vmm::PTEFlags::KRW);
+        // Map IOAPIC MMIO at 0xFEC00000
+        vmm::map(user_pt, 0xFEC0_0000, 0xFEC0_0000, vmm::PTEFlags::KRW);
+        // Map AHCI ABAR region (typical PCI MMIO: 0xF0000000..0x100000000)
+        // Use a generous range to cover most PCI BAR mappings
+        vmm::identity_map(user_pt, 0xF000_0000, 0x1_0000_0000, vmm::PTEFlags::KRW);
     }
 }
 
@@ -144,9 +150,6 @@ impl Process {
                     None => {
                         let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
                         vmm::map_user(user_pt, vaddr, f, vmm::PTEFlags::URWX);
-                        // Also map into kernel page table (x86_64: no CR3 switch)
-                        #[cfg(target_arch = "x86_64")]
-                        vmm::map(vmm::get_kernel_page_table(), vaddr, f, vmm::PTEFlags::URWX);
                         unsafe {
                             core::ptr::write_bytes(f as *mut u8, 0, page_size);
                         }
@@ -182,13 +185,6 @@ impl Process {
             let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
             let vaddr = USER_STACK_TOP - (i + 1) * pmm::page_size();
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
-            #[cfg(target_arch = "x86_64")]
-            vmm::map(
-                vmm::get_kernel_page_table(),
-                vaddr,
-                frame,
-                vmm::PTEFlags::URW,
-            );
         }
 
         // 6. Allocate kernel stack for this process (identity mapped already by vmm::init)

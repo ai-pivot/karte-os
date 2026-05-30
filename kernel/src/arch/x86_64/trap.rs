@@ -159,25 +159,40 @@ pub unsafe extern "C" fn trap_return_user() {
     unsafe {
         core::arch::naked_asm!(
             // ── Restore general-purpose registers ──
-            "pop rax", "pop rbx", "pop rcx", "pop rdx", "pop rbp", "pop rsi", "pop rdi", "pop r8",
-            "pop r9", "pop r10", "pop r11", "pop r12", "pop r13", "pop r14", "pop r15",
+            "pop rax",
+            "pop rbx",
+            "pop rcx",
+            "pop rdx",
+            "pop rbp",
+            "pop rsi",
+            "pop rdi",
+            "pop r8",
+            "pop r9",
+            "pop r10",
+            "pop r11",
+            "pop r12",
+            "pop r13",
+            "pop r14",
+            "pop r15",
             // After 15 pops, rsp now points to the iretq frame (rip field).
             // Layout from rsp:
-            //   +0:  rip      (+0x00)
-            //   +8:  cs       (+0x08)
-            //   +16: rflags   (+0x10)
-            //   +24: rsp      (+0x18)
-            //   +32: ss       (+0x20)
+            //   +0:  rip        (+0x00)
+            //   +8:  cs         (+0x08)
+            //   +16: rflags     (+0x10)
+            //   +24: rsp        (+0x18)
+            //   +32: ss         (+0x20)
             //   +40: kernel_sp  (+0x28)
-            //   +48: user_cr3   (+0x30) ← check this for page table switch
-            //
-            // NOTE: We skip CR3 switching for now. All tasks share the kernel
-            // page table. User code is mapped into kernel page table.
-            // This avoids the complexity of per-process page tables while still
-            // allowing user mode to execute.
-            //
-            // TODO: Implement proper CR3 switching with kernel trampoline page.
+            //   +48: user_cr3   (+0x30) ← per-process page table root
 
+            // ── Switch to user page table if user_cr3 is set ──
+            // CR3 write implicitly flushes the TLB (non-global pages).
+            // cli ensures no interrupt fires between CR3 write and iretq.
+            "cli",
+            "cmp qword ptr [rsp + 0x30], 0",
+            "je 2f",                 // skip if user_cr3 == 0
+            "mov rax, [rsp + 0x30]", // load user_cr3 (physical address of user PT root)
+            "mov cr3, rax",          // switch to user page table
+            "2:",
             // ── Return to Ring 3 ──
             "iretq",
         );
@@ -215,7 +230,7 @@ pub fn set_next_timer() {
 /// - `user_sp`: User-mode stack pointer
 /// - `kernel_sp`: Kernel stack top (used for TSS.RSP0)
 /// - `user_cr3`: Physical address of user PML4 table
-pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, _user_cr3: u64) -> ! {
+pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3: u64) -> ! {
     let user_cs = super::gdt::USER_CODE_SEL.load(Ordering::Relaxed) as u64;
     let user_ss = super::gdt::USER_DATA_SEL.load(Ordering::Relaxed) as u64;
 
@@ -227,12 +242,16 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, _user_cr
     unsafe {
         core::arch::asm!(
             // Disable interrupts during the critical iretq sequence.
-            // iretq will re-enable interrupts via RFLAGS.IF=1 (0x202).
             "cli",
 
-            // NOTE: No CR3 switch. User code is mapped into the kernel page
-            // table (see Process::from_elf), so we keep using kernel PT.
-            // Per-process page tables are not yet supported on x86_64.
+            // ── Switch to user page table ──
+            // user_cr3 is the physical address of the user PML4 table.
+            // If non-zero, switch CR3 before building the iretq frame.
+            "cmp {cr3}, 0",
+            "je 2f",
+            "mov rax, {cr3}",
+            "mov cr3, rax",       // switch to per-process page table
+            "2:",
 
             // Use kernel stack to build iretq frame
             "mov rsp, {ksp}",
@@ -270,6 +289,7 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, _user_cr
             usp   = in(reg) user_sp as u64,
             cs    = in(reg) user_cs,
             entry = in(reg) entry as u64,
+            cr3   = in(reg) user_cr3,
             options(noreturn),
         );
     }
