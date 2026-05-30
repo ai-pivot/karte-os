@@ -6,15 +6,36 @@ edition = "2024"
 [features]
 default = []
 test_mode = []
+arch_x86_64 = ["x86_64", "uart_16550", "raw-cpuid"]
 
 [dependencies]
-riscv = "0.16"
-riscv-rt = "0.17"
-sbi = "0.3"
+# RISC-V dependencies (used when arch_x86_64 is NOT set)
+riscv = { version = "0.16", optional = true }
+riscv-rt = { version = "0.17", optional = true }
+sbi = { version = "0.3", optional = true }
+
+# x86_64 dependencies (used when arch_x86_64 IS set)
+x86_64 = { version = "0.15", optional = true }
+uart_16550 = { version = "0.3", optional = true }
+raw-cpuid = { version = "11.0", optional = true }
+
+# Shared dependencies (both architectures)
 buddy_system_allocator = "0.13"
 spin = "0.12"
 bitflags = "2.11"
+log = { version = "0.4", default-features = false }
+
+# RISC-V only dependencies
+[target.'cfg(not(feature = "arch_x86_64"))'.dependencies]
+riscv = "0.16"
+riscv-rt = "0.17"
+sbi = "0.3"
 virtio-drivers = { version = "0.13.0", features = ["alloc"] }
 starry-fatfs = { version = "0.4.1-preview.2", default-features = false, features = ["alloc", "lfn"] }
-log = { version = "0.4", default-features = false }
 ext4_rs = { path = "vendor/ext4_rs" }
+
+# x86_64 only dependencies
+[target.'cfg(feature = "arch_x86_64")'.dependencies]
+x86_64 = "0.15"
+uart_16550 = "0.3"
+raw-cpuid = "11.0"
