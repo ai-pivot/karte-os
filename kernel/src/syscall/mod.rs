@@ -18,6 +18,8 @@ pub const SYS_READ: usize = 3;
 pub const SYS_BRK: usize = 4;
 pub const SYS_GETPID: usize = 5;
 pub const SYS_MMAP: usize = 6;
+pub const SYS_PIPE: usize = 7; // pipe(int[2] fd_ptr) → 0 on success
+pub const SYS_DUP2: usize = 8; // dup2(oldfd, newfd) → newfd
 
 // Level 2: Filesystem (reserved)
 pub const SYS_OPEN: usize = 10;
@@ -27,6 +29,8 @@ pub const SYS_CLOSE: usize = 11;
 pub const SYS_SPAWN: usize = 30;
 pub const SYS_WAITPID: usize = 31;
 pub const SYS_EXEC: usize = 32; // spawn by file path
+pub const SYS_EXEC_FD: usize = 33; // exec with fd redirection: (path, len, redir_stdin, redir_stdout)
+pub const SYS_FORK: usize = 34; // fork current process
 
 // Level 6: Extended
 pub const SYS_LS: usize = 40;
@@ -39,6 +43,10 @@ pub const SYS_GETENV: usize = 51;
 
 // Level 8: Directory
 pub const SYS_CHDIR: usize = 52;
+
+// Level 9: Signal
+pub const SYS_KILL: usize = 60; // kill(pid, sig)
+pub const SYS_SIGRET: usize = 61; // sigreturn (clear pending signal)
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -90,10 +98,13 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_BRK => sys_brk(args[0]),
         SYS_GETPID => sys_getpid(),
         SYS_MMAP => sys_mmap(args[0], args[1], args[2]),
+        SYS_PIPE => sys_pipe(args[0]),
+        SYS_DUP2 => sys_dup2(args[0] as i32, args[1] as i32),
         SYS_OPEN => sys_open(args[0], args[1], args[2] as u32),
         SYS_CLOSE => sys_close(args[0] as i32),
         SYS_SPAWN => sys_spawn(args[0], args[1]),
         SYS_EXEC => sys_exec(args[0], args[1]),
+        SYS_EXEC_FD => sys_exec_fd(args[0], args[1], args[2] as i32, args[3] as i32),
         SYS_WAITPID => sys_waitpid(args[0]),
         SYS_LS => sys_ls(args[0], args[1]),
         SYS_MKDIR => sys_mkdir(args[0], args[1]),
@@ -101,6 +112,8 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_SETENV => sys_setenv(args[0], args[1], args[2], args[3]),
         SYS_GETENV => sys_getenv(args[0], args[1], args[2], args[3]),
         SYS_CHDIR => sys_chdir(args[0], args[1]),
+        SYS_KILL => sys_kill(args[0], args[1]),
+        SYS_FORK => sys_fork(),
 
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
@@ -153,6 +166,19 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
     if buf == 0 || len == 0 || len > 65536 {
         return ERR_INVAL;
     }
+
+    // Check if fd is a pipe write endpoint — this takes priority over Stdio fallback.
+    let fd_info = get_fd_info(fd);
+    match fd_info {
+        Some((FdType::PipeWrite, Some(pipe_id), _)) => {
+            return pipe_write(pipe_id, buf, len);
+        }
+        Some((FdType::PipeRead, _, _)) => {
+            return ERR_INVAL; // can't write to read end
+        }
+        _ => {}
+    }
+
     match fd {
         1 | 2 => {
             // stdout/stderr: write to console byte by byte
@@ -164,10 +190,10 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         }
         _ => {
             // File fd: get name and position from current process's FD table
-            let (name, pos) = {
+            let (name, pos, flags) = {
                 crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
-                    Some(f) => (f.name.clone(), f.pos),
-                    None => (alloc::string::String::new(), 0),
+                    Some(f) => (f.name.clone(), f.pos, f.flags),
+                    None => (alloc::string::String::new(), 0, 0),
                 })
             };
             if name.is_empty() {
@@ -203,6 +229,18 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
 fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
     if buf == 0 || len == 0 || len > 65536 {
         return ERR_INVAL;
+    }
+
+    // Check if fd is a pipe read endpoint — this takes priority over Stdio fallback.
+    let fd_info = get_fd_info(fd);
+    match fd_info {
+        Some((FdType::PipeRead, Some(pipe_id), _)) => {
+            return pipe_read(pipe_id, buf, len);
+        }
+        Some((FdType::PipeWrite, _, _)) => {
+            return ERR_INVAL; // can't read from write end
+        }
+        _ => {}
     }
 
     // stdin: blocking read from TTY subsystem.
@@ -439,13 +477,39 @@ fn sys_close(fd: i32) -> isize {
     if fd < 0 || fd as usize >= MAX_FDS {
         return ERR_INVAL;
     }
-    crate::process::with_fd_table(|fd_table| {
-        if fd_table.close(fd as usize) {
-            ERR_OK
+
+    // Check if this is a pipe fd — handle pipe reference counting
+    let pipe_action = {
+        crate::process::with_fd_table(|fd_table| {
+            if let Some(desc) = fd_table.get(fd as usize) {
+                match desc.fd_type {
+                    FdType::PipeRead => desc.pipe_id.map(|pid| (pid, true)),
+                    FdType::PipeWrite => desc.pipe_id.map(|pid| (pid, false)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    };
+
+    // Close the fd in the table
+    let closed = crate::process::with_fd_table(|fd_table| fd_table.close(fd as usize));
+    if !closed {
+        return ERR_INVAL;
+    }
+
+    // Handle pipe cleanup
+    if let Some((pipe_id, is_read)) = pipe_action {
+        if is_read {
+            crate::driver::pipe::with_pipe(pipe_id, |p| p.close_read());
         } else {
-            ERR_INVAL
+            crate::driver::pipe::with_pipe(pipe_id, |p| p.close_write());
         }
-    })
+        crate::driver::pipe::dec_ref(pipe_id);
+    }
+
+    ERR_OK
 }
 
 /// Syscall 30: Spawn a new process.
@@ -1072,4 +1136,387 @@ pub fn run_tests() {
         let result = dispatch(SYS_CLOSE, [99, 0, 0, 0, 0, 0]);
         result == ERR_INVAL
     });
+}
+
+// ─── Pipe / Dup2 / Redirect helpers ──────────────────────────────────
+
+use crate::driver::fs::{FdType, O_APPEND};
+
+/// Get fd type, pipe_id, and name for a given fd number.
+/// Returns None if fd is invalid or not a pipe.
+fn get_fd_info(fd: i32) -> Option<(FdType, Option<usize>, alloc::string::String)> {
+    if fd < 0 || fd as usize >= MAX_FDS {
+        return None;
+    }
+    crate::process::with_fd_table(|fd_table| {
+        fd_table
+            .get(fd as usize)
+            .map(|f| (f.fd_type, f.pipe_id, f.name.clone()))
+    })
+}
+
+/// Blocking read from a pipe. Called from sys_read when fd is a PipeRead.
+fn pipe_read(pipe_id: usize, buf: usize, len: usize) -> isize {
+    loop {
+        let result = crate::driver::pipe::with_pipe(pipe_id, |p| p.read(buf, len));
+        match result {
+            Some(n) => {
+                if n == -1 {
+                    // Pipe is empty, write end still open — block
+                    let proc_idx = crate::process::current_index();
+                    crate::driver::pipe::with_pipe(pipe_id, |p| p.set_reader_blocked(proc_idx));
+                    crate::sched::schedule_block();
+                    // Woken up — loop back and try again
+                    continue;
+                }
+                return n; // success (n bytes) or 0 (EOF)
+            }
+            None => return ERR_INVAL, // pipe doesn't exist
+        }
+    }
+}
+
+/// Blocking write to a pipe. Called from sys_write when fd is a PipeWrite.
+fn pipe_write(pipe_id: usize, buf: usize, len: usize) -> isize {
+    loop {
+        let result = crate::driver::pipe::with_pipe(pipe_id, |p| p.write(buf, len));
+        match result {
+            Some(n) => {
+                if n == crate::driver::pipe::EPIPE {
+                    // Read end closed
+                    crate::console_println!("[pipe] write: Broken pipe");
+                    return n;
+                }
+                if n == -1 {
+                    // Pipe is full — block
+                    let proc_idx = crate::process::current_index();
+                    crate::driver::pipe::with_pipe(pipe_id, |p| p.set_writer_blocked(proc_idx));
+                    crate::sched::schedule_block();
+                    // Woken up — loop back and try again
+                    continue;
+                }
+                return n; // success
+            }
+            None => return ERR_INVAL,
+        }
+    }
+}
+
+/// Syscall 7: Create an anonymous pipe.
+/// `fd_ptr` points to a user-space `[i32; 2]` where the two fd numbers are written.
+/// Returns 0 on success, negative on error.
+fn sys_pipe(fd_ptr: usize) -> isize {
+    if fd_ptr == 0 {
+        return ERR_INVAL;
+    }
+
+    let pipe_id = match crate::driver::pipe::alloc_pipe() {
+        Some(id) => id,
+        None => return ERR_NOMEM,
+    };
+
+    // Allocate two fds in the current process's fd table
+    let (read_fd, write_fd) = {
+        crate::process::with_fd_table(|fd_table| {
+            let rfd = fd_table.alloc_pipe_fd(pipe_id, true);
+            let wfd = fd_table.alloc_pipe_fd(pipe_id, false);
+            (rfd, wfd)
+        })
+    };
+
+    match (read_fd, write_fd) {
+        (Some(rfd), Some(wfd)) => {
+            // Write fd pair to user space
+            unsafe {
+                core::ptr::write_volatile(fd_ptr as *mut i32, rfd as i32);
+                core::ptr::write_volatile((fd_ptr + 4) as *mut i32, wfd as i32);
+            }
+            ERR_OK
+        }
+        _ => {
+            // Failed to allocate fds — clean up pipe
+            crate::driver::pipe::dec_ref(pipe_id);
+            crate::driver::pipe::dec_ref(pipe_id);
+            ERR_NOMEM
+        }
+    }
+}
+
+/// Syscall 8: Duplicate a file descriptor.
+/// `old_fd` is the source fd, `new_fd` is the target fd.
+/// If `new_fd` is already open, it is closed first.
+/// Returns `new_fd` on success, negative on error.
+fn sys_dup2(old_fd: i32, new_fd: i32) -> isize {
+    if old_fd < 0 || new_fd < 0 || old_fd as usize >= MAX_FDS || new_fd as usize >= MAX_FDS {
+        return ERR_INVAL;
+    }
+    if old_fd == new_fd {
+        return new_fd as isize;
+    }
+
+    // Clone the fd entry from old_fd to new_fd
+    crate::process::with_fd_table(|fd_table| {
+        let desc = match fd_table.get(old_fd as usize) {
+            Some(d) => d.clone(),
+            None => return ERR_INVAL,
+        };
+
+        // If it's a pipe fd, increment the pipe reference count
+        if let Some(pipe_id) = desc.pipe_id {
+            crate::driver::pipe::inc_ref(pipe_id);
+        }
+
+        fd_table.set_fd(new_fd as usize, desc);
+        new_fd as isize
+    })
+}
+
+/// Syscall 33: Exec a program with fd redirection.
+/// `path` = path string pointer, `path_len` = length
+/// `redir_stdin` = fd to use as stdin for the child (-1 = keep default)
+/// `redir_stdout` = fd to use as stdout for the child (-1 = keep default)
+fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32) -> isize {
+    // Read path from user memory
+    let name = if path_len > 0 && path_len < 256 {
+        let mut buf = [0u8; 256];
+        for i in 0..path_len {
+            buf[i] = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(path_len);
+        let s = core::str::from_utf8(&buf[..len]).unwrap_or("");
+        // Strip leading '/' if present (fs root convention)
+        let name = if s.starts_with('/') { &s[1..] } else { s };
+        alloc::string::String::from(name)
+    } else {
+        return ERR_INVAL;
+    };
+
+    // Load ELF from filesystem
+    let data = match crate::driver::fs::read_file_owned(&name) {
+        Some(d) => d,
+        None => return ERR_NOENT,
+    };
+
+    // Parse ELF and create process
+    let mut proc = match crate::process::Process::from_elf(&data) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::console_println!("[exec] Failed to parse ELF '{}': {}", name, e);
+            return ERR_IO;
+        }
+    };
+
+    // Apply fd redirections: copy parent's fd entries to child
+    if redir_stdin >= 0 || redir_stdout >= 0 {
+        let (stdin_desc, stdout_desc) = {
+            crate::process::with_fd_table(|fd_table| {
+                let sin = if redir_stdin >= 0 {
+                    fd_table.get(redir_stdin as usize).cloned()
+                } else {
+                    None
+                };
+                let sout = if redir_stdout >= 0 {
+                    fd_table.get(redir_stdout as usize).cloned()
+                } else {
+                    None
+                };
+                (sin, sout)
+            })
+        };
+
+        if let Some(desc) = stdin_desc {
+            // Increment pipe ref if applicable
+            if let Some(pipe_id) = desc.pipe_id {
+                crate::driver::pipe::inc_ref(pipe_id);
+            }
+            if let Some(ref mut child_table) = proc.fd_table {
+                child_table.set_fd(0, desc);
+            }
+        }
+        if let Some(desc) = stdout_desc {
+            if let Some(pipe_id) = desc.pipe_id {
+                crate::driver::pipe::inc_ref(pipe_id);
+            }
+            if let Some(ref mut child_table) = proc.fd_table {
+                child_table.set_fd(1, desc);
+            }
+        }
+    }
+
+    // Register process and add to scheduler
+    let parent_pid = crate::process::current_pid();
+    proc.ppid = parent_pid;
+
+    let proc_idx = match crate::process::add_process(proc) {
+        Some(i) => i,
+        None => {
+            crate::console_println!("[exec_fd] Process table full");
+            return ERR_NOMEM;
+        }
+    };
+
+    // Re-read process from table to get registered fields
+    let proc =
+        crate::process::get_process_by_index(proc_idx).expect("Process disappeared after add");
+
+    match crate::sched::add_user_process(
+        proc.entry,
+        proc.user_stack_top,
+        proc.kernel_stack_top,
+        (8usize << 60) | proc.page_table_root,
+        proc_idx,
+    ) {
+        Some(_tid) => {
+            crate::console_println!("[exec] Launched '{}' (pid={})", name, proc.pid);
+            proc.pid as isize
+        }
+        None => {
+            crate::console_println!("[exec] Failed to schedule process");
+            ERR_NOMEM
+        }
+    }
+}
+
+/// Syscall 60: Send a signal to a process.
+/// `pid` = target process ID, `sig` = signal number.
+/// Currently only supports SIGINT (2) which terminates the target.
+fn sys_kill(pid: usize, sig: usize) -> isize {
+    // SIGINT = 2, SIGKILL = 9, SIGTERM = 15
+    if sig != 2 && sig != 9 && sig != 15 {
+        return ERR_INVAL;
+    }
+
+    let proc_idx = match crate::process::find_process_by_pid(pid) {
+        Some(idx) => idx,
+        None => return ERR_NOENT,
+    };
+
+    // Terminate the target process
+    crate::process::set_exit_code(sig);
+    crate::process::set_state(proc_idx, crate::process::ProcessState::Exited);
+
+    // Wake parent if waiting
+    if let Some(parent_idx) = crate::process::find_waiting_parent(proc_idx) {
+        crate::process::set_wait_child(parent_idx, None);
+        crate::sched::wake_task(parent_idx);
+    }
+
+    // Remove task from scheduler
+    crate::sched::remove_task(proc_idx);
+
+    // Reclaim process resources
+    crate::process::reclaim_process(proc_idx);
+
+    ERR_OK
+}
+
+/// Syscall 34: Fork current process.
+/// Creates a copy of the current process with independent page table.
+/// Returns child_pid in parent, 0 in child.
+fn sys_fork() -> isize {
+    // Get current process info
+    let current = match crate::process::current() {
+        Some(p) => p,
+        None => return ERR_INVAL,
+    };
+    let parent_idx = crate::process::current_index();
+
+    // Clone the page table (deep copy user pages)
+    let user_pt = crate::mm::vmm::create_user_page_table();
+    let parent_ppn = current.page_table_root;
+    let parent_pt = crate::process::get_user_page_table(parent_ppn);
+
+    // Copy kernel mappings
+    crate::process::copy_kernel_mappings(user_pt);
+
+    // Copy user page table entries (deep copy physical frames)
+    let page_size = crate::mm::pmm::page_size();
+    for vpn in 0..512 {
+        let pte = parent_pt.entry(vpn);
+        if pte.is_valid() && pte.is_leaf() {
+            let old_ppn = pte.ppn();
+            let old_frame = old_ppn << 12;
+            let new_frame = match crate::mm::pmm::alloc_frame() {
+                Some(f) => f,
+                None => return ERR_NOMEM,
+            };
+            // Copy frame contents
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    old_frame as *const u8,
+                    new_frame as *mut u8,
+                    page_size,
+                );
+            }
+            // Map new frame in child page table with same flags
+            let new_pte = crate::mm::vmm::PTE::new(new_frame >> 12, pte.flags());
+            user_pt.set_entry(vpn, new_pte);
+        }
+    }
+
+    // Allocate kernel stack for child
+    let kstack_base = match crate::mm::pmm::alloc_frame() {
+        Some(f) => f,
+        None => return ERR_NOMEM,
+    };
+    for _ in 0..3 {
+        if crate::mm::pmm::alloc_frame().is_none() {
+            return ERR_NOMEM;
+        }
+    }
+    let kernel_stack_top = kstack_base + 4 * page_size;
+
+    let page_table_ppn = (user_pt as *const crate::mm::vmm::PageTable as usize) >> 12;
+    let child_pid = crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    // Clone fd table
+    let fd_table = current.fd_table.clone();
+
+    // Create child process
+    let child = crate::process::Process {
+        pid: child_pid,
+        ppid: current.pid,
+        page_table_root: page_table_ppn,
+        kernel_stack_top,
+        user_stack_top: current.user_stack_top,
+        brk: current.brk,
+        initial_brk: current.initial_brk,
+        entry: current.entry,
+        state: crate::process::ProcessState::Ready,
+        exit_code: 0,
+        fd_table,
+        wait_child_idx: None,
+        trap_ctx_ptr: 0,
+    };
+
+    // Register child
+    let child_idx = match crate::process::add_process(child) {
+        Some(i) => i,
+        None => return ERR_NOMEM,
+    };
+
+    // Re-read child process from table
+    let child_proc =
+        crate::process::get_process_by_index(child_idx).expect("Child disappeared after add");
+
+    match crate::sched::add_user_process(
+        child_proc.entry,
+        child_proc.user_stack_top,
+        child_proc.kernel_stack_top,
+        (8usize << 60) | child_proc.page_table_root,
+        child_idx,
+    ) {
+        Some(_tid) => {
+            crate::console_println!(
+                "[fork] Created child pid={} (parent pid={})",
+                child_pid,
+                current.pid
+            );
+            child_pid as isize
+        }
+        None => {
+            crate::console_println!("[fork] Failed to schedule child");
+            ERR_NOMEM
+        }
+    }
 }

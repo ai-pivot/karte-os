@@ -12,7 +12,7 @@ make test           # Build test kernel + run tests in QEMU
 make build-test     # Build test kernel only
 make boot-test      # Boot test (normal mode, verifies init sequence)
 make clean          # Clean all artifacts
-cd user && make     # Build user programs (hello.elf, heap_test.elf, file_test.elf, spawn_test.elf, shell.elf)
+cd user && make     # Build user programs (hello.elf, shell.elf, ls/cat/echo/mkdir/rm/env/pwd/grep/sed/wc/head/tail.elf)
 tools/mkdisk.sh init  # Create 64MB FAT32 disk.img
 tools/mkdisk.sh put <file>  # Copy host file to disk (accessible in OS)
 tools/mkdisk.sh list   # List files on disk
@@ -53,7 +53,7 @@ Boot flow: QEMU → OpenSBI → `_start` (entry.S) → `kmain` → init phases �
 
 Synchronization: Three levels of kernel locks. (1) `SpinLock` — for short critical sections (a few instructions, e.g., run queue manipulation). (2) `IntSpinLock` — like SpinLock but also saves/restores `sstatus.SIE` to prevent interrupt-induced deadlocks. (3) `YieldMutex` / `BlockingMutex` — for I/O-bound operations (filesystem, block device); contention yields to the scheduler instead of spinning. **Rule: never hold a SpinLock across block I/O.**
 
-Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, via `starry-fatfs`) → RamFS (embedded ELF files). Boot priority: try ext4 mount, on failure try FAT32, finally RamFS-only. ext4 files are pre-loaded on the host via `tools/mkdisk.sh put`; no boot-time injection (too many I/O round-trips).
+Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, via `starry-fatfs`) → RamFS (embedded ELF files). Boot priority: try ext4 mount, on failure try FAT32, finally RamFS-only. ext4 files are pre-loaded on the host via `tools/mkdisk.sh put`; no boot-time injection (too many I/O round-trips). Pipe IPC: anonymous pipes via `sys_pipe` with 4KB ring buffers, supports blocking read/write with scheduler integration. Shell v0.5 supports pipe (`|`), I/O redirection (`>`, `>>`, `<`), command history (↑/↓), and `sys_exec_fd` for passing pipe fds to child processes.
 
 ## User Programs
 
@@ -62,9 +62,14 @@ Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, 
 - `user/file_test.S` — Tests sys_open/close/read/write file operations with data verification
 - `user/spawn_test.S` — Tests sys_spawn multi-process: parent spawns child (hello), both run concurrently
 - `user/user.ld` — Linker script: entry at 0x1000
-- `user/shell.rs` — Interactive shell (v0.3): launches binaries from PATH, built-ins: cd/exit/export
+- `user/shell.rs` — Interactive shell (v0.5): pipe `|`, redirect `>` `>>` `<`, command history ↑/↓, Tab completion, built-ins: cd/exit/export/help/kill
 - `user/syscall.rs` — Shared syscall wrapper module for all Rust binaries
 - `user/ls.rs`, `cat.rs`, `echo.rs`, `mkdir.rs`, `rm.rs`, `env.rs`, `pwd.rs` — Independent command binaries
+- `user/grep.rs` — Text search with pattern matching (stdin or file)
+- `user/sed.rs` — Stream editor with `s/old/new/g` substitution (stdin or file)
+- `user/wc.rs` — Word/line/byte count (stdin or file)
+- `user/head.rs` — Output first N lines (stdin or file)
+- `user/tail.rs` — Output last N lines (stdin or file)
 - User programs are embedded into the kernel via `include_bytes!()` at compile time
 - **Build before kernel**: `cd user && make` generates `*.elf` files that the kernel references
 - **ext4 deployment**: Copy ELF files to ext4 root without `.elf` extension (e.g., `ls.elf` → `ls`)
@@ -82,17 +87,22 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 4 | brk | (addr) — 0 to query, >0 to grow |
 | 5 | getpid | () |
 | 6 | mmap | (addr, len, flags) |
-| 10 | open | (path, path_len, flags) |
+| 7 | pipe | (fd_ptr) — creates pipe, writes [read_fd, write_fd] to user buf |
+| 8 | dup2 | (old_fd, new_fd) — duplicate fd, returns new_fd |
+| 10 | open | (path, path_len, flags) — O_CREAT=0x100, O_TRUNC=0x200, O_APPEND=0x400 |
 | 11 | close | (fd) |
 | 30 | spawn | (prog_id, arg) — spawn new process (0=hello, 1=heap_test, 2=file_test, 3=spawn_test) |
 | 31 | waitpid | (pid) — wait for child process, returns exit code |
 | 32 | exec | (path, path_len) — spawn process from file path (ext4/FAT32/RamFS), searches PATH |
+| 33 | exec_fd | (path, path_len, redir_stdin, redir_stdout) — exec with fd redirection (-1 = keep default) |
+| 34 | fork | () — fork current process, returns child_pid (parent) or 0 (child) |
 | 40 | ls | (buf, len) — list filesystem contents |
 | 41 | mkdir | (path, path_len) — create a directory |
 | 42 | unlink | (path, path_len) — delete a file or directory |
 | 50 | setenv | (key, key_len, val, val_len) — set environment variable |
 | 51 | getenv | (key, key_len, buf, buf_len) — get environment variable, returns value length or -1 |
 | 52 | chdir | (path, path_len) — change directory, validates dir exists, updates CWD env var |
+| 60 | kill | (pid, sig) — send signal to process (SIGINT=2, SIGKILL=9, SIGTERM=15) |
 
 ## GOTCHAS
 
@@ -128,6 +138,11 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **CWD path resolution**: Kernel `resolve_path()` in `syscall/mod.rs` prepends CWD env var to relative paths for `sys_open`, `sys_mkdir`, `sys_unlink`, `sys_chdir`. `sys_ls` reads CWD directly. CWD is stored as a global env var (`CWD=/test123`), set by `sys_chdir` (called from shell's `builtin_cd`). User programs do NOT need to handle path resolution themselves.
 - **ext4 multi-level paths**: `create_directory`, `delete_file`, `write_file` in `ext4.rs` all use `split_last_component()` to support paths like `parent/child`. The parent is resolved via `lookup()`, then the operation targets the last component.
 - **`cd` validation**: Shell's `builtin_cd` calls `SYS_CHDIR` which validates the target exists in ext4 via `lookup_path()` + `metadata_of().is_dir()`. Non-existent directories produce "cd: no such directory" error.
+- **Pipe fd lifecycle**: `sys_pipe` allocates a pipe with refcount=2 (read+write end). Each `sys_close` on a pipe fd decrements refcount and calls `pipe_close_read()`/`pipe_close_write()`. When both ends are closed, the pipe is freed. Pipe fds are inherited by child processes via `sys_exec_fd` (increments refcount). Shell must close its pipe fds after launching children.
+- **Pipe blocking**: `pipe_read` blocks when buffer is empty and write end is open (calls `schedule_block`). `pipe_write` blocks when buffer is full. Blocked tasks are woken by the opposite end's close/write operation. **Init (shell) must never block on a pipe** — schedule_block on init returns immediately.
+- **FdType routing**: `sys_read`/`sys_write` check `FdType::PipeRead`/`PipeWrite` before falling through to Stdio/TTY/UART. fd=0/1/2 are pre-allocated as `FdType::Stdio` but can be overridden via `sys_dup2` or inherited from parent via `sys_exec_fd`.
+- **O_APPEND**: New flag `O_APPEND=0x400` for `sys_open`. Shell's `>>` redirect uses O_CREAT|O_APPEND. Not yet implemented at kernel write level (appends via write_at_end pattern).
+- **sys_fork**: Deep-copies user page table (no COW). Copies fd table including pipe refs (increments refcount). Child resumes at same sepc — currently always returns parent's PID (child path needs trap_context manipulation to return 0).
 
 ## Knowledge Files
 

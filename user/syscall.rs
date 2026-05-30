@@ -8,12 +8,17 @@ pub const SYS_READ: usize = 3;
 pub const SYS_OPEN: usize = 10;
 pub const SYS_CLOSE: usize = 11;
 pub const SYS_EXEC: usize = 32;
+pub const SYS_EXEC_FD: usize = 33; // exec with fd redirection: (path, len, redir_stdin, redir_stdout)
+pub const SYS_FORK: usize = 34;
 pub const SYS_LS: usize = 40;
 pub const SYS_MKDIR: usize = 41;
 pub const SYS_UNLINK: usize = 42;
 pub const SYS_SETENV: usize = 50;
 pub const SYS_GETENV: usize = 51;
 pub const SYS_CHDIR: usize = 52;
+pub const SYS_PIPE: usize = 7;
+pub const SYS_DUP2: usize = 8;
+pub const SYS_KILL: usize = 60;
 
 #[inline(always)]
 pub unsafe fn syscall1(id: usize, a0: usize) -> isize {

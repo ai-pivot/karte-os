@@ -75,6 +75,21 @@ impl PageTable {
         table
     }
 
+    /// Get PTE at virtual page number (level 0 index).
+    pub fn entry(&self, idx: usize) -> PTE {
+        self.entries[idx]
+    }
+
+    /// Get mutable PTE at virtual page number (level 0 index).
+    pub fn entry_mut(&mut self, idx: usize) -> &mut PTE {
+        &mut self.entries[idx]
+    }
+
+    /// Set PTE at virtual page number (level 0 index).
+    pub fn set_entry(&mut self, idx: usize, pte: PTE) {
+        self.entries[idx] = pte;
+    }
+
     fn vpn(vaddr: usize, level: usize) -> usize {
         (vaddr >> (12 + VPN_BITS * level)) & VPN_MASK
     }

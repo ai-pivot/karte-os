@@ -21,7 +21,7 @@ pub const USER_STACK_PAGES: usize = 64; // 256 KB actual stack
 pub const KERNEL_STACK_PAGES: usize = 4; // 16 KB kernel stack
 
 /// Process identifier allocator
-static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
+pub(crate) static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
 /// Maximum number of processes in the system
 const MAX_PROCESSES: usize = 16;
@@ -68,7 +68,7 @@ pub struct Process {
 
 /// Copy kernel identity mappings into a user page table.
 /// This is needed so that traps from U-mode can still access kernel code/data.
-fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
+pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
     // Identity map kernel (0x80200000 .. 0x80200000 + 128MB)
     vmm::identity_map(
         user_pt,
@@ -488,4 +488,18 @@ pub fn is_child_of(proc_idx: usize, parent_pid: usize) -> bool {
     table[proc_idx]
         .as_ref()
         .map_or(false, |p| p.ppid == parent_pid)
+}
+
+/// Set process state by index (used by sys_kill).
+pub fn set_state(idx: usize, state: ProcessState) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table[idx].as_mut() {
+        p.state = state;
+    }
+}
+
+/// Get a cloned process by its table index.
+pub fn get_process_by_index(idx: usize) -> Option<Process> {
+    let table = PROCESS_TABLE.lock();
+    table[idx].clone()
 }

@@ -3,6 +3,7 @@ pub mod ext4;
 pub mod fat32;
 pub mod fs;
 pub mod net;
+pub mod pipe;
 pub mod ramfs;
 pub mod tty;
 pub mod uart;

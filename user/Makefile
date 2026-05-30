@@ -10,7 +10,8 @@ RUSTFLAGS_USER = --edition 2024 --target riscv64gc-unknown-none-elf \
 	-C panic=abort -C opt-level=2 -C link-arg=-Tuser.ld --crate-type bin
 
 TARGETS = hello.elf heap_test.elf file_test.elf spawn_test.elf shell.elf \
-	ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf
+	ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf \
+	grep.elf sed.elf wc.elf head.elf tail.elf
 
 all: $(TARGETS)
 
@@ -37,6 +38,21 @@ env.elf: env.rs syscall.rs user.ld
 
 pwd.elf: pwd.rs syscall.rs user.ld
 	$(RUSTC) $(RUSTFLAGS_USER) -o $@ pwd.rs
+
+grep.elf: grep.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ grep.rs
+
+sed.elf: sed.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ sed.rs
+
+wc.elf: wc.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ wc.rs
+
+head.elf: head.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ head.rs
+
+tail.elf: tail.rs syscall.rs user.ld
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ tail.rs
 
 hello.o: hello.S
 	$(AS) -march=rv64gc -o $@ $<

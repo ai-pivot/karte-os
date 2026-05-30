@@ -361,6 +361,20 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_CREAT: u32 = 0x100;
 pub const O_TRUNC: u32 = 0x200;
+pub const O_APPEND: u32 = 0x400;
+
+/// File descriptor type — distinguishes regular files from pipe endpoints.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FdType {
+    /// Standard I/O (stdin/stdout/stderr) — routes to TTY/UART unless overridden.
+    Stdio,
+    /// Regular file — routes to filesystem.
+    File,
+    /// Pipe read endpoint.
+    PipeRead,
+    /// Pipe write endpoint.
+    PipeWrite,
+}
 
 /// A file descriptor entry — wraps an in-memory file with seek position
 #[derive(Clone)]
@@ -373,6 +387,10 @@ pub struct FileDescriptor {
     pub flags: u32,
     /// Whether this fd is valid
     pub valid: bool,
+    /// File descriptor type.
+    pub fd_type: FdType,
+    /// Pipe ID (only valid when fd_type is PipeRead or PipeWrite).
+    pub pipe_id: Option<usize>,
 }
 
 /// Per-process file descriptor table
@@ -386,24 +404,30 @@ impl FdTable {
         let mut table = FdTable {
             fds: core::array::from_fn(|_| None),
         };
-        // Pre-allocate stdin/stdout/stderr slots
+        // Pre-allocate stdin/stdout/stderr slots as Stdio type
         table.fds[0] = Some(FileDescriptor {
             name: String::from("stdin"),
             pos: 0,
             flags: O_RDONLY,
             valid: true,
+            fd_type: FdType::Stdio,
+            pipe_id: None,
         });
         table.fds[1] = Some(FileDescriptor {
             name: String::from("stdout"),
             pos: 0,
             flags: O_WRONLY,
             valid: true,
+            fd_type: FdType::Stdio,
+            pipe_id: None,
         });
         table.fds[2] = Some(FileDescriptor {
             name: String::from("stderr"),
             pos: 0,
             flags: O_WRONLY,
             valid: true,
+            fd_type: FdType::Stdio,
+            pipe_id: None,
         });
         table
     }
@@ -417,11 +441,46 @@ impl FdTable {
                     pos: 0,
                     flags,
                     valid: true,
+                    fd_type: FdType::File,
+                    pipe_id: None,
                 });
                 return Some(i);
             }
         }
         None
+    }
+
+    /// Allocate a pipe fd. Used by sys_pipe.
+    pub fn alloc_pipe_fd(&mut self, pipe_id: usize, is_read: bool) -> Option<usize> {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = Some(FileDescriptor {
+                    name: if is_read {
+                        String::from("pipe:read")
+                    } else {
+                        String::from("pipe:write")
+                    },
+                    pos: 0,
+                    flags: if is_read { O_RDONLY } else { O_WRONLY },
+                    valid: true,
+                    fd_type: if is_read {
+                        FdType::PipeRead
+                    } else {
+                        FdType::PipeWrite
+                    },
+                    pipe_id: Some(pipe_id),
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Set (override) an existing fd. Used by dup2 and fd redirection.
+    pub fn set_fd(&mut self, fd: usize, desc: FileDescriptor) {
+        if fd < self.fds.len() {
+            self.fds[fd] = Some(desc);
+        }
     }
 
     /// Get a reference to a file descriptor
