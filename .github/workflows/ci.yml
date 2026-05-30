@@ -284,10 +284,10 @@ jobs:
           tools/mkdisk.sh init
           # Put user programs on disk (without .elf extension)
           for f in user/*.elf; do
-            name=$$(basename "$$f" .elf)
+            name=$(basename "$f" .elf)
             # Skip RISC-V assembly programs that don't exist as standalone files
-            case "$$name" in hello|heap_test|file_test|spawn_test) continue;; esac
-            tools/mkdisk.sh put "$$f" 2>/dev/null || true
+            case "$name" in hello|heap_test|file_test|spawn_test) continue;; esac
+            tools/mkdisk.sh put "$f" 2>/dev/null || true
           done
 
       - name: Upload disk image
