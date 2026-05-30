@@ -226,6 +226,12 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3
 
     unsafe {
         core::arch::asm!(
+            // Disable interrupts during the critical CR3 + iretq sequence.
+            // If a timer interrupt fires between CR3 switch and iretq, the
+            // interrupt handler can corrupt the partially-built iretq frame.
+            // iretq will re-enable interrupts via RFLAGS.IF=1 (0x202).
+            "cli",
+
             // Switch to user page table
             "mov cr3, {cr3}",
 
