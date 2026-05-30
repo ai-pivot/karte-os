@@ -153,6 +153,7 @@ static TTY_WAITING: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Initialize TTY subsystem. Called during kernel init after PLIC init.
 pub fn init() {
     // Enable supervisor external interrupts (PLIC → UART IRQ 10)
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         riscv::register::sie::set_sext();
     }

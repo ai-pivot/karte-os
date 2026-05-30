@@ -56,7 +56,7 @@ macro_rules! console_print {
     ($($arg:tt)*) => {
         {
             use core::fmt::Write;
-            let _ = write!($crate::sbi::Console, $($arg)*);
+            let _ = write!($crate::arch::sbi::Console, $($arg)*);
         }
     };
 }
@@ -67,7 +67,7 @@ macro_rules! console_println {
     ($($arg:tt)*) => {
         {
             use core::fmt::Write;
-            let _ = writeln!($crate::sbi::Console, $($arg)*);
+            let _ = writeln!($crate::arch::sbi::Console, $($arg)*);
         }
     };
 }

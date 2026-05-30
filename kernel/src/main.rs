@@ -7,7 +7,8 @@ extern crate log;
 
 use core::arch::global_asm;
 
-global_asm!(include_str!("entry.S"));
+#[cfg(target_arch = "riscv64")]
+global_asm!(include_str!("arch/riscv64/entry.S"));
 
 pub mod arch;
 pub mod driver;
@@ -15,8 +16,8 @@ pub mod env;
 pub mod kernel_log;
 pub mod lang_items;
 pub mod mm;
+pub mod platform;
 pub mod process;
-pub mod sbi;
 pub mod sched;
 pub mod sync;
 pub mod syscall;
@@ -54,7 +55,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::syscall::run_tests();
 
         crate::test::print_summary();
-        crate::sbi::shutdown()
+        crate::arch::sbi::shutdown()
     }
 
     // ── Normal mode ──
