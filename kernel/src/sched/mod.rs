@@ -104,7 +104,7 @@ pub fn init() {
 /// next Ready child after it (if any). Returning to init is handled by
 /// schedule_exit() when a child exits, not here.
 pub fn schedule() {
-    let (switch_from_init, current, next, next_proc_idx) = {
+    let (switch_from_init, current, next) = {
         let mut sched = SCHEDULER.lock();
         if sched.count == 0 {
             return;
@@ -147,22 +147,8 @@ pub fn schedule() {
         crate::process::set_current_page_table_root(crate::process::get_page_table_root(
             next_proc_idx,
         ));
-        (init_running, current, next, next_proc_idx)
+        (init_running, current, next)
     };
-
-    // Update TSS.RSP0 BEFORE __switch so the new task's first int 0x80
-    // uses the correct kernel stack. This is critical because for a task's
-    // first-ever scheduling, __switch → first_task_shim → trap_return_user
-    // → iretq, and schedule() never returns — the TSS.RSP0 update after
-    // __switch would not execute.
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(kernel_sp) = crate::process::get_kernel_sp(next_proc_idx) {
-            unsafe {
-                crate::arch::gdt::set_kernel_rsp0(kernel_sp as u64);
-            }
-        }
-    }
 
     if switch_from_init {
         // Save init's sp to INIT_TASK_SP, switch to child
@@ -179,8 +165,8 @@ pub fn schedule() {
         }
     }
 
-    // After __switch returns (on an already-running task's stack),
-    // update TSS.RSP0 for the now-current task.
+    // After __switch returns (possibly on a different task's stack),
+    // update TSS.RSP0 so Ring 3 → Ring 0 interrupts use the correct kernel stack.
     #[cfg(target_arch = "x86_64")]
     {
         let proc_idx = crate::process::current_index();
@@ -195,7 +181,7 @@ pub fn schedule() {
 /// Current child exits → switch to another Ready child, or back to init if
 /// none remain. Called from sys_exit (current is always a child here).
 pub fn schedule_exit() {
-    let (switch_to_init, current, next, next_proc_idx) = {
+    let (switch_to_init, current, next) = {
         let mut sched = SCHEDULER.lock();
         let current = sched.current;
         let count = sched.count;
@@ -207,7 +193,6 @@ pub fn schedule_exit() {
 
         // Look for another Ready child, starting after the current one.
         let mut next = INIT_SENTINEL;
-        let mut next_proc_idx = INIT_PROC_IDX;
         for i in 1..count {
             let candidate = (current + i) % count;
             if let Some(ref t) = sched.tasks[candidate] {
@@ -225,30 +210,20 @@ pub fn schedule_exit() {
             crate::process::set_current_page_table_root(crate::process::get_page_table_root(
                 INIT_PROC_IDX,
             ));
-            (true, current, next, INIT_PROC_IDX)
+            (true, current, next)
         } else {
             if let Some(ref mut t) = sched.tasks[next] {
                 t.state = TaskState::Running;
             }
             sched.current = next;
-            next_proc_idx = sched.task_to_process[next];
+            let next_proc_idx = sched.task_to_process[next];
             crate::process::set_current_index(next_proc_idx);
             crate::process::set_current_page_table_root(crate::process::get_page_table_root(
                 next_proc_idx,
             ));
-            (false, current, next, next_proc_idx)
+            (false, current, next)
         }
     };
-
-    // Update TSS.RSP0 BEFORE __switch (same reason as in schedule()).
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(kernel_sp) = crate::process::get_kernel_sp(next_proc_idx) {
-            unsafe {
-                crate::arch::gdt::set_kernel_rsp0(kernel_sp as u64);
-            }
-        }
-    }
 
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     if switch_to_init {
@@ -263,8 +238,7 @@ pub fn schedule_exit() {
         }
     }
 
-    // After __switch returns (on an already-running task's stack),
-    // update TSS.RSP0 for the now-current task.
+    // Update TSS.RSP0 for the new task
     #[cfg(target_arch = "x86_64")]
     {
         let proc_idx = crate::process::current_index();
@@ -294,7 +268,7 @@ pub fn mark_current_exited() {
 }
 
 pub fn schedule_block() {
-    let (current, next, next_proc_idx) = {
+    let (current, next) = {
         let mut sched = SCHEDULER.lock();
         let current = sched.current;
         if current >= sched.count {
@@ -327,34 +301,13 @@ pub fn schedule_block() {
         crate::process::set_current_page_table_root(crate::process::get_page_table_root(
             next_proc_idx,
         ));
-        (current, next, next_proc_idx)
+        (current, next)
     };
-
-    // Update TSS.RSP0 BEFORE __switch (same reason as in schedule()).
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(kernel_sp) = crate::process::get_kernel_sp(next_proc_idx) {
-            unsafe {
-                crate::arch::gdt::set_kernel_rsp0(kernel_sp as u64);
-            }
-        }
-    }
 
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
     unsafe {
         __switch(cur_ptr, nxt_ptr);
-    }
-
-    // After __switch returns, update TSS.RSP0 for the now-current task.
-    #[cfg(target_arch = "x86_64")]
-    {
-        let proc_idx = crate::process::current_index();
-        if let Some(kernel_sp) = crate::process::get_kernel_sp(proc_idx) {
-            unsafe {
-                crate::arch::gdt::set_kernel_rsp0(kernel_sp as u64);
-            }
-        }
     }
 }
 

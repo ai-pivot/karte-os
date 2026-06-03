@@ -184,11 +184,30 @@ impl Process {
                         );
                     }
 
-                    // NOTE: No syscall→int 0x80 patching on x86_64.
-                    // All user programs already use int 0x80 via syscall.rs.
-                    // Naive byte-pattern matching for 0x0F 0x05 ("syscall")
-                    // causes false positives at instruction boundaries,
-                    // corrupting code and leading to Double Faults.
+                    // Patch: replace `syscall` (0x0F 0x05) with `int 0x80` (0xCD 0x80)
+                    // in executable segments. This makes Go binaries use our int 0x80
+                    // syscall path instead of the SYSCALL instruction.
+                    // The replacement is 2 bytes → 2 bytes, no size change.
+                    #[cfg(target_arch = "x86_64")]
+                    if is_executable {
+                        let base = (frame + dst_offset) as *mut u8;
+                        let patch_len = len;
+                        unsafe {
+                            let mut i = 0usize;
+                            while i + 1 < patch_len {
+                                let b0 = *base.add(i);
+                                let b1 = *base.add(i + 1);
+                                if b0 == 0x0F && b1 == 0x05 {
+                                    // syscall → int 0x80
+                                    *base.add(i) = 0xCD;
+                                    *base.add(i + 1) = 0x80;
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if segment.vaddr + segment.mem_size > max_vaddr {
@@ -326,11 +345,26 @@ impl Process {
                         );
                     }
 
-                    // NOTE: No syscall→int 0x80 patching on x86_64.
-                    // All user programs already use int 0x80 via syscall.rs.
-                    // Naive byte-pattern matching for 0x0F 0x05 ("syscall")
-                    // causes false positives at instruction boundaries,
-                    // corrupting code and leading to Double Faults.
+                    // Patch: replace `syscall` (0x0F 0x05) with `int 0x80` (0xCD 0x80)
+                    // in executable segments on x86_64.
+                    #[cfg(target_arch = "x86_64")]
+                    if is_executable {
+                        let base = (frame + dst_offset) as *mut u8;
+                        unsafe {
+                            let mut i = 0usize;
+                            while i + 1 < len {
+                                let b0 = *base.add(i);
+                                let b1 = *base.add(i + 1);
+                                if b0 == 0x0F && b1 == 0x05 {
+                                    *base.add(i) = 0xCD;
+                                    *base.add(i + 1) = 0x80;
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if seg.vaddr + seg.mem_size > max_vaddr {
