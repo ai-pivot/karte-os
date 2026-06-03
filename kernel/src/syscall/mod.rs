@@ -201,6 +201,17 @@ fn sys_exit(code: i32) -> isize {
         crate::arch::platform::shutdown();
     }
 
+    // CLONE_CHILD_CLEARTID: write 0 to the child_tid_ptr on exit.
+    // This is used by Go's futex-based thread joining.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(proc) = crate::process::current() {
+        if proc.child_tid_ptr != 0 {
+            unsafe {
+                core::ptr::write_volatile(proc.child_tid_ptr as *mut i32, 0);
+            }
+        }
+    }
+
     crate::process::set_exit_code(code as usize);
 
     // Wake parent if waiting
@@ -2147,6 +2158,9 @@ fn sys_fork() -> isize {
         fd_table,
         wait_child_idx: None,
         trap_ctx_ptr: 0,
+        shared_page_table: false,
+        clone_tls: 0,
+        child_tid_ptr: 0,
     };
 
     // Register child
@@ -2254,8 +2268,9 @@ fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
 
 /// Linux clone(flags, stack, parent_tid, tls, child_tid)
 ///
-/// Simplified implementation: creates a new "thread" that shares the address space.
-/// For Go runtime, the main use is creating goroutine scheduler threads (M's).
+/// Creates a new thread/process. The child resumes execution right after
+/// the clone syscall with rax=0 (Linux clone semantics). The parent gets
+/// the child's PID as the return value.
 ///
 /// Key flags:
 ///   CLONE_VM (0x100) = share memory space
@@ -2263,76 +2278,252 @@ fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
 ///   CLONE_FILES (0x400) = share fd table
 ///   CLONE_SIGHAND (0x800) = share signal handlers
 ///   CLONE_THREAD (0x10000) = same thread group
+///   CLONE_SETTLS (0x80000) = set FS base (x86_64: IA32_FS_BASE)
+///   CLONE_PARENT_SETTID (0x10000) = write child TID to parent_tid
+///   CLONE_CHILD_CLEARTID (0x200000) = clear child_tid on exit
 fn linux_clone(
     flags: usize,
     stack: usize,
-    _parent_tid: usize,
-    _tls: usize,
-    _child_tid: usize,
+    parent_tid_ptr: usize,
+    tls: usize,
+    child_tid_ptr: usize,
 ) -> isize {
-    let my_pid = crate::process::current_pid();
-    let my_proc_idx = crate::process::current_index();
+    let is_vm_shared = (flags & 0x100) != 0; // CLONE_VM
 
-    // Check if this is CLONE_VM (thread creation, shared address space)
-    let is_thread = (flags & 0x100) != 0; // CLONE_VM
+    // Get parent's trap context (saved by trap_handler before dispatch)
+    #[cfg(target_arch = "x86_64")]
+    let parent_ctx_ptr = crate::process::get_trap_ctx_ptr();
+    #[cfg(not(target_arch = "x86_64"))]
+    let parent_ctx_ptr: usize = 0;
 
-    if is_thread {
-        // Thread creation: share address space with parent
-        // We create a new task in the scheduler with the same page table
+    if !is_vm_shared {
+        // Fork-like: create new address space
+        // Delegate to sys_fork for now
+        return sys_fork();
+    }
+
+    // ── Determine child's user stack ──
+    let child_user_sp = if stack != 0 {
+        stack
+    } else {
+        // No stack provided — not valid for CLONE_VM thread creation
+        return ERR_INVAL;
+    };
+
+    // ── Read parent's register state (x86_64 only) ──
+    #[cfg(target_arch = "x86_64")]
+    if parent_ctx_ptr == 0 {
+        return ERR_INVAL;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let parent_ctx =
+        unsafe { &*(parent_ctx_ptr as *const crate::arch::trap::TrapContext) };
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // RISC-V: clone not fully supported yet, use basic add_user_process
+        let my_proc_idx = crate::process::current_index();
         let user_pt_root = crate::process::current_page_table_root();
-        let user_sp = if stack != 0 {
-            stack
-        } else {
-            // Use parent's stack (shouldn't happen in practice)
-            return ERR_INVAL;
-        };
 
-        // Allocate kernel stack for the new thread
         let kernel_stack_pages = crate::process::KERNEL_STACK_PAGES;
-        let kernel_stack_base = match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages) {
+        let kernel_stack_base = match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages)
+        {
             Some(base) => base,
             None => return ERR_NOMEM,
         };
-        let kernel_stack_top = kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
+        let kernel_stack_top =
+            kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
 
-        // Create a new process entry (sharing the address space)
-        let entry = {
-            // For clone, the child starts at the return from clone
-            // We need to read the current RIP... but in our syscall handler
-            // we don't have easy access to it. For simplicity, use the
-            // parent's entry point.
-            crate::process::current().map(|p| p.entry).unwrap_or(0)
-        };
-
-        // For the child, the clone syscall should return 0
-        // The parent gets the child's tid
-
-        // Register as a new task
-        let user_satp = user_pt_root; // same page table as parent
+        let entry = crate::process::current()
+            .map(|p| p.entry)
+            .unwrap_or(0);
 
         let tid = match crate::sched::add_user_process(
             entry,
-            user_sp,
+            child_user_sp,
             kernel_stack_top,
-            user_satp,
+            user_pt_root,
             my_proc_idx,
         ) {
             Some(tid) => tid,
             None => return ERR_NOMEM,
         };
-
-        // Return child tid to parent
-        tid as isize
-    } else {
-        // Fork-like: create new address space
-        // Delegate to sys_fork for now
-        sys_fork()
+        return tid as isize;
     }
+
+    // ── x86_64: proper clone with register copy ──
+    #[cfg(target_arch = "x86_64")]
+    {
+        let my_pid = crate::process::current_pid();
+        let my_proc_idx = crate::process::current_index();
+        let user_pt_root = crate::process::current_page_table_root();
+
+        // Allocate kernel stack for child thread
+        let kernel_stack_pages = crate::process::KERNEL_STACK_PAGES;
+        let kernel_stack_base =
+            match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages) {
+                Some(base) => base,
+                None => return ERR_NOMEM,
+            };
+        let kernel_stack_top =
+            kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
+
+        // Get parent process info
+        let parent_proc = match crate::process::current() {
+            Some(p) => p,
+            None => return ERR_INVAL,
+        };
+
+        // Create child process entry
+        let child_pid = crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+        // CLONE_FILES: clone fd table (true sharing would require Arc, clone is close enough)
+        let fd_table = if (flags & 0x400) != 0 {
+            // CLONE_FILES
+            parent_proc.fd_table.clone()
+        } else {
+            Some(crate::driver::fs::FdTable::new())
+        };
+
+        let child = crate::process::Process {
+            pid: child_pid,
+            ppid: parent_proc.pid,
+            page_table_root: user_pt_root, // Same as parent (CLONE_VM)
+            kernel_stack_top,
+            user_stack_top: child_user_sp,
+            brk: parent_proc.brk,
+            initial_brk: parent_proc.initial_brk,
+            entry: 0, // Not used for clone (child resumes from TrapContext)
+            state: crate::process::ProcessState::Ready,
+            exit_code: 0,
+            fd_table,
+            wait_child_idx: None,
+            trap_ctx_ptr: 0,
+            shared_page_table: true, // Mark as shared — don't free on reclaim
+            clone_tls: tls,
+            child_tid_ptr: if (flags & 0x200000) != 0 {
+                child_tid_ptr
+            } else {
+                0
+            },
+        };
+
+        let child_idx = match crate::process::add_process(child) {
+            Some(i) => i,
+            None => return ERR_NOMEM,
+        };
+
+        // Build user_cr3: PPN → physical address
+        let user_cr3 = user_pt_root << 12;
+
+        // Use add_clone_process to set up child's kernel stack with
+        // parent's full register state (child returns 0 from clone)
+        let tid = match crate::sched::add_clone_process(
+            parent_ctx,
+            child_user_sp,
+            kernel_stack_top,
+            user_cr3,
+            child_idx,
+            tls,
+        ) {
+            Some(tid) => tid,
+            None => return ERR_NOMEM,
+        };
+
+        // CLONE_PARENT_SETTID: write child PID to parent's memory
+        if (flags & 0x10000) != 0 && parent_tid_ptr != 0 {
+            unsafe {
+                core::ptr::write_volatile(parent_tid_ptr as *mut i32, child_pid as i32);
+            }
+        }
+
+        child_pid as isize
+    }
+}
+
+// ─── Futex support ────────────────────────────────────────────────────
+//
+// Real futex implementation with per-address wait queues.
+// Used by Go runtime for goroutine synchronization (blocking/waking).
+//
+// Linux semantics:
+//   FUTEX_WAIT(0):   if *uaddr == val, block until woken or *uaddr changes
+//   FUTEX_WAKE(1):   wake up to `val` waiters on uaddr
+//   FUTEX_WAIT_BITSET(9) / FUTEX_WAKE_BITSET(10): same but with bitset filter
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use crate::sync::spinlock::SpinLock;
+
+/// A waiter in the futex queue.
+struct FutexWaiter {
+    /// Process index (used by sched::wake_task)
+    proc_idx: usize,
+    /// Whether this waiter has already been woken
+    woken: bool,
+}
+
+/// Global futex wait queues, keyed by user-space futex address.
+static FUTEX_QUEUES: SpinLock<BTreeMap<usize, Vec<FutexWaiter>>> =
+    SpinLock::new(BTreeMap::new());
+
+/// Block the current task on a futex address.
+///
+/// Returns 0 on success (woken up), or -EAGAIN (-11) if *uaddr != expected_val.
+fn futex_wait(uaddr: usize, expected_val: u32) -> isize {
+    // 1. Volatile read of *uaddr from user space.
+    //    SSTATUS.SUM is set in trap_handler, allowing S-mode to read U-mode pages.
+    let current_val = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+    if current_val != expected_val {
+        return -11; // EAGAIN: value changed, don't block
+    }
+
+    // 2. Register current task in the wait queue.
+    let proc_idx = crate::process::current_index();
+    {
+        let mut queues = FUTEX_QUEUES.lock();
+        let queue = queues.entry(uaddr).or_insert_with(Vec::new);
+        queue.push(FutexWaiter {
+            proc_idx,
+            woken: false,
+        });
+    } // drop lock before blocking — avoids holding spinlock across context switch
+
+    // 3. Block current task — switches to another Ready task.
+    //    If no other task is Ready, schedule_block() returns immediately
+    //    (the task stays Running despite being in the queue, which is safe).
+    crate::sched::schedule_block();
+
+    // 4. Woken up (or spuriously resumed). Return 0.
+    0
+}
+
+/// Wake up to `max_count` tasks waiting on a futex address.
+///
+/// Returns the number of tasks actually woken.
+fn futex_wake(uaddr: usize, max_count: u32) -> isize {
+    let mut queues = FUTEX_QUEUES.lock();
+    let mut woken = 0u32;
+    if let Some(queue) = queues.get_mut(&uaddr) {
+        for waiter in queue.iter_mut() {
+            if !waiter.woken && woken < max_count {
+                waiter.woken = true;
+                crate::sched::wake_task(waiter.proc_idx);
+                woken += 1;
+            }
+        }
+        // Remove woken waiters; clean up empty queues
+        queue.retain(|w| !w.woken);
+        if queue.is_empty() {
+            queues.remove(&uaddr);
+        }
+    }
+    woken as isize
 }
 
 /// Linux futex(addr, op, val, timeout, uaddr2, val3)
 ///
-/// Minimal implementation: only supports FUTEX_WAIT and FUTEX_WAKE.
+/// Real implementation with wait queues for FUTEX_WAIT/WAKE.
 /// Go runtime uses futex for goroutine synchronization.
 fn linux_futex(addr: usize, op: usize, val: usize) -> isize {
     const FUTEX_WAIT: usize = 0;
@@ -2341,27 +2532,20 @@ fn linux_futex(addr: usize, op: usize, val: usize) -> isize {
     const FUTEX_WAKE_BITSET: usize = 10;
     const FUTEX_PRIVATE_FLAG: usize = 128;
 
-    let base_op = op & !FUTEX_PRIVATE_FLAG; // strip private flag
+    let base_op = op & !FUTEX_PRIVATE_FLAG; // strip private flag (Go always sets this)
 
     match base_op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            // FUTEX_WAIT: if *addr == val, block.
-            // For simplicity: just yield and return 0 ( pretend we waited)
-            let current_val = if addr != 0 {
-                unsafe { core::ptr::read_volatile(addr as *const u32) }
-            } else {
-                return ERR_INVAL;
-            };
-            if current_val == val as u32 {
-                // Value matches — we should block. For now, just yield.
-                crate::sched::schedule();
+            if addr == 0 {
+                return -1; // EINVAL
             }
-            0 // success (or spurious wakeup)
+            futex_wait(addr, val as u32)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
-            // FUTEX_WAKE: wake up to `val` waiters.
-            // For simplicity: just return val (pretend we woke them)
-            val as isize
+            if addr == 0 {
+                return -1; // EINVAL
+            }
+            futex_wake(addr, val as u32)
         }
         _ => {
             // Unknown futex op — return success to avoid crashing Go runtime

@@ -430,6 +430,114 @@ pub fn add_user_process(
     Some(tid)
 }
 
+/// Clone-specific first entry shim for x86_64.
+///
+/// When a clone child is first scheduled, __switch returns to this function.
+/// It reads the TLS value stored after the TrapContext on the kernel stack,
+/// sets IA32_FS_BASE if non-zero, then falls through to trap_return_user.
+///
+/// Stack layout on entry (rsp points to TrapContext base):
+///   [rsp + 0x00 .. 0xB7] = TrapContext (184 bytes)
+///   [rsp + 0xB8]           = TLS value (8 bytes, 0 = no TLS)
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn clone_first_shim() -> ! {
+    unsafe {
+        core::arch::naked_asm!(
+            // Read TLS value stored right after TrapContext
+            "mov rax, [rsp + 0xB8]",
+            "cmp rax, 0",
+            "je 2f",
+            // Set IA32_FS_BASE MSR (0xC0000100)
+            "mov rcx, 0xC0000100",
+            "wrmsr",
+            "2:",
+            // Fall through to trap_return_user
+            "mov rdi, rsp",
+            "jmp {handler}",
+            handler = sym trap_return_user,
+        );
+    }
+}
+
+/// Add a clone child task to the scheduler.
+///
+/// Unlike `add_user_process` which creates a fresh TrapContext for a new process,
+/// this copies the parent's register state so the child resumes at the exact
+/// point after the clone syscall, with rax=0 and a new user stack.
+///
+/// # Arguments
+/// - `parent_ctx`: Parent's TrapContext (register state at clone time)
+/// - `new_user_sp`: New user stack pointer for the child (from clone flags.stack)
+/// - `kernel_stack_top`: Child's kernel stack top (freshly allocated)
+/// - `user_cr3`: Page table physical address (shared for CLONE_VM)
+/// - `process_idx`: Process table index for the child
+/// - `tls`: TLS address for CLONE_SETTLS (0 = no TLS)
+///
+/// Returns the task slot ID (tid), or None if no slot available.
+#[cfg(target_arch = "x86_64")]
+pub fn add_clone_process(
+    parent_ctx: &crate::arch::trap::TrapContext,
+    new_user_sp: usize,
+    kernel_stack_top: usize,
+    user_cr3: usize,
+    process_idx: usize,
+    tls: usize,
+) -> Option<usize> {
+    let mut sched = SCHEDULER.lock();
+    // Reuse a freed slot if one exists, otherwise grow into a new slot.
+    let tid = match (0..sched.count).find(|&i| sched.tasks[i].is_none()) {
+        Some(free) => free,
+        None => {
+            if sched.count >= MAX_TASKS {
+                return None;
+            }
+            sched.count
+        }
+    };
+
+    let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
+    let tls_storage_size: usize = 8; // 8 bytes for TLS after TrapContext
+    let switch_frame_size: usize = 7 * 8 + 512; // 6 callee-saved + ret addr + fxsave
+    let total_size = ctx_size + tls_storage_size + switch_frame_size;
+    let tls_base = kernel_stack_top - ctx_size - tls_storage_size;
+    let trap_ctx_base = kernel_stack_top - ctx_size;
+    let switch_sp = tls_base - switch_frame_size;
+
+    unsafe {
+        core::ptr::write_bytes(switch_sp as *mut u8, 0, total_size);
+
+        // __switch frame: fxsave area at bottom (512 bytes, zeroed above),
+        // then callee-saved (also zeroed), then ret addr at top
+        let sw = switch_sp as *mut usize;
+        *sw.add(512 / 8 + 6) = clone_first_shim as *const () as usize; // ret addr → clone_first_shim
+
+        // Store TLS value after TrapContext
+        let tls_ptr = tls_base as *mut usize;
+        *tls_ptr = tls;
+
+        // Build TrapContext as a copy of parent's, with modifications for child
+        let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
+        *ctx = parent_ctx.clone();
+        // Modifications for clone child:
+        (*ctx).rax = 0;                       // Child returns 0 from clone
+        (*ctx).rsp = new_user_sp as u64;      // Use new user stack
+        (*ctx).kernel_sp = kernel_stack_top as u64;
+        (*ctx).user_cr3 = user_cr3 as u64;    // Set for first entry (switches CR3)
+        (*ctx).trap_from_user = 1;
+    }
+
+    TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
+
+    let tcb = TaskControlBlock::new(tid);
+    sched.tasks[tid] = Some(tcb);
+    sched.task_to_process[tid] = process_idx;
+    if tid >= sched.count {
+        sched.count = tid + 1;
+    }
+    Some(tid)
+}
+
 pub fn current_task_id() -> usize {
     0
 }

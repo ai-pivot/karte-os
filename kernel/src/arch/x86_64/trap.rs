@@ -315,7 +315,15 @@ unsafe extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
             ctx.r8 as usize,
             ctx.r9 as usize,
         ];
+
+        // Save trap context pointer for linux_clone (needs parent register state)
+        crate::process::set_trap_ctx_ptr(ctx as *mut _ as usize);
+
         let result = crate::syscall::dispatch(syscall_id, args);
+
+        // Clear trap context pointer
+        crate::process::set_trap_ctx_ptr(0);
+
         ctx.rax = result as u64;
         ctx.rip += 2; // skip `int 0x80` (2-byte instruction)
     }

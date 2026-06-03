@@ -73,6 +73,15 @@ pub struct Process {
     pub fd_table: Option<crate::driver::fs::FdTable>,
     /// Trap context pointer (saved on kernel stack)
     pub trap_ctx_ptr: usize,
+    /// Whether this process's page table is shared via CLONE_VM.
+    /// If true, reclaim_process will NOT free the page table.
+    pub shared_page_table: bool,
+    /// TLS address for CLONE_SETTLS (x86_64: IA32_FS_BASE).
+    /// Applied on first entry via clone_first_shim. 0 = no TLS.
+    pub clone_tls: usize,
+    /// Child TID pointer for CLONE_CHILD_CLEARTID.
+    /// When this process exits, kernel writes 0 to this address.
+    pub child_tid_ptr: usize,
 }
 
 /// Copy kernel identity mappings into a user page table.
@@ -249,6 +258,9 @@ impl Process {
             fd_table: Some(crate::driver::fs::FdTable::new()),
             wait_child_idx: None,
             trap_ctx_ptr: 0,
+            shared_page_table: false,
+            clone_tls: 0,
+            child_tid_ptr: 0,
         })
     }
 
@@ -400,8 +412,29 @@ impl Process {
             fd_table: Some(crate::driver::fs::FdTable::new()),
             wait_child_idx: None,
             trap_ctx_ptr: 0,
+            shared_page_table: false,
+            clone_tls: 0,
+            child_tid_ptr: 0,
         })
     }
+}
+
+/// Per-CPU storage for the current trap context pointer (x86_64 only).
+/// Set by trap_handler before calling dispatch, so linux_clone can read
+/// the parent's full register state to build the child's TrapContext.
+#[cfg(target_arch = "x86_64")]
+static CURRENT_TRAP_CTX: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+
+#[cfg(target_arch = "x86_64")]
+/// Set the current trap context pointer (called from trap_handler).
+pub fn set_trap_ctx_ptr(ptr: usize) {
+    CURRENT_TRAP_CTX[hartid()].store(ptr, Ordering::Relaxed);
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Get the current trap context pointer (called from linux_clone).
+pub fn get_trap_ctx_ptr() -> usize {
+    CURRENT_TRAP_CTX[hartid()].load(Ordering::Relaxed)
 }
 
 /// Get a mutable reference to the user page table from its PPN
@@ -567,7 +600,8 @@ pub fn reclaim_process(idx: usize) -> bool {
 
     if let Some(p) = proc {
         // Free user page table (all user-mapped frames + page table frames)
-        if p.page_table_root != 0 {
+        // Skip if page table is shared (CLONE_VM child) — parent owns it
+        if p.page_table_root != 0 && !p.shared_page_table {
             crate::mm::vmm::free_user_page_table(p.page_table_root);
         }
         // Free kernel stack frames (KERNEL_STACK_PAGES * PAGE_SIZE)
