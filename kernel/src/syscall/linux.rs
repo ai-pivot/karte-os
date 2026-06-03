@@ -63,6 +63,7 @@ mod x86_64_syscalls {
     pub const L_FORK: usize = 57;
     pub const L_EXECVE: usize = 59;
     pub const L_EXIT: usize = 60;
+    pub const L_EXIT_GROUP: usize = 231;
     pub const L_WAIT4: usize = 61;
     pub const L_KILL: usize = 62;
     pub const L_FCNTL: usize = 72;
@@ -410,9 +411,12 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_SYSINFO => Some(Translation::Handled(0)), // stub
         L_GETRLIMIT | L_PRLIMIT64 => Some(Translation::Handled(0)), // stub
         L_GETUID | L_GETGID | L_GETEUID | L_GETEGID => Some(Translation::Handled(0)), // stub: root
-        L_SET_TID_ADDR => Some(Translation::Handled(1)), // stub: return tid=1
+        L_SET_TID_ADDR => Some(Translation::Dispatch {
+            karte_nr: 115, // LINUX_SET_TID_ADDRESS
+            args,
+        }),
         L_SET_ROBUST_LIST | L_GET_ROBUST_LIST => Some(Translation::Handled(0)), // stub
-        L_RSEQ => Some(Translation::Handled(super::ERR_INVAL)), // rseq not supported
+        L_RSEQ => Some(Translation::Handled(-38)), // ENOSYS: Go gracefully degrades
 
         // ─── Threading ───────────────────────────────────────
         L_SET_THREAD_AREA => Some(Translation::Handled(0)), // stub
@@ -444,7 +448,10 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_MINCORE => Some(Translation::Handled(0)),
         L_PTRACE => Some(Translation::Handled(super::ERR_INVAL)),
         L_TKILL | L_TGKILL => Some(Translation::Handled(0)), // stub
-        L_GET_RANDOM => Some(Translation::Handled(super::ERR_INVAL)), // no random source
+        L_GET_RANDOM => Some(Translation::Dispatch {
+            karte_nr: 114, // LINUX_GETRANDOM
+            args,
+        }),
         L_GETRUSAGE => Some(Translation::Handled(0)),
         L_TIMES => Some(Translation::Handled(0)),
         L_DUP3 => Some(Translation::Dispatch {

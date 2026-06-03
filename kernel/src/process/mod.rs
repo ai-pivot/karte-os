@@ -547,6 +547,15 @@ pub fn set_exit_code(code: usize) {
     }
 }
 
+/// Set child_tid_ptr for the current process.
+pub fn set_child_tid_ptr(tidptr: usize) {
+    let mut table = PROCESS_TABLE.lock();
+    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
+    if let Some(p) = table[idx].as_mut() {
+        p.child_tid_ptr = tidptr;
+    }
+}
+
 /// Get process state by process index.
 /// Returns None if process doesn't exist.
 pub fn get_state(idx: usize) -> Option<ProcessState> {

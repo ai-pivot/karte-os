@@ -73,6 +73,8 @@ pub const LINUX_MMAP: usize = 110;
 pub const LINUX_MPROTECT: usize = 111;
 pub const LINUX_MUNMAP: usize = 112;
 pub const LINUX_ARCH_PRCTL: usize = 113;
+pub const LINUX_GETRANDOM: usize = 114;
+pub const LINUX_SET_TID_ADDRESS: usize = 115;
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -85,6 +87,29 @@ pub const ERR_IO: isize = -4;
 // ─── Global FD table (single-process simplification) ────────────────
 
 extern crate alloc;
+
+// ─── Linux signal state (for Go runtime compatibility) ────────────
+
+/// Signal handler table: maps signal number to handler address.
+/// Go registers SIGURG handler; we record it but never deliver signals.
+struct SignalState {
+    handlers: [core::sync::atomic::AtomicUsize; 64],
+    mask: core::sync::atomic::AtomicU64,
+    altstack_sp: core::sync::atomic::AtomicUsize,
+    altstack_size: core::sync::atomic::AtomicUsize,
+    altstack_flags: core::sync::atomic::AtomicUsize,
+}
+
+static SIGNAL_STATE: SignalState = SignalState {
+    handlers: const { [const { core::sync::atomic::AtomicUsize::new(0) }; 64] },
+    mask: core::sync::atomic::AtomicU64::new(0),
+    altstack_sp: core::sync::atomic::AtomicUsize::new(0),
+    altstack_size: core::sync::atomic::AtomicUsize::new(0),
+    altstack_flags: core::sync::atomic::AtomicUsize::new(0),
+};
+
+/// Simple LCG PRNG state for getrandom.
+static PRNG_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x12345678_9ABCDEF0);
 
 use crate::driver::fs::{MAX_FDS, O_CREAT};
 #[cfg(feature = "test_mode")]
@@ -155,10 +180,10 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
         LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
         LINUX_FUTEX => linux_futex(args[0], args[1], args[2]),
-        LINUX_RT_SIGACTION => 0,   // stub: success
-        LINUX_RT_SIGPROCMASK => 0, // stub: success
-        LINUX_RT_SIGRETURN => 0,   // stub: success
-        LINUX_SIGALTSTACK => 0,    // stub: success
+        LINUX_RT_SIGACTION => linux_rt_sigaction(args[0], args[1], args[2]),
+        LINUX_RT_SIGPROCMASK => linux_rt_sigprocmask(args[0], args[1], args[2]),
+        LINUX_RT_SIGRETURN => 0, // stub: success
+        LINUX_SIGALTSTACK => linux_sigaltstack(args[0], args[1]),
         LINUX_SCHED_YIELD => {
             crate::sched::schedule();
             0
@@ -166,6 +191,8 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         LINUX_MMAP => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         LINUX_MPROTECT => linux_mprotect(args[0], args[1], args[2]),
         LINUX_MUNMAP => linux_munmap(args[0], args[1]),
+        LINUX_GETRANDOM => linux_getrandom(args[0], args[1], args[2]),
+        LINUX_SET_TID_ADDRESS => linux_set_tid_address(args[0]),
         #[cfg(target_arch = "x86_64")]
         LINUX_ARCH_PRCTL => linux_arch_prctl(args[0], args[1]),
         #[cfg(not(target_arch = "x86_64"))]
@@ -728,6 +755,123 @@ fn flush_tlb_all() {
     {
         crate::arch::trap::flush_tlb();
     }
+}
+
+// ─── Linux signal/random/tid stubs (Go runtime compatibility) ──────
+
+/// Linux rt_sigaction(sig, act, oldact, sigsetsize)
+/// Record the signal handler address. Never actually deliver signals.
+fn linux_rt_sigaction(sig: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
+    if sig == 0 || sig > 64 {
+        return -22; // EINVAL
+    }
+    // Save old handler if requested
+    if oldact_ptr != 0 {
+        // struct sigaction { handler(8), sa_mask(8), sa_flags(8), sa_restorer(8) }
+        // We only record the handler; write zeros for the rest.
+        unsafe {
+            let oldact = oldact_ptr as *mut [usize; 4];
+            (*oldact)[0] = SIGNAL_STATE.handlers[sig - 1].load(core::sync::atomic::Ordering::Relaxed);
+            (*oldact)[1] = 0;
+            (*oldact)[2] = 0;
+            (*oldact)[3] = 0;
+        }
+    }
+    // Set new handler if provided
+    if act_ptr != 0 {
+        let handler = unsafe { core::ptr::read_volatile(act_ptr as *const usize) };
+        SIGNAL_STATE.handlers[sig - 1].store(handler, core::sync::atomic::Ordering::Relaxed);
+    }
+    0
+}
+
+/// Linux rt_sigprocmask(how, set, oldset, sigsetsize)
+/// Record signal mask without actually blocking anything.
+fn linux_rt_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
+    // Return old mask if requested
+    if oldset_ptr != 0 && how != 3 {
+        unsafe {
+            let oldset = oldset_ptr as *mut u64;
+            *oldset = SIGNAL_STATE.mask.load(core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // Apply new mask if provided
+    if set_ptr != 0 {
+        let new_mask = unsafe { core::ptr::read_volatile(set_ptr as *const u64) };
+        match how {
+            0 => {
+                // SIG_BLOCK: add signals to mask
+                let prev = SIGNAL_STATE.mask.load(core::sync::atomic::Ordering::Relaxed);
+                SIGNAL_STATE.mask.store(prev | new_mask, core::sync::atomic::Ordering::Relaxed);
+            }
+            1 => {
+                // SIG_UNBLOCK: remove signals from mask
+                let prev = SIGNAL_STATE.mask.load(core::sync::atomic::Ordering::Relaxed);
+                SIGNAL_STATE.mask.store(prev & !new_mask, core::sync::atomic::Ordering::Relaxed);
+            }
+            2 => {
+                // SIG_SETMASK: replace mask entirely
+                SIGNAL_STATE.mask.store(new_mask, core::sync::atomic::Ordering::Relaxed);
+            }
+            _ => return -22, // EINVAL
+        }
+    }
+    0
+}
+
+/// Linux sigaltstack(ss, oss)
+/// Record alternate signal stack info. Never actually use it.
+fn linux_sigaltstack(ss_ptr: usize, oss_ptr: usize) -> isize {
+    // Return old state if requested
+    if oss_ptr != 0 {
+        // struct stack_t { ss_sp(8), ss_flags(8), ss_size(8) }
+        unsafe {
+            let oss = oss_ptr as *mut [usize; 3];
+            (*oss)[0] = SIGNAL_STATE.altstack_sp.load(core::sync::atomic::Ordering::Relaxed);
+            (*oss)[1] = SIGNAL_STATE.altstack_flags.load(core::sync::atomic::Ordering::Relaxed);
+            (*oss)[2] = SIGNAL_STATE.altstack_size.load(core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // Set new state if provided
+    if ss_ptr != 0 {
+        let ss_sp = unsafe { core::ptr::read_volatile(ss_ptr as *const usize) };
+        let ss_flags = unsafe { core::ptr::read_volatile((ss_ptr + 8) as *const usize) };
+        let ss_size = unsafe { core::ptr::read_volatile((ss_ptr + 16) as *const usize) };
+        SIGNAL_STATE.altstack_sp.store(ss_sp, core::sync::atomic::Ordering::Relaxed);
+        SIGNAL_STATE.altstack_flags.store(ss_flags, core::sync::atomic::Ordering::Relaxed);
+        SIGNAL_STATE.altstack_size.store(ss_size, core::sync::atomic::Ordering::Relaxed);
+    }
+    0
+}
+
+/// Linux getrandom(buf, count, flags)
+/// Fill buffer with pseudo-random data using a simple LCG PRNG.
+fn linux_getrandom(buf: usize, count: usize, _flags: usize) -> isize {
+    if buf == 0 || count == 0 {
+        return ERR_INVAL;
+    }
+    let buf_ptr = buf as *mut u8;
+    for i in 0..count {
+        // LCG: next = state * 6364136223846793005 + 1442695040888963407
+        let prev = PRNG_STATE.load(core::sync::atomic::Ordering::Relaxed);
+        let next = prev.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        PRNG_STATE.store(next, core::sync::atomic::Ordering::Relaxed);
+        // Use bytes from the state
+        let byte = ((next >> (i % 8 * 8)) & 0xFF) as u8;
+        unsafe {
+            core::ptr::write_volatile(buf_ptr.add(i), byte);
+        }
+    }
+    count as isize
+}
+
+/// Linux set_tid_address(tidptr)
+/// Record the clear_child_tid pointer and return the current TID.
+fn linux_set_tid_address(tidptr: usize) -> isize {
+    // Store tidptr in current process for CLONE_CHILD_CLEARTID on exit.
+    crate::process::set_child_tid_ptr(tidptr);
+    // Return current TID
+    sys_getpid()
 }
 
 /// Syscall 10: Open a file.
