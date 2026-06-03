@@ -221,6 +221,21 @@ pub fn identity_map(root: &mut PageTable, start: usize, end: usize, flags: PTEFl
     }
 }
 
+/// Identity map, but skip pages that are already mapped (preserves user ELF mappings).
+#[cfg(target_arch = "x86_64")]
+pub fn identity_map_skip(root: &mut PageTable, start: usize, end: usize, flags: PTEFlags) {
+    let start_page = start & !(PAGE_SIZE - 1);
+    let end_page = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let mut addr = start_page;
+    while addr < end_page {
+        // Only map if not already mapped by ELF loader
+        if translate_user(root, addr).is_none() {
+            map(root, addr, addr, flags);
+        }
+        addr += PAGE_SIZE;
+    }
+}
+
 static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
 
 pub fn get_kernel_page_table() -> &'static mut PageTable {

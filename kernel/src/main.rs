@@ -253,10 +253,27 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     proc.pid,
                     proc.entry
                 );
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let user_pt_phys = proc.page_table_root << 12;
+                    let user_pt = unsafe {
+                        &mut *(user_pt_phys as *mut crate::mm::vmm::PageTable)
+                    };
+                    let page_addr = proc.entry & !0xFFF;
+                    if let Some(paddr) = crate::mm::vmm::translate_user(user_pt, page_addr) {
+                        crate::console_println!(
+                            "[init] Entry page {:#x} → phys {:#x}, first byte={:#x}",
+                            page_addr, paddr,
+                            unsafe { *((paddr + (proc.entry & 0xFFF)) as *const u8) }
+                        );
+                    } else {
+                        crate::console_println!("[init] WARNING: entry {:#x} NOT mapped!", page_addr);
+                    }
+                }
+
                 crate::console_println!(
-                    "[init]   kstack={:#x}, ustack={:#x}",
-                    proc.kernel_stack_top,
-                    proc.user_stack_top
+                    "[init]   user_cr3={:#x}",
+                    proc.page_table_root << 12
                 );
 
                 // Register process in the global process table

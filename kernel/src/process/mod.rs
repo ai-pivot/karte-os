@@ -104,21 +104,16 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Minimal kernel mappings for user page tables.
-        // Most kernel access is handled by CR3 switching on trap/syscall entry.
-        // We only need to map:
-        // - Trap entry code (the ISR stub itself must be mapped before CR3 switch)
-        // - VGA buffer (used by console_putchar in some paths)
-        // - LAPIC/IOAPIC (for EOI and timer)
-        //
-        // IMPORTANT: The ISR stubs are in kernel code space (0x100000-0x2f6000).
-        // When an interrupt fires while CR3=user PT, the CPU pushes the interrupt
-        // frame using the current (user) CR3. The ISR stub code at 0x1xxxxx must
-        // be mapped in the user PT so the CPU can fetch the first instructions.
-        // After the stub switches CR3, all kernel memory becomes accessible.
-        vmm::identity_map(user_pt, 0x0, 0x40_0000, vmm::PTEFlags::KRWX); // 0-4MB: kernel code
+        // Map kernel code/data — start from 1MB to avoid conflicting with
+        // user ELF segments which may use low addresses (e.g., shell.elf at 0x1000).
+        // Map 1MB..512MB, skipping pages already mapped by ELF loader.
+        vmm::identity_map_skip(user_pt, 0x10_0000, 0x2000_0000, vmm::PTEFlags::KRWX);
+        // Map VGA text buffer at 0xB8000 (below 1MB, needed for console)
+        vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
+        // Map LAPIC/IOAPIC MMIO
         vmm::map(user_pt, 0xFEE0_0000, 0xFEE0_0000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xFEC0_0000, 0xFEC0_0000, vmm::PTEFlags::KRW);
+        // Map PCI MMIO region
         vmm::identity_map(user_pt, 0xF000_0000, 0x1_0000_0000, vmm::PTEFlags::KRW);
     }
 }
@@ -136,8 +131,8 @@ impl Process {
         // 2. Create independent user page table
         let user_pt = vmm::create_user_page_table();
 
-        // 3. Copy kernel mappings so traps can access kernel code
-        copy_kernel_mappings(user_pt);
+        // 3. Load ELF segments into user page table FIRST
+        // (before copy_kernel_mappings, so identity mappings don't interfere)
 
         // 4. Load ELF segments into user page table
         let mut max_vaddr = 0usize;
@@ -210,6 +205,10 @@ impl Process {
                 max_vaddr = segment.vaddr + segment.mem_size;
             }
         }
+
+        // 4. Copy kernel mappings AFTER loading ELF segments
+        // (identity mappings must not interfere with ELF segment mapping)
+        copy_kernel_mappings(user_pt);
 
         // 5. Map user stack in user page table (URW, no execute)
         for i in 0..USER_STACK_PAGES {

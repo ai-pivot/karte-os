@@ -65,50 +65,32 @@ core::arch::global_asm!(
     "syscall_isr_stub:",
     "cli",
 
-    // Switch CR3 to kernel page table
-    "mov rcx, cr3",
-    "lea rax, [rip + KERNEL_CR3]",
-    "mov rax, [rax]",
-    "cmp rax, rcx",
-    "je 3f",
-    "mov cr3, rax",
-    "3:",
-
-    // Save registers (10 slots, 80 bytes)
-    "push rcx",     // [0] saved user CR3
-    "push r11",     // [1]
-    "push r10",     // [2]
-    "push r9",      // [3]
-    "push r8",      // [4]
-    "push rdx",     // [5]
-    "push rsi",     // [6]
-    "push rdi",     // [7]
-    "push rax",     // [8] placeholder for return value
-    "push rax",     // [9] syscall number (rax)
+    // Save registers (9 slots, 72 bytes)
+    "push r11",     // [0]
+    "push r10",     // [1]
+    "push r9",      // [2]
+    "push r8",      // [3]
+    "push rdx",     // [4]
+    "push rsi",     // [5]
+    "push rdi",     // [6]
+    "push rax",     // [7] placeholder for return value
+    "push rax",     // [8] syscall number
 
     "mov rdi, rsp",
     "call syscall_handler_impl",
 
-    // Store return value at [rsp + 72] = slot [8]
-    "mov [rsp + 72], rax",
+    // Store return value at [rsp + 56] = slot [7]
+    "mov [rsp + 56], rax",
 
-    "add rsp, 8",   // skip [9]
-    "pop rax",      // skip [8] (return value slot, value was stored)
-    "pop rdi",      // [7]
-    "pop rsi",      // [6]
-    "pop rdx",      // [5]
-    "pop r9",       // [4]
-    "pop r8",       // [3]
-    "pop r10",      // [2]
-    "pop r11",      // [1]
-    "pop rcx",      // [0] saved user CR3
-
-    // Switch CR3 back to user
-    "mov rax, cr3",
-    "cmp rax, rcx",
-    "je 4f",
-    "mov cr3, rcx",
-    "4:",
+    "add rsp, 8",   // skip [8]
+    "pop rax",      // [7] (return value)
+    "pop rdi",      // [6]
+    "pop rsi",      // [5]
+    "pop rdx",      // [4]
+    "pop r9",       // [3]
+    "pop r8",       // [2]
+    "pop r10",      // [1]
+    "pop r11",      // [0]
 
     "sti",
     "iretq",
@@ -118,18 +100,7 @@ core::arch::global_asm!(
     ".type timer_isr_stub, @function",
     "timer_isr_stub:",
 
-    // Switch CR3 to kernel
-    "push rax",
-    "push rcx",
-    "mov rcx, cr3",
-    "lea rax, [rip + KERNEL_CR3]",
-    "mov rax, [rax]",
-    "cmp rax, rcx",
-    "je 1f",
-    "mov cr3, rax",
-    "1:",
-    "pop rcx",
-    "pop rax",
+    // NOTE: CR3 switching disabled — user PT has kernel mappings.
 
     // Save all 15 GP registers
     "push rax",
@@ -255,28 +226,27 @@ unsafe extern "C" {
 // ─── Rust handlers called from assembly ──────────────────────
 
 /// Handler for int 0x80 syscalls.
-/// Stack layout at state_ptr:
-///   [0] rax (syscall number)
-///   [1] (return value placeholder)
+/// Stack layout at state_ptr (from syscall_isr_stub):
+///   [0] rax (syscall number)  ← last pushed, lowest address
+///   [1] rax (placeholder for return value)
 ///   [2] rdi
 ///   [3] rsi
 ///   [4] rdx
-///   [5] r9
-///   [6] r8
+///   [5] r8
+///   [6] r9
 ///   [7] r10
 ///   [8] r11
-///   [9] saved user CR3
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
     unsafe {
         let s = state_ptr;
         let syscall_nr = *s.add(0) as usize;
-        let a0 = *s.add(2) as usize;
-        let a1 = *s.add(3) as usize;
-        let a2 = *s.add(4) as usize;
-        let a3 = *s.add(7) as usize;
-        let a4 = *s.add(6) as usize;
-        let a5 = *s.add(5) as usize;
+        let a0 = *s.add(2) as usize;  // rdi
+        let a1 = *s.add(3) as usize;  // rsi
+        let a2 = *s.add(4) as usize;  // rdx
+        let a3 = *s.add(7) as usize;  // r10
+        let a4 = *s.add(5) as usize;  // r8
+        let a5 = *s.add(6) as usize;  // r9
 
         crate::syscall::dispatch(syscall_nr, [a0, a1, a2, a3, a4, a5]) as u64
     }
