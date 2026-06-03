@@ -8,18 +8,26 @@ use spin::Mutex;
 
 use crate::mm::{pmm, vmm};
 
-/// User address space layout constants
-/// Extended for large Go binaries — Go runtime needs 100MB+ virtual address space.
+/// User address space layout constants.
+///
+/// x86_64 address space layout:
+///   0x0000_0000 .. 0x0040_0000 = kernel (identity mapped, first 4MB)
+///   0x0040_0000 .. 0x1000_0000 = user code + data (up to 252MB for Go binary)
+///   0x1000_0000 .. 0x2000_0000 = user heap (brk, 256MB)
+///   0x2000_0000 .. 0x8000_0000 = user mmap (1.5GB)
+///   0x7FC0_0000 .. 0x8000_0000 = user stack (4MB, top at 2GB)
+///   0xF000_0000 .. 0x1_0000_0000 = PCI MMIO (kernel only)
+///   0xFEC0_0000, 0xFEE0_0000    = IOAPIC, LAPIC (kernel only)
 pub const USER_CODE_BASE: usize = 0x0000_0000;
-pub const USER_CODE_LIMIT: usize = 0x0800_0000; // 128 MB for code + data (Go binary is ~67MB)
-pub const USER_HEAP_BASE: usize = 0x0800_0000;
-pub const USER_HEAP_LIMIT: usize = 0x1000_0000; // 128 MB heap (brk)
-pub const USER_MMAP_BASE: usize = 0x1000_0000; // 256 MB — start of mmap region
-pub const USER_MMAP_LIMIT: usize = 0x8000_0000; // 2 GB — end of mmap region
-pub const USER_STACK_TOP: usize = 0x8000_0000; // Top of user stack
-pub const USER_STACK_BASE: usize = 0x7FC0_0000; // 4 MB stack
+pub const USER_CODE_LIMIT: usize = 0x1000_0000; // 256MB for code+data
+pub const USER_HEAP_BASE: usize = 0x1000_0000;
+pub const USER_HEAP_LIMIT: usize = 0x2000_0000; // 256MB heap (brk)
+pub const USER_MMAP_BASE: usize = 0x2000_0000;
+pub const USER_MMAP_LIMIT: usize = 0x8000_0000; // 1.5GB mmap region
+pub const USER_STACK_TOP: usize = 0x8000_0000; // 2GB — top of user stack
+pub const USER_STACK_BASE: usize = 0x7FC0_0000; // 4MB stack
 pub const USER_STACK_PAGES: usize = 64; // 256 KB actual stack (lazy-allocated on fault)
-pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack (Go runtime needs more stack)
+pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack
 
 /// Process identifier allocator
 pub(crate) static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
@@ -96,35 +104,31 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Map kernel code/data (1MB..8MB) — covers kernel text, data, heap, PMM bitmap
-        // Note: must cover trap_return_user and all kernel code that runs
-        // after CR3 switch to user page table
-        vmm::identity_map(
-            user_pt,
-            0x10_0000,   // 1MB — start of kernel
-            0x0800_0000, // 8MB
-            vmm::PTEFlags::KRWX,
-        );
-        // Map VGA text buffer at 0xB8000 (needed for console output in trap context)
-        vmm::identity_map(user_pt, 0xB8000, 0xC0000, vmm::PTEFlags::KRW);
-        // Map LAPIC MMIO at 0xFEE00000
+        // Minimal kernel mappings for user page tables.
+        // Most kernel access is handled by CR3 switching on trap/syscall entry.
+        // We only need to map:
+        // - Trap entry code (the ISR stub itself must be mapped before CR3 switch)
+        // - VGA buffer (used by console_putchar in some paths)
+        // - LAPIC/IOAPIC (for EOI and timer)
+        //
+        // IMPORTANT: The ISR stubs are in kernel code space (0x100000-0x2f6000).
+        // When an interrupt fires while CR3=user PT, the CPU pushes the interrupt
+        // frame using the current (user) CR3. The ISR stub code at 0x1xxxxx must
+        // be mapped in the user PT so the CPU can fetch the first instructions.
+        // After the stub switches CR3, all kernel memory becomes accessible.
+        vmm::identity_map(user_pt, 0x0, 0x40_0000, vmm::PTEFlags::KRWX); // 0-4MB: kernel code
         vmm::map(user_pt, 0xFEE0_0000, 0xFEE0_0000, vmm::PTEFlags::KRW);
-        // Map IOAPIC MMIO at 0xFEC00000
         vmm::map(user_pt, 0xFEC0_0000, 0xFEC0_0000, vmm::PTEFlags::KRW);
-        // Map AHCI ABAR region (typical PCI MMIO: 0xF0000000..0x100000000)
-        // Use a generous range to cover most PCI BAR mappings
         vmm::identity_map(user_pt, 0xF000_0000, 0x1_0000_0000, vmm::PTEFlags::KRW);
     }
 }
 
 impl Process {
-    /// Create a new user process from an ELF binary embedded in the kernel.
-    /// `elf_data` is the raw ELF file bytes (statically linked into the kernel).
+    /// Create a new user process from an ELF binary.
     ///
-    /// Creates an independent page table for the process with:
-    /// - Kernel identity mappings (so traps can access kernel code/data)
-    /// - User code/data segments (URWX)
-    /// - User stack (URW)
+    /// User ELF segments are loaded at their original virtual addresses.
+    /// The kernel identity-maps only its own code region (0..4MB), so user
+    /// segments starting at 0x400000+ don't conflict.
     pub fn from_elf(elf_data: &[u8]) -> Result<Self, &'static str> {
         // 1. Parse ELF
         let elf = elf::ElfFile::parse(elf_data)?;
@@ -143,6 +147,7 @@ impl Process {
             let seg_vaddr_end = segment.vaddr + segment.mem_size;
             let page_start = seg_vaddr_start & !(page_size - 1);
             let page_end = (seg_vaddr_end + page_size - 1) & !(page_size - 1);
+            let is_executable = segment.flags & 1 != 0; // PF_X
 
             for vaddr in (page_start..page_end).step_by(page_size) {
                 // Check if already mapped (multiple segments may share a page)
@@ -174,6 +179,31 @@ impl Process {
                             len,
                         );
                     }
+
+                    // Patch: replace `syscall` (0x0F 0x05) with `int 0x80` (0xCD 0x80)
+                    // in executable segments. This makes Go binaries use our int 0x80
+                    // syscall path instead of the SYSCALL instruction.
+                    // The replacement is 2 bytes → 2 bytes, no size change.
+                    #[cfg(target_arch = "x86_64")]
+                    if is_executable {
+                        let base = (frame + dst_offset) as *mut u8;
+                        let patch_len = len;
+                        unsafe {
+                            let mut i = 0usize;
+                            while i + 1 < patch_len {
+                                let b0 = *base.add(i);
+                                let b1 = *base.add(i + 1);
+                                if b0 == 0x0F && b1 == 0x05 {
+                                    // syscall → int 0x80
+                                    *base.add(i) = 0xCD;
+                                    *base.add(i + 1) = 0x80;
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if segment.vaddr + segment.mem_size > max_vaddr {
@@ -188,20 +218,21 @@ impl Process {
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 
-        // 6. Allocate kernel stack for this process (identity mapped already by vmm::init)
-        let kstack_base = pmm::alloc_frame().ok_or("Out of memory for kernel stack")?;
-        for _ in 0..3 {
-            pmm::alloc_frame().ok_or("Out of memory for kernel stack")?;
-        }
-        let kernel_stack_top = kstack_base + 4 * pmm::page_size();
+        // 6. Allocate kernel stack for this process
+        let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
+            .ok_or("Out of memory for kernel stack")?;
+        let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * pmm::page_size();
 
         // 7. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
 
-        // 8. Set up initial brk
+        // 8. Set up initial brk (after loaded segments, aligned to page)
         let page_size = pmm::page_size();
         let initial_brk = (max_vaddr + page_size - 1) & !(page_size - 1);
         let brk = core::cmp::max(initial_brk, USER_HEAP_BASE);
+
+        // Entry point with relocation offset
+        let entry = elf.entry;
 
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 

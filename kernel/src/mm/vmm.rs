@@ -227,6 +227,11 @@ pub fn get_kernel_page_table() -> &'static mut PageTable {
     unsafe { &mut *KERNEL_PAGE_TABLE }
 }
 
+/// Get the physical address of the kernel page table root (for CR3 loading).
+pub fn kernel_cr3() -> u64 {
+    unsafe { (KERNEL_PAGE_TABLE as *const PageTable as u64) }
+}
+
 pub fn init() {
     let root = PageTable::zeroed();
     let root_addr = root as *const PageTable as usize;
@@ -251,9 +256,15 @@ pub fn init() {
 
     #[cfg(target_arch = "x86_64")]
     {
-        identity_map(root, 0x0, 0x0800_0000, PTEFlags::KRWX);
+        // Map all physical memory for kernel access.
+        // This is the kernel page table — used when CR3 is switched on trap entry.
+        // Identity map 0..512MB (covers kernel, PMM bitmap, kernel stacks, etc.)
+        identity_map(root, 0x0, 0x2000_0000, PTEFlags::KRWX);
+        // Map MMIO regions
         map(root, 0xFEE0_0000, 0xFEE0_0000, PTEFlags::KRW);
         map(root, 0xFEC0_0000, 0xFEC0_0000, PTEFlags::KRW);
+        // Map PCI MMIO region
+        identity_map(root, 0xF000_0000, 0x1_0000_0000, PTEFlags::KRW);
     }
 
     let ppn = root_addr >> 12;
