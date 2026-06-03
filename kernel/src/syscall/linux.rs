@@ -203,26 +203,48 @@ pub fn translate(id: usize, args: [usize; 6]) -> Option<Translation> {
 fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
     use x86_64_syscalls::*;
 
-    match id {
-        // ─── Core I/O ────────────────────────────────────────
-        L_READ => Some(Translation::Dispatch {
-            karte_nr: super::SYS_READ,
-            args,
-        }),
-        L_WRITE => Some(Translation::Dispatch {
-            karte_nr: super::SYS_WRITE,
-            args,
-        }),
-        L_CLOSE => Some(Translation::Dispatch {
-            karte_nr: super::SYS_CLOSE,
-            args,
-        }),
+    // ═══════════════════════════════════════════════════════════
+    // Guard: protect KarteOS native syscall numbers from being
+    // mis-translated. Both KarteOS programs and Go programs enter
+    // via int 0x80, but they use different syscall number schemes.
+    // KarteOS native range: 0-80 (with gaps).
+    // Linux x86_64 range: 0-450+.
+    // Numbers in the KarteOS range are NEVER translated — they go
+    // directly to the native KarteOS dispatch in mod.rs.
+    // ═══════════════════════════════════════════════════════════
+    const KARTEOS_NATIVE_NUMBERS: &[usize] = &[
+        // 0-8: debug_print, exit, write, read, brk, getpid, mmap, pipe, dup2
+        0, 1, 2, 3, 4, 5, 6, 7, 8,
+        // 10-11: open, close
+        10, 11,
+        // 30-34: spawn, waitpid, exec, exec_fd, fork
+        30, 31, 32, 33, 34,
+        // 40-42: ls, mkdir, unlink
+        40, 41, 42,
+        // 50-52: setenv, getenv, chdir
+        50, 51, 52,
+        // 60-61: kill, sigret
+        60, 61,
+        // 70-77: socket..shutdown
+        70, 71, 72, 73, 74, 75, 76, 77,
+        // 80: ioctl
+        80,
+    ];
+    if KARTEOS_NATIVE_NUMBERS.contains(&id) {
+        return None;
+    }
 
+    // Also skip L_BRK(12): Linux brk is functionally equivalent to
+    // KarteOS SYS_BRK(4). Since Go binaries use int 0x80 + Linux
+    // numbers, a Go brk(12) should not be intercepted here — let
+    // it fall through to the `_ => None` and be handled by the
+    // caller (or the Go program should use the Linux mmap path).
+    if id == L_BRK {
+        return None;
+    }
+
+    match id {
         // ─── Memory management ───────────────────────────────
-        L_BRK => Some(Translation::Dispatch {
-            karte_nr: super::SYS_BRK,
-            args,
-        }),
         // Linux mmap(addr, len, prot, flags, fd, offset) → KarteOS mmap(addr, len, prot)
         L_MMAP => Some(Translation::Dispatch {
             karte_nr: super::SYS_MMAP,
@@ -233,10 +255,6 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_MADVISE => Some(Translation::Handled(0)), // stub: success
 
         // ─── Process management ──────────────────────────────
-        L_EXIT => Some(Translation::Dispatch {
-            karte_nr: super::SYS_EXIT,
-            args,
-        }),
         L_EXIT_GROUP => Some(Translation::Dispatch {
             karte_nr: super::SYS_EXIT,
             args,
@@ -288,20 +306,10 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             args,
         }),
 
-        // ─── File system ─────────────────────────────────────
-        L_OPEN => {
-            // Linux open(pathname, flags, mode) → KarteOS open(path, path_len, flags)
-            let path_ptr = args[0];
-            let flags = args[1];
-            let path_len = count_user_string(path_ptr);
-            if path_len == 0 {
-                return Some(Translation::Handled(super::ERR_NOENT));
-            }
-            Some(Translation::Dispatch {
-                karte_nr: super::SYS_OPEN,
-                args: [path_ptr, path_len, flags, 0, 0, 0],
-            })
-        }
+        // ─── File system (Linux-only numbers, no KarteOS conflict) ──
+        // Note: L_OPEN(2), L_CLOSE(3), L_READ(0), L_WRITE(1) are
+        // blocked by the guard above since they collide with KarteOS.
+        // Linux programs should use L_OPENAT(257) and L_EXIT_GROUP(231).
         L_OPENAT => {
             // Linux openat(dirfd, pathname, flags, mode)
             let path_ptr = args[1];
@@ -315,26 +323,21 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
                 args: [path_ptr, path_len, flags, 0, 0, 0],
             })
         }
-        L_STAT | L_FSTAT | L_NEWFSTATAT => Some(Translation::Handled(0)), // stub
-        L_FCNTL => Some(Translation::Handled(0)), // stub
+        L_NEWFSTATAT => Some(Translation::Handled(0)), // stub
+        // Note: L_STAT(4) and L_FSTAT(5) removed — conflict with
+        // KarteOS SYS_BRK(4) and SYS_GETPID(5)
         L_PREAD64 => Some(Translation::Dispatch {
             karte_nr: super::SYS_READ,
             args: [args[0], args[1], args[2], 0, 0, 0], // fd, buf, count
         }),
-        L_DUP => Some(Translation::Dispatch {
-            karte_nr: super::SYS_DUP2,
-            args: [args[0], args[0], 0, 0, 0, 0], // dup(fd) = dup2(fd, fd) ... not quite right but ok for stub
-        }),
+        // Note: L_DUP(32) removed — conflicts with KarteOS SYS_EXEC(32)
         L_PIPE | L_PIPE2 => Some(Translation::Dispatch {
             karte_nr: super::SYS_PIPE,
             args,
         }),
         L_GETDENTS => Some(Translation::Handled(0)), // stub
         L_GETCWD => Some(Translation::Handled(0)),   // stub
-        L_CHDIR => Some(Translation::Dispatch {
-            karte_nr: super::SYS_CHDIR,
-            args: [args[0], count_user_string(args[0]), 0, 0, 0, 0],
-        }),
+        // Note: L_CHDIR(80) removed — conflicts with KarteOS SYS_IOCTL(80)
         L_MKDIR => Some(Translation::Dispatch {
             karte_nr: super::SYS_MKDIR,
             args: [args[0], count_user_string(args[0]), 0, 0, 0, 0],
@@ -434,7 +437,8 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         }
 
         // ─── Misc stubs ──────────────────────────────────────
-        L_POLL | L_SELECT => Some(Translation::Handled(0)),
+        // Note: L_POLL(7) removed — conflicts with KarteOS SYS_PIPE(7)
+        L_SELECT => Some(Translation::Handled(0)),
         L_UNSHARE => Some(Translation::Handled(0)),
         L_MREMAP => Some(Translation::Handled(super::ERR_INVAL)),
         L_MINCORE => Some(Translation::Handled(0)),
@@ -449,10 +453,12 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         }),
 
         // ─── Network (stubs for now) ─────────────────────────
-        L_SOCKET | L_BIND | L_CONNECT | L_LISTEN | L_ACCEPT
-        | L_SENDTO | L_RECVFROM | L_SHUTDOWN | L_GETSOCKNAME
-        | L_GETPEERNAME | L_SETSOCKOPT | L_GETSOCKOPT
-        | L_SENDMSG | L_RECVMSG => {
+        // Note: L_SOCKET(41), L_CONNECT(42), L_LISTEN(50) removed —
+        // conflict with KarteOS SYS_MKDIR(41), SYS_UNLINK(42),
+        // SYS_SETENV(50). Also L_GETSOCKNAME(51) conflicts with
+        // SYS_GETENV(51), L_GETPEERNAME(52) conflicts with SYS_CHDIR(52).
+        L_BIND | L_ACCEPT | L_SENDTO | L_RECVFROM | L_SHUTDOWN
+        | L_SETSOCKOPT | L_GETSOCKOPT | L_SENDMSG | L_RECVMSG => {
             Some(Translation::Handled(super::ERR_IO))
         }
 

@@ -243,8 +243,8 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
         // ── Load user program ──
         crate::console_println!("[init] Loading user program...");
-        // init (shell) is always loaded from embedded bytes (703KB, no heap allocation).
-        // External programs loaded via `run` will use FAT32/RamFS.
+        // init (shell) is always loaded from embedded bytes.
+        // External programs loaded via `run` will use ext4/FAT32/RamFS.
         let init_result = process::Process::from_elf(include_bytes!("../../user/shell.elf"));
         match init_result {
             Ok(proc) => {

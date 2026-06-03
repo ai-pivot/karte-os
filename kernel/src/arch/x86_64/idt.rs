@@ -142,80 +142,65 @@ core::arch::global_asm!(
     // CR3 was already set by timer_trap_handler to the new task's user PT
     "iretq",
 
-    // ─── SYSCALL fast entry (for Go binaries) ────────────
+    // ─── SYSCALL fast entry (MSR LSTAR) ──────────────────
     ".globl syscall_entry",
     ".type syscall_entry, @function",
     "syscall_entry:",
-    // On entry: rcx=return RIP, r11=return RFLAGS
+    // On entry: rcx=return RIP, r11=return RFLAGS (set by CPU)
     //           rax=syscall_nr, rdi/rsi/rdx/r10/r8/r9=args
-    //           rsp=user RSP, IF cleared, Ring 0
+    //           rsp=user RSP (NOT switched by SYSCALL), Ring 0
 
-    // Save user RSP in callee-saved rbx
+    // 1. Save user RSP in callee-saved rbx
     "mov rbx, rsp",
 
-    // Load kernel stack
+    // 2. Switch to kernel stack
     "lea rsp, [rip + SYSCALL_KSP]",
     "mov rsp, [rsp]",
 
-    // Switch CR3 to kernel
-    "push rax",
-    "mov rax, cr3",
-    "push rax",          // save user CR3 on kernel stack
+    // 3. Save user CR3 and switch to kernel CR3
+    "mov rax, cr3",              // rax = user CR3
+    "push rax",                  // [rsp+0x50] user CR3 (on kernel stack)
     "lea rax, [rip + KERNEL_CR3]",
-    "mov rax, [rax]",
-    "mov cr3, rax",
-    "pop rax",            // discard temp (we'll get user CR3 from stack later)
-    "pop rax",            // restore rax
+    "mov rax, [rax]",            // rax = kernel CR3
+    "mov cr3, rax",              // switch to kernel page table
 
-    // Build stack frame
-    "push rbx",    // [0] user RSP
-    "push r11",    // [1] user RFLAGS
-    "push rcx",    // [2] user RIP
-    "push r9",     // [3] a5
-    "push r8",     // [4] a4
-    "push r10",    // [5] a3
-    "push rdx",    // [6] a2
-    "push rsi",    // [7] a1
-    "push rdi",    // [8] a0
-    "push rax",    // [9] syscall_nr
+    // 4. Build register state frame on kernel stack
+    "push rbx",      // [rsp+0x48] user RSP
+    "push r11",      // [rsp+0x40] user RFLAGS
+    "push rcx",      // [rsp+0x38] user RIP
+    "push r9",       // [rsp+0x30] a5
+    "push r8",       // [rsp+0x28] a4
+    "push r10",      // [rsp+0x20] a3
+    "push rdx",      // [rsp+0x18] a2
+    "push rsi",      // [rsp+0x10] a1
+    "push rdi",      // [rsp+0x08] a0
+    "push rax",      // [rsp+0x00] syscall_nr
 
+    // 5. Call Rust handler
     "mov rdi, rsp",
     "call syscall_fast_handler",
 
-    // Restore: need rcx=user RIP, r11=user RFLAGS, then sysretq
-    // rax = return value
-    "add rsp, 8*7",     // skip [9]..[3]
-    "pop rcx",           // [2] user RIP
-    "pop r11",           // [1] user RFLAGS
-    "pop rsp",           // [0] user RSP (restore user stack!)
+    // 6. Return path: rax = return value
+    //    Skip syscall_nr, a0..a5 (8 slots)
+    "add rsp, 8*8",
 
-    // CR3: we're on user stack now but still have kernel CR3.
-    // We need user CR3. But we lost it... 
-    // FIX: save user CR3 before switching, restore before sysretq.
-    // Let me restructure.
+    // Restore user RIP and RFLAGS
+    "pop rcx",       // user RIP → rcx (for sysretq)
+    "pop r11",       // user RFLAGS → r11 (for sysretq)
 
-    // Actually this is wrong — we clobbered the user CR3.
-    // We need to save it on the kernel stack and restore it.
-    // Let me restructure the SYSCALL entry.
+    // Restore user RSP
+    "pop rsp",       // user RSP → rsp
+
+    // 7. Restore user CR3
+    "pop rax",       // user CR3
+    "mov cr3, rax",
+
+    // 8. Return to user: rcx→RIP, r11→RFLAGS (CPU does this)
+    "sysretq",
 );
 
-// The SYSCALL entry above is incomplete. Let me rewrite it properly.
-// Instead of fighting with global_asm, let me use a simpler approach:
-// Make the SYSCALL entry redirect to int 0x80 by replacing the Go binary's
-// syscall instructions with int 0x80 at load time.
-//
-// Actually, even simpler: we can just make the LSTAR entry point switch CR3
-// and then immediately call the same handler as int 0x80.
-// The key difference is that SYSCALL doesn't push an interrupt frame,
-// so we need to handle it differently.
-//
-// For now, let me just handle int 0x80 and make Go use that instead of syscall.
-// Go's runtime checks for the syscall instruction availability and falls back
-// to int 0x80 if it's not available. But Go on x86_64 always uses syscall.
-//
-// The simplest fix: in the ELF loader, when loading a Go binary, patch all
-// `syscall` (0x0F 0x05) instructions to `int 0x80` (0xCD 0x80).
-// This is a 2-byte → 2-byte replacement and doesn't change code size.
+// SYSCALL instruction support is now fully implemented via syscall_entry + syscall_fast_handler.
+// Go binaries can use either `syscall` instruction (LSTAR) or `int 0x80` (IDT).
 
 unsafe extern "C" {
     fn syscall_isr_stub();
@@ -279,18 +264,19 @@ unsafe extern "C" fn lapic_local_eoi() {
     super::lapic::local_eoi();
 }
 
-/// Handler for SYSCALL fast entry (Go binaries).
-/// Stack layout at state_ptr:
+/// Handler for SYSCALL fast entry (via MSR LSTAR).
+/// Stack layout at state_ptr (from syscall_entry):
 ///   [0] rax (syscall number)
-///   [1] rdi
-///   [2] rsi
-///   [3] rdx
-///   [4] r10
-///   [5] r8
-///   [6] r9
-///   [7] user RIP (rcx)
-///   [8] user RFLAGS (r11)
+///   [1] rdi (a0)
+///   [2] rsi (a1)
+///   [3] rdx (a2)
+///   [4] r10 (a3)
+///   [5] r8  (a4)
+///   [6] r9  (a5)
+///   [7] rcx (user RIP)
+///   [8] r11 (user RFLAGS)
 ///   [9] user RSP
+///   [10] user CR3
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
     unsafe {
