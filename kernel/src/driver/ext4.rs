@@ -292,6 +292,31 @@ mod riscv_impl {
         Some(buf)
     }
 
+    /// Read a range of bytes from an ext4 file by path.
+    /// `read_fn(offset, buf)` fills `buf` with data starting at `offset` in the file.
+    /// Returns Ok(bytes_read) or Err on failure.
+    /// The returned closure can be called multiple times (e.g., page-by-page).
+    pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result<usize, ()>> {
+        if !has_ext4() {
+            return None;
+        }
+        // Resolve path to inode once
+        let guard = EXT4_FS.lock();
+        let fs = guard.as_ref()?;
+        let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
+        let inode_val = inode;
+        drop(guard);
+
+        Some(move |offset: usize, buf: &mut [u8]| -> Result<usize, ()> {
+            if !has_ext4() {
+                return Err(());
+            }
+            let guard = EXT4_FS.lock();
+            let fs = guard.as_ref().ok_or(())?;
+            fs.read_file(inode_val, offset, buf).map_err(|_| ())
+        })
+    }
+
     pub fn lookup_path(name: &str) -> Option<u64> {
         if !has_ext4() {
             return None;
@@ -723,6 +748,29 @@ mod x86_64_impl {
         let bytes_read = fs.read_file(inode, 0, &mut buf).ok()?;
         buf.truncate(bytes_read);
         Some(buf)
+    }
+
+    /// Read a range of bytes from an ext4 file by path.
+    /// Returns a closure that can be called multiple times for page-by-page reads.
+    pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result<usize, ()>> {
+        if !has_ext4() {
+            return None;
+        }
+        // Resolve path to inode once
+        let guard = EXT4_FS.lock();
+        let fs = guard.as_ref()?;
+        let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
+        let inode_val = inode;
+        drop(guard);
+
+        Some(move |offset: usize, buf: &mut [u8]| -> Result<usize, ()> {
+            if !has_ext4() {
+                return Err(());
+            }
+            let guard = EXT4_FS.lock();
+            let fs = guard.as_ref().ok_or(())?;
+            fs.read_file(inode_val, offset, buf).map_err(|_| ())
+        })
     }
 
     pub fn lookup_path(name: &str) -> Option<u64> {

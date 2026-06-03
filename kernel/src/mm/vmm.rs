@@ -31,6 +31,8 @@ bitflags! {
         const KRX  = Self::V.bits() | Self::R.bits() | Self::X.bits();
         const URWX = Self::KRWX.bits() | Self::U.bits();
         const URW  = Self::KRW.bits() | Self::U.bits();
+        const UX   = Self::V.bits() | Self::X.bits() | Self::U.bits();
+        const UR   = Self::V.bits() | Self::R.bits() | Self::U.bits();
     }
 }
 
@@ -56,6 +58,7 @@ bitflags! {
         const URWX = Self::PRESENT.bits() | Self::WRITABLE.bits() | Self::USER.bits();
         const URW  = Self::PRESENT.bits() | Self::WRITABLE.bits() | Self::USER.bits();
         const UR   = Self::PRESENT.bits() | Self::USER.bits(); // read-only user
+        const UX   = Self::PRESENT.bits() | Self::USER.bits(); // execute only user (no NX)
     }
 }
 
@@ -326,6 +329,64 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
         return None;
     }
     Some((entry.ppn() << 12) | (vaddr & 0xFFF))
+}
+
+/// Unmap a single page from the user page table (clear PTE present bit).
+/// Returns the physical address that was mapped, or None if not mapped.
+pub fn unmap_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
+    let mut table = root;
+    for level in (1..PT_LEVELS).rev() {
+        let vpn = PageTable::vpn(vaddr, level);
+        let entry = table.entries[vpn];
+        if !entry.is_valid() {
+            return None;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if entry.flags().contains(PTEFlags::PS) {
+            // Don't unmap huge pages
+            return None;
+        }
+        table = unsafe { &mut *((entry.ppn() << 12) as *mut PageTable) };
+    }
+    let vpn = PageTable::vpn(vaddr, 0);
+    let entry = table.entries[vpn];
+    if !entry.is_valid() {
+        return None;
+    }
+    let paddr = (entry.ppn() << 12) | (vaddr & 0xFFF);
+    // Clear the PTE (set to zero)
+    table.entries[vpn] = PTE(0);
+    Some(paddr)
+}
+
+/// Change flags on a mapped user page.
+/// If the page is not currently mapped, this is a no-op.
+pub fn mprotect_user(root: &mut PageTable, vaddr: usize, flags: PTEFlags) -> bool {
+    let mut table = root;
+    for level in (1..PT_LEVELS).rev() {
+        let vpn = PageTable::vpn(vaddr, level);
+        let entry = table.entries[vpn];
+        if !entry.is_valid() {
+            return false;
+        }
+        table = unsafe { &mut *((entry.ppn() << 12) as *mut PageTable) };
+    }
+    let vpn = PageTable::vpn(vaddr, 0);
+    let entry = table.entries[vpn];
+    if !entry.is_valid() {
+        return false;
+    }
+    // Preserve the physical address, update flags only
+    let ppn = entry.ppn();
+    #[cfg(target_arch = "riscv64")]
+    {
+        table.entries[vpn] = PTE::new(ppn, flags);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        table.entries[vpn] = PTE(((ppn as u64) << 12) | flags.bits());
+    }
+    true
 }
 
 pub fn free_user_page_table(root_ppn: usize) {

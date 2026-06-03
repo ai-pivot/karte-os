@@ -69,6 +69,10 @@ pub const LINUX_RT_SIGPROCMASK: usize = 103;
 pub const LINUX_RT_SIGRETURN: usize = 104;
 pub const LINUX_SIGALTSTACK: usize = 105;
 pub const LINUX_SCHED_YIELD: usize = 106;
+pub const LINUX_MMAP: usize = 110;
+pub const LINUX_MPROTECT: usize = 111;
+pub const LINUX_MUNMAP: usize = 112;
+pub const LINUX_ARCH_PRCTL: usize = 113;
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -151,13 +155,22 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
         LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
         LINUX_FUTEX => linux_futex(args[0], args[1], args[2]),
-        LINUX_RT_SIGACTION => 0, // stub: success
+        LINUX_RT_SIGACTION => 0,   // stub: success
         LINUX_RT_SIGPROCMASK => 0, // stub: success
-        LINUX_RT_SIGRETURN => 0, // stub: success
-        LINUX_SIGALTSTACK => 0, // stub: success
+        LINUX_RT_SIGRETURN => 0,   // stub: success
+        LINUX_SIGALTSTACK => 0,    // stub: success
         LINUX_SCHED_YIELD => {
             crate::sched::schedule();
             0
+        }
+        LINUX_MMAP => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
+        LINUX_MPROTECT => linux_mprotect(args[0], args[1], args[2]),
+        LINUX_MUNMAP => linux_munmap(args[0], args[1]),
+        #[cfg(target_arch = "x86_64")]
+        LINUX_ARCH_PRCTL => linux_arch_prctl(args[0], args[1]),
+        #[cfg(not(target_arch = "x86_64"))]
+        LINUX_ARCH_PRCTL => {
+            0 // stub: not needed on non-x86_64
         }
 
         _ => {
@@ -434,8 +447,8 @@ fn sys_getpid() -> isize {
     }
 }
 
-/// Syscall 6: Map anonymous memory.
-/// `addr` = hint address (0 = kernel chooses), `len` = size, `flags` = prot flags
+/// Syscall 6: Map anonymous memory (KarteOS native ABI — 3 args).
+/// `addr` = hint address (0 = kernel chooses), `len` = size, `_flags` = prot flags
 /// Returns the mapped virtual address, or error.
 ///
 /// When addr=0, allocates from a per-process mmap region that grows upward
@@ -445,65 +458,257 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
     if len == 0 {
         return ERR_INVAL;
     }
+    linux_mmap(
+        addr,
+        len,
+        3,    /* PROT_READ|PROT_WRITE */
+        0x22, /* MAP_PRIVATE|MAP_ANONYMOUS */
+        usize::MAX,
+        0,
+    )
+}
+
+// ─── Linux mmap/mprotect/munmap ────────────────────────────────────────
+
+/// Linux mmap constants
+const PROT_READ: usize = 1;
+const PROT_WRITE: usize = 2;
+const PROT_EXEC: usize = 4;
+const MAP_SHARED: usize = 0x01;
+const MAP_PRIVATE: usize = 0x02;
+const MAP_FIXED: usize = 0x10;
+const MAP_ANONYMOUS: usize = 0x20;
+
+/// Linux mmap(addr, length, prot, flags, fd, offset)
+/// Full Linux mmap6 implementation for Go runtime support.
+fn linux_mmap(
+    addr: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    _fd: usize,
+    _offset: usize,
+) -> isize {
+    if len == 0 {
+        return -22; // EINVAL
+    }
+
+    let page_size = crate::mm::pmm::page_size();
+    let aligned_len = (len + page_size - 1) & !(page_size - 1);
 
     // Use current process page table
     let user_pt = crate::arch::trap::get_current_user_pt();
-    let page_size = crate::mm::pmm::page_size();
 
-    let base = if addr == 0 {
-        // Kernel chooses address: use mmap region, grow from current brk/mmap_top
-        let mmap_base = crate::process::USER_MMAP_BASE;
-        // Find first unmapped region in mmap area
-        let mut candidate = mmap_base;
-        let needed_pages = (len + page_size - 1) / page_size;
-        // Simple linear scan for a free region
-        'outer: loop {
-            let mut all_free = true;
-            for i in 0..needed_pages {
-                let vaddr = candidate + i * page_size;
-                if vaddr >= crate::process::USER_MMAP_LIMIT {
-                    return ERR_NOMEM;
+    let target_addr = if addr == 0 || (flags & MAP_FIXED != 0) {
+        if addr == 0 {
+            // Kernel chooses address: find first free region in mmap area
+            let mmap_base = crate::process::USER_MMAP_BASE;
+            let needed_pages = aligned_len / page_size;
+            let mut candidate = mmap_base;
+            'outer: loop {
+                for i in 0..needed_pages {
+                    let vaddr = candidate + i * page_size;
+                    if vaddr >= crate::process::USER_MMAP_LIMIT {
+                        return -12; // ENOMEM
+                    }
+                    if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
+                        candidate = vaddr + page_size;
+                        continue 'outer;
+                    }
                 }
-                if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
-                    // This page is already mapped, skip past it
-                    candidate = vaddr + page_size;
-                    continue 'outer;
-                }
+                break 'outer;
             }
-            break 'outer;
+            candidate
+        } else {
+            // MAP_FIXED or addr != 0: use the provided address (page-aligned)
+            addr & !(page_size - 1)
         }
-        candidate
     } else {
-        // Use hint address (aligned down)
-        addr & !(page_size - 1)
+        // addr != 0 without MAP_FIXED: try at addr, but don't overwrite
+        let aligned_addr = addr & !(page_size - 1);
+        // Check if the region is free
+        let mut all_free = true;
+        for i in 0..(aligned_len / page_size) {
+            let vaddr = aligned_addr + i * page_size;
+            if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
+                all_free = false;
+                break;
+            }
+        }
+        if all_free {
+            aligned_addr
+        } else {
+            // Fall back to kernel-chosen address
+            let mmap_base = crate::process::USER_MMAP_BASE;
+            let needed_pages = aligned_len / page_size;
+            let mut candidate = mmap_base;
+            'outer2: loop {
+                for i in 0..needed_pages {
+                    let vaddr = candidate + i * page_size;
+                    if vaddr >= crate::process::USER_MMAP_LIMIT {
+                        return -12; // ENOMEM
+                    }
+                    if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
+                        candidate = vaddr + page_size;
+                        continue 'outer2;
+                    }
+                }
+                break 'outer2;
+            }
+            candidate
+        }
     };
 
-    let end = (base + len + page_size - 1) & !(page_size - 1);
+    let end = target_addr + aligned_len;
 
-    // Validate range — allow mmap region and heap region
+    // Validate range
     let valid_start = crate::process::USER_HEAP_BASE;
     let valid_end = crate::process::USER_MMAP_LIMIT;
-    if base < valid_start || end > valid_end {
-        crate::console_println!("[mmap] range {:#x}-{:#x} out of bounds", base, end);
-        return ERR_INVAL;
+    if target_addr < valid_start || end > valid_end {
+        crate::console_println!("[mmap] range {:#x}-{:#x} out of bounds", target_addr, end);
+        return -22; // EINVAL
     }
 
-    // Allocate and map pages
-    let mut vaddr = base;
+    // Determine PTE flags from prot
+    let pte_flags = prot_to_pte_flags(prot);
+
+    // Allocate and map pages (zero-fill for MAP_ANONYMOUS)
+    let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
+    let mut vaddr = target_addr;
     while vaddr < end {
-        if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
+        let needs_map = if flags & MAP_FIXED != 0 {
+            // MAP_FIXED: unmap existing pages first, then remap
+            if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+                crate::mm::vmm::unmap_user(user_pt, vaddr);
+            }
+            true
+        } else {
+            crate::mm::vmm::translate_user(user_pt, vaddr).is_none()
+        };
+
+        if needs_map {
             let frame = match crate::mm::pmm::alloc_frame() {
                 Some(f) => f,
-                None => return ERR_NOMEM,
+                None => return -12, // ENOMEM
             };
-            unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            if is_anonymous {
+                unsafe {
+                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                }
             }
-            crate::mm::vmm::map(user_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
+            crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
+        } else if flags & MAP_FIXED != 0 {
+            // Page was already mapped but MAP_FIXED means we should remap
+            // This case is handled by needs_map above
+        } else {
+            // Page already exists, update its flags to match prot
+            crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
         }
         vaddr += page_size;
     }
 
+    // Flush TLB
+    flush_tlb_all();
+
+    // Advance brk tracking (for addr=0 kernel-chosen allocations)
+    if addr == 0 && end > crate::process::current_brk() {
+        crate::process::set_current_brk(end);
+    }
+
+    target_addr as isize
+}
+
+/// Convert Linux prot flags to KarteOS PTEFlags.
+fn prot_to_pte_flags(prot: usize) -> crate::mm::vmm::PTEFlags {
+    let readable = prot & PROT_READ != 0;
+    let writable = prot & PROT_WRITE != 0;
+    let executable = prot & PROT_EXEC != 0;
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        use crate::mm::vmm::PTEFlags;
+        let mut f = PTEFlags::V | PTEFlags::U;
+        if readable {
+            f |= PTEFlags::R;
+        }
+        if writable {
+            f |= PTEFlags::W;
+        }
+        if executable {
+            f |= PTEFlags::X;
+        }
+        // If nothing specified, default to R+W
+        if prot == 0 {
+            f |= PTEFlags::R | PTEFlags::W;
+        }
+        f
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::mm::vmm::PTEFlags;
+        let mut f = PTEFlags::PRESENT | PTEFlags::USER;
+        if writable {
+            f |= PTEFlags::WRITABLE;
+        }
+        if !executable {
+            f |= PTEFlags::NX;
+        }
+        // Default: no NX (executable)
+        f
+    }
+}
+
+/// Linux mprotect(addr, len, prot) — change page protections.
+fn linux_mprotect(addr: usize, len: usize, prot: usize) -> isize {
+    if addr == 0 || len == 0 {
+        return -22; // EINVAL
+    }
+
+    let page_size = crate::mm::pmm::page_size();
+    let start = addr & !(page_size - 1);
+    let end = (addr + len + page_size - 1) & !(page_size - 1);
+
+    let user_pt = crate::arch::trap::get_current_user_pt();
+    let pte_flags = prot_to_pte_flags(prot);
+
+    for vaddr in (start..end).step_by(page_size) {
+        crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
+    }
+
+    flush_tlb_all();
+    0
+}
+
+/// Linux munmap(addr, len) — unmap pages.
+/// Does not free physical frames (Go may remap the same region).
+fn linux_munmap(addr: usize, len: usize) -> isize {
+    if addr == 0 || len == 0 {
+        return -22; // EINVAL
+    }
+
+    let page_size = crate::mm::pmm::page_size();
+    let start = addr & !(page_size - 1);
+    let end = (addr + len + page_size - 1) & !(page_size - 1);
+
+    // Validate range
+    let valid_start = crate::process::USER_HEAP_BASE;
+    let valid_end = crate::process::USER_MMAP_LIMIT;
+    if start < valid_start || end > valid_end {
+        return -22; // EINVAL
+    }
+
+    let user_pt = crate::arch::trap::get_current_user_pt();
+    for vaddr in (start..end).step_by(page_size) {
+        crate::mm::vmm::unmap_user(user_pt, vaddr);
+    }
+
+    flush_tlb_all();
+    0
+}
+
+/// Helper: flush the entire TLB (architecture-independent).
+fn flush_tlb_all() {
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma");
@@ -512,13 +717,6 @@ fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
     {
         crate::arch::trap::flush_tlb();
     }
-
-    // If addr was 0, advance brk
-    if addr == 0 {
-        crate::process::set_current_brk(end);
-    }
-
-    base as isize
 }
 
 /// Syscall 10: Open a file.
@@ -1207,18 +1405,47 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
 
     crate::console_println!("[exec] Loading '{}'...", name);
 
-    // Load ELF data from filesystem (FAT32 + RamFS)
-    let proc = match crate::driver::fs::read_file_owned(&name) {
-        Some(data) => match crate::process::Process::from_elf(&data) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::console_println!("[exec] Failed to create process: {}", e);
-                return ERR_NOMEM;
+    // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
+    let proc = if crate::driver::ext4::has_ext4() {
+        match crate::driver::ext4::read_file_range(&name) {
+            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn) {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::console_println!("[exec] Streaming ELF load failed: {}", e);
+                    return ERR_NOMEM;
+                }
+            },
+            None => {
+                // File not found on ext4, try fallback
+                match crate::driver::fs::read_file_owned(&name) {
+                    Some(data) => match crate::process::Process::from_elf(&data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            crate::console_println!("[exec] Failed to create process: {}", e);
+                            return ERR_NOMEM;
+                        }
+                    },
+                    None => {
+                        crate::console_println!("[exec] Program '{}' not found", name);
+                        return ERR_NOENT;
+                    }
+                }
             }
-        },
-        None => {
-            crate::console_println!("[exec] Program '{}' not found", name);
-            return ERR_NOENT;
+        }
+    } else {
+        // No ext4 — use traditional loader (FAT32 + RamFS)
+        match crate::driver::fs::read_file_owned(&name) {
+            Some(data) => match crate::process::Process::from_elf(&data) {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::console_println!("[exec] Failed to create process: {}", e);
+                    return ERR_NOMEM;
+                }
+            },
+            None => {
+                crate::console_println!("[exec] Program '{}' not found", name);
+                return ERR_NOENT;
+            }
         }
     };
 
@@ -1692,18 +1919,45 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         return ERR_INVAL;
     };
 
-    // Load ELF from filesystem
-    let data = match crate::driver::fs::read_file_owned(&name) {
-        Some(d) => d,
-        None => return ERR_NOENT,
-    };
-
-    // Parse ELF and create process
-    let mut proc = match crate::process::Process::from_elf(&data) {
-        Ok(p) => p,
-        Err(e) => {
-            crate::console_println!("[exec] Failed to parse ELF '{}': {}", name, e);
-            return ERR_IO;
+    // Load ELF from filesystem — try streaming loader from ext4 first
+    let mut proc = if crate::driver::ext4::has_ext4() {
+        match crate::driver::ext4::read_file_range(&name) {
+            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn) {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::console_println!(
+                        "[exec] Streaming ELF load failed for '{}': {}",
+                        name,
+                        e
+                    );
+                    return ERR_IO;
+                }
+            },
+            None => {
+                // File not found on ext4, try fallback
+                match crate::driver::fs::read_file_owned(&name) {
+                    Some(data) => match crate::process::Process::from_elf(&data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            crate::console_println!("[exec] Failed to parse ELF '{}': {}", name, e);
+                            return ERR_IO;
+                        }
+                    },
+                    None => return ERR_NOENT,
+                }
+            }
+        }
+    } else {
+        // No ext4 — use traditional loader
+        match crate::driver::fs::read_file_owned(&name) {
+            Some(data) => match crate::process::Process::from_elf(&data) {
+                Ok(p) => p,
+                Err(e) => {
+                    crate::console_println!("[exec] Failed to parse ELF '{}': {}", name, e);
+                    return ERR_IO;
+                }
+            },
+            None => return ERR_NOENT,
         }
     };
 
@@ -2009,7 +2263,13 @@ fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
 ///   CLONE_FILES (0x400) = share fd table
 ///   CLONE_SIGHAND (0x800) = share signal handlers
 ///   CLONE_THREAD (0x10000) = same thread group
-fn linux_clone(flags: usize, stack: usize, _parent_tid: usize, _tls: usize, _child_tid: usize) -> isize {
+fn linux_clone(
+    flags: usize,
+    stack: usize,
+    _parent_tid: usize,
+    _tls: usize,
+    _child_tid: usize,
+) -> isize {
     let my_pid = crate::process::current_pid();
     let my_proc_idx = crate::process::current_index();
 
@@ -2020,7 +2280,9 @@ fn linux_clone(flags: usize, stack: usize, _parent_tid: usize, _tls: usize, _chi
         // Thread creation: share address space with parent
         // We create a new task in the scheduler with the same page table
         let user_pt_root = crate::process::current_page_table_root();
-        let user_sp = if stack != 0 { stack } else {
+        let user_sp = if stack != 0 {
+            stack
+        } else {
             // Use parent's stack (shouldn't happen in practice)
             return ERR_INVAL;
         };
@@ -2048,7 +2310,13 @@ fn linux_clone(flags: usize, stack: usize, _parent_tid: usize, _tls: usize, _chi
         // Register as a new task
         let user_satp = user_pt_root; // same page table as parent
 
-        let tid = match crate::sched::add_user_process(entry, user_sp, kernel_stack_top, user_satp, my_proc_idx) {
+        let tid = match crate::sched::add_user_process(
+            entry,
+            user_sp,
+            kernel_stack_top,
+            user_satp,
+            my_proc_idx,
+        ) {
             Some(tid) => tid,
             None => return ERR_NOMEM,
         };
@@ -2099,5 +2367,48 @@ fn linux_futex(addr: usize, op: usize, val: usize) -> isize {
             // Unknown futex op — return success to avoid crashing Go runtime
             0
         }
+    }
+}
+
+/// Linux arch_prctl(code, addr) — x86_64 FS/GS base management for TLS.
+///
+/// Go runtime calls arch_prctl(ARCH_SET_FS, addr) at startup to set up
+/// goroutine thread-local storage via the %fs segment.
+#[cfg(target_arch = "x86_64")]
+fn linux_arch_prctl(code: usize, addr: usize) -> isize {
+    const ARCH_SET_GS: usize = 0x1001;
+    const ARCH_SET_FS: usize = 0x1002;
+    const ARCH_GET_FS: usize = 0x1003;
+    const ARCH_GET_GS: usize = 0x1004;
+    const MSR_FS_BASE: u32 = 0xC000_0100;
+    const MSR_GS_BASE: u32 = 0xC000_0101;
+    const EINVAL: isize = -22;
+
+    match code {
+        ARCH_SET_GS => {
+            unsafe { crate::arch::idt::wrmsr(MSR_GS_BASE, addr as u64) };
+            0
+        }
+        ARCH_SET_FS => {
+            unsafe { crate::arch::idt::wrmsr(MSR_FS_BASE, addr as u64) };
+            0
+        }
+        ARCH_GET_FS => {
+            if addr == 0 {
+                return EINVAL;
+            }
+            let val = unsafe { crate::arch::idt::rdmsr(MSR_FS_BASE) };
+            unsafe { core::ptr::write_volatile(addr as *mut u64, val) };
+            0
+        }
+        ARCH_GET_GS => {
+            if addr == 0 {
+                return EINVAL;
+            }
+            let val = unsafe { crate::arch::idt::rdmsr(MSR_GS_BASE) };
+            unsafe { core::ptr::write_volatile(addr as *mut u64, val) };
+            0
+        }
+        _ => EINVAL,
     }
 }

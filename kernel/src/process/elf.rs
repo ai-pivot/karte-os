@@ -58,6 +58,96 @@ pub struct Segment {
     pub flags: usize,
 }
 
+/// A loadable segment's metadata (used by streaming loader)
+#[derive(Debug, Clone, Copy)]
+pub struct ElfSegmentInfo {
+    pub vaddr: usize,
+    pub mem_size: usize,
+    pub file_size: usize,
+    pub offset: usize,
+    pub flags: u32,
+}
+
+/// Parsed ELF header + segment info (only needs first ~4KB of the file)
+pub struct ElfInfo {
+    pub entry: usize,
+    pub segments: [Option<ElfSegmentInfo>; 16],
+    pub num_segments: usize,
+}
+
+impl ElfInfo {
+    /// Parse ELF header and program headers from a small buffer
+    /// (first 4096 bytes of the file is sufficient).
+    pub fn parse_header_only(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < core::mem::size_of::<ElfHeader>() {
+            return Err("ELF: too small for header");
+        }
+
+        let header: &ElfHeader = unsafe { &*(data.as_ptr() as *const ElfHeader) };
+
+        // Verify magic
+        let magic = u32::from_le_bytes(header.ident[0..4].try_into().unwrap());
+        if magic != ELF_MAGIC {
+            return Err("ELF: bad magic");
+        }
+
+        // Verify 64-bit, little-endian
+        if header.ident[4] != 2 {
+            return Err("ELF: not 64-bit");
+        }
+        if header.ident[5] != 1 {
+            return Err("ELF: not little-endian");
+        }
+
+        // Verify machine type
+        if u16::from_le(header.machine) != EM_MACHINE {
+            return Err("ELF: wrong machine type");
+        }
+
+        let entry = u64::from_le(header.entry) as usize;
+        let phoff = u64::from_le(header.phoff) as usize;
+        let phentsize = u16::from_le(header.phentsize) as usize;
+        let phnum = u16::from_le(header.phnum) as usize;
+
+        let mut segments = [const { None }; 16];
+        let mut num_segments = 0usize;
+
+        for i in 0..phnum {
+            if num_segments >= 16 {
+                break; // safety limit
+            }
+            let ph_offset = phoff + i * phentsize;
+            if ph_offset + phentsize > data.len() {
+                return Err("ELF: program header out of bounds");
+            }
+
+            let ph: &ProgramHeader =
+                unsafe { &*(data.as_ptr().add(ph_offset) as *const ProgramHeader) };
+
+            if u32::from_le(ph.ptype) == PT_LOAD {
+                segments[num_segments] = Some(ElfSegmentInfo {
+                    vaddr: u64::from_le(ph.vaddr) as usize,
+                    offset: u64::from_le(ph.offset) as usize,
+                    file_size: u64::from_le(ph.file_size) as usize,
+                    mem_size: u64::from_le(ph.mem_size) as usize,
+                    flags: u32::from_le(ph.flags),
+                });
+                num_segments += 1;
+            }
+        }
+
+        if num_segments == 0 {
+            return Err("ELF: no loadable segments");
+        }
+
+        Ok(Self {
+            entry,
+            segments,
+            num_segments,
+        })
+    }
+}
+
 /// Parsed ELF file
 pub struct ElfFile<'a> {
     pub entry: usize,

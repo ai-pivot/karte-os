@@ -21,10 +21,16 @@ const MSR_LSTAR: u32 = 0xC000_282;
 const MSR_CSTAR: u32 = 0xC000_283;
 const MSR_SFMASK: u32 = 0xC000_284;
 
-unsafe fn wrmsr(msr: u32, val: u64) {
+pub unsafe fn wrmsr(msr: u32, val: u64) {
     let lo = val as u32;
     let hi = (val >> 32) as u32;
     core::arch::asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi);
+}
+
+pub unsafe fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi);
+    ((hi as u64) << 32) | (lo as u64)
 }
 
 /// Cached physical address of the kernel page table root.
@@ -36,11 +42,15 @@ static mut KERNEL_CR3: u64 = 0;
 static mut SYSCALL_KSP: u64 = 0;
 
 pub fn set_syscall_ksp(ksp: u64) {
-    unsafe { SYSCALL_KSP = ksp; }
+    unsafe {
+        SYSCALL_KSP = ksp;
+    }
 }
 
 pub fn cache_kernel_cr3() {
-    unsafe { KERNEL_CR3 = crate::mm::vmm::kernel_cr3(); }
+    unsafe {
+        KERNEL_CR3 = crate::mm::vmm::kernel_cr3();
+    }
 }
 
 pub fn init_syscall_msrs() {
@@ -58,48 +68,40 @@ pub fn init_syscall_msrs() {
 
 core::arch::global_asm!(
     ".section .text",
-
     // ─── int 0x80 syscall ISR stub ───────────────────────
     ".globl syscall_isr_stub",
     ".type syscall_isr_stub, @function",
     "syscall_isr_stub:",
     "cli",
-
     // Save registers (9 slots, 72 bytes)
-    "push r11",     // [0]
-    "push r10",     // [1]
-    "push r9",      // [2]
-    "push r8",      // [3]
-    "push rdx",     // [4]
-    "push rsi",     // [5]
-    "push rdi",     // [6]
-    "push rax",     // [7] placeholder for return value
-    "push rax",     // [8] syscall number
-
+    "push r11", // [0]
+    "push r10", // [1]
+    "push r9",  // [2]
+    "push r8",  // [3]
+    "push rdx", // [4]
+    "push rsi", // [5]
+    "push rdi", // [6]
+    "push rax", // [7] placeholder for return value
+    "push rax", // [8] syscall number
     "mov rdi, rsp",
     "call syscall_handler_impl",
-
     // Store return value at [rsp + 56] = slot [7]
     "mov [rsp + 56], rax",
-
-    "add rsp, 8",   // skip [8]
-    "pop rax",      // [7] (return value)
-    "pop rdi",      // [6]
-    "pop rsi",      // [5]
-    "pop rdx",      // [4]
-    "pop r9",       // [3]
-    "pop r8",       // [2]
-    "pop r10",      // [1]
-    "pop r11",      // [0]
-
+    "add rsp, 8", // skip [8]
+    "pop rax",    // [7] (return value)
+    "pop rdi",    // [6]
+    "pop rsi",    // [5]
+    "pop rdx",    // [4]
+    "pop r9",     // [3]
+    "pop r8",     // [2]
+    "pop r10",    // [1]
+    "pop r11",    // [0]
     "sti",
     "iretq",
-
     // ─── Timer ISR stub ──────────────────────────────────
     ".globl timer_isr_stub",
     ".type timer_isr_stub, @function",
     "timer_isr_stub:",
-
     // NOTE: CR3 switching disabled — user PT has kernel mappings.
 
     // Save all 15 GP registers
@@ -118,11 +120,9 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
-
     "mov rdi, rsp",
     "call timer_trap_handler",
     "call lapic_local_eoi",
-
     "pop r15",
     "pop r14",
     "pop r13",
@@ -138,10 +138,8 @@ core::arch::global_asm!(
     "pop rcx",
     "pop rbx",
     "pop rax",
-
     // CR3 was already set by timer_trap_handler to the new task's user PT
     "iretq",
-
     // ─── SYSCALL fast entry (MSR LSTAR) ──────────────────
     ".globl syscall_entry",
     ".type syscall_entry, @function",
@@ -152,49 +150,40 @@ core::arch::global_asm!(
 
     // 1. Save user RSP in callee-saved rbx
     "mov rbx, rsp",
-
     // 2. Switch to kernel stack
     "lea rsp, [rip + SYSCALL_KSP]",
     "mov rsp, [rsp]",
-
     // 3. Save user CR3 and switch to kernel CR3
-    "mov rax, cr3",              // rax = user CR3
-    "push rax",                  // [rsp+0x50] user CR3 (on kernel stack)
+    "mov rax, cr3", // rax = user CR3
+    "push rax",     // [rsp+0x50] user CR3 (on kernel stack)
     "lea rax, [rip + KERNEL_CR3]",
-    "mov rax, [rax]",            // rax = kernel CR3
-    "mov cr3, rax",              // switch to kernel page table
-
+    "mov rax, [rax]", // rax = kernel CR3
+    "mov cr3, rax",   // switch to kernel page table
     // 4. Build register state frame on kernel stack
-    "push rbx",      // [rsp+0x48] user RSP
-    "push r11",      // [rsp+0x40] user RFLAGS
-    "push rcx",      // [rsp+0x38] user RIP
-    "push r9",       // [rsp+0x30] a5
-    "push r8",       // [rsp+0x28] a4
-    "push r10",      // [rsp+0x20] a3
-    "push rdx",      // [rsp+0x18] a2
-    "push rsi",      // [rsp+0x10] a1
-    "push rdi",      // [rsp+0x08] a0
-    "push rax",      // [rsp+0x00] syscall_nr
-
+    "push rbx", // [rsp+0x48] user RSP
+    "push r11", // [rsp+0x40] user RFLAGS
+    "push rcx", // [rsp+0x38] user RIP
+    "push r9",  // [rsp+0x30] a5
+    "push r8",  // [rsp+0x28] a4
+    "push r10", // [rsp+0x20] a3
+    "push rdx", // [rsp+0x18] a2
+    "push rsi", // [rsp+0x10] a1
+    "push rdi", // [rsp+0x08] a0
+    "push rax", // [rsp+0x00] syscall_nr
     // 5. Call Rust handler
     "mov rdi, rsp",
     "call syscall_fast_handler",
-
     // 6. Return path: rax = return value
     //    Skip syscall_nr, a0..a5 (8 slots)
     "add rsp, 8*8",
-
     // Restore user RIP and RFLAGS
-    "pop rcx",       // user RIP → rcx (for sysretq)
-    "pop r11",       // user RFLAGS → r11 (for sysretq)
-
+    "pop rcx", // user RIP → rcx (for sysretq)
+    "pop r11", // user RFLAGS → r11 (for sysretq)
     // Restore user RSP
-    "pop rsp",       // user RSP → rsp
-
+    "pop rsp", // user RSP → rsp
     // 7. Restore user CR3
-    "pop rax",       // user CR3
+    "pop rax", // user CR3
     "mov cr3, rax",
-
     // 8. Return to user: rcx→RIP, r11→RFLAGS (CPU does this)
     "sysretq",
 );
@@ -226,12 +215,12 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
     unsafe {
         let s = state_ptr;
         let syscall_nr = *s.add(0) as usize;
-        let a0 = *s.add(2) as usize;  // rdi
-        let a1 = *s.add(3) as usize;  // rsi
-        let a2 = *s.add(4) as usize;  // rdx
-        let a3 = *s.add(7) as usize;  // r10
-        let a4 = *s.add(5) as usize;  // r8
-        let a5 = *s.add(6) as usize;  // r9
+        let a0 = *s.add(2) as usize; // rdi
+        let a1 = *s.add(3) as usize; // rsi
+        let a2 = *s.add(4) as usize; // rdx
+        let a3 = *s.add(7) as usize; // r10
+        let a4 = *s.add(5) as usize; // r8
+        let a5 = *s.add(6) as usize; // r9
 
         crate::syscall::dispatch(syscall_nr, [a0, a1, a2, a3, a4, a5]) as u64
     }
@@ -296,18 +285,26 @@ unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
 // ─── Exception handlers ──────────────────────────────────────
 
 extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
-    crate::console_println!("[EXCEPTION] BP at {:#x}", frame.instruction_pointer.as_u64());
+    crate::console_println!(
+        "[EXCEPTION] BP at {:#x}",
+        frame.instruction_pointer.as_u64()
+    );
 }
 
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _err: u64) -> ! {
-    panic!("[EXCEPTION] Double Fault at {:#x}", frame.instruction_pointer.as_u64());
+    panic!(
+        "[EXCEPTION] Double Fault at {:#x}",
+        frame.instruction_pointer.as_u64()
+    );
 }
 
 extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64) {
     let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
     crate::console_println!(
         "[EXCEPTION] GP Fault at {:#x}, err={:#x}, from_user={}",
-        frame.instruction_pointer.as_u64(), err, from_user
+        frame.instruction_pointer.as_u64(),
+        err,
+        from_user
     );
     if from_user {
         crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
@@ -324,11 +321,16 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: P
     let page_addr = fault_addr_val & !(page_size - 1);
 
     // Try lazy allocation for heap
-    if from_user && fault_addr_val >= crate::process::USER_HEAP_BASE && fault_addr_val < crate::process::USER_HEAP_LIMIT {
+    if from_user
+        && fault_addr_val >= crate::process::USER_HEAP_BASE
+        && fault_addr_val < crate::process::USER_HEAP_LIMIT
+    {
         let user_pt = super::trap::get_current_user_pt();
         if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
             if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                unsafe { core::ptr::write_bytes(frame as *mut u8, 0, page_size); }
+                unsafe {
+                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                }
                 crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
                 super::trap::flush_tlb_addr(page_addr);
                 let new_brk = page_addr + page_size;
@@ -342,11 +344,16 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: P
     }
 
     // Try lazy allocation for stack
-    if from_user && fault_addr_val >= crate::process::USER_STACK_BASE && fault_addr_val < crate::process::USER_STACK_TOP {
+    if from_user
+        && fault_addr_val >= crate::process::USER_STACK_BASE
+        && fault_addr_val < crate::process::USER_STACK_TOP
+    {
         let user_pt = super::trap::get_current_user_pt();
         if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
             if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                unsafe { core::ptr::write_bytes(frame as *mut u8, 0, page_size); }
+                unsafe {
+                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                }
                 crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
                 super::trap::flush_tlb_addr(page_addr);
                 return;
@@ -356,11 +363,16 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: P
     }
 
     // Try lazy allocation for mmap region
-    if from_user && fault_addr_val >= crate::process::USER_MMAP_BASE && fault_addr_val < crate::process::USER_MMAP_LIMIT {
+    if from_user
+        && fault_addr_val >= crate::process::USER_MMAP_BASE
+        && fault_addr_val < crate::process::USER_MMAP_LIMIT
+    {
         let user_pt = super::trap::get_current_user_pt();
         if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
             if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                unsafe { core::ptr::write_bytes(frame as *mut u8, 0, page_size); }
+                unsafe {
+                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                }
                 crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
                 super::trap::flush_tlb_addr(page_addr);
                 return;
@@ -371,7 +383,8 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: P
 
     crate::console_println!(
         "[EXCEPTION] Page Fault at {:#x}, accessing {:#x}",
-        frame.instruction_pointer.as_u64(), fault_addr_val
+        frame.instruction_pointer.as_u64(),
+        fault_addr_val
     );
     if from_user {
         crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
@@ -381,7 +394,10 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: P
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
-    crate::console_println!("[EXCEPTION] Invalid Opcode at {:#x}", frame.instruction_pointer.as_u64());
+    crate::console_println!(
+        "[EXCEPTION] Invalid Opcode at {:#x}",
+        frame.instruction_pointer.as_u64()
+    );
 }
 
 extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
@@ -399,7 +415,11 @@ extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
 
 // ─── IDT init ─────────────────────────────────────────────────
 
-fn set_naked_handler(entry: &mut x86_64::structures::idt::Entry<x86_64::structures::idt::HandlerFunc>, addr: usize, attr: u64) {
+fn set_naked_handler(
+    entry: &mut x86_64::structures::idt::Entry<x86_64::structures::idt::HandlerFunc>,
+    addr: usize,
+    attr: u64,
+) {
     let selector: u64 = 0x0008;
     let lo = ((addr as u64 & 0xFFFF) << 0)
         | (selector << 16)
@@ -423,18 +443,27 @@ pub fn init() {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(super::gdt::DOUBLE_FAULT_IST_INDEX);
         }
-        idt.general_protection_fault.set_handler_fn(gp_fault_handler);
+        idt.general_protection_fault
+            .set_handler_fn(gp_fault_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
         // Timer: naked ISR with CR3 switch
-        set_naked_handler(&mut idt[TIMER_VECTOR], timer_isr_stub as *const () as usize, 0x8E00);
+        set_naked_handler(
+            &mut idt[TIMER_VECTOR],
+            timer_isr_stub as *const () as usize,
+            0x8E00,
+        );
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_handler);
         idt[COM1_VECTOR].set_handler_fn(com1_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
         // Syscall (int 0x80): DPL=3
-        set_naked_handler(&mut idt[SYSCALL_VECTOR], syscall_isr_stub as *const () as usize, 0xEE00);
+        set_naked_handler(
+            &mut idt[SYSCALL_VECTOR],
+            syscall_isr_stub as *const () as usize,
+            0xEE00,
+        );
 
         idt
     });

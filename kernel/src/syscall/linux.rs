@@ -159,6 +159,8 @@ mod riscv_syscalls {
     pub const L_BRK: usize = 214;
     pub const L_MUNMAP: usize = 215;
     pub const L_MMAP: usize = 222;
+    pub const L_MPROTECT: usize = 226;
+    pub const L_MADVISE: usize = 233;
     pub const L_SOCKET: usize = 198;
     pub const L_BIND: usize = 200;
     pub const L_CONNECT: usize = 203;
@@ -214,20 +216,13 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
     // ═══════════════════════════════════════════════════════════
     const KARTEOS_NATIVE_NUMBERS: &[usize] = &[
         // 0-8: debug_print, exit, write, read, brk, getpid, mmap, pipe, dup2
-        0, 1, 2, 3, 4, 5, 6, 7, 8,
-        // 10-11: open, close
-        10, 11,
-        // 30-34: spawn, waitpid, exec, exec_fd, fork
-        30, 31, 32, 33, 34,
-        // 40-42: ls, mkdir, unlink
-        40, 41, 42,
-        // 50-52: setenv, getenv, chdir
-        50, 51, 52,
-        // 60-61: kill, sigret
-        60, 61,
-        // 70-77: socket..shutdown
-        70, 71, 72, 73, 74, 75, 76, 77,
-        // 80: ioctl
+        0, 1, 2, 3, 4, 5, 6, 7, 8, // 10-11: open, close
+        10, 11, // 30-34: spawn, waitpid, exec, exec_fd, fork
+        30, 31, 32, 33, 34, // 40-42: ls, mkdir, unlink
+        40, 41, 42, // 50-52: setenv, getenv, chdir
+        50, 51, 52, // 60-61: kill, sigret
+        60, 61, // 70-77: socket..shutdown
+        70, 71, 72, 73, 74, 75, 76, 77, // 80: ioctl
         80,
     ];
     if KARTEOS_NATIVE_NUMBERS.contains(&id) {
@@ -245,13 +240,19 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
 
     match id {
         // ─── Memory management ───────────────────────────────
-        // Linux mmap(addr, len, prot, flags, fd, offset) → KarteOS mmap(addr, len, prot)
+        // Linux mmap(addr, len, prot, flags, fd, offset) → LINUX_MMAP (dedicated handler)
         L_MMAP => Some(Translation::Dispatch {
-            karte_nr: super::SYS_MMAP,
+            karte_nr: 110, // LINUX_MMAP
+            args,
+        }),
+        L_MPROTECT => Some(Translation::Dispatch {
+            karte_nr: 111, // LINUX_MPROTECT
             args: [args[0], args[1], args[2], 0, 0, 0],
         }),
-        L_MUNMAP => Some(Translation::Handled(0)), // stub: success
-        L_MPROTECT => Some(Translation::Handled(0)), // stub: success
+        L_MUNMAP => Some(Translation::Dispatch {
+            karte_nr: 112, // LINUX_MUNMAP
+            args: [args[0], args[1], 0, 0, 0, 0],
+        }),
         L_MADVISE => Some(Translation::Handled(0)), // stub: success
 
         // ─── Process management ──────────────────────────────
@@ -348,7 +349,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         }),
         L_READLINK | L_READLINKAT => Some(Translation::Handled(0)), // stub
         L_ACCESS | L_FACCESSAT | L_FACCESSAT2 => Some(Translation::Handled(0)), // stub
-        L_IOCTL => Some(Translation::Handled(0)),  // stub
+        L_IOCTL => Some(Translation::Handled(0)),                   // stub
 
         // ─── Scheduling ──────────────────────────────────────
         L_SCHED_YIELD => Some(Translation::Dispatch {
@@ -373,7 +374,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             if args[0] != 0 {
                 let tv = args[0] as *mut u64;
                 unsafe {
-                    *tv = 0;          // seconds
+                    *tv = 0; // seconds
                     *(tv.add(1)) = 0; // microseconds
                 }
             }
@@ -384,7 +385,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             if args[1] != 0 {
                 let tp = args[1] as *mut u64;
                 unsafe {
-                    *tp = 0;          // seconds
+                    *tp = 0; // seconds
                     *(tp.add(1)) = 0; // nanoseconds
                 }
             }
@@ -414,12 +415,11 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_RSEQ => Some(Translation::Handled(super::ERR_INVAL)), // rseq not supported
 
         // ─── Threading ───────────────────────────────────────
-        L_SET_THREAD_AREA | L_ARCH_PRCTL => {
-            // arch_prctl(code, addr) — set FS/GS base for TLS
-            // Go needs ARCH_SET_FS (0x1002) to set up goroutine TLS
-            // For now, just succeed silently
-            Some(Translation::Handled(0))
-        }
+        L_SET_THREAD_AREA => Some(Translation::Handled(0)), // stub
+        L_ARCH_PRCTL => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_ARCH_PRCTL,
+            args,
+        }),
         L_PRCTL => Some(Translation::Handled(0)), // stub
 
         // ─── epoll / eventfd ─────────────────────────────────
@@ -457,10 +457,8 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         // conflict with KarteOS SYS_MKDIR(41), SYS_UNLINK(42),
         // SYS_SETENV(50). Also L_GETSOCKNAME(51) conflicts with
         // SYS_GETENV(51), L_GETPEERNAME(52) conflicts with SYS_CHDIR(52).
-        L_BIND | L_ACCEPT | L_SENDTO | L_RECVFROM | L_SHUTDOWN
-        | L_SETSOCKOPT | L_GETSOCKOPT | L_SENDMSG | L_RECVMSG => {
-            Some(Translation::Handled(super::ERR_IO))
-        }
+        L_BIND | L_ACCEPT | L_SENDTO | L_RECVFROM | L_SHUTDOWN | L_SETSOCKOPT | L_GETSOCKOPT
+        | L_SENDMSG | L_RECVMSG => Some(Translation::Handled(super::ERR_IO)),
 
         _ => None, // Unknown — let KarteOS dispatch handle it
     }
@@ -532,11 +530,19 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_BRK,
             args,
         }),
-        L_MUNMAP => Some(Translation::Handled(0)),
+        L_MUNMAP => Some(Translation::Dispatch {
+            karte_nr: 112, // LINUX_MUNMAP
+            args: [args[0], args[1], 0, 0, 0, 0],
+        }),
         L_MMAP => Some(Translation::Dispatch {
-            karte_nr: super::SYS_MMAP,
+            karte_nr: 110, // LINUX_MMAP
+            args,
+        }),
+        L_MPROTECT => Some(Translation::Dispatch {
+            karte_nr: 111, // LINUX_MPROTECT
             args: [args[0], args[1], args[2], 0, 0, 0],
         }),
+        L_MADVISE => Some(Translation::Handled(0)), // stub
         L_SOCKET => Some(Translation::Dispatch {
             karte_nr: super::SYS_SOCKET,
             args,

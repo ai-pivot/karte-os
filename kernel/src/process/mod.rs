@@ -251,6 +251,157 @@ impl Process {
             trap_ctx_ptr: 0,
         })
     }
+
+    /// Create a new user process using streaming ELF loader.
+    ///
+    /// Unlike `from_elf` which requires the entire ELF data in memory,
+    /// this reads only the ELF header + program headers (~4KB) upfront,
+    /// then reads each PT_LOAD segment page-by-page via `read_fn`.
+    ///
+    /// This allows loading large binaries (e.g., 69MB Go executables) from
+    /// ext4 without allocating a contiguous 69MB buffer in kernel heap.
+    ///
+    /// `read_fn(offset, buf)` should fill `buf` with file data starting
+    /// at `offset`, returning Ok(bytes_read) or Err on failure.
+    pub fn from_elf_streaming<F>(read_fn: F) -> Result<Self, &'static str>
+    where
+        F: Fn(usize, &mut [u8]) -> Result<usize, ()>,
+    {
+        let page_size = pmm::page_size();
+
+        // 1. Read ELF header (first 4096 bytes covers header + program headers)
+        let header_size = 4096usize;
+        let mut header_buf = alloc::vec![0u8; header_size];
+        let bytes_read = read_fn(0, &mut header_buf).map_err(|_| "ELF: failed to read header")?;
+        if bytes_read < core::mem::size_of::<elf::ElfHeader>() {
+            return Err("ELF: header too small");
+        }
+
+        // 2. Parse header and segment info
+        let elf_info = elf::ElfInfo::parse_header_only(&header_buf[..bytes_read])?;
+
+        // 3. Create independent user page table
+        let user_pt = vmm::create_user_page_table();
+
+        // 4. Load ELF segments page-by-page
+        let mut max_vaddr = 0usize;
+        for seg_idx in 0..elf_info.num_segments {
+            let seg = elf_info.segments[seg_idx].as_ref().unwrap();
+            let seg_vaddr_start = seg.vaddr;
+            let seg_vaddr_end = seg.vaddr + seg.mem_size;
+            let page_start = seg_vaddr_start & !(page_size - 1);
+            let page_end = (seg_vaddr_end + page_size - 1) & !(page_size - 1);
+            let is_executable = seg.flags & 1 != 0; // PF_X
+
+            for vaddr in (page_start..page_end).step_by(page_size) {
+                // Check if already mapped (multiple segments may share a page)
+                let frame = match vmm::translate_user(user_pt, vaddr) {
+                    Some(f) => f,
+                    None => {
+                        let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
+                        vmm::map_user(user_pt, vaddr, f, vmm::PTEFlags::URWX);
+                        // Zero-fill the entire frame
+                        unsafe {
+                            core::ptr::write_bytes(f as *mut u8, 0, page_size);
+                        }
+                        f
+                    }
+                };
+
+                // Determine what portion of this page comes from the file
+                let copy_start = core::cmp::max(vaddr, seg_vaddr_start);
+                let copy_end = core::cmp::min(vaddr + page_size, seg_vaddr_start + seg.file_size);
+                if copy_start < copy_end {
+                    let file_offset = seg.offset + (copy_start - seg_vaddr_start);
+                    let dst_offset = copy_start & (page_size - 1);
+                    let len = copy_end - copy_start;
+                    // Read file data into a temporary buffer, then copy to frame
+                    let mut tmp_buf = [0u8; 4096];
+                    let bytes = read_fn(file_offset, &mut tmp_buf[..len])
+                        .map_err(|_| "ELF: failed to read segment data")?;
+                    if bytes < len {
+                        // Short read — zero-fill the rest
+                        unsafe {
+                            core::ptr::write_bytes(tmp_buf[bytes..].as_mut_ptr(), 0, len - bytes);
+                        }
+                    }
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            tmp_buf[..len].as_ptr(),
+                            (frame + dst_offset) as *mut u8,
+                            len,
+                        );
+                    }
+
+                    // Patch: replace `syscall` (0x0F 0x05) with `int 0x80` (0xCD 0x80)
+                    // in executable segments on x86_64.
+                    #[cfg(target_arch = "x86_64")]
+                    if is_executable {
+                        let base = (frame + dst_offset) as *mut u8;
+                        unsafe {
+                            let mut i = 0usize;
+                            while i + 1 < len {
+                                let b0 = *base.add(i);
+                                let b1 = *base.add(i + 1);
+                                if b0 == 0x0F && b1 == 0x05 {
+                                    *base.add(i) = 0xCD;
+                                    *base.add(i + 1) = 0x80;
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if seg.vaddr + seg.mem_size > max_vaddr {
+                max_vaddr = seg.vaddr + seg.mem_size;
+            }
+        }
+
+        // 5. Copy kernel mappings AFTER loading ELF segments
+        copy_kernel_mappings(user_pt);
+
+        // 6. Map user stack in user page table (URW, no execute)
+        for i in 0..USER_STACK_PAGES {
+            let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
+            let vaddr = USER_STACK_TOP - (i + 1) * page_size;
+            vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
+        }
+
+        // 7. Allocate kernel stack for this process
+        let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
+            .ok_or("Out of memory for kernel stack")?;
+        let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * page_size;
+
+        // 8. Store page_table_root as PPN
+        let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
+
+        // 9. Set up initial brk (after loaded segments, aligned to page)
+        let initial_brk = (max_vaddr + page_size - 1) & !(page_size - 1);
+        let brk = core::cmp::max(initial_brk, USER_HEAP_BASE);
+
+        let entry = elf_info.entry;
+
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Self {
+            pid,
+            ppid: 0, // Set by caller
+            page_table_root: page_table_ppn,
+            kernel_stack_top,
+            user_stack_top: USER_STACK_TOP,
+            brk,
+            initial_brk: brk,
+            entry,
+            state: ProcessState::Ready,
+            exit_code: 0,
+            fd_table: Some(crate::driver::fs::FdTable::new()),
+            wait_child_idx: None,
+            trap_ctx_ptr: 0,
+        })
+    }
 }
 
 /// Get a mutable reference to the user page table from its PPN
