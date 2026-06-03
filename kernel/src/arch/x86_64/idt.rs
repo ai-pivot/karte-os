@@ -74,28 +74,38 @@ core::arch::global_asm!(
     "syscall_isr_stub:",
     "cli",
     // Save registers (9 slots, 72 bytes)
-    "push r11", // [0]
-    "push r10", // [1]
-    "push r9",  // [2]
-    "push r8",  // [3]
-    "push rdx", // [4]
-    "push rsi", // [5]
-    "push rdi", // [6]
-    "push rax", // [7] placeholder for return value
-    "push rax", // [8] syscall number
+    // Stack layout from rsp (growing down):
+    //   [0] = rax (syscall nr)   — last push
+    //   [1] = rax (placeholder for return value)
+    //   [2] = rdi (a0)
+    //   [3] = rsi (a1)
+    //   [4] = rdx (a2)
+    //   [5] = r8  (a4)
+    //   [6] = r9  (a5)
+    //   [7] = r10 (a3)
+    //   [8] = r11                  — first push
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rax", // [1] placeholder for return value
+    "push rax", // [0] syscall number
     "mov rdi, rsp",
     "call syscall_handler_impl",
-    // Store return value at [rsp + 56] = slot [7]
-    "mov [rsp + 56], rax",
-    "add rsp, 8", // skip [8]
-    "pop rax",    // [7] (return value)
-    "pop rdi",    // [6]
-    "pop rsi",    // [5]
+    // Store return value at slot [1] (offset 8) — NOT slot [7]
+    "mov [rsp + 8], rax",
+    "add rsp, 8", // skip [0] (syscall nr)
+    "pop rax",    // [1] (return value)
+    "pop rdi",    // [2]
+    "pop rsi",    // [3]
     "pop rdx",    // [4]
-    "pop r9",     // [3]
-    "pop r8",     // [2]
-    "pop r10",    // [1]
-    "pop r11",    // [0]
+    "pop r8",     // [5]  — was incorrectly r9 before
+    "pop r9",     // [6]  — was incorrectly r8 before
+    "pop r10",    // [7]
+    "pop r11",    // [8]
     "sti",
     "iretq",
     // ─── Timer ISR stub ──────────────────────────────────
@@ -215,6 +225,9 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
     unsafe {
         let s = state_ptr;
         let syscall_nr = *s.add(0) as usize;
+        // Stack layout (from stub push order):
+        //   [0] rax (syscall nr)  [1] rax (placeholder)  [2] rdi
+        //   [3] rsi  [4] rdx  [5] r8  [6] r9  [7] r10  [8] r11
         let a0 = *s.add(2) as usize; // rdi
         let a1 = *s.add(3) as usize; // rsi
         let a2 = *s.add(4) as usize; // rdx
