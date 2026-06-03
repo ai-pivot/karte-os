@@ -1259,7 +1259,7 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
     };
 
     #[cfg(target_arch = "x86_64")]
-    let user_satp = proc.page_table_root << 12; // CR3 = PPN << 12 = physical address of PML4
+    let user_satp = proc.page_table_root << 12; // CR3 = PPN << 12
 
     // Register process in the global process table
     let proc_idx = match crate::process::add_process(proc) {
@@ -2182,6 +2182,13 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         proc_idx,
     ) {
         Some(_tid) => {
+            #[cfg(target_arch = "x86_64")]
+            crate::console_println!(
+                "[exec] Launched '{}' pid={} entry={:#x} stack={:#x} kstack={:#x} pt_root={:#x} cr3={:#x}",
+                name, proc.pid, proc.entry, proc.user_stack_top, proc.kernel_stack_top,
+                proc.page_table_root, user_satp
+            );
+            #[cfg(target_arch = "riscv64")]
             crate::console_println!("[exec] Launched '{}' (pid={})", name, proc.pid);
             proc.pid as isize
         }
