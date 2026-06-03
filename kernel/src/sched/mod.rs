@@ -427,6 +427,14 @@ pub fn add_user_process(
     if tid >= sched.count {
         sched.count = tid + 1;
     }
+    // Mark the new task as Running and set current to it.
+    // Without this, the first timer ISR would see current == INIT_SENTINEL
+    // and save init's timer-ISR stack into INIT_TASK_SP. On child exit,
+    // restoring that stale RSP leads to Double Fault.
+    if let Some(ref mut t) = sched.tasks[tid] {
+        t.state = TaskState::Running;
+    }
+    sched.current = tid;
     Some(tid)
 }
 

@@ -365,6 +365,10 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                         proc.page_table_root
                     );
 
+                    // Disable interrupts before first_enter_user to prevent timer ISR
+                    // from interfering with the context switch sequence.
+                    x86_64::instructions::interrupts::disable();
+
                     arch::trap::first_enter_user(
                         proc.entry,
                         proc.user_stack_top,

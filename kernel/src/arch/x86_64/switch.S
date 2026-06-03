@@ -7,7 +7,7 @@
 //! Equivalent to the RISC-V switch.S which saves ra + s0-s11 (13 regs).
 //! x86_64 calling convention callee-saved: rbx, rbp, r12, r13, r14, r15 (6 regs + ra = 7)
 //!
-//! Layout on stack (56 + 512 = 568 bytes):
+//! Layout on stack (56 + 8 + 512 = 576 bytes):
 //!   offset 0:    rip (return address, pushed by `call`)
 //!   offset 8:    rbp
 //!   offset 16:   rbx
@@ -15,7 +15,8 @@
 //!   offset 32:   r13
 //!   offset 40:   r14
 //!   offset 48:   r15
-//!   offset 56:   fxsave area (512 bytes, aligned to 16 bytes)
+//!   offset 56:   dummy qword (for 16-byte alignment)
+//!   offset 64:   fxsave area (512 bytes, must be 16-byte aligned)
 
 .section .text
 .global __switch
@@ -35,7 +36,10 @@ __switch:
     push r15
 
     # Save FPU/SSE state (512 bytes, requires 16-byte alignment)
-    # Allocate 512 bytes on stack (aligned to 16)
+    # After 6 pushes (48 bytes) + return address (8 bytes) = 56 bytes,
+    # RSP is 8 mod 16. Push a dummy qword to make it 0 mod 16 (aligned).
+    xor rax, rax
+    push rax            # dummy for 16-byte alignment
     sub rsp, 512
     fxsave64 [rsp]
 
@@ -48,6 +52,9 @@ __switch:
     # Restore FPU/SSE state
     fxrstor64 [rsp]
     add rsp, 512
+
+    # Remove alignment dummy
+    add rsp, 8
 
     # Restore callee-saved registers from next stack
     pop r15
