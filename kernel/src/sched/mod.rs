@@ -434,6 +434,24 @@ pub fn current_task_id() -> usize {
     0
 }
 
+/// Get the kernel stack pointer of the currently running task.
+/// Used by the syscall fast entry path (SYSCALL instruction) to set up its kernel stack.
+#[cfg(target_arch = "x86_64")]
+pub fn current_kernel_sp() -> usize {
+    let sched = SCHEDULER.lock();
+    let current = sched.current;
+    if current == INIT_SENTINEL {
+        // Init is running — return INIT_TASK_SP
+        INIT_TASK_SP.load(Ordering::Relaxed)
+    } else if current < sched.count {
+        // A child task is running — return its kernel_sp from the process table
+        let proc_idx = sched.task_to_process[current];
+        crate::process::get_kernel_sp(proc_idx).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 pub fn current_brk() -> usize {
     crate::process::current_brk()
 }

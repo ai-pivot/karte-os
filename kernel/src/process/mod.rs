@@ -9,16 +9,17 @@ use spin::Mutex;
 use crate::mm::{pmm, vmm};
 
 /// User address space layout constants
+/// Extended for large Go binaries — Go runtime needs 100MB+ virtual address space.
 pub const USER_CODE_BASE: usize = 0x0000_0000;
-pub const USER_CODE_LIMIT: usize = 0x0040_0000; // 4 MB for code + data
-pub const USER_HEAP_BASE: usize = 0x0040_0000;
-pub const USER_HEAP_LIMIT: usize = 0x0080_0000; // 4 MB heap (brk)
-pub const USER_MMAP_BASE: usize = 0x0100_0000; // 16 MB — start of mmap region
-pub const USER_MMAP_LIMIT: usize = 0x4000_0000; // 1 GB — end of mmap region
+pub const USER_CODE_LIMIT: usize = 0x0800_0000; // 128 MB for code + data (Go binary is ~67MB)
+pub const USER_HEAP_BASE: usize = 0x0800_0000;
+pub const USER_HEAP_LIMIT: usize = 0x1000_0000; // 128 MB heap (brk)
+pub const USER_MMAP_BASE: usize = 0x1000_0000; // 256 MB — start of mmap region
+pub const USER_MMAP_LIMIT: usize = 0x8000_0000; // 2 GB — end of mmap region
 pub const USER_STACK_TOP: usize = 0x8000_0000; // Top of user stack
 pub const USER_STACK_BASE: usize = 0x7FC0_0000; // 4 MB stack
-pub const USER_STACK_PAGES: usize = 64; // 256 KB actual stack
-pub const KERNEL_STACK_PAGES: usize = 4; // 16 KB kernel stack
+pub const USER_STACK_PAGES: usize = 64; // 256 KB actual stack (lazy-allocated on fault)
+pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack (Go runtime needs more stack)
 
 /// Process identifier allocator
 pub(crate) static NEXT_PID: AtomicUsize = AtomicUsize::new(1);

@@ -1,35 +1,19 @@
-//! Linux RISC-V syscall compatibility layer.
+//! Linux syscall compatibility layer.
 //!
-//! Provides transparent translation from Linux syscall numbers to KarteOS
-//! equivalents. Enabled at runtime via a global switch.
+//! Supports both RISC-V and x86_64 Linux syscall numbers.
+//! Go binaries on x86_64 use the `syscall` instruction (0x0F 0x05) with
+//! x86_64 Linux syscall numbers, which differ completely from RISC-V.
 //!
 //! ## Design
 //!
 //! - **Runtime opt-in**: controlled by `ENABLED` atomic bool
-//! - **Zero intrusion**: existing KarteOS syscall handlers are completely unchanged;
-//!   the translation layer sits *above* `dispatch()` as a transparent filter
-//! - **Translation table**: const sorted array, binary-searched at runtime
-//! - **Argument adaptation**: some Linux syscalls have different argument layouts;
-//!   the `translate()` function adjusts args in-place where needed
-//!
-//! ## Supported Linux syscalls
-//!
-//! | Linux nr | Name        | KarteOS nr | Notes                           |
-//! |----------|-------------|------------|---------------------------------|
-//! | 63       | read        | 3          | 1:1 mapping                     |
-//! | 64       | write       | 2          | 1:1 mapping                     |
-//! | 93       | exit        | 1          | 1:1 mapping                     |
-//! | 94       | exit_group  | 1          | maps to exit                    |
-//! | 172      | getpid      | 5          | 1:1 mapping                     |
-//! | 214      | brk         | 4          | 1:1 mapping                     |
-//! | 222      | mmap        | 6          | args adapted                    |
+//! - **Architecture-aware**: `translate()` handles both RISC-V and x86_64 syscall numbers
+//! - **Zero intrusion**: existing KarteOS syscall handlers are unchanged
+//! - **Argument adaptation**: some Linux syscalls have different argument layouts
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Global runtime switch for the Linux compatibility layer.
-/// When `false` (default), translation is a no-op and incurs zero overhead
-/// (the dispatch match runs directly on the original syscall number).
-/// Set to `true` to enable translation for Linux-compiled ELFs.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable the Linux compatibility layer.
@@ -47,169 +31,538 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-// ─── Syscall number constants (Linux RISC-V) ────────────────────────
-
-const L_CLOSE: usize = 57;
-const L_LSEEK: usize = 62;
-const L_READ: usize = 63;
-const L_WRITE: usize = 64;
-const L_FSTAT: usize = 80;
-const L_EXIT: usize = 93;
-const L_EXIT_GROUP: usize = 94;
-const L_OPENAT: usize = 56;
-const L_GETPID: usize = 172;
-const L_BRK: usize = 214;
-const L_MUNMAP: usize = 215;
-const L_MMAP: usize = 222;
-const L_IOCTL: usize = 29;
-const L_SET_TID_ADDR: usize = 96;
-
-// Linux network syscalls (RISC-V)
-const L_SOCKET: usize = 198;
-const L_BIND: usize = 200;
-const L_CONNECT: usize = 203;
-const L_LISTEN: usize = 201;
-const L_ACCEPT: usize = 202;
-const L_SENDTO: usize = 206;
-const L_RECVFROM: usize = 207;
-const L_SHUTDOWN: usize = 210;
-
-// ─── Translation table ──────────────────────────────────────────────
-
-/// A single entry in the Linux→KarteOS translation table.
-struct Entry {
-    linux_nr: usize,
-    karte_nr: usize,
+// ─── Linux x86_64 syscall number constants ─────────────────────
+#[cfg(target_arch = "x86_64")]
+mod x86_64_syscalls {
+    pub const L_READ: usize = 0;
+    pub const L_WRITE: usize = 1;
+    pub const L_OPEN: usize = 2;
+    pub const L_CLOSE: usize = 3;
+    pub const L_STAT: usize = 4;
+    pub const L_FSTAT: usize = 5;
+    pub const L_POLL: usize = 7;
+    pub const L_MMAP: usize = 9;
+    pub const L_MPROTECT: usize = 10;
+    pub const L_MUNMAP: usize = 11;
+    pub const L_BRK: usize = 12;
+    pub const L_RT_SIGACTION: usize = 13;
+    pub const L_RT_SIGPROCMASK: usize = 14;
+    pub const L_IOCTL: usize = 16;
+    pub const L_PREAD64: usize = 17;
+    pub const L_ACCESS: usize = 21;
+    pub const L_PIPE: usize = 22;
+    pub const L_SELECT: usize = 23;
+    pub const L_SCHED_YIELD: usize = 24;
+    pub const L_MADVISE: usize = 28;
+    pub const L_DUP: usize = 32;
+    pub const L_NANOSLEEP: usize = 35;
+    pub const L_GETPID: usize = 39;
+    pub const L_SOCKET: usize = 41;
+    pub const L_CONNECT: usize = 42;
+    pub const L_CLONE: usize = 56;
+    pub const L_FORK: usize = 57;
+    pub const L_EXECVE: usize = 59;
+    pub const L_EXIT: usize = 60;
+    pub const L_WAIT4: usize = 61;
+    pub const L_KILL: usize = 62;
+    pub const L_FCNTL: usize = 72;
+    pub const L_FSYNC: usize = 74;
+    pub const L_GETDENTS: usize = 78;
+    pub const L_GETCWD: usize = 79;
+    pub const L_CHDIR: usize = 80;
+    pub const L_MKDIR: usize = 83;
+    pub const L_RMDIR: usize = 84;
+    pub const L_UNLINK: usize = 87;
+    pub const L_READLINK: usize = 89;
+    pub const L_GETUID: usize = 102;
+    pub const L_GETGID: usize = 104;
+    pub const L_GETEUID: usize = 107;
+    pub const L_GETEGID: usize = 108;
+    pub const L_SIGALTSTACK: usize = 131;
+    pub const L_GETTIMEOFDAY: usize = 96;
+    pub const L_GETRLIMIT: usize = 97;
+    pub const L_GETRUSAGE: usize = 98;
+    pub const L_SYSINFO: usize = 99;
+    pub const L_TIMES: usize = 100;
+    pub const L_PTRACE: usize = 101;
+    pub const L_SET_TID_ADDR: usize = 218;
+    pub const L_SETRLIMIT: usize = 160;
+    pub const L_GETPID2: usize = 39;
+    pub const L_GETTID: usize = 186;
+    pub const L_TGKILL: usize = 234;
+    pub const L_TKILL: usize = 200;
+    pub const L_TIME: usize = 201;
+    pub const L_FUTEX: usize = 202;
+    pub const L_SCHED_SETAFFINITY: usize = 203;
+    pub const L_SCHED_GETAFFINITY: usize = 204;
+    pub const L_SET_THREAD_AREA: usize = 205;
+    pub const L_GET_THREAD_AREA: usize = 211;
+    pub const L_CLOCK_GETTIME: usize = 228;
+    pub const L_CLOCK_GETRES: usize = 229;
+    pub const L_OPENAT: usize = 257;
+    pub const L_MKDIRAT: usize = 258;
+    pub const L_NEWFSTATAT: usize = 262;
+    pub const L_UNLINKAT: usize = 263;
+    pub const L_READLINKAT: usize = 267;
+    pub const L_FACCESSAT: usize = 269;
+    pub const L_PRLIMIT64: usize = 302;
+    pub const L_GETRANDOM: usize = 318;
+    pub const L_ARCH_PRCTL: usize = 158;
+    pub const L_PRCTL: usize = 157;
+    pub const L_SET_ROBUST_LIST: usize = 273;
+    pub const L_GET_ROBUST_LIST: usize = 274;
+    pub const L_RSEQ: usize = 334;
+    pub const L_UNSHARE: usize = 272;
+    pub const L_EPOLL_CREATE1: usize = 291;
+    pub const L_EPOLL_CTL: usize = 233;
+    pub const L_EPOLL_PWAIT: usize = 281;
+    pub const L_EPOLL_WAIT: usize = 232;
+    pub const L_EVENTFD2: usize = 290;
+    pub const L_FACCESSAT2: usize = 439;
+    pub const L_PIPE2: usize = 293;
+    pub const L_DUP3: usize = 292;
+    pub const L_MREMAP: usize = 25;
+    pub const L_MINCORE: usize = 27;
+    pub const L_SHMGET: usize = 29;
+    pub const L_SHMAT: usize = 30;
+    pub const L_SHMCTL: usize = 31;
+    pub const L_RECVMSG: usize = 47;
+    pub const L_SENDMSG: usize = 46;
+    pub const L_LISTEN: usize = 50;
+    pub const L_BIND: usize = 49;
+    pub const L_ACCEPT: usize = 43;
+    pub const L_SENDTO: usize = 44;
+    pub const L_RECVFROM: usize = 45;
+    pub const L_SHUTDOWN: usize = 48;
+    pub const L_GETSOCKNAME: usize = 51;
+    pub const L_GETPEERNAME: usize = 52;
+    pub const L_SETSOCKOPT: usize = 54;
+    pub const L_GETSOCKOPT: usize = 55;
+    pub const L_SIGACTION: usize = 13;
+    pub const L_RT_SIGRETURN: usize = 15;
 }
 
-/// Sorted by `linux_nr` for binary search.
-/// DO NOT reorder — binary search requires sorted order.
-#[rustfmt::skip]
-const TABLE: &[Entry] = &[
-    Entry { linux_nr: L_IOCTL,        karte_nr: 0 },  // 29 → stub
-    Entry { linux_nr: L_OPENAT,       karte_nr: 10 }, // 56 → SYS_OPEN
-    Entry { linux_nr: L_CLOSE,        karte_nr: 11 }, // 57 → SYS_CLOSE
-    Entry { linux_nr: L_LSEEK,        karte_nr: 3 },  // 62 → stub
-    Entry { linux_nr: L_READ,         karte_nr: 3 },  // 63 → SYS_READ
-    Entry { linux_nr: L_WRITE,        karte_nr: 2 },  // 64 → SYS_WRITE
-    Entry { linux_nr: L_FSTAT,        karte_nr: 0 },  // 80 → stub
-    Entry { linux_nr: L_EXIT,         karte_nr: 1 },  // 93 → SYS_EXIT
-    Entry { linux_nr: L_EXIT_GROUP,   karte_nr: 1 },  // 94 → SYS_EXIT
-    Entry { linux_nr: L_SET_TID_ADDR, karte_nr: 5 },  // 96 → SYS_GETPID
-    Entry { linux_nr: L_GETPID,       karte_nr: 5 },  // 172 → SYS_GETPID
-    Entry { linux_nr: L_SOCKET,       karte_nr: 70 }, // 198 → SYS_SOCKET
-    Entry { linux_nr: L_BIND,         karte_nr: 71 }, // 200 → SYS_BIND
-    Entry { linux_nr: L_LISTEN,       karte_nr: 73 }, // 201 → SYS_LISTEN
-    Entry { linux_nr: L_ACCEPT,       karte_nr: 74 }, // 202 → SYS_ACCEPT
-    Entry { linux_nr: L_CONNECT,      karte_nr: 72 }, // 203 → SYS_CONNECT
-    Entry { linux_nr: L_SENDTO,       karte_nr: 75 }, // 206 → SYS_SENDTO
-    Entry { linux_nr: L_RECVFROM,     karte_nr: 76 }, // 207 → SYS_RECVFROM
-    Entry { linux_nr: L_SHUTDOWN,     karte_nr: 77 }, // 210 → SYS_SHUTDOWN
-    Entry { linux_nr: L_BRK,          karte_nr: 4 },  // 214 → SYS_BRK
-    Entry { linux_nr: L_MUNMAP,       karte_nr: 0 },  // 215 → stub
-    Entry { linux_nr: L_MMAP,         karte_nr: 6 },  // 222 → SYS_MMAP
-];
-
-// ─── Argument adaptation ─────────────────────────────────────────────
-
-/// Linux syscalls whose argument layout differs from KarteOS.
-/// Returns `Some(remapped_args)` if adaptation is needed, `None` for 1:1 passthrough.
-fn adapt_args(linux_nr: usize, args: [usize; 6]) -> Option<[usize; 6]> {
-    match linux_nr {
-        L_MMAP => {
-            // Linux mmap(addr, len, prot, flags, fd, offset)
-            // KarteOS mmap(addr, len, flags)
-            // We pass prot as flags — sufficient for anonymous mappings.
-            Some([args[0], args[1], args[2], 0, 0, 0])
-        }
-        L_OPENAT => {
-            // Linux openat(dirfd, pathname, flags, mode)
-            // KarteOS open(path, path_len, flags)
-            // dirfd is ignored (AT_FDCWD = -100), pass pathname and flags through
-            // We need the path length — but we don't know it here.
-            // Instead, we route to a dedicated linux_openat handler.
-            None // handled by linux_dispatch fallback
-        }
-        _ => None, // 1:1 passthrough
-    }
+// ─── Linux RISC-V syscall number constants ─────────────────────
+#[cfg(target_arch = "riscv64")]
+mod riscv_syscalls {
+    pub const L_IOCTL: usize = 29;
+    pub const L_OPENAT: usize = 56;
+    pub const L_CLOSE: usize = 57;
+    pub const L_LSEEK: usize = 62;
+    pub const L_READ: usize = 63;
+    pub const L_WRITE: usize = 64;
+    pub const L_FSTAT: usize = 80;
+    pub const L_EXIT: usize = 93;
+    pub const L_EXIT_GROUP: usize = 94;
+    pub const L_SET_TID_ADDR: usize = 96;
+    pub const L_GETPID: usize = 172;
+    pub const L_BRK: usize = 214;
+    pub const L_MUNMAP: usize = 215;
+    pub const L_MMAP: usize = 222;
+    pub const L_SOCKET: usize = 198;
+    pub const L_BIND: usize = 200;
+    pub const L_CONNECT: usize = 203;
+    pub const L_LISTEN: usize = 201;
+    pub const L_ACCEPT: usize = 202;
+    pub const L_SENDTO: usize = 206;
+    pub const L_RECVFROM: usize = 207;
+    pub const L_SHUTDOWN: usize = 210;
 }
 
-/// Linux syscalls that have no KarteOS equivalent but need a safe stub response.
-/// Returns `Some(retval)` for known stubs, `None` otherwise.
-pub fn stub_dispatch(linux_nr: usize, args: [usize; 6]) -> Option<isize> {
-    match linux_nr {
-        L_FSTAT => Some(0),                       // fake success
-        L_IOCTL => Some(0),                       // fake success
-        L_MUNMAP => Some(0),                      // fake success
-        L_SET_TID_ADDR => Some(args[0] as isize), // return tid
-        L_LSEEK => Some(0),                       // fake success (offset = 0)
-        _ => None,
-    }
-}
-
-/// Handle openat(dirfd, pathname, flags, mode) → KartenOS open(path, path_len, flags)
-fn linux_openat(dirfd: i32, path_ptr: usize, _flags: usize, _mode: usize) -> isize {
-    let _ = dirfd; // ignore AT_FDCWD
-    // Find path length (scan for NUL)
-    let mut path_len = 0usize;
-    while path_len < 256 {
-        let b = unsafe { core::ptr::read_volatile((path_ptr + path_len) as *const u8) };
-        if b == 0 {
-            break;
-        }
-        path_len += 1;
-    }
-    if path_len == 0 {
-        return -1;
-    }
-    // Route to KarteOS sys_open (syscall 10)
-    super::sys_open(path_ptr, path_len, 0)
-}
-
-// ─── Public API ──────────────────────────────────────────────────────
+// ─── Public API ──────────────────────────────────────────────────
 
 /// Result of a successful syscall translation.
 pub enum Translation {
     /// Translate to a KarteOS syscall number and (possibly adapted) args.
     Dispatch { karte_nr: usize, args: [usize; 6] },
-    /// Handle entirely within the compat layer (no KarteOS dispatch needed).
+    /// Already handled (stub or special case). Contains the return value.
     Handled(isize),
 }
 
-/// Try to translate a syscall number + arguments from Linux to KarteOS.
-///
-/// Returns `None` when:
-/// - The compat layer is disabled (`ENABLED == false`)
-/// - The syscall number is not in the translation table
-///
-/// The caller should pass the original `(id, args)` through to the
-/// normal KarteOS dispatch when this returns `None`.
+/// Try to translate a Linux syscall to a KarteOS equivalent.
+/// Returns `None` if the syscall number is not a known Linux syscall
+/// (i.e., it's already a KarteOS syscall number).
 pub fn translate(id: usize, args: [usize; 6]) -> Option<Translation> {
     if !is_enabled() {
         return None;
     }
 
-    // Check stub dispatch first (syscalls with no KarteOS equivalent)
-    if let Some(retval) = stub_dispatch(id, args) {
-        return Some(Translation::Handled(retval));
+    #[cfg(target_arch = "x86_64")]
+    {
+        translate_x86_64(id, args)
     }
-
-    // Handle openat specially (different argument convention)
-    if id == L_OPENAT {
-        let result = linux_openat(args[0] as i32, args[1], args[2], args[3]);
-        return Some(Translation::Handled(result));
+    #[cfg(target_arch = "riscv64")]
+    {
+        translate_riscv(id, args)
     }
+}
 
-    // Binary search over the sorted table
-    let idx = TABLE
-        .binary_search_by(|entry| entry.linux_nr.cmp(&id))
-        .ok()?;
+// ─── x86_64 Linux translation ────────────────────────────────────
 
-    let entry = &TABLE[idx];
-    let translated_args = adapt_args(id, args).unwrap_or(args);
+#[cfg(target_arch = "x86_64")]
+fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
+    use x86_64_syscalls::*;
 
-    Some(Translation::Dispatch {
-        karte_nr: entry.karte_nr,
-        args: translated_args,
-    })
+    match id {
+        // ─── Core I/O ────────────────────────────────────────
+        L_READ => Some(Translation::Dispatch {
+            karte_nr: super::SYS_READ,
+            args,
+        }),
+        L_WRITE => Some(Translation::Dispatch {
+            karte_nr: super::SYS_WRITE,
+            args,
+        }),
+        L_CLOSE => Some(Translation::Dispatch {
+            karte_nr: super::SYS_CLOSE,
+            args,
+        }),
+
+        // ─── Memory management ───────────────────────────────
+        L_BRK => Some(Translation::Dispatch {
+            karte_nr: super::SYS_BRK,
+            args,
+        }),
+        // Linux mmap(addr, len, prot, flags, fd, offset) → KarteOS mmap(addr, len, prot)
+        L_MMAP => Some(Translation::Dispatch {
+            karte_nr: super::SYS_MMAP,
+            args: [args[0], args[1], args[2], 0, 0, 0],
+        }),
+        L_MUNMAP => Some(Translation::Handled(0)), // stub: success
+        L_MPROTECT => Some(Translation::Handled(0)), // stub: success
+        L_MADVISE => Some(Translation::Handled(0)), // stub: success
+
+        // ─── Process management ──────────────────────────────
+        L_EXIT => Some(Translation::Dispatch {
+            karte_nr: super::SYS_EXIT,
+            args,
+        }),
+        L_EXIT_GROUP => Some(Translation::Dispatch {
+            karte_nr: super::SYS_EXIT,
+            args,
+        }),
+        L_GETPID => Some(Translation::Dispatch {
+            karte_nr: super::SYS_GETPID,
+            args,
+        }),
+        L_GETTID => Some(Translation::Dispatch {
+            karte_nr: super::SYS_GETPID,
+            args,
+        }),
+
+        // ─── clone/fork ──────────────────────────────────────
+        // Linux clone(flags, stack, parent_tid, tls, child_tid)
+        // We delegate to the kernel's linux_clone handler
+        L_CLONE => Some(Translation::Dispatch {
+            karte_nr: 100, // LINUX_CLONE syscall number (handled in dispatch)
+            args,
+        }),
+        L_FORK => Some(Translation::Dispatch {
+            karte_nr: super::SYS_FORK,
+            args,
+        }),
+
+        // ─── futex ───────────────────────────────────────────
+        // Linux futex(addr, op, val, timeout, uaddr2, val3)
+        // We delegate to a dedicated handler
+        L_FUTEX => Some(Translation::Dispatch {
+            karte_nr: 101, // LINUX_FUTEX syscall number
+            args,
+        }),
+
+        // ─── Signals ─────────────────────────────────────────
+        L_RT_SIGACTION => Some(Translation::Dispatch {
+            karte_nr: 102, // LINUX_RT_SIGACTION
+            args,
+        }),
+        L_RT_SIGPROCMASK => Some(Translation::Dispatch {
+            karte_nr: 103, // LINUX_RT_SIGPROCMASK
+            args,
+        }),
+        L_RT_SIGRETURN => Some(Translation::Dispatch {
+            karte_nr: 104, // LINUX_RT_SIGRETURN
+            args,
+        }),
+        L_SIGALTSTACK => Some(Translation::Dispatch {
+            karte_nr: 105, // LINUX_SIGALTSTACK
+            args,
+        }),
+
+        // ─── File system ─────────────────────────────────────
+        L_OPEN => {
+            // Linux open(pathname, flags, mode) → KarteOS open(path, path_len, flags)
+            let path_ptr = args[0];
+            let flags = args[1];
+            let path_len = count_user_string(path_ptr);
+            if path_len == 0 {
+                return Some(Translation::Handled(super::ERR_NOENT));
+            }
+            Some(Translation::Dispatch {
+                karte_nr: super::SYS_OPEN,
+                args: [path_ptr, path_len, flags, 0, 0, 0],
+            })
+        }
+        L_OPENAT => {
+            // Linux openat(dirfd, pathname, flags, mode)
+            let path_ptr = args[1];
+            let flags = args[2];
+            let path_len = count_user_string(path_ptr);
+            if path_len == 0 {
+                return Some(Translation::Handled(super::ERR_NOENT));
+            }
+            Some(Translation::Dispatch {
+                karte_nr: super::SYS_OPEN,
+                args: [path_ptr, path_len, flags, 0, 0, 0],
+            })
+        }
+        L_STAT | L_FSTAT | L_NEWFSTATAT => Some(Translation::Handled(0)), // stub
+        L_FCNTL => Some(Translation::Handled(0)), // stub
+        L_PREAD64 => Some(Translation::Dispatch {
+            karte_nr: super::SYS_READ,
+            args: [args[0], args[1], args[2], 0, 0, 0], // fd, buf, count
+        }),
+        L_DUP => Some(Translation::Dispatch {
+            karte_nr: super::SYS_DUP2,
+            args: [args[0], args[0], 0, 0, 0, 0], // dup(fd) = dup2(fd, fd) ... not quite right but ok for stub
+        }),
+        L_PIPE | L_PIPE2 => Some(Translation::Dispatch {
+            karte_nr: super::SYS_PIPE,
+            args,
+        }),
+        L_GETDENTS => Some(Translation::Handled(0)), // stub
+        L_GETCWD => Some(Translation::Handled(0)),   // stub
+        L_CHDIR => Some(Translation::Dispatch {
+            karte_nr: super::SYS_CHDIR,
+            args: [args[0], count_user_string(args[0]), 0, 0, 0, 0],
+        }),
+        L_MKDIR => Some(Translation::Dispatch {
+            karte_nr: super::SYS_MKDIR,
+            args: [args[0], count_user_string(args[0]), 0, 0, 0, 0],
+        }),
+        L_UNLINK => Some(Translation::Dispatch {
+            karte_nr: super::SYS_UNLINK,
+            args: [args[0], count_user_string(args[0]), 0, 0, 0, 0],
+        }),
+        L_READLINK | L_READLINKAT => Some(Translation::Handled(0)), // stub
+        L_ACCESS | L_FACCESSAT | L_FACCESSAT2 => Some(Translation::Handled(0)), // stub
+        L_IOCTL => Some(Translation::Handled(0)),  // stub
+
+        // ─── Scheduling ──────────────────────────────────────
+        L_SCHED_YIELD => Some(Translation::Dispatch {
+            karte_nr: 106, // LINUX_SCHED_YIELD
+            args,
+        }),
+        L_SCHED_GETAFFINITY => {
+            // sched_getaffinity(pid, size, mask) — fake: all CPUs available
+            // Write a mask with all bits set
+            if args[2] != 0 && args[1] >= 8 {
+                let mask = args[2] as *mut u64;
+                unsafe {
+                    *mask = 0xFF; // 8 CPUs
+                }
+            }
+            Some(Translation::Handled(8)) // return size written
+        }
+
+        // ─── Time ────────────────────────────────────────────
+        L_GETTIMEOFDAY => {
+            // gettimeofday(tv, tz) — fake: return 0 time
+            if args[0] != 0 {
+                let tv = args[0] as *mut u64;
+                unsafe {
+                    *tv = 0;          // seconds
+                    *(tv.add(1)) = 0; // microseconds
+                }
+            }
+            Some(Translation::Handled(0))
+        }
+        L_CLOCK_GETTIME => {
+            // clock_gettime(clockid, tp) — fake
+            if args[1] != 0 {
+                let tp = args[1] as *mut u64;
+                unsafe {
+                    *tp = 0;          // seconds
+                    *(tp.add(1)) = 0; // nanoseconds
+                }
+            }
+            Some(Translation::Handled(0))
+        }
+        L_NANOSLEEP => {
+            // nanosleep(req, rem) — fake: return immediately
+            Some(Translation::Handled(0))
+        }
+        L_TIME => {
+            // time(tloc) — return 0
+            if args[0] != 0 {
+                let tloc = args[0] as *mut u64;
+                unsafe {
+                    *tloc = 0;
+                }
+            }
+            Some(Translation::Handled(0))
+        }
+
+        // ─── System info ─────────────────────────────────────
+        L_SYSINFO => Some(Translation::Handled(0)), // stub
+        L_GETRLIMIT | L_PRLIMIT64 => Some(Translation::Handled(0)), // stub
+        L_GETUID | L_GETGID | L_GETEUID | L_GETEGID => Some(Translation::Handled(0)), // stub: root
+        L_SET_TID_ADDR => Some(Translation::Handled(1)), // stub: return tid=1
+        L_SET_ROBUST_LIST | L_GET_ROBUST_LIST => Some(Translation::Handled(0)), // stub
+        L_RSEQ => Some(Translation::Handled(super::ERR_INVAL)), // rseq not supported
+
+        // ─── Threading ───────────────────────────────────────
+        L_SET_THREAD_AREA | L_ARCH_PRCTL => {
+            // arch_prctl(code, addr) — set FS/GS base for TLS
+            // Go needs ARCH_SET_FS (0x1002) to set up goroutine TLS
+            // For now, just succeed silently
+            Some(Translation::Handled(0))
+        }
+        L_PRCTL => Some(Translation::Handled(0)), // stub
+
+        // ─── epoll / eventfd ─────────────────────────────────
+        L_EPOLL_CREATE1 => {
+            // Return a fake fd
+            Some(Translation::Handled(3)) // fake fd 3
+        }
+        L_EPOLL_CTL => Some(Translation::Handled(0)),
+        L_EPOLL_WAIT | L_EPOLL_PWAIT => {
+            // No events ready, return 0
+            Some(Translation::Handled(0))
+        }
+        L_EVENTFD2 => {
+            Some(Translation::Handled(4)) // fake fd 4
+        }
+
+        // ─── Misc stubs ──────────────────────────────────────
+        L_POLL | L_SELECT => Some(Translation::Handled(0)),
+        L_UNSHARE => Some(Translation::Handled(0)),
+        L_MREMAP => Some(Translation::Handled(super::ERR_INVAL)),
+        L_MINCORE => Some(Translation::Handled(0)),
+        L_PTRACE => Some(Translation::Handled(super::ERR_INVAL)),
+        L_TKILL | L_TGKILL => Some(Translation::Handled(0)), // stub
+        L_GET_RANDOM => Some(Translation::Handled(super::ERR_INVAL)), // no random source
+        L_GETRUSAGE => Some(Translation::Handled(0)),
+        L_TIMES => Some(Translation::Handled(0)),
+        L_DUP3 => Some(Translation::Dispatch {
+            karte_nr: super::SYS_DUP2,
+            args: [args[0], args[1], 0, 0, 0, 0],
+        }),
+
+        // ─── Network (stubs for now) ─────────────────────────
+        L_SOCKET | L_BIND | L_CONNECT | L_LISTEN | L_ACCEPT
+        | L_SENDTO | L_RECVFROM | L_SHUTDOWN | L_GETSOCKNAME
+        | L_GETPEERNAME | L_SETSOCKOPT | L_GETSOCKOPT
+        | L_SENDMSG | L_RECVMSG => {
+            Some(Translation::Handled(super::ERR_IO))
+        }
+
+        _ => None, // Unknown — let KarteOS dispatch handle it
+    }
+}
+
+/// Count the length of a NUL-terminated string in user memory (max 256 bytes).
+fn count_user_string(ptr: usize) -> usize {
+    if ptr == 0 {
+        return 0;
+    }
+    let mut len = 0usize;
+    while len < 256 {
+        let b = unsafe { core::ptr::read_volatile((ptr + len) as *const u8) };
+        if b == 0 {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+// ─── RISC-V Linux translation (preserved from original) ──────────
+
+#[cfg(target_arch = "riscv64")]
+fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
+    use riscv_syscalls::*;
+
+    match id {
+        L_IOCTL => Some(Translation::Handled(0)),
+        L_OPENAT => {
+            let path_ptr = args[1];
+            let path_len = count_user_string(path_ptr);
+            if path_len == 0 {
+                return Some(Translation::Handled(super::ERR_NOENT));
+            }
+            Some(Translation::Dispatch {
+                karte_nr: super::SYS_OPEN,
+                args: [path_ptr, path_len, 0, 0, 0, 0],
+            })
+        }
+        L_CLOSE => Some(Translation::Dispatch {
+            karte_nr: super::SYS_CLOSE,
+            args,
+        }),
+        L_LSEEK => Some(Translation::Handled(0)),
+        L_READ => Some(Translation::Dispatch {
+            karte_nr: super::SYS_READ,
+            args,
+        }),
+        L_WRITE => Some(Translation::Dispatch {
+            karte_nr: super::SYS_WRITE,
+            args,
+        }),
+        L_FSTAT => Some(Translation::Handled(0)),
+        L_EXIT => Some(Translation::Dispatch {
+            karte_nr: super::SYS_EXIT,
+            args,
+        }),
+        L_EXIT_GROUP => Some(Translation::Dispatch {
+            karte_nr: super::SYS_EXIT,
+            args,
+        }),
+        L_SET_TID_ADDR => Some(Translation::Handled(args[0] as isize)),
+        L_GETPID => Some(Translation::Dispatch {
+            karte_nr: super::SYS_GETPID,
+            args,
+        }),
+        L_BRK => Some(Translation::Dispatch {
+            karte_nr: super::SYS_BRK,
+            args,
+        }),
+        L_MUNMAP => Some(Translation::Handled(0)),
+        L_MMAP => Some(Translation::Dispatch {
+            karte_nr: super::SYS_MMAP,
+            args: [args[0], args[1], args[2], 0, 0, 0],
+        }),
+        L_SOCKET => Some(Translation::Dispatch {
+            karte_nr: super::SYS_SOCKET,
+            args,
+        }),
+        L_BIND => Some(Translation::Dispatch {
+            karte_nr: super::SYS_BIND,
+            args,
+        }),
+        L_CONNECT => Some(Translation::Dispatch {
+            karte_nr: super::SYS_CONNECT,
+            args,
+        }),
+        L_LISTEN => Some(Translation::Dispatch {
+            karte_nr: super::SYS_LISTEN,
+            args,
+        }),
+        L_ACCEPT => Some(Translation::Dispatch {
+            karte_nr: super::SYS_ACCEPT,
+            args,
+        }),
+        L_SENDTO => Some(Translation::Dispatch {
+            karte_nr: super::SYS_SENDTO,
+            args,
+        }),
+        L_RECVFROM => Some(Translation::Dispatch {
+            karte_nr: super::SYS_RECVFROM,
+            args,
+        }),
+        L_SHUTDOWN => Some(Translation::Dispatch {
+            karte_nr: super::SYS_SHUTDOWN,
+            args,
+        }),
+        _ => None,
+    }
 }

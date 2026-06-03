@@ -61,6 +61,15 @@ pub const SYS_SENDTO: usize = 75; // sendto(fd, buf, len, flags, addr_ptr, addr_
 pub const SYS_RECVFROM: usize = 76; // recvfrom(fd, buf, len, flags, addr_ptr, addr_len_ptr) → received
 pub const SYS_SHUTDOWN: usize = 77; // shutdown(fd, how) → 0
 
+// ─── Linux compatibility syscalls (translated from Linux x86_64 numbers) ──
+pub const LINUX_CLONE: usize = 100;
+pub const LINUX_FUTEX: usize = 101;
+pub const LINUX_RT_SIGACTION: usize = 102;
+pub const LINUX_RT_SIGPROCMASK: usize = 103;
+pub const LINUX_RT_SIGRETURN: usize = 104;
+pub const LINUX_SIGALTSTACK: usize = 105;
+pub const LINUX_SCHED_YIELD: usize = 106;
+
 // ─── Error codes ──────────────────────────────────────────────────
 
 pub const ERR_OK: isize = 0;
@@ -138,6 +147,18 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_SENDTO => sys_sendto(args[0] as i32, args[1], args[2], args[3], args[4], args[5]),
         SYS_RECVFROM => sys_recvfrom(args[0] as i32, args[1], args[2]),
         SYS_SHUTDOWN => sys_shutdown(args[0] as i32),
+
+        // Linux compatibility syscalls (translated from x86_64 Linux numbers)
+        LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
+        LINUX_FUTEX => linux_futex(args[0], args[1], args[2]),
+        LINUX_RT_SIGACTION => 0, // stub: success
+        LINUX_RT_SIGPROCMASK => 0, // stub: success
+        LINUX_RT_SIGRETURN => 0, // stub: success
+        LINUX_SIGALTSTACK => 0, // stub: success
+        LINUX_SCHED_YIELD => {
+            crate::sched::schedule();
+            0
+        }
 
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
@@ -1972,5 +1993,111 @@ fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
             }
         }
         _ => ERR_INVAL,
+    }
+}
+
+// ─── Linux compatibility syscall implementations ──────────────
+
+/// Linux clone(flags, stack, parent_tid, tls, child_tid)
+///
+/// Simplified implementation: creates a new "thread" that shares the address space.
+/// For Go runtime, the main use is creating goroutine scheduler threads (M's).
+///
+/// Key flags:
+///   CLONE_VM (0x100) = share memory space
+///   CLONE_FS (0x200) = share fs info
+///   CLONE_FILES (0x400) = share fd table
+///   CLONE_SIGHAND (0x800) = share signal handlers
+///   CLONE_THREAD (0x10000) = same thread group
+fn linux_clone(flags: usize, stack: usize, _parent_tid: usize, _tls: usize, _child_tid: usize) -> isize {
+    let my_pid = crate::process::current_pid();
+    let my_proc_idx = crate::process::current_index();
+
+    // Check if this is CLONE_VM (thread creation, shared address space)
+    let is_thread = (flags & 0x100) != 0; // CLONE_VM
+
+    if is_thread {
+        // Thread creation: share address space with parent
+        // We create a new task in the scheduler with the same page table
+        let user_pt_root = crate::process::current_page_table_root();
+        let user_sp = if stack != 0 { stack } else {
+            // Use parent's stack (shouldn't happen in practice)
+            return ERR_INVAL;
+        };
+
+        // Allocate kernel stack for the new thread
+        let kernel_stack_pages = crate::process::KERNEL_STACK_PAGES;
+        let kernel_stack_base = match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages) {
+            Some(base) => base,
+            None => return ERR_NOMEM,
+        };
+        let kernel_stack_top = kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
+
+        // Create a new process entry (sharing the address space)
+        let entry = {
+            // For clone, the child starts at the return from clone
+            // We need to read the current RIP... but in our syscall handler
+            // we don't have easy access to it. For simplicity, use the
+            // parent's entry point.
+            crate::process::current().map(|p| p.entry).unwrap_or(0)
+        };
+
+        // For the child, the clone syscall should return 0
+        // The parent gets the child's tid
+
+        // Register as a new task
+        let user_satp = user_pt_root; // same page table as parent
+
+        let tid = match crate::sched::add_user_process(entry, user_sp, kernel_stack_top, user_satp, my_proc_idx) {
+            Some(tid) => tid,
+            None => return ERR_NOMEM,
+        };
+
+        // Return child tid to parent
+        tid as isize
+    } else {
+        // Fork-like: create new address space
+        // Delegate to sys_fork for now
+        sys_fork()
+    }
+}
+
+/// Linux futex(addr, op, val, timeout, uaddr2, val3)
+///
+/// Minimal implementation: only supports FUTEX_WAIT and FUTEX_WAKE.
+/// Go runtime uses futex for goroutine synchronization.
+fn linux_futex(addr: usize, op: usize, val: usize) -> isize {
+    const FUTEX_WAIT: usize = 0;
+    const FUTEX_WAKE: usize = 1;
+    const FUTEX_WAIT_BITSET: usize = 9;
+    const FUTEX_WAKE_BITSET: usize = 10;
+    const FUTEX_PRIVATE_FLAG: usize = 128;
+
+    let base_op = op & !FUTEX_PRIVATE_FLAG; // strip private flag
+
+    match base_op {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            // FUTEX_WAIT: if *addr == val, block.
+            // For simplicity: just yield and return 0 ( pretend we waited)
+            let current_val = if addr != 0 {
+                unsafe { core::ptr::read_volatile(addr as *const u32) }
+            } else {
+                return ERR_INVAL;
+            };
+            if current_val == val as u32 {
+                // Value matches — we should block. For now, just yield.
+                crate::sched::schedule();
+            }
+            0 // success (or spurious wakeup)
+        }
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            // FUTEX_WAKE: wake up to `val` waiters.
+            // For simplicity: just return val (pretend we woke them)
+            val as isize
+        }
+        _ => {
+            // Unknown futex op — return success to avoid crashing Go runtime
+            0
+        }
     }
 }

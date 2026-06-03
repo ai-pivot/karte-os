@@ -14,7 +14,7 @@ const MEMORY_START: usize = 0x0020_0000; // 2MB — typical x86_64 kernel load a
 const MEMORY_SIZE: usize = 128 * 1024 * 1024; // 128MB
 
 #[cfg(target_arch = "x86_64")]
-const MEMORY_SIZE: usize = 128 * 1024 * 1024; // 128MB
+const MEMORY_SIZE: usize = 512 * 1024 * 1024; // 512MB for Go runtime support
 
 unsafe extern "C" {
     static _ekernel: u8;
