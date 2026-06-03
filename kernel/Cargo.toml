@@ -14,6 +14,15 @@ bitflags = "2.11"
 starry-fatfs = { version = "0.4.1-preview.2", default-features = false, features = ["alloc", "lfn"] }
 log = { version = "0.4", default-features = false }
 ext4_rs = { path = "vendor/ext4_rs" }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "proto-ipv4",
+    "socket-icmp",
+    "socket-udp",
+    "socket-tcp",
+    "socket-dns",
+    "medium-ethernet",
+] }
 
 # RISC-V 64-bit specific dependencies
 [target.'cfg(target_arch = "riscv64")'.dependencies]

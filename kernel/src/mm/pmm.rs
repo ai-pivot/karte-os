@@ -166,6 +166,25 @@ pub const fn page_size() -> usize {
     PAGE_SIZE
 }
 
+/// Debug: return (total_frames, used_frames, next_free)
+pub fn debug_stats() -> (usize, usize, usize) {
+    let guard = FRAME_ALLOCATOR.lock();
+    match guard.as_ref() {
+        Some(alloc) => {
+            let mut used = 0usize;
+            for i in 0..alloc.total_frames {
+                let word = i / 64;
+                let bit = i % 64;
+                if alloc.bitmap[word] & (1u64 << bit) != 0 {
+                    used += 1;
+                }
+            }
+            (alloc.total_frames, used, alloc.next_free)
+        }
+        None => (0, 0, 0),
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(feature = "test_mode")]

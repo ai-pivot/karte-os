@@ -338,9 +338,25 @@ fn parse_redirects(cmd: &[u8]) -> (&[u8], &[u8], &[u8], bool) {
         let (name, _) = split_first(rest);
         out_file = trim(name);
     }
-    if in_file_start != usize::MAX && out_file_start == usize::MAX {
-        let rest = trim(&cmd[in_file_start + 1..]);
-        let (name, _) = split_first(rest);
+    if in_file_start != usize::MAX {
+        // Determine where the < filename starts (after the < char)
+        // If > comes before <, skip past the > section
+        let scan_start = if out_file_start != usize::MAX && out_file_start < in_file_start {
+            // < is after >, so the filename follows < directly
+            in_file_start + 1
+        } else {
+            in_file_start + 1
+        };
+        let rest = trim(&cmd[scan_start..]);
+        // Take only up to the next redirect operator if any
+        let mut name_end = rest.len();
+        for (i, &b) in rest.iter().enumerate() {
+            if b == b'>' || b == b'<' {
+                name_end = i;
+                break;
+            }
+        }
+        let (name, _) = split_first(&rest[..name_end]);
         in_file = trim(name);
     }
 

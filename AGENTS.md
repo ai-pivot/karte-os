@@ -73,7 +73,7 @@ make test                             # 4. Run tests (must be ALL PASSED)
 - Rust stable (1.93+), target `riscv64gc-unknown-none-elf`
 - `qemu-system-riscv64` (8.2+)
 - `gcc-riscv64-linux-gnu` (for user programs, objdump, nm)
-- Dependencies: `riscv` 0.16, `sbi` 0.3.0, `buddy_system_allocator`, `virtio-drivers` (alloc feature), `spin`, `bitflags`
+- Dependencies: `riscv` 0.16, `sbi` 0.3.0, `buddy_system_allocator`, `virtio-drivers` (alloc feature), `spin`, `bitflags`, `smoltcp` 0.12
 
 ### x86_64 (secondary)
 - Rust nightly (required for `abi_x86_interrupt` and `#[unsafe(naked)]`), target `x86_64-unknown-none`
@@ -93,7 +93,7 @@ Boot flow: QEMU → OpenSBI → `_start` (arch/riscv64/entry.S) → `kmain` → 
 
 Synchronization: Three levels of kernel locks. (1) `SpinLock` — for short critical sections (a few instructions, e.g., run queue manipulation). (2) `IntSpinLock` — like SpinLock but also saves/restores `sstatus.SIE` to prevent interrupt-induced deadlocks. (3) `YieldMutex` / `BlockingMutex` — for I/O-bound operations (filesystem, block device); contention yields to the scheduler instead of spinning. **Rule: never hold a SpinLock across block I/O.**
 
-Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, via `starry-fatfs`) → RamFS (embedded ELF files). Boot priority: try ext4 mount, on failure try FAT32, finally RamFS-only. ext4 files are pre-loaded on the host via `tools/mkdisk.sh put`; no boot-time injection (too many I/O round-trips). Pipe IPC: anonymous pipes via `sys_pipe` with 4KB ring buffers, supports blocking read/write with scheduler integration. Shell v0.5 supports pipe (`|`), I/O redirection (`>`, `>>`, `<`), command history (↑/↓), and `sys_exec_fd` for passing pipe fds to child processes.
+Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, via `starry-fatfs`) → RamFS (embedded ELF files). Boot priority: try ext4 mount, on failure try FAT32, finally RamFS-only. ext4 files are pre-loaded on the host via `tools/mkdisk.sh put`; no boot-time injection (too many I/O round-trips). **Network**: smoltcp 0.12 TCP/IP stack over VirtIO Net (QEMU user-mode, 10.0.2.15/24). Supports TCP/UDP/ICMP sockets via syscalls 70-77. Timer-driven polling at ~10ms interval. Pipe IPC: anonymous pipes via `sys_pipe` with 4KB ring buffers, supports blocking read/write with scheduler integration. Shell v0.5 supports pipe (`|`), I/O redirection (`>`, `>>`, `<`), command history (↑/↓), and `sys_exec_fd` for passing pipe fds to child processes.
 
 ## User Programs
 
@@ -146,6 +146,14 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 51 | getenv | (key, key_len, buf, buf_len) — get environment variable, returns value length or -1 |
 | 52 | chdir | (path, path_len) — change directory, validates dir exists, updates CWD env var |
 | 60 | kill | (pid, sig) — send signal to process (SIGINT=2, SIGKILL=9, SIGTERM=15) |
+| 70 | socket | (domain, type, protocol) — domain=2(AF_INET), type=1(TCP)/2(UDP)/3(ICMP) |
+| 71 | bind | (fd, addr_ptr, addr_len) — bind socket to sockaddr_in |
+| 72 | connect | (fd, addr_ptr, addr_len) — connect TCP to remote |
+| 73 | listen | (fd, backlog) — listen on bound TCP socket |
+| 74 | accept | (fd) — accept incoming TCP connection |
+| 75 | sendto | (fd, buf, len, flags, addr_ptr, addr_len) — send data |
+| 76 | recvfrom | (fd, buf, len) — receive data |
+| 77 | shutdown | (fd) — close/shutdown socket |
 
 ## GOTCHAS
 
@@ -162,6 +170,13 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **VirtIO MMIO**: Fixed — stride is 0x1000 (page-sized), not 0x200. Requires `-device virtio-blk-device` in QEMU for block device.
 - **amoswap/lr/sc**: RISC-V atomic extensions NOT available on bare target
 - **sys_write**: Use byte-by-byte `read_volatile` + `console_putchar`, NOT `from_raw_parts` + `from_utf8` (causes bounds panic in S-mode trap context)
+- **VirtIO Net MMIO version**: QEMU virt reports MMIO version **1**, NOT version 2. Do NOT filter by `version != 2` or the net device will never be found. The version field at offset 0x04 reads as 1 for all QEMU virt VirtIO devices.
+- **VirtIO Net slot**: On QEMU virt with `-device virtio-blk-device` + `-device virtio-net-device`, net is at slot 6 (0x10007000), block is at slot 7 (0x10008000). Slots 0-5 are empty. Probe must scan all 8 slots.
+- **QueueMem repr(C)**: `QueueMem` struct in `driver/net.rs` MUST use `#[repr(C)]`. Without it, Rust compiler reorders fields, causing VirtIO DMA to write to wrong addresses → memory corruption → VMM panic during user program loading.
+- **Network init timing**: Network initialization (`init_net_device()` + `NetStack::init()`) must happen AFTER user program loading completes. The DMA buffer setup (~25KB) can interfere with VMM page table allocation if done before user space is established. Network init is placed after `process::add_process()` in `kmain()`.
+- **smoltcp Device trait**: `receive()` must drop the NET_STATE lock before returning tokens (tokens re-acquire the lock in `consume()`). Holding the lock across token return causes deadlock.
+- **smoltcp TCP connect**: Requires `Interface::context()` call for source address selection: `sock.connect(cx, remote_endpoint, local_port)`. Omitting `cx` causes compile error.
+- **Network poll in timer ISR**: `NetStack::poll()` is called from the timer interrupt handler. It acquires `NET_STACK` mutex. If any syscall also holds this mutex during interrupt, deadlock occurs. Current design is safe because ISR disables interrupts before acquiring spin::Mutex.
 - **illegal_instruction handler**: Must NOT use console_println! — the SpinLock in UART output can deadlock when timer interrupts fire during CSR probing. Silently skip_trap_instruction instead.
 - **ext4_rs vendored**: patched to add `try_open()` (returns Err on non-ext4 disks instead of panicking) and `Ext4Superblock::is_valid()`. Do NOT upgrade to upstream without these patches.
 - **ext4 boot-time injection**: NEVER inject files into ext4 at boot. ext4 metadata ops (inode alloc, bitmap update, dir entry write) require ~30+ block I/O round-trips per file, causing kernel to appear hung. Use `tools/mkdisk.sh put` on the host instead.
@@ -216,6 +231,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | `docs/agent/trap.md` | Trap frame layout, exception dispatch, timer interrupts, syscall handling |
 | `docs/agent/smp.md` | SMP hart management, BSP/secondary init, SBI hart_start |
 | `docs/agent/conventions.md` | Rust 2024 patterns, coding style, error handling |
+| `docs/agent/network.md` | smoltcp network stack, Device adapter, socket syscalls, QEMU net config |
 
 ## Testing
 

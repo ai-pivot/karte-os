@@ -40,14 +40,51 @@ pub fn irq_restore(flags: usize) {
 }
 
 /// Shut down the system.
-/// Uses QEMU's `isa-debug-exit` device at I/O port 0x501.
-/// Exit code is `(value << 1) | 1`, so writing 0x31 gives exit code 99.
+/// Tries multiple methods:
+/// 1. QEMU isa-debug-exit (port 0x501) — works in QEMU
+/// 2. ACPI shutdown — works on real hardware with ACPI
+/// 3. Legacy AT keyboard controller reset — last resort
 pub fn shutdown() -> ! {
+    // Method 1: QEMU debug exit
     unsafe {
         let mut port = x86_64::instructions::port::Port::new(0x501);
         port.write(0x31u8);
     }
-    // If isa-debug-exit is not available, fall through to infinite halt
+
+    // Method 2: ACPI shutdown (via SCI)
+    // Try to write to the PM1a_CNT register (typically at 0x604 for QEMU,
+    // but on real hardware it's read from the FADT table)
+    // For a simple approach, try the common ports:
+    unsafe {
+        // Try QEMU's ACPI port (PIIX4 PM)
+        let mut pm1a: x86_64::instructions::port::Port<u16> =
+            x86_64::instructions::port::Port::new(0x604);
+        pm1a.write(0x2000); // SLP_TYP=S5 | SLP_EN
+    }
+
+    // Method 3: Fast ACPI shutdown via I/O port 0xB004 (some machines)
+    unsafe {
+        let mut pm: x86_64::instructions::port::Port<u16> =
+            x86_64::instructions::port::Port::new(0xB004);
+        pm.write(0x2000);
+    }
+
+    // Method 4: Legacy keyboard controller reset (triple fault → reset)
+    unsafe {
+        // Disable interrupts
+        core::arch::asm!("cli");
+        // Pulse the reset line via keyboard controller
+        let mut port64: x86_64::instructions::port::Port<u8> =
+            x86_64::instructions::port::Port::new(0x64);
+        let mut port60: x86_64::instructions::port::Port<u8> =
+            x86_64::instructions::port::Port::new(0x60);
+        // Wait for keyboard controller ready
+        while port64.read() & 0x02 != 0 {}
+        port64.write(0xFE); // Pulse reset line
+        let _ = port60.read(); // Small delay
+    }
+
+    // If all methods fail, infinite halt
     loop {
         x86_64::instructions::hlt();
     }
@@ -109,4 +146,17 @@ pub fn read_page_table_root() -> usize {
 /// Print a string to the console via COM1.
 pub fn print(s: &str) {
     crate::arch::console::print(s);
+}
+
+/// Monotonic uptime counter (milliseconds since boot).
+static UPTIME_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Increment the uptime counter (called from timer interrupt).
+pub fn tick_uptime() {
+    UPTIME_MS.fetch_add(10, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Get the current uptime in milliseconds.
+pub fn uptime_ms() -> u64 {
+    UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed)
 }

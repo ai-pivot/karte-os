@@ -1,7 +1,7 @@
 .PHONY: build run debug clean doc check build-test test boot-test smp-test \
         shell disk user-build user-clean \
         run-riscv run-x86 build-riscv build-x86 shell-riscv shell-x86 \
-        setup-riscv setup-x86
+        setup-riscv setup-x86 usb-image usb-write run-9p
 
 # ═══════════════════════════════════════════════════════════════
 #  KarteOS — Dual-Architecture Makefile
@@ -28,7 +28,9 @@ QEMU_RV_FLAGS := \
   -machine virt -cpu rv64 -bios default -nographic \
   -m 128M -smp 1 \
   -drive id=blk0,file=disk.img,format=raw,if=none \
-  -device virtio-blk-device,drive=blk0
+  -device virtio-blk-device,drive=blk0 \
+  -netdev user,id=net0,hostfwd=tcp::2323-:23,hostfwd=udp::2323-:23 \
+  -device virtio-net-device,netdev=net0
 
 # ── x86_64 config ──
 QEMU_X86     := qemu-system-x86_64
@@ -111,6 +113,7 @@ smp-test: disk.img
 	cargo build --release -p karte-os-kernel
 	@timeout 15 $(QEMU_RV) -machine virt -cpu rv64 -bios default -nographic -m 128M -smp 4 \
 		-drive id=blk0,file=disk.img,format=raw,if=none -device virtio-blk-device,drive=blk0 \
+		-netdev user,id=net0 -device virtio-net-device,netdev=net0 \
 		-kernel $(KERNEL_RV) 2>&1 | grep -qa "KarteOS Shell" \
 		&& echo "SMP test passed" || echo "SMP test failed"
 
@@ -238,5 +241,32 @@ help:
 	@echo "    tools/mkdisk.sh put <file>    Copy file to disk"
 	@echo "    tools/mkdisk.sh list          List files on disk"
 	@echo ""
+	@echo "  USB / Installation:"
+	@echo "    make usb-image    Create bootable USB disk image"
+	@echo "    make usb-write    Write to USB drive (set USB_DEV=/dev/sdX)"
+	@echo ""
 	@echo "  QEMU exit: Ctrl+A then X"
 	@echo ""
+
+# ═══════════════════════════════════════════════════════════════
+#  USB / Installation (x86_64)
+# ═══════════════════════════════════════════════════════════════
+
+## Create bootable USB image (512MB by default, set USB_SIZE_MB=...)
+usb-image: build-x86 disk.img
+	@echo "[usb] Creating bootable USB image..."
+	sudo tools/mkusb.sh image
+	@echo "[usb] Image: target/karte-os-usb.img"
+	@echo "[usb] Write to USB: dd if=target/karte-os-usb.img of=/dev/sdX bs=4M status=progress"
+
+## Write directly to USB drive (set USB_DEV=/dev/sdX)
+usb-write: build-x86 disk.img
+	@test -n "$(USB_DEV)" || (echo "Usage: make usb-write USB_DEV=/dev/sdX" && exit 1)
+	sudo tools/mkusb.sh $(USB_DEV)
+
+## Run x86_64 QEMU with virtio-9p host directory sharing
+## Usage: make run-9p HOST_DIR=/path/to/share
+run-9p: build-x86 disk.img
+	$(QEMU_X86) $(QEMU_X86_FLAGS) \
+	  -fsdev local,id=share1,path=$(HOST_DIR),security_model=none \
+	  -device virtio-9p-pci,fsdev=share1,mount_tag=hostshare

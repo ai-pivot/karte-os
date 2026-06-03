@@ -64,6 +64,16 @@ const L_MMAP: usize = 222;
 const L_IOCTL: usize = 29;
 const L_SET_TID_ADDR: usize = 96;
 
+// Linux network syscalls (RISC-V)
+const L_SOCKET: usize = 198;
+const L_BIND: usize = 200;
+const L_CONNECT: usize = 203;
+const L_LISTEN: usize = 201;
+const L_ACCEPT: usize = 202;
+const L_SENDTO: usize = 206;
+const L_RECVFROM: usize = 207;
+const L_SHUTDOWN: usize = 210;
+
 // ─── Translation table ──────────────────────────────────────────────
 
 /// A single entry in the Linux→KarteOS translation table.
@@ -87,6 +97,14 @@ const TABLE: &[Entry] = &[
     Entry { linux_nr: L_EXIT_GROUP,   karte_nr: 1 },  // 94 → SYS_EXIT
     Entry { linux_nr: L_SET_TID_ADDR, karte_nr: 5 },  // 96 → SYS_GETPID
     Entry { linux_nr: L_GETPID,       karte_nr: 5 },  // 172 → SYS_GETPID
+    Entry { linux_nr: L_SOCKET,       karte_nr: 70 }, // 198 → SYS_SOCKET
+    Entry { linux_nr: L_BIND,         karte_nr: 71 }, // 200 → SYS_BIND
+    Entry { linux_nr: L_LISTEN,       karte_nr: 73 }, // 201 → SYS_LISTEN
+    Entry { linux_nr: L_ACCEPT,       karte_nr: 74 }, // 202 → SYS_ACCEPT
+    Entry { linux_nr: L_CONNECT,      karte_nr: 72 }, // 203 → SYS_CONNECT
+    Entry { linux_nr: L_SENDTO,       karte_nr: 75 }, // 206 → SYS_SENDTO
+    Entry { linux_nr: L_RECVFROM,     karte_nr: 76 }, // 207 → SYS_RECVFROM
+    Entry { linux_nr: L_SHUTDOWN,     karte_nr: 77 }, // 210 → SYS_SHUTDOWN
     Entry { linux_nr: L_BRK,          karte_nr: 4 },  // 214 → SYS_BRK
     Entry { linux_nr: L_MUNMAP,       karte_nr: 0 },  // 215 → stub
     Entry { linux_nr: L_MMAP,         karte_nr: 6 },  // 222 → SYS_MMAP

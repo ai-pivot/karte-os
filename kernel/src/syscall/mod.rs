@@ -48,6 +48,19 @@ pub const SYS_CHDIR: usize = 52;
 pub const SYS_KILL: usize = 60; // kill(pid, sig)
 pub const SYS_SIGRET: usize = 61; // sigreturn (clear pending signal)
 
+// Level 10: Terminal control
+pub const SYS_IOCTL: usize = 80; // ioctl(fd, cmd, arg) — terminal control
+
+// Level 10: Network
+pub const SYS_SOCKET: usize = 70; // socket(domain, type, protocol) → fd
+pub const SYS_BIND: usize = 71; // bind(fd, addr_ptr, addr_len) → 0
+pub const SYS_CONNECT: usize = 72; // connect(fd, addr_ptr, addr_len) → 0
+pub const SYS_LISTEN: usize = 73; // listen(fd, backlog) → 0
+pub const SYS_ACCEPT: usize = 74; // accept(fd, addr_ptr, addr_len_ptr) → fd
+pub const SYS_SENDTO: usize = 75; // sendto(fd, buf, len, flags, addr_ptr, addr_len) → sent
+pub const SYS_RECVFROM: usize = 76; // recvfrom(fd, buf, len, flags, addr_ptr, addr_len_ptr) → received
+pub const SYS_SHUTDOWN: usize = 77; // shutdown(fd, how) → 0
+
 // ─── Error codes ──────────────────────────────────────────────────
 
 pub const ERR_OK: isize = 0;
@@ -114,6 +127,17 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         SYS_CHDIR => sys_chdir(args[0], args[1]),
         SYS_KILL => sys_kill(args[0], args[1]),
         SYS_FORK => sys_fork(),
+        SYS_IOCTL => sys_ioctl(args[0] as i32, args[1], args[2]),
+
+        // Network syscalls
+        SYS_SOCKET => sys_socket(args[0], args[1], args[2]),
+        SYS_BIND => sys_bind(args[0] as i32, args[1], args[2]),
+        SYS_CONNECT => sys_connect(args[0] as i32, args[1], args[2]),
+        SYS_LISTEN => sys_listen(args[0] as i32, args[1]),
+        SYS_ACCEPT => sys_accept(args[0] as i32),
+        SYS_SENDTO => sys_sendto(args[0] as i32, args[1], args[2], args[3], args[4], args[5]),
+        SYS_RECVFROM => sys_recvfrom(args[0] as i32, args[1], args[2]),
+        SYS_SHUTDOWN => sys_shutdown(args[0] as i32),
 
         _ => {
             crate::console_println!("[syscall] Unknown syscall: {}", id);
@@ -167,7 +191,8 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    // Check if fd is a pipe write endpoint — this takes priority over Stdio fallback.
+    // First check fd_table for the actual fd type.
+    // This handles redirected stdout/stderr (e.g., file or pipe).
     let fd_info = get_fd_info(fd);
     match fd_info {
         Some((FdType::PipeWrite, Some(pipe_id), _)) => {
@@ -176,53 +201,62 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         Some((FdType::PipeRead, _, _)) => {
             return ERR_INVAL; // can't write to read end
         }
-        _ => {}
-    }
-
-    match fd {
-        1 | 2 => {
-            // stdout/stderr: write to console byte by byte
+        Some((FdType::Stdio, _, _)) => {
+            // Stdio (fd 0/1/2 default): write to console
             for i in 0..len {
                 let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
                 crate::arch::platform::console_putchar(byte);
             }
-            len as isize
+            return len as isize;
+        }
+        Some((FdType::File, _, _)) => {
+            // Fall through to file write below
         }
         _ => {
-            // File fd: get name and position from current process's FD table
-            let (name, pos, flags) = {
-                crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
-                    Some(f) => (f.name.clone(), f.pos, f.flags),
-                    None => (alloc::string::String::new(), 0, 0),
-                })
-            };
-            if name.is_empty() {
-                return ERR_INVAL;
-            }
-
-            // Read current file data, modify at pos, write back
-            {
-                let mut data = crate::driver::fs::read_file_owned(&name).unwrap_or_default();
-                let end = pos + len;
-                if end > data.len() {
-                    data.resize(end, 0);
-                }
+            // Unknown type or no info — if fd is 1/2, write to console
+            if fd == 1 || fd == 2 {
                 for i in 0..len {
-                    data[pos + i] = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+                    let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+                    crate::arch::platform::console_putchar(byte);
                 }
-                let _ = crate::driver::fs::write_file_owned(&name, &data);
+                return len as isize;
             }
-
-            // Update seek position
-            crate::process::with_fd_table(|fd_table| {
-                if let Some(f) = fd_table.get_mut(fd as usize) {
-                    f.pos += len;
-                }
-            });
-
-            len as isize
+            return ERR_INVAL;
         }
     }
+
+    // File write path
+    let (name, pos, flags) = {
+        crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
+            Some(f) => (f.name.clone(), f.pos, f.flags),
+            None => (alloc::string::String::new(), 0, 0),
+        })
+    };
+    if name.is_empty() {
+        return ERR_INVAL;
+    }
+
+    // Read current file data, modify at pos, write back
+    {
+        let mut data = crate::driver::fs::read_file_owned(&name).unwrap_or_default();
+        let end = pos + len;
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        for i in 0..len {
+            data[pos + i] = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+        }
+        let _ = crate::driver::fs::write_file_owned(&name, &data);
+    }
+
+    // Update seek position
+    crate::process::with_fd_table(|fd_table| {
+        if let Some(f) = fd_table.get_mut(fd as usize) {
+            f.pos += len;
+        }
+    });
+
+    len as isize
 }
 
 /// Syscall 3: Read from file descriptor.
@@ -231,7 +265,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    // Check if fd is a pipe read endpoint — this takes priority over Stdio fallback.
+    // Check fd_table for the actual fd type.
     let fd_info = get_fd_info(fd);
     match fd_info {
         Some((FdType::PipeRead, Some(pipe_id), _)) => {
@@ -240,24 +274,37 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         Some((FdType::PipeWrite, _, _)) => {
             return ERR_INVAL; // can't read from write end
         }
-        _ => {}
-    }
-
-    // stdin: blocking read from TTY subsystem.
-    if fd == 0 {
-        loop {
-            let result = crate::driver::tty::read(buf, len);
-            if result > 0 {
-                return result;
+        Some((FdType::Stdio, _, _)) => {
+            // Stdio stdin (fd 0 default): blocking read from TTY
+            loop {
+                let result = crate::driver::tty::read(buf, len);
+                if result > 0 {
+                    return result;
+                }
+                crate::driver::tty::poll_uart();
+                crate::sched::schedule();
             }
-            // Poll UART for new input
-            crate::driver::tty::poll_uart();
-            // Yield CPU to other tasks while waiting for input
-            crate::sched::schedule();
+        }
+        Some((FdType::File, _, _)) => {
+            // Fall through to file read below
+        }
+        _ => {
+            // Unknown type — if fd == 0, use TTY
+            if fd == 0 {
+                loop {
+                    let result = crate::driver::tty::read(buf, len);
+                    if result > 0 {
+                        return result;
+                    }
+                    crate::driver::tty::poll_uart();
+                    crate::sched::schedule();
+                }
+            }
+            return ERR_INVAL;
         }
     }
 
-    // Get file info from current process's FD table
+    // File read path
     let (name, pos) = {
         crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
             Some(f) => (f.name.clone(), f.pos),
@@ -872,6 +919,244 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
     }
 }
 
+// ─── Network Syscalls (Level 10) ────────────────────────────────────
+
+/// Parse a sockaddr_in from user memory.
+/// Returns (port, ip_bytes) or error.
+fn parse_sockaddr_in(addr_ptr: usize, addr_len: usize) -> Result<(u16, [u8; 4]), isize> {
+    if addr_ptr == 0 || addr_len < 8 {
+        return Err(ERR_INVAL);
+    }
+
+    let data = unsafe { core::slice::from_raw_parts(addr_ptr as *const u8, addr_len.min(16)) };
+
+    // family (bytes 0-1), port (bytes 2-3, big-endian), ip (bytes 4-7, big-endian)
+    let family = u16::from_le_bytes([data[0], data[1]]);
+    if family != 2 {
+        // Not AF_INET
+        return Err(ERR_INVAL);
+    }
+
+    let port = u16::from_be_bytes([data[2], data[3]]);
+    let ip = [data[4], data[5], data[6], data[7]];
+
+    Ok((port, ip))
+}
+
+/// Syscall 70: socket(domain, type, protocol) → fd
+/// domain: 2 = AF_INET
+/// type:   1 = SOCK_STREAM (TCP), 2 = SOCK_DGRAM (UDP), 3 = SOCK_RAW (ICMP)
+#[allow(unused_variables)]
+#[cfg(target_arch = "riscv64")]
+fn sys_socket(domain: usize, socket_type: usize, _protocol: usize) -> isize {
+    if domain != 2 {
+        return ERR_INVAL;
+    }
+
+    let stype = match socket_type {
+        1 => crate::net::iface::SocketType::Tcp,
+        2 => crate::net::iface::SocketType::Udp,
+        3 => crate::net::iface::SocketType::Icmp,
+        _ => return ERR_INVAL,
+    };
+
+    if !crate::net::iface::NetStack::is_initialized() {
+        return ERR_IO;
+    }
+
+    crate::net::iface::NetStack::create_socket(stype)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sys_socket(_domain: usize, _socket_type: usize, _protocol: usize) -> isize {
+    ERR_IO // Network not available on x86_64
+}
+
+/// Syscall 71: bind(fd, addr_ptr, addr_len) → 0
+#[cfg(target_arch = "riscv64")]
+fn sys_bind(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
+    if fd < 0 {
+        return ERR_INVAL;
+    }
+
+    if !crate::net::iface::NetStack::is_initialized() {
+        return ERR_IO;
+    }
+
+    let (port, _) = match parse_sockaddr_in(addr_ptr, addr_len) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    crate::net::iface::NetStack::bind(fd as usize, port)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sys_bind(_fd: i32, _addr_ptr: usize, _addr_len: usize) -> isize {
+    ERR_IO
+}
+
+/// Syscall 72: connect(fd, addr_ptr, addr_len) → 0
+#[cfg(target_arch = "riscv64")]
+fn sys_connect(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
+    if fd < 0 {
+        return ERR_INVAL;
+    }
+
+    if !crate::net::iface::NetStack::is_initialized() {
+        return ERR_IO;
+    }
+
+    let (port, ip) = match parse_sockaddr_in(addr_ptr, addr_len) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    crate::net::iface::NetStack::connect(fd as usize, ip, port)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sys_connect(_fd: i32, _addr_ptr: usize, _addr_len: usize) -> isize {
+    ERR_IO
+}
+
+/// Syscall 73: listen(fd, backlog) → 0
+#[cfg(target_arch = "riscv64")]
+fn sys_listen(fd: i32, _backlog: usize) -> isize {
+    if fd < 0 {
+        return ERR_INVAL;
+    }
+
+    if !crate::net::iface::NetStack::is_initialized() {
+        return ERR_IO;
+    }
+
+    // bind with port 0 means "pick an ephemeral port and listen"
+    crate::net::iface::NetStack::bind(fd as usize, 0)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sys_listen(_fd: i32, _backlog: usize) -> isize {
+    ERR_IO
+}
+
+/// Syscall 74: accept(fd) → new_fd
+#[cfg(target_arch = "riscv64")]
+fn sys_accept(fd: i32) -> isize {
+    if fd < 0 {
+        return ERR_INVAL;
+    }
+
+    if !crate::net::iface::NetStack::is_initialized() {
+        return ERR_IO;
+    }
+
+    if crate::net::iface::NetStack::is_connected(fd as usize) {
+        fd as isize
+    } else {
+        -2 // EAGAIN — would block
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sys_accept(_fd: i32) -> isize {
+    ERR_IO
+}
+
+/// Syscall 75: sendto(fd, buf, len, flags, addr_ptr, addr_len) → bytes_sent
+#[cfg(target_arch = "riscv64")]
+fn sys_sendto(
+    fd: i32,
+    buf: usize,
+    len: usize,
+    _flags: usize,
+    addr_ptr: usize,
+    addr_len: usize,
+) -> isize {
+    if fd < 0 || buf == 0 || len == 0 {
+        return ERR_INVAL;
+    }
+
+    if !crate::net::iface::NetStack::is_initialized() {
+        return ERR_IO;
+    }
+
+    let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+
+    // If destination address is provided, parse it
+    let dest = if addr_ptr != 0 && addr_len >= 8 {
+        match parse_sockaddr_in(addr_ptr, addr_len) {
+            Ok((port, ip)) => Some((ip, port)),
+            Err(_) => return ERR_INVAL,
+        }
+    } else {
+        None
+    };
+
+    let (ip, port) = match dest {
+        Some((ip, port)) => (Some(ip), Some(port)),
+        None => (None, None),
+    };
+
+    crate::net::iface::NetStack::send(fd as usize, data, ip, port)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_variables)]
+fn sys_sendto(
+    fd: i32,
+    buf: usize,
+    len: usize,
+    flags: usize,
+    addr_ptr: usize,
+    addr_len: usize,
+) -> isize {
+    ERR_IO
+}
+
+/// Syscall 76: recvfrom(fd, buf, len, flags) → bytes_received
+#[cfg(target_arch = "riscv64")]
+fn sys_recvfrom(fd: i32, buf: usize, len: usize) -> isize {
+    if fd < 0 || buf == 0 || len == 0 {
+        return ERR_INVAL;
+    }
+
+    if !crate::net::iface::NetStack::is_initialized() {
+        return ERR_IO;
+    }
+
+    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+
+    match crate::net::iface::NetStack::recv(fd as usize, user_buf) {
+        Ok((n, _src_ip, _src_port)) => n as isize,
+        Err(e) => e,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sys_recvfrom(_fd: i32, _buf: usize, _len: usize) -> isize {
+    ERR_IO
+}
+
+/// Syscall 77: shutdown(fd, how) → 0
+#[cfg(target_arch = "riscv64")]
+fn sys_shutdown(fd: i32) -> isize {
+    if fd < 0 {
+        return ERR_INVAL;
+    }
+
+    if !crate::net::iface::NetStack::is_initialized() {
+        return ERR_IO;
+    }
+
+    crate::net::iface::NetStack::shutdown(fd as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sys_shutdown(_fd: i32) -> isize {
+    ERR_IO
+}
+
 /// Syscall 32: Execute (spawn) a program by file path.
 /// `path` = pointer to file path string, `path_len` = length.
 /// Returns child PID on success, or negative error code.
@@ -1160,6 +1445,76 @@ pub fn run_tests() {
         // fd 99 is not allocated
         let result = dispatch(SYS_CLOSE, [99, 0, 0, 0, 0, 0]);
         result == ERR_INVAL
+    });
+
+    // ── Network syscall tests ──
+
+    crate::test::run_test("syscall_socket_invalid_domain", || {
+        // domain != AF_INET(2) should fail
+        dispatch(SYS_SOCKET, [3, 1, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_socket_invalid_type", || {
+        // type=99 is invalid
+        dispatch(SYS_SOCKET, [2, 99, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_socket_negative_fd_invalid", || {
+        // Negative fd should fail
+        dispatch(SYS_BIND, [!0u32 as usize, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_connect_negative_fd", || {
+        dispatch(SYS_CONNECT, [!0u32 as usize, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_listen_negative_fd", || {
+        dispatch(SYS_LISTEN, [!0u32 as usize, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_accept_negative_fd", || {
+        dispatch(SYS_ACCEPT, [!0u32 as usize, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_sendto_negative_fd", || {
+        dispatch(SYS_SENDTO, [!0u32 as usize, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_sendto_null_buf", || {
+        dispatch(SYS_SENDTO, [0, 0, 10, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_sendto_zero_len", || {
+        let buf = b"test";
+        dispatch(SYS_SENDTO, [0, buf.as_ptr() as usize, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_recvfrom_negative_fd", || {
+        dispatch(SYS_RECVFROM, [!0u32 as usize, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_recvfrom_null_buf", || {
+        dispatch(SYS_RECVFROM, [0, 0, 10, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_recvfrom_zero_len", || {
+        let mut buf = [0u8; 10];
+        dispatch(SYS_RECVFROM, [0, buf.as_mut_ptr() as usize, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_shutdown_negative_fd", || {
+        dispatch(SYS_SHUTDOWN, [!0u32 as usize, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_net_constants_correct", || {
+        SYS_SOCKET == 70
+            && SYS_BIND == 71
+            && SYS_CONNECT == 72
+            && SYS_LISTEN == 73
+            && SYS_ACCEPT == 74
+            && SYS_SENDTO == 75
+            && SYS_RECVFROM == 76
+            && SYS_SHUTDOWN == 77
     });
 }
 
@@ -1553,5 +1908,69 @@ fn sys_fork() -> isize {
             crate::console_println!("[fork] Failed to schedule child");
             ERR_NOMEM
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Syscall 80: ioctl — Terminal/device control
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ioctl command numbers (inspired by Linux termios)
+pub const TCGETS: usize = 0x5401; // Get terminal attributes
+pub const TCSETS: usize = 0x5402; // Set terminal attributes
+pub const TIOCGWINSZ: usize = 0x5413; // Get window size
+
+// Terminal mode flags (simplified)
+pub const TERM_COOKED: usize = 0; // Canonical mode (default)
+pub const TERM_RAW: usize = 1; // Raw mode (no echo, no line editing)
+pub const TERM_ECHO_ON: usize = 2; // Enable echo
+pub const TERM_ECHO_OFF: usize = 3; // Disable echo
+
+/// ioctl(fd, cmd, arg) — Terminal control interface.
+///
+/// For fd=0 (stdin), supports:
+///   cmd=TCSETS, arg=TERM_RAW: Switch to raw mode (for TUI apps)
+///   cmd=TCSETS, arg=TERM_COOKED: Switch to canonical mode (default)
+///   cmd=TCSETS, arg=TERM_ECHO_ON: Enable echo
+///   cmd=TCSETS, arg=TERM_ECHO_OFF: Disable echo
+///   cmd=TIOCGWINSZ: Returns (cols << 16 | rows) packed into usize
+fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
+    if fd != 0 {
+        return ERR_INVAL;
+    }
+
+    match cmd {
+        TCSETS => match arg {
+            TERM_RAW => {
+                crate::driver::tty::set_mode(crate::driver::tty::TtyMode::Raw);
+                0
+            }
+            TERM_COOKED => {
+                crate::driver::tty::set_mode(crate::driver::tty::TtyMode::Canonical);
+                0
+            }
+            TERM_ECHO_ON => {
+                crate::driver::tty::set_echo(true);
+                0
+            }
+            TERM_ECHO_OFF => {
+                crate::driver::tty::set_echo(false);
+                0
+            }
+            _ => ERR_INVAL,
+        },
+        TIOCGWINSZ => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let (cols, rows) = crate::driver::vga::screen_size();
+                (cols << 16 | rows) as isize
+            }
+            #[cfg(target_arch = "riscv64")]
+            {
+                // Default terminal size for serial console
+                (80 << 16 | 25) as isize
+            }
+        }
+        _ => ERR_INVAL,
     }
 }

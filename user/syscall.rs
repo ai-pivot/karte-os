@@ -19,6 +19,15 @@ pub const SYS_CHDIR: usize = 52;
 pub const SYS_PIPE: usize = 7;
 pub const SYS_DUP2: usize = 8;
 pub const SYS_KILL: usize = 60;
+pub const SYS_IOCTL: usize = 80;
+
+// ioctl commands
+pub const TCSETS: usize = 0x5402;
+pub const TIOCGWINSZ: usize = 0x5413;
+pub const TERM_COOKED: usize = 0;
+pub const TERM_RAW: usize = 1;
+pub const TERM_ECHO_ON: usize = 2;
+pub const TERM_ECHO_OFF: usize = 3;
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
@@ -169,4 +178,29 @@ pub fn print_u64(n: u64) {
     let mut m = n;
     while m > 0 { buf[i] = b'0' + (m % 10) as u8; m /= 10; i += 1; }
     for j in (0..i).rev() { print(&[buf[j]]); }
+}
+
+// ── Terminal control (for TUI applications) ──
+
+/// Switch terminal to raw mode (no echo, no line editing, immediate input).
+/// Required for full-screen TUI programs.
+pub fn enter_raw_mode() {
+    unsafe { syscall3(SYS_IOCTL, 0, TCSETS, TERM_RAW); }
+}
+
+/// Switch terminal back to canonical (cooked) mode.
+pub fn exit_raw_mode() {
+    unsafe { syscall3(SYS_IOCTL, 0, TCSETS, TERM_COOKED); }
+}
+
+/// Get terminal window size. Returns (cols, rows).
+pub fn winsize() -> (usize, usize) {
+    let v = unsafe { syscall3(SYS_IOCTL, 0, TIOCGWINSZ, 0) };
+    if v > 0 {
+        let cols = (v as usize) >> 16;
+        let rows = (v as usize) & 0xFFFF;
+        (cols, rows)
+    } else {
+        (80, 25) // default
+    }
 }

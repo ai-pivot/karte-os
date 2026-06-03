@@ -17,6 +17,8 @@ pub mod env;
 pub mod kernel_log;
 pub mod lang_items;
 pub mod mm;
+#[cfg(target_arch = "riscv64")]
+pub mod net;
 pub mod platform;
 pub mod process;
 pub mod sched;
@@ -171,6 +173,37 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             // Initialize PS/2 keyboard
             crate::console_println!("[init] Initializing PS/2 keyboard...");
             crate::driver::keyboard::init();
+
+            // Try NVMe first (fastest), then AHCI (SATA), then VirtIO block
+            if let Some(nvme_dev) = arch::pci::find_nvme() {
+                crate::console_println!(
+                    "[pci] Found NVMe controller at {:02x}:{:02x}.{} bars=[{:#x},{:#x}]",
+                    nvme_dev.bus,
+                    nvme_dev.device,
+                    nvme_dev.function,
+                    nvme_dev.bars[0],
+                    nvme_dev.bars[1]
+                );
+
+                nvme_dev.enable();
+
+                // NVMe uses BAR0 (Memory-Mapped I/O)
+                let bar0 = nvme_dev.bar_address(0) as usize;
+                let bar0_size = nvme_dev.bar_size(0) as usize;
+
+                crate::console_println!("[pci] NVMe BAR0: {:#x}, size={:#x}", bar0, bar0_size);
+
+                if bar0 != 0 {
+                    match crate::driver::nvme::init(bar0, bar0_size) {
+                        Ok(()) => {
+                            crate::console_println!("[pci] NVMe controller initialized");
+                        }
+                        Err(e) => {
+                            crate::console_println!("[pci] NVMe init failed: {}", e);
+                        }
+                    }
+                }
+            }
         }
 
         crate::console_println!("[init] Initializing filesystem...");
@@ -241,6 +274,15 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 // Re-read the process from the table for building trap context
                 let proc = process::current().unwrap();
                 process::set_current_page_table_root(proc.page_table_root);
+
+                // Initialize network AFTER user program is loaded
+                #[cfg(target_arch = "riscv64")]
+                {
+                    crate::console_println!("[init] Initializing network...");
+                    if let Some(mac) = driver::net::init_net_device() {
+                        net::iface::NetStack::init(mac);
+                    }
+                }
 
                 #[cfg(target_arch = "riscv64")]
                 unsafe {

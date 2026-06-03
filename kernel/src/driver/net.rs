@@ -43,8 +43,8 @@ const VIRTIO_MAGIC: u32 = 0x7472_6976;
 /// VirtIO MMIO base address on QEMU virt machine
 const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
 
-/// Stride between consecutive VirtIO MMIO devices
-const VIRTIO_MMIO_STRIDE: usize = 0x200;
+/// Stride between consecutive VirtIO MMIO devices (page-sized, per QEMU virt machine)
+const VIRTIO_MMIO_STRIDE: usize = 0x1000;
 
 /// Maximum number of VirtIO devices to probe
 const VIRTIO_MAX_DEVICES: usize = 8;
@@ -114,6 +114,8 @@ struct VringUsed {
 // ---------------------------------------------------------------------------
 
 /// Receive queue descriptor table, available ring, used ring, and data buffers.
+/// MUST use repr(C) to guarantee field order for VirtIO DMA.
+#[repr(C)]
 struct QueueMem {
     desc: [VringDesc; QUEUE_SIZE as usize],
     // available ring: flags(2) + idx(2) + ring[QUEUE_SIZE](2*QUEUE_SIZE) + used_event(2)
@@ -209,13 +211,18 @@ impl VirtIONet {
 
             let version =
                 unsafe { core::ptr::read_volatile((base + VIRTIO_MMIO_VERSION) as *const u32) };
-            if version != 2 {
-                // We expect VirtIO MMIO version 2 (legacy is 1)
-                continue;
-            }
-
             let device_id =
                 unsafe { core::ptr::read_volatile((base + VIRTIO_MMIO_DEVICE_ID) as *const u32) };
+
+            crate::console_println!(
+                "[net] Slot {} at {:#x}: magic={:#x} ver={} dev_id={}",
+                i,
+                base,
+                magic,
+                version,
+                device_id
+            );
+
             if device_id == VIRTIO_ID_NET {
                 return Some(Self::new(base));
             }
@@ -524,7 +531,60 @@ impl VirtIONet {
 // Test / demo entry point
 // ---------------------------------------------------------------------------
 
-/// Probe for VirtIO Net devices and print diagnostic information.
+/// Global VirtIO Net instance (initialized once during boot).
+static NET_DEVICE: spin::Mutex<Option<VirtIONet>> = spin::Mutex::new(None);
+
+/// Initialize the VirtIO Net device. Called once during kernel init.
+/// Returns the MAC address if a device was found.
+pub fn init_net_device() -> Option<[u8; 6]> {
+    crate::console_println!("[net] Probing VirtIO network devices...");
+    if let Some(mut net) = VirtIONet::probe() {
+        let mac = net.mac_addr();
+        crate::console_println!(
+            "[net] Found VirtIO Net at MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
+        );
+        net.init();
+        net.prepare_rx();
+        let mac_copy = net.mac_addr();
+        *NET_DEVICE.lock() = Some(net);
+        crate::console_println!("[net] VirtIO Net initialized");
+        Some(mac_copy)
+    } else {
+        crate::console_println!("[net] No VirtIO Net device found");
+        None
+    }
+}
+
+/// Send a raw Ethernet frame (without VirtIO net header — caller provides
+/// the full Ethernet frame). The VirtIO header is prepended internally.
+pub fn send_raw(frame: &[u8]) {
+    let mut guard = NET_DEVICE.lock();
+    if let Some(ref mut net) = *guard {
+        let _ = net.send_packet(frame);
+    }
+}
+
+/// Attempt to receive a raw Ethernet frame.
+/// Returns `Some(len)` with the frame length, or `None` if no packet is available.
+pub fn recv_raw(buf: &mut [u8]) -> Option<usize> {
+    let mut guard = NET_DEVICE.lock();
+    if let Some(ref mut net) = *guard {
+        match net.recv_packet(buf) {
+            Ok(len) => Some(len),
+            Err(()) => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Probe for VirtIO Net devices and print diagnostic information (legacy).
 pub fn test_net() {
     crate::console_println!("[net] Probing VirtIO network devices...");
     if let Some(mut net) = VirtIONet::probe() {

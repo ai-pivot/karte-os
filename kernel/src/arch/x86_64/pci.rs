@@ -264,3 +264,20 @@ pub fn init() {
 
     crate::console_println!("[pci] Found {} devices", devices.len());
 }
+
+/// Find an NVMe controller on the PCI bus.
+/// NVMe: class_code = 0x01 (Mass Storage), subclass = 0x08 (NVM), prog_if = 0x02 (NVMe).
+pub fn find_nvme() -> Option<PciDevice> {
+    for device in 0..32 {
+        let header_type = pci_read(0, device, 0, 0x0C);
+        let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
+        for function in 0..max_fn {
+            if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
+                if dev.class_code == 0x01 && dev.subclass == 0x08 && dev.prog_if == 0x02 {
+                    return Some(dev);
+                }
+            }
+        }
+    }
+    None
+}

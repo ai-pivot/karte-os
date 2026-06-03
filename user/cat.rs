@@ -15,8 +15,14 @@ unsafe extern "C" fn _start() -> ! {
     let path = trim(path);
 
     if path.is_empty() {
-        println(b"Usage: cat <file>");
-        syscall1(SYS_EXIT, 1);
+        // Read from stdin (fd 0) — supports pipe input
+        let buf = [0u8; 512];
+        loop {
+            let n = syscall3(SYS_READ, 0, buf.as_ptr() as usize, buf.len());
+            if n <= 0 { break; }
+            print(&buf[..n as usize]);
+        }
+        syscall1(SYS_EXIT, 0);
         loop {}
     }
 

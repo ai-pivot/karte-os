@@ -266,6 +266,13 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     // Poll UART for input
     crate::driver::tty::poll_uart();
 
+    // Tick uptime counter
+    crate::arch::platform::tick_uptime();
+
+    // Poll network stack (non-blocking, RISC-V only — x86_64 has no net driver)
+    #[cfg(target_arch = "riscv64")]
+    crate::net::iface::NetStack::poll();
+
     // Reset timer (periodic mode — no-op, but call for consistency)
     super::lapic::set_next_timer();
 

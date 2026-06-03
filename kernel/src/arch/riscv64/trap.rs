@@ -129,10 +129,19 @@ pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
     }
 }
 
-/// Handle timer interrupt: poll UART, advance scheduler.
+/// Handle timer interrupt: poll UART, advance scheduler, tick network.
 fn handle_timer() {
     // Poll UART RX and feed characters into TTY ring buffer.
     crate::driver::tty::poll_uart();
+
+    // Tick uptime counter
+    crate::arch::platform::tick_uptime();
+
+    // Poll network stack (non-blocking) — only after init is complete
+    // to avoid interfering with user program loading.
+    if crate::net::iface::NetStack::is_initialized() {
+        crate::net::iface::NetStack::poll();
+    }
 
     set_next_timer();
     crate::sched::schedule();

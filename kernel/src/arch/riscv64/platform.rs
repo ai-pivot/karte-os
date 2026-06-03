@@ -84,3 +84,16 @@ pub fn read_page_table_root() -> usize {
     unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
     (satp & ((1usize << 44) - 1)) << 12
 }
+
+/// Monotonic uptime counter (milliseconds since boot).
+static UPTIME_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Increment the uptime counter (called from timer interrupt).
+pub fn tick_uptime() {
+    UPTIME_MS.fetch_add(10, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Get the current uptime in milliseconds.
+pub fn uptime_ms() -> u64 {
+    UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed)
+}

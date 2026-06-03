@@ -1,29 +1,32 @@
 //! TTY subsystem — interrupt-driven terminal input with lock-free ring buffer.
 //!
+//! Supports two input modes:
+//! - **Canonical mode** (cooked): Line editing with echo, backspace, Ctrl+C.
+//!   Completed lines delivered to sys_read. Default mode.
+//! - **Raw mode**: No echo, no line editing. Every keystroke delivered immediately.
+//!   Required for TUI applications (vim, htop, etc.)
+//!
+//! Mode is controlled via `set_raw_mode()` / `set_canonical_mode()` from sys_ioctl.
+//!
 //! Architecture:
-//!   UART RX ──► timer/PLIC interrupt ──► feed_byte() ──► ring buffer
+//!   UART/keyboard ──► timer/IRQ handler ──► feed_byte() ──► ring buffer
 //!   sys_read(fd=0) ──► read() ──► buffer empty? ──► block task
 //!                                               └─► woken by feed_byte()
-//!
-//! Safety: producer (feed_byte) runs in interrupt handler, consumer (read)
-//! runs in syscall dispatch. Both execute in trap-handler context with SIE=0,
-//! so they never overlap. Atomics are used for the ring buffer indices anyway
-//! to enforce memory ordering and for future SMP safety.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Ring buffer capacity (power of 2 for fast modulo)
 const TTY_BUF_SIZE: usize = 4096;
 const TTY_BUF_MASK: usize = TTY_BUF_SIZE - 1;
 
 /// Line editing buffer capacity
-const TTY_LINE_SIZE: usize = 256;
+const TTY_LINE_SIZE: usize = 512;
 
 /// Signal flag bits (stored in Process::pending_signals)
 pub const SIGINT: u64 = 1 << 2;
 
-// ─── Lock-free SPSC ring buffer ──────────────────────────────────────
+// ─── Lock-free SPSC ring buffer ──────────────────────────────────────────
 
 struct RingBuffer {
     data: UnsafeCell<[u8; TTY_BUF_SIZE]>,
@@ -78,11 +81,11 @@ impl RingBuffer {
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.tail.load(Ordering::Relaxed) == self.head.load(Ordering::Acquire)
     }
 
-    /// Number of bytes in the buffer
     #[allow(dead_code)]
     fn len(&self) -> usize {
         let head = self.head.load(Ordering::Acquire);
@@ -91,7 +94,7 @@ impl RingBuffer {
     }
 }
 
-// ─── Line editor state ───────────────────────────────────────────────
+// ─── Line editor state ──────────────────────────────────────────────────
 
 struct LineEditor {
     /// Current line being composed (not yet terminated by Enter)
@@ -130,12 +133,22 @@ impl LineEditor {
     }
 }
 
-// ─── Global state ────────────────────────────────────────────────────
+// ─── TTY mode ───────────────────────────────────────────────────────────
 
-/// TTY input ring buffer (completed lines ready for sys_read)
+#[derive(Clone, Copy, PartialEq)]
+pub enum TtyMode {
+    /// Canonical (cooked) mode: line editing, echo, signals
+    Canonical,
+    /// Raw mode: no echo, no line editing, immediate delivery
+    Raw,
+}
+
+// ─── Global state ───────────────────────────────────────────────────────
+
+/// TTY input ring buffer (completed lines / raw bytes ready for sys_read)
 static TTY_INPUT: RingBuffer = RingBuffer::new();
 
-/// Line editor (current line being composed)
+/// Line editor (only used in canonical mode)
 static TTY_LINE: LineEditorData = LineEditorData {
     inner: UnsafeCell::new(LineEditor::new()),
 };
@@ -145,25 +158,59 @@ struct LineEditorData {
 }
 unsafe impl Sync for LineEditorData {}
 
+/// Current TTY mode
+static TTY_MODE: AtomicBool = AtomicBool::new(false); // false = Canonical, true = Raw
+
+/// Echo enabled flag (can be toggled independently)
+static TTY_ECHO: AtomicBool = AtomicBool::new(true);
+
 /// Process index blocked on stdin read (usize::MAX = no waiter)
 static TTY_WAITING: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-// ─── Public API ──────────────────────────────────────────────────────
+// ─── Public API ─────────────────────────────────────────────────────────
 
-/// Initialize TTY subsystem. Called during kernel init after PLIC init.
+/// Initialize TTY subsystem.
 pub fn init() {
-    // Enable supervisor external interrupts (PLIC → UART IRQ 10)
     #[cfg(target_arch = "riscv64")]
     unsafe {
         riscv::register::sie::set_sext();
     }
 }
 
-/// Poll UART RX FIFO and feed all available bytes into the TTY line editor.
+/// Set TTY input mode.
+pub fn set_mode(mode: TtyMode) {
+    match mode {
+        TtyMode::Canonical => {
+            TTY_MODE.store(false, Ordering::Relaxed);
+            TTY_ECHO.store(true, Ordering::Relaxed);
+        }
+        TtyMode::Raw => {
+            TTY_MODE.store(true, Ordering::Relaxed);
+            TTY_ECHO.store(false, Ordering::Relaxed);
+            // Flush any pending line editor content
+            let line = unsafe { &mut *TTY_LINE.inner.get() };
+            line.clear();
+        }
+    }
+}
+
+/// Get current TTY mode.
+pub fn get_mode() -> TtyMode {
+    if TTY_MODE.load(Ordering::Relaxed) {
+        TtyMode::Raw
+    } else {
+        TtyMode::Canonical
+    }
+}
+
+/// Set echo on/off independently.
+pub fn set_echo(enabled: bool) {
+    TTY_ECHO.store(enabled, Ordering::Relaxed);
+}
+
+/// Poll UART RX FIFO and feed all available bytes into the TTY.
 /// Called from timer interrupt handler.
 pub fn poll_uart() {
-    #[cfg(target_arch = "riscv64")]
-    let uart = crate::driver::uart::Uart::new(0x1000_0000);
     #[cfg(target_arch = "x86_64")]
     {
         while let Some(c) = crate::arch::uart::getchar() {
@@ -172,35 +219,58 @@ pub fn poll_uart() {
         return;
     }
     #[cfg(target_arch = "riscv64")]
-    while let Some(c) = uart.getc() {
-        on_char(c);
+    {
+        let uart = crate::driver::uart::Uart::new(0x1000_0000);
+        while let Some(c) = uart.getc() {
+            on_char(c);
+        }
     }
 }
 
-/// Feed a single character into the TTY line editor.
-///
-/// Public interface for keyboard and other input drivers to inject characters.
-/// Same processing as UART input (line editing, echo, ring buffer).
+/// Feed a single character into the TTY input.
+/// Public interface for keyboard and other input drivers.
 pub fn feed_byte(c: u8) {
     on_char(c);
 }
 
-/// Process a single character from UART.
-/// Handles canonical-mode line editing: echo, backspace, Ctrl+C, Enter.
-/// Completed lines are pushed into the ring buffer.
+/// Process a single character from input.
 fn on_char(c: u8) {
+    let is_raw = TTY_MODE.load(Ordering::Relaxed);
+
+    if is_raw {
+        // ── Raw mode: pass through immediately, no echo ──
+        on_char_raw(c);
+    } else {
+        // ── Canonical mode: line editing + echo ──
+        on_char_canonical(c);
+    }
+}
+
+/// Raw mode character handler.
+/// Delivers every byte immediately to the ring buffer.
+fn on_char_raw(c: u8) {
+    // In raw mode, deliver the byte immediately
+    if TTY_INPUT.push(c) {
+        // Wake blocked reader
+        let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
+        if waiting != usize::MAX {
+            crate::sched::wake_task(waiting);
+        }
+    }
+    // No echo in raw mode
+}
+
+/// Canonical mode character handler.
+/// Handles line editing: echo, backspace, Ctrl+C, Enter.
+fn on_char_canonical(c: u8) {
     let line = unsafe { &mut *TTY_LINE.inner.get() };
 
     match c {
-        // Ctrl+C — send SIGINT, discard current line, push empty line
+        // Ctrl+C — send SIGINT, discard current line
         0x03 => {
             echo(b"^C\r\n");
             line.clear();
-            // Push a bare newline so sys_read returns immediately with an
-            // empty line.  The shell will trim it, see an empty command,
-            // and re-print the prompt.
             TTY_INPUT.push(b'\n');
-            // Wake blocked reader (same as Enter handling)
             let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
             if waiting != usize::MAX {
                 crate::sched::wake_task(waiting);
@@ -209,26 +279,21 @@ fn on_char(c: u8) {
         // Backspace (BS) or Delete (DEL)
         0x08 | 0x7F => {
             if line.pop() {
-                // Erase character on terminal: BS + space + BS
                 echo(&[0x08, b' ', 0x08]);
             }
         }
-        // Enter — CR or LF: commit the line to the ring buffer
+        // Enter — CR or LF: commit the line
         b'\r' | b'\n' => {
             echo(b"\r\n");
-            // Push the entire line into the ring buffer
             let len = line.len;
             for i in 0..len {
-                let byte = line.buf[i];
-                if !TTY_INPUT.push(byte) {
-                    break; // Ring buffer full
+                if !TTY_INPUT.push(line.buf[i]) {
+                    break;
                 }
             }
-            // Append newline
             TTY_INPUT.push(b'\n');
             line.clear();
 
-            // Wake blocked reader
             let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
             if waiting != usize::MAX {
                 crate::sched::wake_task(waiting);
@@ -240,6 +305,40 @@ fn on_char(c: u8) {
                 echo(&[c]);
             }
         }
+        // Ctrl+D — EOF on empty line
+        0x04 => {
+            if line.len == 0 {
+                // Push nothing — sys_read returns 0 (EOF)
+                let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
+                if waiting != usize::MAX {
+                    crate::sched::wake_task(waiting);
+                }
+            }
+        }
+        // Ctrl+L — clear screen (convenience)
+        0x0C => {
+            echo(b"\x1b[2J\x1b[H");
+        }
+        // Ctrl+U — kill line
+        0x15 => {
+            // Erase the entire line visually
+            for _ in 0..line.len {
+                echo(&[0x08, b' ', 0x08]);
+            }
+            line.clear();
+        }
+        // Ctrl+W — delete word
+        0x17 => {
+            // Trim trailing spaces, then delete word
+            while line.len > 0 && line.buf[line.len - 1] == b' ' {
+                line.pop();
+                echo(&[0x08, b' ', 0x08]);
+            }
+            while line.len > 0 && line.buf[line.len - 1] != b' ' {
+                line.pop();
+                echo(&[0x08, b' ', 0x08]);
+            }
+        }
         // Ignore other control characters
         _ => {}
     }
@@ -247,21 +346,17 @@ fn on_char(c: u8) {
 
 /// Read from TTY input (sys_read for fd=0).
 ///
-/// In canonical mode, returns complete lines (ending with \n).
-/// If no data is available, returns 0 (non-blocking).
-/// The caller (shell) should retry after a brief yield.
-///
-/// Data arrives via timer interrupt polling UART RX (every 10ms),
-/// which feeds characters through the TTY line editor.
+/// In canonical mode: returns complete lines (ending with \n).
+/// In raw mode: returns whatever bytes are available immediately.
+/// Returns 0 if no data is available (non-blocking).
 pub fn read(buf: usize, len: usize) -> isize {
     if len == 0 || buf == 0 {
         return 0;
     }
-
     read_available(buf, len)
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────
+// ─── Internal helpers ────────────────────────────────────────────────────
 
 /// Copy available bytes from ring buffer to user buffer.
 fn read_available(buf: usize, len: usize) -> isize {
@@ -278,7 +373,7 @@ fn read_available(buf: usize, len: usize) -> isize {
     count
 }
 
-/// Echo bytes directly to UART (raw MMIO, no SpinLock, safe from interrupt context).
+/// Echo bytes to UART + VGA output.
 fn echo(bytes: &[u8]) {
     #[cfg(target_arch = "riscv64")]
     {
@@ -291,7 +386,6 @@ fn echo(bytes: &[u8]) {
     {
         for &b in bytes {
             crate::arch::uart::putchar(b);
-            // Also echo to VGA for local display
             crate::driver::vga::putchar(b);
         }
     }

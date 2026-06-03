@@ -28,6 +28,22 @@ fn main() {
             // No PIE
             println!("cargo:rustc-link-arg=-no-pie");
             println!("cargo:rerun-if-changed=memory-x86_64.ld");
+
+            // Assemble AP trampoline using system assembler
+            let asm_src = fs::canonicalize("src/arch/x86_64/ap_trampoline.S").unwrap();
+            let asm_obj = out_dir.join("ap_trampoline.o");
+            let status = std::process::Command::new("as")
+                .arg("--64")
+                .arg("-o")
+                .arg(&asm_obj)
+                .arg(&asm_src)
+                .status()
+                .expect("Failed to run `as` assembler. Install: sudo apt install binutils");
+            if !status.success() {
+                panic!("Failed to assemble ap_trampoline.S");
+            }
+            println!("cargo:rustc-link-arg={}", asm_obj.display());
+            println!("cargo:rerun-if-changed=src/arch/x86_64/ap_trampoline.S");
         }
         _ => {}
     }
