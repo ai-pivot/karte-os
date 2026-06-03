@@ -228,7 +228,6 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
         // Stack layout (from stub push order):
         //   [0] rax (syscall nr)  [1] rax (placeholder)  [2] rdi
         //   [3] rsi  [4] rdx  [5] r8  [6] r9  [7] r10  [8] r11
-        
         let a0 = *s.add(2) as usize; // rdi
         let a1 = *s.add(3) as usize; // rsi
         let a2 = *s.add(4) as usize; // rdx
