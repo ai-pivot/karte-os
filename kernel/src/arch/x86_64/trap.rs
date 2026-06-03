@@ -183,6 +183,7 @@ pub unsafe extern "C" fn trap_return_user() {
             //   +32: ss         (+0x20)
             //   +40: kernel_sp  (+0x28)
             //   +48: user_cr3   (+0x30) ← per-process page table root
+            //   +56: trap_from_user (+0x38)
 
             // ── Switch to user page table if user_cr3 is set ──
             // CR3 write implicitly flushes the TLB (non-global pages).
