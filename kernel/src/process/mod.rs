@@ -117,8 +117,9 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
         // Always map (don't skip) to ensure all kernel pages are accessible
         // when CR3 is switched to user page table during iretq.
         vmm::identity_map(user_pt, 0x10_0000, 0x2000_0000, vmm::PTEFlags::KRWX);
-        // Map VGA text buffer at 0xB8000 (below 1MB, needed for console)
+        // Map VGA text buffer at 0xB8000 (2 pages to cover potential overflow)
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
+        vmm::map(user_pt, 0xB9000, 0xB9000, vmm::PTEFlags::KRW);
         // Map LAPIC/IOAPIC MMIO
         vmm::map(user_pt, 0xFEE0_0000, 0xFEE0_0000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xFEC0_0000, 0xFEC0_0000, vmm::PTEFlags::KRW);

@@ -87,6 +87,8 @@ PYEOF
 # Step 4: Force rebuild kernel (include_bytes! must pick up new files)
 echo "=== Building x86_64 kernel ==="
 rm -rf target/x86_64-unknown-none
+# IMPORTANT: Also clean the release fingerprint cache to ensure
+# cfg(target_arch) constants are correctly compiled
 cargo +nightly build --release --target x86_64-unknown-none \
     -p karte-os-kernel -Z build-std=core,alloc 2>&1 | tail -5
 

@@ -93,8 +93,16 @@ core::arch::global_asm!(
     "push rdi",
     "push rax", // [1] placeholder for return value
     "push rax", // [0] syscall number
+    // Enable interrupts during handler execution so Timer ISR can fire.
+    // We will cli before restoring registers to prevent Timer ISR nesting
+    // during pop/iretq (which would clobber the iretq frame on RSP0).
+    "sti",
     "mov rdi, rsp",
     "call syscall_handler_impl",
+    // Disable interrupts before restoring registers. This prevents Timer ISR
+    // from nesting during pop/iretq, which would use the same RSP0 stack and
+    // clobber the CPU-pushed iretq frame (RIP, CS, RFLAGS, RSP, SS).
+    "cli",
     // Store return value at slot [1] (offset 8) — NOT slot [7]
     "mov [rsp + 8], rax",
     "add rsp, 8", // skip [0] (syscall nr)
@@ -102,11 +110,11 @@ core::arch::global_asm!(
     "pop rdi",    // [2]
     "pop rsi",    // [3]
     "pop rdx",    // [4]
-    "pop r8",     // [5]  — was incorrectly r9 before
-    "pop r9",     // [6]  — was incorrectly r8 before
+    "pop r8",     // [5]
+    "pop r9",     // [6]
     "pop r10",    // [7]
     "pop r11",    // [8]
-    "sti",
+    // No sti here! iretq restores IF from RFLAGS on stack (user had IF=1).
     "iretq",
     // ─── Timer ISR stub ──────────────────────────────────
     ".globl timer_isr_stub",
@@ -472,10 +480,11 @@ pub fn init() {
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
         // Syscall (int 0x80): DPL=3
+        // Syscall (int 0x80): DPL=3, IST[1] to isolate from Timer ISR nesting
         set_naked_handler(
             &mut idt[SYSCALL_VECTOR],
             syscall_isr_stub as *const () as usize,
-            0xEE00,
+            0xEE01, // IST index = SYSCALL_IST_INDEX = 1
         );
 
         idt

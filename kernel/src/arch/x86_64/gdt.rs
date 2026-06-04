@@ -23,7 +23,14 @@ pub const MAX_CPUS: usize = 4;
 /// IST index for double fault handler (separate stack to avoid corruption).
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// IST index for syscall (int 0x80) handler — separate stack so that
+/// nested Timer ISR (which uses TSS.RSP0) does not clobber the syscall
+/// handler's CPU-pushed iretq frame (RIP, CS, RFLAGS, RSP, SS).
+pub const SYSCALL_IST_INDEX: u16 = 1;
+
 /// Number of IST entries we actually use.
+const NUM_IST: usize = 2;
+
 const IST_STACK_SIZE: usize = 4096 * 8; // 32KB per IST stack
 
 /// Per-CPU GDT structure.
@@ -36,8 +43,9 @@ struct PerCpuGdt {
     tss: SegmentSelector,
 }
 
-/// IST stacks — one set per CPU.
-static mut IST_STACKS: [[u8; IST_STACK_SIZE]; MAX_CPUS] = [[0u8; IST_STACK_SIZE]; MAX_CPUS];
+/// IST stacks — one set per CPU, one per IST index.
+static mut IST_STACKS: [[u8; IST_STACK_SIZE]; MAX_CPUS * NUM_IST] =
+    [[0u8; IST_STACK_SIZE]; MAX_CPUS * NUM_IST];
 
 /// TSS — one per CPU.
 static mut PER_CPU_TSS: [TaskStateSegment; MAX_CPUS] = [
@@ -74,11 +82,23 @@ pub fn init_for_cpu(cpu_id: usize) {
     let cpu_id = cpu_id.min(MAX_CPUS - 1);
 
     PER_CPU_GDT[cpu_id].call_once(|| {
-        // Set up IST[0] for double fault on this CPU's TSS
+        // Set up IST stacks for this CPU's TSS
         unsafe {
-            let stack_top =
-                VirtAddr::new(IST_STACKS[cpu_id].as_ptr() as u64 + IST_STACKS[cpu_id].len() as u64);
-            PER_CPU_TSS[cpu_id].interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_top;
+            // IST[0]: Double Fault
+            let df_stack_top = VirtAddr::new(
+                IST_STACKS[cpu_id * NUM_IST].as_ptr() as u64
+                    + IST_STACKS[cpu_id * NUM_IST].len() as u64,
+            );
+            PER_CPU_TSS[cpu_id].interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+                df_stack_top;
+
+            // IST[1]: Syscall (int 0x80) — prevents Timer ISR nesting from
+            // clobbering the syscall handler's CPU-pushed iretq frame.
+            let sys_stack_top = VirtAddr::new(
+                IST_STACKS[cpu_id * NUM_IST + 1].as_ptr() as u64
+                    + IST_STACKS[cpu_id * NUM_IST + 1].len() as u64,
+            );
+            PER_CPU_TSS[cpu_id].interrupt_stack_table[SYSCALL_IST_INDEX as usize] = sys_stack_top;
         }
 
         let mut gdt = GlobalDescriptorTable::new();
