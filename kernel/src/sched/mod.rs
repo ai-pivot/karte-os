@@ -528,10 +528,10 @@ pub fn add_clone_process(
         let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
         *ctx = parent_ctx.clone();
         // Modifications for clone child:
-        (*ctx).rax = 0;                       // Child returns 0 from clone
-        (*ctx).rsp = new_user_sp as u64;      // Use new user stack
+        (*ctx).rax = 0; // Child returns 0 from clone
+        (*ctx).rsp = new_user_sp as u64; // Use new user stack
         (*ctx).kernel_sp = kernel_stack_top as u64;
-        (*ctx).user_cr3 = user_cr3 as u64;    // Set for first entry (switches CR3)
+        (*ctx).user_cr3 = user_cr3 as u64; // Set for first entry (switches CR3)
         (*ctx).trap_from_user = 1;
     }
 

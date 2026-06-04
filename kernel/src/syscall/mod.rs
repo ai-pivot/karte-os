@@ -109,7 +109,8 @@ static SIGNAL_STATE: SignalState = SignalState {
 };
 
 /// Simple LCG PRNG state for getrandom.
-static PRNG_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0x12345678_9ABCDEF0);
+static PRNG_STATE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x12345678_9ABCDEF0);
 
 use crate::driver::fs::{MAX_FDS, O_CREAT};
 #[cfg(feature = "test_mode")]
@@ -771,7 +772,8 @@ fn linux_rt_sigaction(sig: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
         // We only record the handler; write zeros for the rest.
         unsafe {
             let oldact = oldact_ptr as *mut [usize; 4];
-            (*oldact)[0] = SIGNAL_STATE.handlers[sig - 1].load(core::sync::atomic::Ordering::Relaxed);
+            (*oldact)[0] =
+                SIGNAL_STATE.handlers[sig - 1].load(core::sync::atomic::Ordering::Relaxed);
             (*oldact)[1] = 0;
             (*oldact)[2] = 0;
             (*oldact)[3] = 0;
@@ -792,7 +794,9 @@ fn linux_rt_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize 
     if oldset_ptr != 0 && how != 3 {
         unsafe {
             let oldset = oldset_ptr as *mut u64;
-            *oldset = SIGNAL_STATE.mask.load(core::sync::atomic::Ordering::Relaxed);
+            *oldset = SIGNAL_STATE
+                .mask
+                .load(core::sync::atomic::Ordering::Relaxed);
         }
     }
     // Apply new mask if provided
@@ -801,17 +805,27 @@ fn linux_rt_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize 
         match how {
             0 => {
                 // SIG_BLOCK: add signals to mask
-                let prev = SIGNAL_STATE.mask.load(core::sync::atomic::Ordering::Relaxed);
-                SIGNAL_STATE.mask.store(prev | new_mask, core::sync::atomic::Ordering::Relaxed);
+                let prev = SIGNAL_STATE
+                    .mask
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                SIGNAL_STATE
+                    .mask
+                    .store(prev | new_mask, core::sync::atomic::Ordering::Relaxed);
             }
             1 => {
                 // SIG_UNBLOCK: remove signals from mask
-                let prev = SIGNAL_STATE.mask.load(core::sync::atomic::Ordering::Relaxed);
-                SIGNAL_STATE.mask.store(prev & !new_mask, core::sync::atomic::Ordering::Relaxed);
+                let prev = SIGNAL_STATE
+                    .mask
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                SIGNAL_STATE
+                    .mask
+                    .store(prev & !new_mask, core::sync::atomic::Ordering::Relaxed);
             }
             2 => {
                 // SIG_SETMASK: replace mask entirely
-                SIGNAL_STATE.mask.store(new_mask, core::sync::atomic::Ordering::Relaxed);
+                SIGNAL_STATE
+                    .mask
+                    .store(new_mask, core::sync::atomic::Ordering::Relaxed);
             }
             _ => return -22, // EINVAL
         }
@@ -827,9 +841,15 @@ fn linux_sigaltstack(ss_ptr: usize, oss_ptr: usize) -> isize {
         // struct stack_t { ss_sp(8), ss_flags(8), ss_size(8) }
         unsafe {
             let oss = oss_ptr as *mut [usize; 3];
-            (*oss)[0] = SIGNAL_STATE.altstack_sp.load(core::sync::atomic::Ordering::Relaxed);
-            (*oss)[1] = SIGNAL_STATE.altstack_flags.load(core::sync::atomic::Ordering::Relaxed);
-            (*oss)[2] = SIGNAL_STATE.altstack_size.load(core::sync::atomic::Ordering::Relaxed);
+            (*oss)[0] = SIGNAL_STATE
+                .altstack_sp
+                .load(core::sync::atomic::Ordering::Relaxed);
+            (*oss)[1] = SIGNAL_STATE
+                .altstack_flags
+                .load(core::sync::atomic::Ordering::Relaxed);
+            (*oss)[2] = SIGNAL_STATE
+                .altstack_size
+                .load(core::sync::atomic::Ordering::Relaxed);
         }
     }
     // Set new state if provided
@@ -837,9 +857,15 @@ fn linux_sigaltstack(ss_ptr: usize, oss_ptr: usize) -> isize {
         let ss_sp = unsafe { core::ptr::read_volatile(ss_ptr as *const usize) };
         let ss_flags = unsafe { core::ptr::read_volatile((ss_ptr + 8) as *const usize) };
         let ss_size = unsafe { core::ptr::read_volatile((ss_ptr + 16) as *const usize) };
-        SIGNAL_STATE.altstack_sp.store(ss_sp, core::sync::atomic::Ordering::Relaxed);
-        SIGNAL_STATE.altstack_flags.store(ss_flags, core::sync::atomic::Ordering::Relaxed);
-        SIGNAL_STATE.altstack_size.store(ss_size, core::sync::atomic::Ordering::Relaxed);
+        SIGNAL_STATE
+            .altstack_sp
+            .store(ss_sp, core::sync::atomic::Ordering::Relaxed);
+        SIGNAL_STATE
+            .altstack_flags
+            .store(ss_flags, core::sync::atomic::Ordering::Relaxed);
+        SIGNAL_STATE
+            .altstack_size
+            .store(ss_size, core::sync::atomic::Ordering::Relaxed);
     }
     0
 }
@@ -854,7 +880,9 @@ fn linux_getrandom(buf: usize, count: usize, _flags: usize) -> isize {
     for i in 0..count {
         // LCG: next = state * 6364136223846793005 + 1442695040888963407
         let prev = PRNG_STATE.load(core::sync::atomic::Ordering::Relaxed);
-        let next = prev.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let next = prev
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         PRNG_STATE.store(next, core::sync::atomic::Ordering::Relaxed);
         // Use bytes from the state
         let byte = ((next >> (i % 8 * 8)) & 0xFF) as u8;
@@ -2185,8 +2213,13 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
             #[cfg(target_arch = "x86_64")]
             crate::console_println!(
                 "[exec] Launched '{}' pid={} entry={:#x} stack={:#x} kstack={:#x} pt_root={:#x} cr3={:#x}",
-                name, proc.pid, proc.entry, proc.user_stack_top, proc.kernel_stack_top,
-                proc.page_table_root, user_satp
+                name,
+                proc.pid,
+                proc.entry,
+                proc.user_stack_top,
+                proc.kernel_stack_top,
+                proc.page_table_root,
+                user_satp
             );
             #[cfg(target_arch = "riscv64")]
             crate::console_println!("[exec] Launched '{}' (pid={})", name, proc.pid);
@@ -2467,8 +2500,7 @@ fn linux_clone(
         return ERR_INVAL;
     }
     #[cfg(target_arch = "x86_64")]
-    let parent_ctx =
-        unsafe { &*(parent_ctx_ptr as *const crate::arch::trap::TrapContext) };
+    let parent_ctx = unsafe { &*(parent_ctx_ptr as *const crate::arch::trap::TrapContext) };
 
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -2477,17 +2509,13 @@ fn linux_clone(
         let user_pt_root = crate::process::current_page_table_root();
 
         let kernel_stack_pages = crate::process::KERNEL_STACK_PAGES;
-        let kernel_stack_base = match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages)
-        {
+        let kernel_stack_base = match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages) {
             Some(base) => base,
             None => return ERR_NOMEM,
         };
-        let kernel_stack_top =
-            kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
+        let kernel_stack_top = kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
 
-        let entry = crate::process::current()
-            .map(|p| p.entry)
-            .unwrap_or(0);
+        let entry = crate::process::current().map(|p| p.entry).unwrap_or(0);
 
         let tid = match crate::sched::add_user_process(
             entry,
@@ -2511,13 +2539,11 @@ fn linux_clone(
 
         // Allocate kernel stack for child thread
         let kernel_stack_pages = crate::process::KERNEL_STACK_PAGES;
-        let kernel_stack_base =
-            match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages) {
-                Some(base) => base,
-                None => return ERR_NOMEM,
-            };
-        let kernel_stack_top =
-            kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
+        let kernel_stack_base = match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages) {
+            Some(base) => base,
+            None => return ERR_NOMEM,
+        };
+        let kernel_stack_top = kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
 
         // Get parent process info
         let parent_proc = match crate::process::current() {
@@ -2526,7 +2552,8 @@ fn linux_clone(
         };
 
         // Create child process entry
-        let child_pid = crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let child_pid =
+            crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         // CLONE_FILES: clone fd table (true sharing would require Arc, clone is close enough)
         let fd_table = if (flags & 0x400) != 0 {
@@ -2602,9 +2629,9 @@ fn linux_clone(
 //   FUTEX_WAKE(1):   wake up to `val` waiters on uaddr
 //   FUTEX_WAIT_BITSET(9) / FUTEX_WAKE_BITSET(10): same but with bitset filter
 
+use crate::sync::spinlock::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use crate::sync::spinlock::SpinLock;
 
 /// A waiter in the futex queue.
 struct FutexWaiter {
@@ -2615,8 +2642,7 @@ struct FutexWaiter {
 }
 
 /// Global futex wait queues, keyed by user-space futex address.
-static FUTEX_QUEUES: SpinLock<BTreeMap<usize, Vec<FutexWaiter>>> =
-    SpinLock::new(BTreeMap::new());
+static FUTEX_QUEUES: SpinLock<BTreeMap<usize, Vec<FutexWaiter>>> = SpinLock::new(BTreeMap::new());
 
 /// Block the current task on a futex address.
 ///

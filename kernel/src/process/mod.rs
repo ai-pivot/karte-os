@@ -113,10 +113,10 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Map kernel code/data — start from 1MB to avoid conflicting with
-        // user ELF segments which may use low addresses (e.g., shell.elf at 0x1000).
-        // Map 1MB..512MB, skipping pages already mapped by ELF loader.
-        vmm::identity_map_skip(user_pt, 0x10_0000, 0x2000_0000, vmm::PTEFlags::KRWX);
+        // Map kernel code/data (1MB..512MB) into user page table.
+        // Always map (don't skip) to ensure all kernel pages are accessible
+        // when CR3 is switched to user page table during iretq.
+        vmm::identity_map(user_pt, 0x10_0000, 0x2000_0000, vmm::PTEFlags::KRWX);
         // Map VGA text buffer at 0xB8000 (below 1MB, needed for console)
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
         // Map LAPIC/IOAPIC MMIO
