@@ -42,9 +42,17 @@ static mut KERNEL_CR3: u64 = 0;
 #[unsafe(no_mangle)]
 static mut SYSCALL_KSP: u64 = 0;
 
+/// Kernel CR3 physical address, used by Timer ISR for CR3 switching.
+#[used]
+#[cfg_attr(target_arch = "x86_64", unsafe(link_section = ".data"))]
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+static mut KERNEL_CR3_PHYS: u64 = 0;
+
 pub fn set_syscall_ksp(ksp: u64) {
     unsafe {
         SYSCALL_KSP = ksp;
+        KERNEL_CR3_PHYS = crate::mm::vmm::kernel_cr3();
     }
 }
 
@@ -121,8 +129,6 @@ core::arch::global_asm!(
     ".globl timer_isr_stub",
     ".type timer_isr_stub, @function",
     "timer_isr_stub:",
-    // NOTE: CR3 switching disabled — user PT has kernel mappings.
-
     // Save all 15 GP registers
     "push rax",
     "push rbx",
@@ -139,8 +145,22 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    // ── Switch to kernel CR3 ──
+    // Timer ISR fires under user CR3 when running user programs.
+    // Switch to kernel CR3 to ensure all kernel data is accessible.
+    "mov rax, cr3",
+    "push rax", // save user CR3 on stack
+    "lea rax, [rip + KERNEL_CR3_PHYS]",
+    "mov rax, [rax]", // load kernel CR3 value
+    "cmp rax, 0",
+    "je 7f",
+    "mov cr3, rax", // switch to kernel page table
+    "7:",
     "mov rdi, rsp",
     "call timer_trap_handler",
+    // ── Restore user CR3 ──
+    "pop rax",
+    "mov cr3, rax",
     // EOI is already sent inside timer_trap_handler (before schedule/sti)
     "pop r15",
     "pop r14",
