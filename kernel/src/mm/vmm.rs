@@ -239,6 +239,44 @@ pub fn identity_map_skip(root: &mut PageTable, start: usize, end: usize, flags: 
     }
 }
 
+/// Identity map using 2MB huge pages (x86_64 only).
+/// Uses P2-level entries with PS=1 to cover 2MB per entry, avoiding page table alloc overhead.
+#[cfg(target_arch = "x86_64")]
+pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: PTEFlags) {
+    const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
+    let start_aligned = start & !(HUGE_PAGE_SIZE - 1);
+    let end_aligned = (end + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
+
+    let mut table = root;
+    // Walk P4 → P3, creating intermediate tables as needed
+    for level in &[3usize, 2] {
+        // For 0..512GB range, P4[0] covers it all. level=3 is P3.
+        // Use vpn=0 for the low-memory identity map.
+        let vpn = PageTable::vpn(start_aligned, *level);
+        let entry = &mut table.entries[vpn];
+        if !entry.is_valid() {
+            let new_table = PageTable::zeroed();
+            let ppn = (new_table as *const PageTable as usize) >> 12;
+            *entry = PTE(((ppn as u64) << 12)
+                | PTEFlags::PRESENT.bits()
+                | PTEFlags::WRITABLE.bits()
+                | PTEFlags::USER.bits());
+        }
+        let ppn = entry.ppn();
+        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+    }
+
+    // table is now P2. Set 2MB entries directly.
+    let mut addr = start_aligned;
+    while addr < end_aligned {
+        let vpn = PageTable::vpn(addr, 1); // P2 index
+        let ppn = addr >> 12;
+        let huge_flags = flags.bits() | PTEFlags::PS.bits();
+        table.entries[vpn] = PTE(((ppn as u64) << 12) | huge_flags);
+        addr += HUGE_PAGE_SIZE;
+    }
+}
+
 static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
 
 pub fn get_kernel_page_table() -> &'static mut PageTable {
@@ -274,15 +312,10 @@ pub fn init() {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Map all physical memory for kernel access.
-        // This is the kernel page table — used when CR3 is switched on trap entry.
-        // Identity map 0..512MB (covers kernel, PMM bitmap, kernel stacks, etc.)
-        identity_map(root, 0x0, 0x2000_0000, PTEFlags::KRWX);
-        // Map MMIO regions
-        map(root, 0xFEE0_0000, 0xFEE0_0000, PTEFlags::KRW);
-        map(root, 0xFEC0_0000, 0xFEC0_0000, PTEFlags::KRW);
-        // Map PCI MMIO region
-        identity_map(root, 0xF000_0000, 0x1_0000_0000, PTEFlags::KRW);
+        // Map all physical memory for kernel access using 2MB huge pages.
+        identity_map_2mb(root, 0x0, 0x2000_0000, PTEFlags::KRWX);
+        // Map MMIO regions via 2MB pages (AHCI, LAPIC, IOAPIC, etc.)
+        identity_map_2mb(root, 0xFE000000, 0xFF000000, PTEFlags::KRW);
     }
 
     let ppn = root_addr >> 12;

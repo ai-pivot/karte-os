@@ -17,6 +17,7 @@ pub const SPURIOUS_VECTOR: u8 = IRQ_BASE + 7;
 pub const PAGE_FAULT_VECTOR: u8 = 14; // CPU exception vector for #PF
 
 // ─── MSR constants for SYSCALL/SYSRET ─────────────────────────
+const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xC000_281;
 const MSR_LSTAR: u32 = 0xC000_282;
 const MSR_CSTAR: u32 = 0xC000_283;
@@ -65,10 +66,14 @@ pub fn cache_kernel_cr3() {
 
 pub fn init_syscall_msrs() {
     unsafe {
+        // Enable SYSCALL/SYSRET in EFER (bit 0 = SCE)
+        let efer = rdmsr(MSR_EFER);
+        wrmsr(MSR_EFER, efer | 1);
+        // Set up SYSCALL MSRs
         wrmsr(MSR_STAR, (0x18u64 << 48) | (0x08u64 << 32));
         wrmsr(MSR_LSTAR, syscall_entry as usize as u64);
         wrmsr(MSR_CSTAR, 0);
-        wrmsr(MSR_SFMASK, 1 << 9);
+        wrmsr(MSR_SFMASK, 1 << 9); // Mask IF on syscall entry
     }
 }
 
@@ -341,26 +346,26 @@ extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
     );
 }
 
-extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _err: u64) -> ! {
+extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
     // Switch to kernel CR3 for reliable output
-    let saved_cr3 = x86_64::registers::control::Cr3::read();
     let kcr3 = crate::mm::vmm::kernel_cr3();
     if kcr3 != 0 {
-        unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) kcr3);
-        }
+        unsafe { core::arch::asm!("mov cr3, {}", in(reg) kcr3); }
     }
-    let ip = frame.instruction_pointer.as_u64();
-    let sp = frame.stack_pointer.as_u64();
-    let cs = frame.code_segment.0 as u64;
-    let ss = frame.stack_segment.0 as u64;
+    // WARNING: The InterruptStackFrame fields are shifted by 8 bytes relative
+    // to the actual CPU push order. The `error_code` parameter contains the
+    // actual RIP of the faulting context.
+    // Real layout:  [SS, RSP, RFLAGS, CS, RIP] ← pushed by CPU
+    // What we get:  error_code=RIP, instruction_pointer=CS, code_segment=RFLAGS,
+    //                cpu_flags=RSP, stack_pointer=SS
+    let actual_rip = error_code;
+    let actual_cs = frame.instruction_pointer.as_u64();
+    let actual_rflags = frame.code_segment.0 as u64;
+    let actual_rsp = frame.cpu_flags;
+    let actual_ss = frame.stack_pointer.as_u64();
     crate::console_println!(
-        "[DF] IP={:#x} SP={:#x} CS={:#x} SS={:#x} err={:#x}",
-        ip,
-        sp,
-        cs,
-        ss,
-        _err
+        "[DF] RIP={:#x} CS={:#x} RSP={:#x} SS={:#x} RFLAGS={:#x}",
+        actual_rip, actual_cs, actual_rsp, actual_ss, actual_rflags
     );
     loop {}
 }
@@ -697,7 +702,27 @@ fn patch_ist_index(
     }
 }
 
+/// Disable legacy 8259 PIC by masking all interrupts.
+/// After this, only LAPIC/IOAPIC interrupts are delivered.
+pub fn disable_pic() {
+    unsafe {
+        // Mask all interrupts on master (port 0x21) and slave (port 0xA1)
+        core::arch::asm!(
+            "mov al, 0xFF",
+            "out 0x21, al",
+            "out 0xA1, al",
+            out("al") _,
+        );
+    }
+    crate::console_println!("[pic] Legacy 8259 PIC masked");
+}
+
 pub fn init() {
+    // Disable legacy 8259 PIC — we use LAPIC/IOAPIC for interrupts.
+    // Without this, PIC IRQ0 (timer) fires on vector 0x08, which collides
+    // with the CPU Double Fault exception vector.
+    disable_pic();
+
     IDT.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
 

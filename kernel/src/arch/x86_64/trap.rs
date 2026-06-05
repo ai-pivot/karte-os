@@ -276,11 +276,6 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3
             "mov cr3, rax",       // switch to per-process page table
             "2:",
 
-            // Debug: output 'A' to COM1 before iretq
-            "mov dx, 0x3f8",
-            "mov al, 0x41",
-            "out dx, al",
-
             // Clear all GP registers (prevent kernel data leaks)
             "xor rax, rax",
             "xor rbx, rbx",

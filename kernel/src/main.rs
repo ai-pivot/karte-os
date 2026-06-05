@@ -36,6 +36,21 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     {
         crate::arch::uart::init_uart();
         crate::driver::vga::init();
+
+        // Parse multiboot2 info to get actual RAM size.
+        // kmain params: EDI=multiboot2_magic, ESI=multiboot2_info_addr
+        let (_mb2_magic, mb2_info) = (hartid, dtb_ptr);
+        let (_mem_lower, mem_upper_kb) = crate::arch::multiboot2::parse_memory_size(mb2_info);
+        if mem_upper_kb > 0 {
+            // mem_upper_kb = KB of RAM above 1MB.
+            // Total RAM = 1MB (below) + mem_upper_kb KB (above).
+            // Leave 2MB for kernel/code start area.
+            let total_ram = 1024 * 1024 + (mem_upper_kb as usize) * 1024;
+            crate::console_println!("[init] Multiboot2 memory: {} MB total", total_ram / 1024 / 1024);
+            mm::pmm::init_with_size(total_ram - 0x0020_0000);
+        } else {
+            mm::pmm::init();
+        }
     }
 
     crate::console_println!("=== KarteOS v0.2.0 ===");
@@ -45,7 +60,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     crate::kernel_log::init();
 
     arch::trap::init();
+    #[cfg(target_arch = "riscv64")]
     mm::pmm::init();
+    // x86_64 pmm init is done earlier (via multiboot2 or fallback)
     mm::vmm::init();
     mm::heap::init();
 
@@ -250,47 +267,13 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         let init_result = {
             #[cfg(target_arch = "x86_64")]
             {
-                if crate::driver::ext4::has_ext4() {
-                    // Verify heap mapping in kernel PT
-                    {
-                        let kpt = crate::mm::vmm::get_kernel_page_table();
-                        let hs = crate::mm::heap::heap_start();
-                        let he = hs + crate::mm::heap::heap_size();
-                        let s = crate::mm::vmm::translate_user(kpt, hs & !0xFFF);
-                        let e = crate::mm::vmm::translate_user(kpt, (he - 1) & !0xFFF);
-                        crate::console_println!(
-                            "[init] Kernel PT heap {:#x}-{:#x}: start={:?} end={:?}",
-                            hs,
-                            he,
-                            s,
-                            e
-                        );
-                    }
-                    match crate::driver::ext4::read_file_range("xbot-cli-static") {
-                        Some(read_fn) => {
-                            crate::console_println!("[init] Loading xbot-cli-static from ext4...");
-                            match crate::process::Process::from_elf_streaming(read_fn) {
-                                Ok(p) => {
-                                    crate::console_println!(
-                                        "[init] xbot-cli-static loaded! entry={:#x}",
-                                        p.entry
-                                    );
-                                    Ok(p)
-                                }
-                                Err(e) => {
-                                    crate::console_println!(
-                                        "[init] xbot-cli-static load failed: {}, using shell",
-                                        e
-                                    );
-                                    process::Process::from_elf(include_bytes!(
-                                        "../../user/shell.elf"
-                                    ))
-                                }
-                            }
-                        }
-                        None => process::Process::from_elf(include_bytes!("../../user/shell.elf")),
-                    }
+                // Try xbot-cli-static from ext4 first (streaming to avoid 68MB heap alloc),
+                // fallback to shell.elf
+                if let Some(read_fn) = crate::driver::ext4::read_file_range("/xbot-cli-static") {
+                    crate::console_println!("[init] Loading xbot-cli-static from ext4 (streaming)");
+                    process::Process::from_elf_streaming(read_fn)
                 } else {
+                    crate::console_println!("[init] xbot-cli-static not on ext4, falling back to shell");
                     process::Process::from_elf(include_bytes!("../../user/shell.elf"))
                 }
             }
@@ -314,14 +297,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     let user_pt_phys = proc.page_table_root << 12;
                     let user_pt = unsafe { &mut *(user_pt_phys as *mut crate::mm::vmm::PageTable) };
                     let page_addr = proc.entry & !0xFFF;
-                    if let Some(paddr) = crate::mm::vmm::translate_user(user_pt, page_addr) {
-                        crate::console_println!(
-                            "[init] Entry page {:#x} → phys {:#x}, first byte={:#x}",
-                            page_addr,
-                            paddr,
-                            unsafe { *((paddr + (proc.entry & 0xFFF)) as *const u8) }
-                        );
-                    } else {
+                    if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
                         crate::console_println!(
                             "[init] WARNING: entry {:#x} NOT mapped!",
                             page_addr
@@ -417,63 +393,12 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     };
 
                     crate::console_println!("[init] Entering user mode...");
-                    crate::console_println!(
-                        "[init]   user_cr3={:#x}, ksp={:#x}, usp={:#x}",
-                        user_cr3,
-                        proc.kernel_stack_top,
-                        proc.user_stack_top,
-                    );
-
-                    // Verify GDTR, IDTR, and critical pages mapped in user page table
-                    {
-                        let user_pt = crate::process::get_user_page_table(proc.page_table_root);
-
-                        // Read GDTR and IDTR base addresses
-                        let mut gdtr: [u16; 5] = [0; 5]; // limit(2) + base(8) = 10 bytes
-                        let mut idtr: [u16; 5] = [0; 5];
-                        unsafe {
-                            core::arch::asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr() as u64);
-                            core::arch::asm!("sidt [{}]", in(reg) idtr.as_mut_ptr() as u64);
-                        }
-                        // GDTR base is bytes [2..10] (little-endian u64)
-                        let gdt_base = unsafe {
-                            let p = gdtr.as_ptr().add(1) as *const u64;
-                            core::ptr::read_volatile(p)
-                        } as usize;
-                        let idt_base = unsafe {
-                            let p = idtr.as_ptr().add(1) as *const u64;
-                            core::ptr::read_volatile(p)
-                        } as usize;
-
-                        let gdt_mapped = crate::mm::vmm::translate_user(user_pt, gdt_base & !0xFFF);
-                        let idt_mapped = crate::mm::vmm::translate_user(user_pt, idt_base & !0xFFF);
-
-                        let entry_page = proc.entry & !0xFFF;
-                        let stack_page = (proc.user_stack_top - 8) & !0xFFF;
-                        let entry_mapped = crate::mm::vmm::translate_user(user_pt, entry_page);
-                        let stack_mapped = crate::mm::vmm::translate_user(user_pt, stack_page);
-                        let kstack_top_page = (proc.kernel_stack_top - 8) & !0xFFF;
-                        let ks_mapped = crate::mm::vmm::translate_user(user_pt, kstack_top_page);
-                        crate::console_println!(
-                            "[init] GDTR={:#x} map={:?}, IDTR={:#x} map={:?}",
-                            gdt_base,
-                            gdt_mapped,
-                            idt_base,
-                            idt_mapped
-                        );
-                        crate::console_println!(
-                            "[init] VERIFY: entry={:#x}->{:?}, stack={:#x}->{:?}, kstack={:#x}->{:?}",
-                            entry_page,
-                            entry_mapped,
-                            stack_page,
-                            stack_mapped,
-                            kstack_top_page,
-                            ks_mapped
-                        );
-                    }
 
                     // Disable interrupts before first_enter_user
                     x86_64::instructions::interrupts::disable();
+
+                    // Initialize SYSCALL kernel stack pointer for Go's syscall instruction
+                    arch::idt::set_syscall_ksp(proc.kernel_stack_top as u64);
 
                     arch::trap::first_enter_user(
                         proc.entry,

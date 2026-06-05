@@ -191,8 +191,12 @@ _start64:
 
     lea boot_stack_top(%rip), %rsp
 
-    xorl %edi, %edi
-    xorl %esi, %esi
+    # Pass multiboot2 info to kmain:
+    #   EDI = multiboot2 magic (from %eax at _start)
+    #   ESI = multiboot2 info physical address (from %ebx at _start)
+    # Clear upper 32 bits to ensure valid 64-bit values.
+    movl %edi, %edi
+    movl %esi, %esi
 
     call kmain
 

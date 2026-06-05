@@ -13,8 +13,10 @@ const MEMORY_START: usize = 0x0020_0000; // 2MB — typical x86_64 kernel load a
 #[cfg(target_arch = "riscv64")]
 const MEMORY_SIZE: usize = 128 * 1024 * 1024; // 128MB
 
+// On x86_64, MEMORY_SIZE is set dynamically from multiboot2 info.
+// See `init_with_size()` below. This constant is only a fallback.
 #[cfg(target_arch = "x86_64")]
-const MEMORY_SIZE: usize = 512 * 1024 * 1024; // 512MB for Go runtime support
+static mut MEMORY_SIZE: usize = 128 * 1024 * 1024; // 128MB default, updated by multiboot2
 
 unsafe extern "C" {
     static _ekernel: u8;
@@ -36,7 +38,11 @@ impl FrameAllocator {
     fn new() -> Self {
         let kernel_end = unsafe { &_ekernel as *const u8 as usize };
         let start = (kernel_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1); // Align up
-        let end = MEMORY_START + MEMORY_SIZE;
+        #[cfg(target_arch = "riscv64")]
+        let mem_size = MEMORY_SIZE;
+        #[cfg(target_arch = "x86_64")]
+        let mem_size = unsafe { MEMORY_SIZE };
+        let end = MEMORY_START + mem_size;
         let total_frames = (end - start) / PAGE_SIZE;
 
         // Calculate bitmap size (in 64-bit words)
@@ -51,6 +57,11 @@ impl FrameAllocator {
         let bitmap =
             unsafe { core::slice::from_raw_parts_mut(bitmap_start as *mut u64, bitmap_words) };
 
+        // Clear the bitmap — all frames start as free
+        for word in bitmap.iter_mut() {
+            *word = 0;
+        }
+
         // Mark bitmap region as used
         let bitmap_frames = (managed_start - start + PAGE_SIZE - 1) / PAGE_SIZE;
         for i in 0..bitmap_frames {
@@ -61,14 +72,32 @@ impl FrameAllocator {
             }
         }
 
-        Self {
+        let allocator = Self {
             start: managed_start,
             end,
             bitmap,
             total_frames: managed_frames,
             next_free: bitmap_frames,
-        }
+        };
+        allocator.debug_init_info(kernel_end, start, managed_start, end);
+        allocator
     }
+
+    #[cfg(debug_assertions)]
+    fn debug_init_info(&self, kernel_end: usize, start: usize, managed_start: usize, end: usize) {
+        crate::console_println!(
+            "[pmm] kernel_end={:#x} start={:#x} managed_start={:#x} end={:#x}",
+            kernel_end, start, managed_start, end
+        );
+        crate::console_println!(
+            "[pmm] total_frames={} managed_frames={} bitmap_words={} bitmap_frames={}",
+            (end - start) / PAGE_SIZE, self.total_frames, 
+            ((end - start) / PAGE_SIZE + 63) / 64,
+            (managed_start - start + PAGE_SIZE - 1) / PAGE_SIZE
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    fn debug_init_info(&self, _a: usize, _b: usize, _c: usize, _d: usize) {}
 
     fn alloc(&mut self) -> Option<usize> {
         // Search from next_free
@@ -146,6 +175,18 @@ pub fn init() {
     let available_mb = allocator.total_frames * PAGE_SIZE / 1024 / 1024;
     *FRAME_ALLOCATOR.lock() = Some(allocator);
     crate::console_println!("[pmm] Initialized: {} MB available", available_mb);
+}
+
+/// Initialize PMM with a specific memory size (x86_64 only).
+/// Called from kmain after parsing multiboot2 info.
+#[cfg(target_arch = "x86_64")]
+pub fn init_with_size(mem_size: usize) {
+    unsafe { MEMORY_SIZE = mem_size; }
+    let allocator = FrameAllocator::new();
+    let available_mb = allocator.total_frames * PAGE_SIZE / 1024 / 1024;
+    *FRAME_ALLOCATOR.lock() = Some(allocator);
+    crate::console_println!("[pmm] Initialized: {} MB available (total RAM: {} MB)",
+        available_mb, mem_size / 1024 / 1024);
 }
 
 pub fn alloc_frame() -> Option<usize> {

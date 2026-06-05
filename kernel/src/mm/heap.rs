@@ -7,9 +7,7 @@ use super::pmm;
 #[global_allocator]
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
 
-// 4MB heap — ext4 filesystem metadata (superblock, block group descriptors,
-// inode tables, extent trees) requires significantly more memory than the
-// previous 1MB allocation.
+// 4MB heap — ext4 filesystem metadata requires significant memory.
 const HEAP_PAGES: usize = 1024; // 1024 * 4KB = 4MB heap
 
 static mut HEAP_START: usize = 0;

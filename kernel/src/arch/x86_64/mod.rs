@@ -15,6 +15,7 @@ pub mod gdt;
 pub mod idt;
 pub mod ioapic;
 pub mod lapic;
+pub mod multiboot2;
 pub mod paging;
 pub mod pci;
 pub mod platform;
