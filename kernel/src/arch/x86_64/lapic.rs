@@ -31,6 +31,8 @@ mod reg {
     pub const LOGICAL_DESTINATION: u64 = 0x0D0;
     pub const DESTINATION_FORMAT: u64 = 0x0E0;
     pub const SPURIOUS_VECTOR: u64 = 0x0F0;
+    // Vector for spurious interrupts — must match IDT[SPURIOUS_VECTOR]
+    // Defined in idt.rs as IRQ_BASE + 7 = 0x27
     pub const ERROR_STATUS: u64 = 0x280;
     pub const LVT_TIMER: u64 = 0x320;
     pub const LVT_THERMAL: u64 = 0x330;
@@ -66,7 +68,10 @@ impl Lapic {
     pub fn init(&self) {
         // Enable LAPIC via the spurious interrupt vector register.
         // Bit 8 = APIC software enable, vector = 0xFF (spurious)
-        self.write(reg::SPURIOUS_VECTOR, 0x1FF);
+        self.write(
+            reg::SPURIOUS_VECTOR,
+            (0x100u32 | crate::arch::idt::SPURIOUS_VECTOR as u32),
+        );
 
         // Mask all LVT entries except Timer (which is configured later).
         // Without this, QEMU may deliver legacy PIC interrupts through LINT0
@@ -146,7 +151,10 @@ unsafe fn lapic_write(offset: u64, value: u32) {
 pub fn init() {
     unsafe {
         // Enable LAPIC via the spurious interrupt vector register.
-        lapic_write(reg::SPURIOUS_VECTOR, 0x1FF);
+        lapic_write(
+            reg::SPURIOUS_VECTOR,
+            (0x100u32 | crate::arch::idt::SPURIOUS_VECTOR as u32),
+        );
     }
 }
 

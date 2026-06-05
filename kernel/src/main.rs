@@ -424,9 +424,30 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                         proc.user_stack_top,
                     );
 
-                    // Verify GDTR, IDTR, and critical pages are mapped in user page table
+                    // Verify GDTR, IDTR, and critical pages mapped in user page table
                     {
                         let user_pt = crate::process::get_user_page_table(proc.page_table_root);
+
+                        // Read GDTR and IDTR base addresses
+                        let mut gdtr: [u16; 5] = [0; 5]; // limit(2) + base(8) = 10 bytes
+                        let mut idtr: [u16; 5] = [0; 5];
+                        unsafe {
+                            core::arch::asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr() as u64);
+                            core::arch::asm!("sidt [{}]", in(reg) idtr.as_mut_ptr() as u64);
+                        }
+                        // GDTR base is bytes [2..10] (little-endian u64)
+                        let gdt_base = unsafe {
+                            let p = gdtr.as_ptr().add(1) as *const u64;
+                            core::ptr::read_volatile(p)
+                        } as usize;
+                        let idt_base = unsafe {
+                            let p = idtr.as_ptr().add(1) as *const u64;
+                            core::ptr::read_volatile(p)
+                        } as usize;
+
+                        let gdt_mapped = crate::mm::vmm::translate_user(user_pt, gdt_base & !0xFFF);
+                        let idt_mapped = crate::mm::vmm::translate_user(user_pt, idt_base & !0xFFF);
+
                         let entry_page = proc.entry & !0xFFF;
                         let stack_page = (proc.user_stack_top - 8) & !0xFFF;
                         let entry_mapped = crate::mm::vmm::translate_user(user_pt, entry_page);
@@ -434,7 +455,14 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                         let kstack_top_page = (proc.kernel_stack_top - 8) & !0xFFF;
                         let ks_mapped = crate::mm::vmm::translate_user(user_pt, kstack_top_page);
                         crate::console_println!(
-                            "[init] VERIFY: entry={:#x}->{:?}, stack={:#x}->{:?}, kstack_top={:#x}->{:?}",
+                            "[init] GDTR={:#x} map={:?}, IDTR={:#x} map={:?}",
+                            gdt_base,
+                            gdt_mapped,
+                            idt_base,
+                            idt_mapped
+                        );
+                        crate::console_println!(
+                            "[init] VERIFY: entry={:#x}->{:?}, stack={:#x}->{:?}, kstack={:#x}->{:?}",
                             entry_page,
                             entry_mapped,
                             stack_page,
