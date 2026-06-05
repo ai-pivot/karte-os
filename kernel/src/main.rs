@@ -244,8 +244,46 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         // ── Load user program ──
         crate::console_println!("[init] Loading user program...");
 
-        // Load init program: shell from embedded bytes.
-        let init_result = { process::Process::from_elf(include_bytes!("../../user/shell.elf")) };
+        // Load init program.
+        // On x86_64: try xbot-cli-static from ext4 (like Linux init=).
+        // Falls back to shell if not found.
+        let init_result = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if crate::driver::ext4::has_ext4() {
+                    match crate::driver::ext4::read_file_range("xbot-cli-static") {
+                        Some(read_fn) => {
+                            crate::console_println!("[init] Loading xbot-cli-static from ext4...");
+                            match crate::process::Process::from_elf_streaming(read_fn) {
+                                Ok(p) => {
+                                    crate::console_println!(
+                                        "[init] xbot-cli-static loaded! entry={:#x}",
+                                        p.entry
+                                    );
+                                    Ok(p)
+                                }
+                                Err(e) => {
+                                    crate::console_println!(
+                                        "[init] xbot-cli-static load failed: {}, using shell",
+                                        e
+                                    );
+                                    process::Process::from_elf(include_bytes!(
+                                        "../../user/shell.elf"
+                                    ))
+                                }
+                            }
+                        }
+                        None => process::Process::from_elf(include_bytes!("../../user/shell.elf")),
+                    }
+                } else {
+                    process::Process::from_elf(include_bytes!("../../user/shell.elf"))
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                process::Process::from_elf(include_bytes!("../../user/shell.elf"))
+            }
+        };
 
         // init (shell) is always loaded from embedded bytes.
         // External programs loaded via `run` will use ext4/FAT32/RamFS.
@@ -308,8 +346,10 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     riscv::register::sstatus::set_sie()
                 };
 
-                #[cfg(target_arch = "x86_64")]
-                x86_64::instructions::interrupts::enable();
+                // On x86_64, do NOT enable interrupts here. The Timer ISR
+                // fires on the boot stack which is too small. Let iretq
+                // restore RFLAGS with IF=1 to atomically enable interrupts
+                // upon entering user mode.
 
                 // Architecture-specific first user entry
                 #[cfg(target_arch = "riscv64")]

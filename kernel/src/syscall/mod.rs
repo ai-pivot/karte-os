@@ -2284,12 +2284,24 @@ fn sys_fork() -> isize {
     let user_pt = crate::mm::vmm::create_user_page_table();
     let parent_ppn = current.page_table_root;
     let parent_pt = crate::process::get_user_page_table(parent_ppn);
+    let page_size = crate::mm::pmm::page_size();
 
-    // Copy kernel mappings
-    crate::process::copy_kernel_mappings(user_pt);
+    // Allocate kernel stack for child BEFORE copy_kernel_mappings
+    let kstack_base_fork = match crate::mm::pmm::alloc_frame() {
+        Some(f) => f,
+        None => return ERR_NOMEM,
+    };
+    for _ in 0..3 {
+        if crate::mm::pmm::alloc_frame().is_none() {
+            return ERR_NOMEM;
+        }
+    }
+    let kernel_stack_top = kstack_base_fork + 4 * page_size;
+
+    // Copy kernel mappings (with kernel stack mapping)
+    crate::process::copy_kernel_mappings(user_pt, kernel_stack_top);
 
     // Copy user page table entries (deep copy physical frames)
-    let page_size = crate::mm::pmm::page_size();
     for vpn in 0..512 {
         let pte = parent_pt.entry(vpn);
         if pte.is_valid() && pte.is_leaf() {
@@ -2312,18 +2324,6 @@ fn sys_fork() -> isize {
             user_pt.set_entry(vpn, new_pte);
         }
     }
-
-    // Allocate kernel stack for child
-    let kstack_base = match crate::mm::pmm::alloc_frame() {
-        Some(f) => f,
-        None => return ERR_NOMEM,
-    };
-    for _ in 0..3 {
-        if crate::mm::pmm::alloc_frame().is_none() {
-            return ERR_NOMEM;
-        }
-    }
-    let kernel_stack_top = kstack_base + 4 * page_size;
 
     let page_table_ppn = (user_pt as *const crate::mm::vmm::PageTable as usize) >> 12;
     let child_pid = crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

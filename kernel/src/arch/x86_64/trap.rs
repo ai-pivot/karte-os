@@ -253,14 +253,9 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3
             // Disable interrupts during the critical iretq sequence.
             "cli",
 
-            // ── Switch to user page table ──
-            // user_cr3 is the physical address of the user PML4 table.
-            // If non-zero, switch CR3 before building the iretq frame.
-            "cmp {cr3}, 0",
-            "je 2f",
-            "mov rax, {cr3}",
-            "mov cr3, rax",       // switch to per-process page table
-            "2:",
+            // ── Build iretq frame FIRST (on current kernel page table) ──
+            // The kernel stack address must be mapped. CR3 switch happens
+            // after the frame is built, right before iretq.
 
             // Use kernel stack to build iretq frame
             "mov rsp, {ksp}",
@@ -272,6 +267,16 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3
             "push 0x202",             // RFLAGS: IF=1, reserved bit 1=1
             "push {cs}",
             "push {entry}",
+
+            // ── Now switch to user page table ──
+            // The iretq frame is already built on the kernel stack.
+            // CR3 switch must happen after frame construction because
+            // the kernel stack may not be mapped in the user page table.
+            "cmp {cr3}, 0",
+            "je 2f",
+            "mov rax, {cr3}",
+            "mov cr3, rax",       // switch to per-process page table
+            "2:",
 
             // Clear all GP registers (prevent kernel data leaks)
             "xor rax, rax",

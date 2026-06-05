@@ -86,7 +86,7 @@ pub struct Process {
 
 /// Copy kernel identity mappings into a user page table.
 /// This is needed so that traps from U-mode can still access kernel code/data.
-pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
+pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_top: usize) {
     #[cfg(target_arch = "riscv64")]
     {
         // Identity map kernel (0x80200000 .. 0x80200000 + 128MB)
@@ -113,18 +113,37 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Map kernel code/data (1MB..512MB) into user page table.
-        // Always map (don't skip) to ensure all kernel pages are accessible
-        // when CR3 is switched to user page table during iretq.
-        vmm::identity_map(user_pt, 0x10_0000, 0x2000_0000, vmm::PTEFlags::KRWX);
+        unsafe extern "C" {
+            static _ekernel: u8;
+        }
+        // Map kernel code/data into user page table.
+        // CRITICAL: only map the actual kernel binary range, NOT the entire
+        // 0x100000-0x20000000 region. Large user programs (e.g. Go binaries)
+        // use virtual addresses >= 0x400000 which would overlap with a broad
+        // identity mapping, causing copy_kernel_mappings to overwrite user
+        // page table entries with kernel identity mappings.
+        let kernel_end = unsafe { &_ekernel as *const u8 as usize };
+        // Round up to page boundary
+        let kernel_end_page = (kernel_end + 4095) & !4095;
+        vmm::identity_map(user_pt, 0x10_0000, kernel_end_page, vmm::PTEFlags::KRWX);
         // Map VGA text buffer at 0xB8000 (2 pages to cover potential overflow)
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xB9000, 0xB9000, vmm::PTEFlags::KRW);
         // Map LAPIC/IOAPIC MMIO
         vmm::map(user_pt, 0xFEE0_0000, 0xFEE0_0000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xFEC0_0000, 0xFEC0_0000, vmm::PTEFlags::KRW);
-        // Map PCI MMIO region
+        // Map PCI MMIO region (AHCI BAR5 is typically in this range)
         vmm::identity_map(user_pt, 0xF000_0000, 0x1_0000_0000, vmm::PTEFlags::KRW);
+
+        // Map kernel stack pages into user page table.
+        // CRITICAL: first_enter_user switches CR3 before iretq. The iretq
+        // frame is built on the kernel stack, so the stack pages MUST be
+        // mapped in the user page table for iretq to read the frame.
+        // Without this, CR3 switch makes the kernel stack inaccessible → PF.
+        let kstack_base = kernel_stack_top - KERNEL_STACK_PAGES * 4096;
+        for addr in (kstack_base..kernel_stack_top).step_by(4096) {
+            vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+        }
     }
 }
 
@@ -141,10 +160,13 @@ impl Process {
         // 2. Create independent user page table
         let user_pt = vmm::create_user_page_table();
 
-        // 3. Load ELF segments into user page table FIRST
-        // (before copy_kernel_mappings, so identity mappings don't interfere)
+        // 3. Allocate kernel stack (needed before copy_kernel_mappings)
+        let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
+            .ok_or("Out of memory for kernel stack")?;
+        let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * pmm::page_size();
 
-        // 4. Load ELF segments into user page table
+        // 4. Load ELF segments into user page table FIRST
+        // (before copy_kernel_mappings, so identity mappings don't interfere)
         let mut max_vaddr = 0usize;
         for segment in &elf.loadable_segments {
             let page_size = pmm::page_size();
@@ -218,7 +240,7 @@ impl Process {
 
         // 4. Copy kernel mappings AFTER loading ELF segments
         // (identity mappings must not interfere with ELF segment mapping)
-        copy_kernel_mappings(user_pt);
+        copy_kernel_mappings(user_pt, kernel_stack_top);
 
         // 5. Map user stack in user page table (URW, no execute)
         for i in 0..USER_STACK_PAGES {
@@ -227,12 +249,7 @@ impl Process {
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 
-        // 6. Allocate kernel stack for this process
-        let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
-            .ok_or("Out of memory for kernel stack")?;
-        let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * pmm::page_size();
-
-        // 7. Store page_table_root as PPN
+        // 6. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
 
         // 8. Set up initial brk (after loaded segments, aligned to page)
@@ -281,6 +298,11 @@ impl Process {
         F: Fn(usize, &mut [u8]) -> Result<usize, ()>,
     {
         let page_size = pmm::page_size();
+
+        // 0. Allocate kernel stack (needed before copy_kernel_mappings)
+        let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
+            .ok_or("Out of memory for kernel stack")?;
+        let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * page_size;
 
         // 1. Read ELF header (first 4096 bytes covers header + program headers)
         let header_size = 4096usize;
@@ -374,7 +396,7 @@ impl Process {
         }
 
         // 5. Copy kernel mappings AFTER loading ELF segments
-        copy_kernel_mappings(user_pt);
+        copy_kernel_mappings(user_pt, kernel_stack_top);
 
         // 6. Map user stack in user page table (URW, no execute)
         for i in 0..USER_STACK_PAGES {
@@ -383,12 +405,7 @@ impl Process {
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 
-        // 7. Allocate kernel stack for this process
-        let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
-            .ok_or("Out of memory for kernel stack")?;
-        let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * page_size;
-
-        // 8. Store page_table_root as PPN
+        // 7. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
 
         // 9. Set up initial brk (after loaded segments, aligned to page)
