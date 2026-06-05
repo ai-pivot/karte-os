@@ -28,8 +28,21 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 /// handler's CPU-pushed iretq frame (RIP, CS, RFLAGS, RSP, SS).
 pub const SYSCALL_IST_INDEX: u16 = 1;
 
+/// IST index for Timer ISR — separate stack so that IOAPIC-routed external
+/// interrupts (keyboard, UART) can nest on TSS.RSP0 without clobbering the
+/// Timer ISR's stack frame.
+pub const TIMER_IST_INDEX: u16 = 2;
+
+/// IST index for external IRQ ISR (keyboard).
+pub const KEYBOARD_IST_INDEX: u16 = 3;
+
+/// IST index for external IRQ ISR (COM1 UART).
+/// Separate from keyboard to prevent IST[3] stack corruption when both
+/// IRQ1 and IRQ4 fire during the same Timer ISR 'sti' window.
+pub const COM1_IST_INDEX: u16 = 4;
+
 /// Number of IST entries we actually use.
-const NUM_IST: usize = 2;
+const NUM_IST: usize = 5;
 
 const IST_STACK_SIZE: usize = 4096 * 8; // 32KB per IST stack
 
@@ -99,6 +112,29 @@ pub fn init_for_cpu(cpu_id: usize) {
                     + IST_STACKS[cpu_id * NUM_IST + 1].len() as u64,
             );
             PER_CPU_TSS[cpu_id].interrupt_stack_table[SYSCALL_IST_INDEX as usize] = sys_stack_top;
+
+            // IST[2]: Timer ISR — prevents IOAPIC-routed IRQs (keyboard, UART)
+            // from clobbering the Timer ISR's stack frame when they nest during
+            // the Timer handler's 'sti'.
+            let timer_stack_top = VirtAddr::new(
+                IST_STACKS[cpu_id * NUM_IST + 2].as_ptr() as u64
+                    + IST_STACKS[cpu_id * NUM_IST + 2].len() as u64,
+            );
+            PER_CPU_TSS[cpu_id].interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack_top;
+
+            // IST[3]: Keyboard handler
+            let kbd_stack_top = VirtAddr::new(
+                IST_STACKS[cpu_id * NUM_IST + 3].as_ptr() as u64
+                    + IST_STACKS[cpu_id * NUM_IST + 3].len() as u64,
+            );
+            PER_CPU_TSS[cpu_id].interrupt_stack_table[KEYBOARD_IST_INDEX as usize] = kbd_stack_top;
+
+            // IST[4]: COM1 UART handler
+            let com1_stack_top = VirtAddr::new(
+                IST_STACKS[cpu_id * NUM_IST + 4].as_ptr() as u64
+                    + IST_STACKS[cpu_id * NUM_IST + 4].len() as u64,
+            );
+            PER_CPU_TSS[cpu_id].interrupt_stack_table[COM1_IST_INDEX as usize] = com1_stack_top;
         }
 
         let mut gdt = GlobalDescriptorTable::new();

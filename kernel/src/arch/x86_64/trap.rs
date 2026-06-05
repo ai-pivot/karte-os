@@ -199,12 +199,17 @@ pub unsafe extern "C" fn trap_return_user() {
     }
 }
 
-/// Initialize trap handling: set up GDT, IDT, and configure the LAPIC.
+/// Initialize trap handling: set up GDT, IDT, LAPIC, then IOAPIC.
 pub fn init() {
     // GDT must be initialized before IDT (TSS selector needed for double fault IST)
     super::gdt::init();
     super::idt::init();
+    // LAPIC must be initialized first so it can handle interrupts.
     super::lapic::init();
+    // IOAPIC routes external IRQs to LAPIC vectors.
+    // Must come after LAPIC init so the LAPIC can accept the redirected IRQs.
+    super::ioapic::init();
+    // Enable LAPIC timer last — now both LAPIC and IOAPIC are ready.
     super::lapic::enable_timer();
 }
 
@@ -233,6 +238,10 @@ pub fn set_next_timer() {
 pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3: u64) -> ! {
     let user_cs = super::gdt::USER_CODE_SEL.load(Ordering::Relaxed) as u64;
     let user_ss = super::gdt::USER_DATA_SEL.load(Ordering::Relaxed) as u64;
+
+    // NOTE: Do NOT call console_println! here — it clobbers stack-local
+    // variables (entry, user_sp, kernel_sp, user_cr3) which are needed
+    // for the inline asm below.
 
     // Set TSS.RSP0 so Ring 3 → Ring 0 interrupts use the kernel stack
     unsafe {

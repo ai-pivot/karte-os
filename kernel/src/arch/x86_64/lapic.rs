@@ -67,6 +67,15 @@ impl Lapic {
         // Enable LAPIC via the spurious interrupt vector register.
         // Bit 8 = APIC software enable, vector = 0xFF (spurious)
         self.write(reg::SPURIOUS_VECTOR, 0x1FF);
+
+        // Mask all LVT entries except Timer (which is configured later).
+        // Without this, QEMU may deliver legacy PIC interrupts through LINT0
+        // with vector 0 (unhandled) → GP Fault → Double Fault.
+        self.write(reg::LVT_LINT0, 1 << 16); // Mask LINT0
+        self.write(reg::LVT_LINT1, 1 << 16); // Mask LINT1 (NMI)
+        self.write(reg::LVT_ERROR, 1 << 16); // Mask error
+        self.write(reg::LVT_PERF, 1 << 16); // Mask performance counter
+        self.write(reg::LVT_THERMAL, 1 << 16); // Mask thermal
     }
 
     /// Set up the LAPIC timer for periodic interrupts.

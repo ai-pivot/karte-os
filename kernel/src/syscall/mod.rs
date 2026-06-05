@@ -132,6 +132,10 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         TIMER_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
         crate::arch::trap::enable_timer_interrupt();
         crate::arch::trap::set_next_timer();
+        // Unmask external IRQs (keyboard, UART) via IOAPIC now that the
+        // user program is running and can handle them safely.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::ioapic::unmask_external_irqs();
     }
 
     // Try Linux compat layer first.

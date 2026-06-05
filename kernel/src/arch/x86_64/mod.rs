@@ -13,6 +13,7 @@ pub mod console;
 pub mod emergency_stack;
 pub mod gdt;
 pub mod idt;
+pub mod ioapic;
 pub mod lapic;
 pub mod paging;
 pub mod pci;

@@ -59,8 +59,17 @@ impl ComPort {
         unsafe {
             let mut lsr = Port::<u8>::new(self.base + 5);
             let mut data = Port::<u8>::new(self.base);
-            // Wait until THR is empty (bit 5 of LSR)
-            while lsr.read() & 0x20 == 0 {}
+            // Wait until THR is empty (bit 5 of LSR), but with a timeout.
+            // If the output buffer is full (e.g., PTY not being read), we must
+            // not deadlock the kernel. Spin up to ~1M iterations then drop.
+            let mut timeout = 1_000_000u32;
+            while lsr.read() & 0x20 == 0 {
+                timeout -= 1;
+                if timeout == 0 {
+                    return; // Drop character to avoid deadlock
+                }
+                core::hint::spin_loop();
+            }
             data.write(c);
         }
     }

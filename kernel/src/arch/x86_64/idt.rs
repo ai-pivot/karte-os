@@ -140,7 +140,7 @@ core::arch::global_asm!(
     "push r15",
     "mov rdi, rsp",
     "call timer_trap_handler",
-    "call lapic_local_eoi",
+    // EOI is already sent inside timer_trap_handler (before schedule/sti)
     "pop r15",
     "pop r14",
     "pop r13",
@@ -251,6 +251,13 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     let _ = ctx;
+
+    // Send EOI early — before any 'sti' that might allow nested interrupts.
+    // If we don't EOI before schedule(), the LAPIC will see the timer vector
+    // as still in-service and may deliver another timer interrupt on 'sti',
+    // causing nested Timer ISR on the same IST stack.
+    super::lapic::local_eoi();
+
     crate::driver::tty::poll_uart();
     crate::arch::platform::tick_uptime();
     super::lapic::set_next_timer();
@@ -421,15 +428,81 @@ extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
     );
 }
 
-extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
-    let scancode: u8 = unsafe { x86_64::instructions::port::Port::new(0x60).read() };
-    crate::driver::keyboard::handle_scancode(scancode);
-    super::lapic::local_eoi();
+/// Naked stub for keyboard ISR (IRQ1). Uses IST[3] for stack isolation.
+/// Written as naked function because `extern "x86-interrupt"` with `patch_ist_index`
+/// can cause stack corruption on `iretq`.
+unsafe extern "C" fn keyboard_isr_stub() {
+    core::arch::asm!(
+        // Save callee-saved registers
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push rbp",
+        "push rbx",
+        // Read scancode from PS/2 data port
+        "xor rax, rax",
+        "in al, 0x60",
+        "mov rdi, rax",
+        "call {handle}",
+        // Send EOI
+        "call {eoi}",
+        // Restore and return
+        "pop rbx",
+        "pop rbp",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "iretq",
+        handle = sym crate::driver::keyboard::handle_scancode,
+        eoi = sym super::lapic::local_eoi,
+        options(noreturn)
+    );
 }
 
-extern "x86-interrupt" fn com1_handler(_frame: InterruptStackFrame) {
-    crate::driver::tty::poll_uart();
-    super::lapic::local_eoi();
+/// Naked stub for COM1 UART ISR (IRQ4). Uses IST[4] for stack isolation.
+unsafe extern "C" fn com1_isr_stub() {
+    core::arch::asm!(
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push rbp",
+        "push rbx",
+        // Handle UART: drain ALL interrupt types to prevent interrupt storm.
+        // Read IIR to identify interrupt type, then handle accordingly.
+        "mov dx, 0x3FA",       // IIR (Interrupt Identification Register)
+        "in al, dx",
+        "test al, 1",
+        "jnz 3f",              // No pending interrupt → skip
+        // Check interrupt type (bits 3:1)
+        "and al, 0x0E",
+        "cmp al, 0x04",        // Received Data Available
+        "jne 4f",
+        "call {poll}",         // Handle received data
+        "jmp 5f",
+        "4:",
+        // Other interrupt types (Line Status, Modem Status, TX empty):
+        // Read the corresponding register to clear the interrupt condition.
+        "mov dx, 0x3FD",       // LSR (Line Status Register)
+        "in al, dx",
+        "mov dx, 0x3FE",       // MSR (Modem Status Register)
+        "in al, dx",
+        "5:",
+        "3:",
+        "call {eoi}",
+        "pop rbx",
+        "pop rbp",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "iretq",
+        poll = sym crate::driver::tty::poll_uart,
+        eoi = sym super::lapic::local_eoi,
+        options(noreturn)
+    );
 }
 
 extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
@@ -440,17 +513,41 @@ fn set_naked_handler(
     entry: &mut x86_64::structures::idt::Entry<x86_64::structures::idt::HandlerFunc>,
     addr: usize,
     attr: u64,
+    ist_index: u16,
 ) {
+    // Hardware IST: 0 = no IST, 1-7 = table[0-6].
+    // Software IST (0-based, same as x86_64 crate's set_stack_index): 0-6.
+    // Convert: hardware = software + 1.
+    let hw_ist = (ist_index + 1) & 0x7;
+    let attr_with_ist = (attr & !(0x7)) | hw_ist as u64;
+
     let selector: u64 = 0x0008;
     let lo = ((addr as u64 & 0xFFFF) << 0)
         | (selector << 16)
-        | (attr << 32)
+        | (attr_with_ist << 32)
         | (((addr as u64 >> 16) & 0xFFFF) << 48);
     let hi = (addr as u64 >> 32) & 0xFFFFFFFF;
     unsafe {
         let ptr = entry as *mut _ as *mut u64;
         *ptr = lo;
         *ptr.add(1) = hi;
+    }
+}
+
+/// Patch the IST index in an IDT entry (bits 32..34 of the low 64-bit word).
+/// Uses 0-based software IST index (same as x86_64 crate's set_stack_index).
+fn patch_ist_index(
+    entry: &mut x86_64::structures::idt::Entry<x86_64::structures::idt::HandlerFunc>,
+    ist_index: u16,
+) {
+    // Convert software index (0-based) to hardware IST value (1-based).
+    let hw_ist = ((ist_index + 1) & 0x7) as u64;
+    unsafe {
+        let ptr = entry as *mut _ as *mut u64;
+        let mut lo = *ptr;
+        lo &= !(0x7 << 32); // Clear IST bits [34:32]
+        lo |= hw_ist << 32; // Set new IST index (hardware value)
+        *ptr = lo;
     }
 }
 
@@ -469,22 +566,40 @@ pub fn init() {
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
-        // Timer: naked ISR with CR3 switch
+        // Timer: naked ISR with CR3 switch, using software IST index 2
+        // (hardware IST=3 → TSS interrupt_stack_table[2])
         set_naked_handler(
             &mut idt[TIMER_VECTOR],
             timer_isr_stub as *const () as usize,
-            0x8E00,
+            0x8E00,                      // Base attributes (64-bit interrupt gate, DPL=0, P=1)
+            super::gdt::TIMER_IST_INDEX, // Software IST index 2
         );
-        idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_handler);
-        idt[COM1_VECTOR].set_handler_fn(com1_handler);
+
+        // Keyboard (IRQ1): naked ISR with IST[3]
+        set_naked_handler(
+            &mut idt[KEYBOARD_VECTOR],
+            keyboard_isr_stub as *const () as usize,
+            0x8E00,                         // 64-bit interrupt gate, DPL=0, P=1
+            super::gdt::KEYBOARD_IST_INDEX, // Software IST index 3
+        );
+
+        // COM1 UART (IRQ4): naked ISR with IST[4]
+        set_naked_handler(
+            &mut idt[COM1_VECTOR],
+            com1_isr_stub as *const () as usize,
+            0x8E00,
+            super::gdt::COM1_IST_INDEX, // Software IST index 4
+        );
+
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
-        // Syscall (int 0x80): DPL=3
-        // Syscall (int 0x80): DPL=3, IST[1] to isolate from Timer ISR nesting
+        // Syscall (int 0x80): DPL=3, using software IST index 1
+        // (hardware IST=2 → TSS interrupt_stack_table[1])
         set_naked_handler(
             &mut idt[SYSCALL_VECTOR],
             syscall_isr_stub as *const () as usize,
-            0xEE01, // IST index = SYSCALL_IST_INDEX = 1
+            0xEE00, // Base attributes (DPL=3, 64-bit interrupt gate, P=1)
+            super::gdt::SYSCALL_IST_INDEX, // Software IST index 1
         );
 
         idt
