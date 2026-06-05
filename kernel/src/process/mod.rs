@@ -303,6 +303,11 @@ impl Process {
         let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
             .ok_or("Out of memory for kernel stack")?;
         let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * page_size;
+        crate::console_println!(
+            "[elf] kstack_base={:#x} kstack_top={:#x}",
+            kstack_base,
+            kernel_stack_top
+        );
 
         // 1. Read ELF header (first 4096 bytes covers header + program headers)
         let header_size = 4096usize;
@@ -327,6 +332,17 @@ impl Process {
             let page_start = seg_vaddr_start & !(page_size - 1);
             let page_end = (seg_vaddr_end + page_size - 1) & !(page_size - 1);
             let is_executable = seg.flags & 1 != 0; // PF_X
+            let num_pages = (page_end - page_start) / page_size;
+            crate::console_println!(
+                "[elf] seg {}: vaddr={:#x}-{:#x} pages={} filesz={:#x} memsz={:#x} flags={:#x}",
+                seg_idx,
+                seg_vaddr_start,
+                seg_vaddr_end,
+                num_pages,
+                seg.file_size,
+                seg.mem_size,
+                seg.flags
+            );
 
             for vaddr in (page_start..page_end).step_by(page_size) {
                 // Check if already mapped (multiple segments may share a page)

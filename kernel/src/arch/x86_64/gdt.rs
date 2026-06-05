@@ -41,8 +41,12 @@ pub const KEYBOARD_IST_INDEX: u16 = 3;
 /// IRQ1 and IRQ4 fire during the same Timer ISR 'sti' window.
 pub const COM1_IST_INDEX: u16 = 4;
 
+/// IST index for Page Fault handler — uses dedicated stack and CR3 switch
+/// so that kernel data structures are accessible during page fault handling.
+pub const PAGE_FAULT_IST_INDEX: u16 = 5;
+
 /// Number of IST entries we actually use.
-const NUM_IST: usize = 5;
+const NUM_IST: usize = 6;
 
 const IST_STACK_SIZE: usize = 4096 * 8; // 32KB per IST stack
 
@@ -135,6 +139,13 @@ pub fn init_for_cpu(cpu_id: usize) {
                     + IST_STACKS[cpu_id * NUM_IST + 4].len() as u64,
             );
             PER_CPU_TSS[cpu_id].interrupt_stack_table[COM1_IST_INDEX as usize] = com1_stack_top;
+
+            // IST[5]: Page Fault handler
+            let pf_stack_top = VirtAddr::new(
+                IST_STACKS[cpu_id * NUM_IST + 5].as_ptr() as u64
+                    + IST_STACKS[cpu_id * NUM_IST + 5].len() as u64,
+            );
+            PER_CPU_TSS[cpu_id].interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = pf_stack_top;
         }
 
         let mut gdt = GlobalDescriptorTable::new();
@@ -153,6 +164,14 @@ pub fn init_for_cpu(cpu_id: usize) {
         USER_CODE_SEL.store(user_code.0, Ordering::Relaxed);
         USER_DATA_SEL.store(user_data.0, Ordering::Relaxed);
         KCODE_SEL.store(code.0, Ordering::Relaxed);
+        crate::console_println!(
+            "[GDT] code={:#x} data={:#x} user_code={:#x} user_data={:#x} tss={:#x}",
+            code.0,
+            data.0,
+            user_code.0,
+            user_data.0,
+            tss.0
+        );
 
         PerCpuGdt {
             gdt,

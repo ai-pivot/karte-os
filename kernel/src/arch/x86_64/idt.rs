@@ -14,6 +14,7 @@ pub const TIMER_VECTOR: u8 = IRQ_BASE + 0;
 pub const KEYBOARD_VECTOR: u8 = IRQ_BASE + 1;
 pub const COM1_VECTOR: u8 = IRQ_BASE + 4;
 pub const SPURIOUS_VECTOR: u8 = IRQ_BASE + 7;
+pub const PAGE_FAULT_VECTOR: u8 = 14; // CPU exception vector for #PF
 
 // ─── MSR constants for SYSCALL/SYSRET ─────────────────────────
 const MSR_STAR: u32 = 0xC000_281;
@@ -320,10 +321,27 @@ extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _err: u64) -> ! {
-    panic!(
-        "[EXCEPTION] Double Fault at {:#x}",
-        frame.instruction_pointer.as_u64()
+    // Switch to kernel CR3 for reliable output
+    let saved_cr3 = x86_64::registers::control::Cr3::read();
+    let kcr3 = crate::mm::vmm::kernel_cr3();
+    if kcr3 != 0 {
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) kcr3);
+        }
+    }
+    let ip = frame.instruction_pointer.as_u64();
+    let sp = frame.stack_pointer.as_u64();
+    let cs = frame.code_segment.0 as u64;
+    let ss = frame.stack_segment.0 as u64;
+    crate::console_println!(
+        "[DF] IP={:#x} SP={:#x} CS={:#x} SS={:#x} err={:#x}",
+        ip,
+        sp,
+        cs,
+        ss,
+        _err
     );
+    loop {}
 }
 
 extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64) {
@@ -341,83 +359,163 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
     }
 }
 
-extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, _err: PageFaultErrorCode) {
+/// Naked stub for Page Fault handler (vector 14).
+/// Switches to kernel CR3 immediately because the PF handler must access
+/// kernel data structures that may not be mapped in the user page table.
+/// Without this, a PF from Ring 3 → Ring 0 runs under user CR3 →
+/// accessing kernel data → nested PF → Double Fault.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn page_fault_isr_stub() {
+    core::arch::asm!(
+        // CPU has already pushed: error_code, RIP, CS, RFLAGS, RSP, SS
+        // Save all GP registers
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        // Don't need to save callee-saved (rbx, rbp, r12-r15) since
+        // page_fault_handler_body doesn't modify them
+
+        // ── Switch to kernel CR3 ──
+        "mov rax, cr3",
+        "push rax",                    // save user CR3 on stack
+        "mov rax, {kcr3}",
+        "cmp rax, 0",
+        "je 5f",
+        "mov cr3, rax",                // switch to kernel page table
+        "5:",
+
+        // Call Rust handler body
+        // RDI = pointer to InterruptStackFrame (skip our saved regs)
+        // RSI = error code (at RSP + 10*8 from our pushes + saved CR3)
+        "mov rdi, rsp",
+        "add rdi, 11*8",               // skip 10 saved regs + saved CR3 → points to error_code
+        "mov rsi, [rdi]",              // error code
+        "add rdi, 8",                  // skip error code → InterruptStackFrame
+        "call {body}",
+
+        // ── Restore user CR3 ──
+        "pop rax",
+        "mov cr3, rax",
+
+        // Restore GP registers
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "add rsp, 8",                  // skip error code
+        "iretq",
+        kcr3 = sym crate::mm::vmm::kernel_cr3,
+        body = sym page_fault_handler_body,
+        options(noreturn)
+    );
+}
+
+/// Page fault handler body (called from naked stub with kernel CR3).
+#[cfg(target_arch = "x86_64")]
+fn page_fault_handler_body(frame: &InterruptStackFrame, _error_code: u64) {
+    // CR3 already switched to kernel by naked stub.
     let fault_addr = x86_64::registers::control::Cr2::read();
     let fault_addr_val = fault_addr.map(|a| a.as_u64()).unwrap_or(0) as usize;
     let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
     let page_size = crate::mm::pmm::page_size();
     let page_addr = fault_addr_val & !(page_size - 1);
 
-    // Try lazy allocation for heap
-    if from_user
-        && fault_addr_val >= crate::process::USER_HEAP_BASE
-        && fault_addr_val < crate::process::USER_HEAP_LIMIT
-    {
-        let user_pt = super::trap::get_current_user_pt();
-        if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
-            if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                unsafe {
-                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                }
-                crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                super::trap::flush_tlb_addr(page_addr);
-                let new_brk = page_addr + page_size;
-                if new_brk > crate::process::current_brk() {
-                    crate::process::set_current_brk(new_brk);
-                }
-                return;
-            }
-        }
-        return;
-    }
-
-    // Try lazy allocation for stack
-    if from_user
-        && fault_addr_val >= crate::process::USER_STACK_BASE
-        && fault_addr_val < crate::process::USER_STACK_TOP
-    {
-        let user_pt = super::trap::get_current_user_pt();
-        if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
-            if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                unsafe {
-                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                }
-                crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                super::trap::flush_tlb_addr(page_addr);
-                return;
-            }
-        }
-        return;
-    }
-
-    // Try lazy allocation for mmap region
-    if from_user
-        && fault_addr_val >= crate::process::USER_MMAP_BASE
-        && fault_addr_val < crate::process::USER_MMAP_LIMIT
-    {
-        let user_pt = super::trap::get_current_user_pt();
-        if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
-            if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                unsafe {
-                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                }
-                crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                super::trap::flush_tlb_addr(page_addr);
-                return;
-            }
-        }
-        return;
-    }
-
+    // Debug: log page fault
     crate::console_println!(
-        "[EXCEPTION] Page Fault at {:#x}, accessing {:#x}",
-        frame.instruction_pointer.as_u64(),
-        fault_addr_val
+        "[PF] addr={:#x} page={:#x} user={} ip={:#x}",
+        fault_addr_val,
+        page_addr,
+        from_user,
+        frame.instruction_pointer.as_u64()
     );
-    if from_user {
-        crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
-    } else {
-        loop {}
+
+    let handled = 'handler: {
+        // Try lazy allocation for heap
+        if from_user
+            && fault_addr_val >= crate::process::USER_HEAP_BASE
+            && fault_addr_val < crate::process::USER_HEAP_LIMIT
+        {
+            let user_pt = super::trap::get_current_user_pt();
+            if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                    unsafe {
+                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    }
+                    crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
+                    super::trap::flush_tlb_addr(page_addr);
+                    let new_brk = page_addr + page_size;
+                    if new_brk > crate::process::current_brk() {
+                        crate::process::set_current_brk(new_brk);
+                    }
+                    break 'handler true;
+                }
+            }
+            break 'handler true;
+        }
+
+        // Try lazy allocation for stack
+        if from_user
+            && fault_addr_val >= crate::process::USER_STACK_BASE
+            && fault_addr_val < crate::process::USER_STACK_TOP
+        {
+            let user_pt = super::trap::get_current_user_pt();
+            if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                    unsafe {
+                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    }
+                    crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
+                    super::trap::flush_tlb_addr(page_addr);
+                    break 'handler true;
+                }
+            }
+            break 'handler true;
+        }
+
+        // Try lazy allocation for mmap region
+        if from_user
+            && fault_addr_val >= crate::process::USER_MMAP_BASE
+            && fault_addr_val < crate::process::USER_MMAP_LIMIT
+        {
+            let user_pt = super::trap::get_current_user_pt();
+            if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                    unsafe {
+                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    }
+                    crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
+                    super::trap::flush_tlb_addr(page_addr);
+                    break 'handler true;
+                }
+            }
+            break 'handler true;
+        }
+
+        false
+    };
+
+    if !handled {
+        crate::console_println!(
+            "[EXCEPTION] Page Fault at {:#x}, accessing {:#x}",
+            frame.instruction_pointer.as_u64(),
+            fault_addr_val
+        );
+        if from_user {
+            crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
+        } else {
+            loop {}
+        }
     }
 }
 
@@ -534,6 +632,33 @@ fn set_naked_handler(
     }
 }
 
+/// Same as set_naked_handler but for IDT entries that push an error code
+/// (e.g., Page Fault #PF, Double Fault #DF, General Protection #GP).
+/// Set a naked handler on any IDT entry (raw pointer version).
+/// Works for both error-code and non-error-code entries since the
+/// IDT entry format is identical — only the handler code differs.
+unsafe fn set_naked_handler_raw(
+    entry: *mut u128, // raw pointer to IDT entry (128 bits)
+    addr: usize,
+    attr: u64,
+    ist_index: u16,
+) {
+    let hw_ist = (ist_index + 1) & 0x7;
+    let attr_with_ist = (attr & !(0x7)) | hw_ist as u64;
+
+    let selector: u64 = 0x0008;
+    let lo = ((addr as u64 & 0xFFFF) << 0)
+        | (selector << 16)
+        | (attr_with_ist << 32)
+        | (((addr as u64 >> 16) & 0xFFFF) << 48);
+    let hi = (addr as u64 >> 32) & 0xFFFFFFFF;
+    unsafe {
+        let ptr = entry as *mut u64;
+        *ptr = lo;
+        *ptr.add(1) = hi;
+    }
+}
+
 /// Patch the IST index in an IDT entry (bits 32..34 of the low 64-bit word).
 /// Uses 0-based software IST index (same as x86_64 crate's set_stack_index).
 fn patch_ist_index(
@@ -563,7 +688,16 @@ pub fn init() {
         }
         idt.general_protection_fault
             .set_handler_fn(gp_fault_handler);
-        idt.page_fault.set_handler_fn(page_fault_handler);
+        // Page Fault: naked ISR with immediate CR3 switch
+        // Use raw pointer since idt.page_fault has specific error code type
+        unsafe {
+            set_naked_handler_raw(
+                &mut idt.page_fault as *mut _ as *mut u128,
+                page_fault_isr_stub as *const () as usize,
+                0x8E00,                           // 64-bit interrupt gate, DPL=0, P=1
+                super::gdt::PAGE_FAULT_IST_INDEX, // Use dedicated IST
+            );
+        }
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
         // Timer: naked ISR with CR3 switch, using software IST index 2

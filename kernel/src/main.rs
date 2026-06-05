@@ -403,10 +403,31 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
                     crate::console_println!("[init] Entering user mode...");
                     crate::console_println!(
-                        "[init]   user_cr3={:#x}, page_table_ppn={:#x}",
+                        "[init]   user_cr3={:#x}, ksp={:#x}, usp={:#x}",
                         user_cr3,
-                        proc.page_table_root
+                        proc.kernel_stack_top,
+                        proc.user_stack_top,
                     );
+
+                    // Verify critical pages are mapped in user page table
+                    {
+                        let user_pt = crate::process::get_user_page_table(proc.page_table_root);
+                        let entry_page = proc.entry & !0xFFF;
+                        let stack_page = (proc.user_stack_top - 8) & !0xFFF;
+                        let entry_mapped = crate::mm::vmm::translate_user(user_pt, entry_page);
+                        let stack_mapped = crate::mm::vmm::translate_user(user_pt, stack_page);
+                        let jmp_target_page = 0x492000usize;
+                        let jmp_mapped = crate::mm::vmm::translate_user(user_pt, jmp_target_page);
+                        crate::console_println!(
+                            "[init] VERIFY: entry_page={:#x}->{:?}, stack_page={:#x}->{:?}, jmp_target={:#x}->{:?}",
+                            entry_page,
+                            entry_mapped,
+                            stack_page,
+                            stack_mapped,
+                            jmp_target_page,
+                            jmp_mapped
+                        );
+                    }
 
                     // Disable interrupts before first_enter_user to prevent timer ISR
                     // from interfering with the context switch sequence.
@@ -414,7 +435,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
                     arch::trap::first_enter_user(
                         proc.entry,
-                        proc.user_stack_top,
+                        proc.user_stack_top - 8, // RSP must point into mapped stack region
                         proc.kernel_stack_top,
                         user_cr3,
                     );

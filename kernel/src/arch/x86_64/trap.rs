@@ -270,13 +270,16 @@ pub fn first_enter_user(entry: usize, user_sp: usize, kernel_sp: usize, user_cr3
 
             // ── Now switch to user page table ──
             // The iretq frame is already built on the kernel stack.
-            // CR3 switch must happen after frame construction because
-            // the kernel stack may not be mapped in the user page table.
             "cmp {cr3}, 0",
             "je 2f",
             "mov rax, {cr3}",
             "mov cr3, rax",       // switch to per-process page table
             "2:",
+
+            // Debug: output 'A' to COM1 before iretq
+            "mov dx, 0x3f8",
+            "mov al, 0x41",
+            "out dx, al",
 
             // Clear all GP registers (prevent kernel data leaks)
             "xor rax, rax",
