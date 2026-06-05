@@ -267,15 +267,12 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         let init_result = {
             #[cfg(target_arch = "x86_64")]
             {
-                // Try xbot-cli-static from ext4 first (streaming to avoid 68MB heap alloc),
-                // fallback to shell.elf
-                if let Some(read_fn) = crate::driver::ext4::read_file_range("/xbot-cli-static") {
-                    crate::console_println!("[init] Loading xbot-cli-static from ext4 (streaming)");
-                    process::Process::from_elf_streaming(read_fn)
-                } else {
-                    crate::console_println!("[init] xbot-cli-static not on ext4, falling back to shell");
-                    process::Process::from_elf(include_bytes!("../../user/shell.elf"))
+                // Shell is always the init process. xbot-cli-static and other
+                // programs are loaded from ext4 at runtime via shell's exec command.
+                if crate::driver::ext4::has_ext4() {
+                    crate::console_println!("[init] ext4 ready, xbot-cli-static available for exec");
                 }
+                process::Process::from_elf(include_bytes!("../../user/shell.elf"))
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
