@@ -251,6 +251,21 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             #[cfg(target_arch = "x86_64")]
             {
                 if crate::driver::ext4::has_ext4() {
+                    // Verify heap mapping in kernel PT
+                    {
+                        let kpt = crate::mm::vmm::get_kernel_page_table();
+                        let hs = crate::mm::heap::heap_start();
+                        let he = hs + crate::mm::heap::heap_size();
+                        let s = crate::mm::vmm::translate_user(kpt, hs & !0xFFF);
+                        let e = crate::mm::vmm::translate_user(kpt, (he - 1) & !0xFFF);
+                        crate::console_println!(
+                            "[init] Kernel PT heap {:#x}-{:#x}: start={:?} end={:?}",
+                            hs,
+                            he,
+                            s,
+                            e
+                        );
+                    }
                     match crate::driver::ext4::read_file_range("xbot-cli-static") {
                         Some(read_fn) => {
                             crate::console_println!("[init] Loading xbot-cli-static from ext4...");
@@ -409,28 +424,27 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                         proc.user_stack_top,
                     );
 
-                    // Verify critical pages are mapped in user page table
+                    // Verify GDTR, IDTR, and critical pages are mapped in user page table
                     {
                         let user_pt = crate::process::get_user_page_table(proc.page_table_root);
                         let entry_page = proc.entry & !0xFFF;
                         let stack_page = (proc.user_stack_top - 8) & !0xFFF;
                         let entry_mapped = crate::mm::vmm::translate_user(user_pt, entry_page);
                         let stack_mapped = crate::mm::vmm::translate_user(user_pt, stack_page);
-                        let jmp_target_page = 0x492000usize;
-                        let jmp_mapped = crate::mm::vmm::translate_user(user_pt, jmp_target_page);
+                        let kstack_top_page = (proc.kernel_stack_top - 8) & !0xFFF;
+                        let ks_mapped = crate::mm::vmm::translate_user(user_pt, kstack_top_page);
                         crate::console_println!(
-                            "[init] VERIFY: entry_page={:#x}->{:?}, stack_page={:#x}->{:?}, jmp_target={:#x}->{:?}",
+                            "[init] VERIFY: entry={:#x}->{:?}, stack={:#x}->{:?}, kstack_top={:#x}->{:?}",
                             entry_page,
                             entry_mapped,
                             stack_page,
                             stack_mapped,
-                            jmp_target_page,
-                            jmp_mapped
+                            kstack_top_page,
+                            ks_mapped
                         );
                     }
 
-                    // Disable interrupts before first_enter_user to prevent timer ISR
-                    // from interfering with the context switch sequence.
+                    // Disable interrupts before first_enter_user
                     x86_64::instructions::interrupts::disable();
 
                     arch::trap::first_enter_user(

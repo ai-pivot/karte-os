@@ -36,6 +36,7 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
 
 /// Cached physical address of the kernel page table root.
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
 static mut KERNEL_CR3: u64 = 0;
 
 /// Kernel stack pointer for SYSCALL fast entry.

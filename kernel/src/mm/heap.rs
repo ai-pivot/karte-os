@@ -12,6 +12,16 @@ static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
 // previous 1MB allocation.
 const HEAP_PAGES: usize = 1024; // 1024 * 4KB = 4MB heap
 
+static mut HEAP_START: usize = 0;
+static mut HEAP_SIZE: usize = 0;
+
+pub fn heap_start() -> usize {
+    unsafe { HEAP_START }
+}
+pub fn heap_size() -> usize {
+    unsafe { HEAP_SIZE }
+}
+
 pub fn init() {
     // Allocate contiguous physical pages for the buddy allocator.
     // We use the PMM's contiguous allocator to guarantee physical continuity,
@@ -20,6 +30,8 @@ pub fn init() {
         .expect("Failed to allocate contiguous heap memory");
 
     unsafe {
+        HEAP_START = heap_start;
+        HEAP_SIZE = HEAP_PAGES * pmm::page_size();
         HEAP_ALLOCATOR
             .lock()
             .init(heap_start, HEAP_PAGES * pmm::page_size());
