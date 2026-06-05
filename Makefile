@@ -39,10 +39,11 @@ KERNEL_X86   := target/$(TARGET_X86)/release/karte-os-kernel
 ISO_DIR      := target/x86_64-iso
 ISO_FILE     := target/karte-os-x86_64.iso
 QEMU_X86_FLAGS := \
-  -machine pc -cpu qemu64 -nographic -m 128M -smp 1 \
-  -cdrom $(ISO_FILE) -no-reboot \
+  -machine pc -cpu qemu64 -m 128M -smp 1 \
+  -cdrom $(ISO_FILE) -serial stdio -display none -no-reboot \
   -drive file=disk.img,format=raw,if=none,id=hd0 \
-  -device virtio-blk-pci,drive=hd0
+  -device ich9-ahci,id=ahci \
+  -device ide-hd,drive=hd0,bus=ahci.0
 
 # ═══════════════════════════════════════════════════════════════
 #  Disk image (auto-created if missing)
