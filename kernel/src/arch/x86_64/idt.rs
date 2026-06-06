@@ -18,10 +18,13 @@ pub const PAGE_FAULT_VECTOR: u8 = 14; // CPU exception vector for #PF
 
 // ─── MSR constants for SYSCALL/SYSRET ─────────────────────────
 const MSR_EFER: u32 = 0xC000_0080;
-const MSR_STAR: u32 = 0xC000_281;
-const MSR_LSTAR: u32 = 0xC000_282;
-const MSR_CSTAR: u32 = 0xC000_283;
-const MSR_SFMASK: u32 = 0xC000_284;
+const MSR_STAR: u32 = 0xC000_0081;
+const MSR_LSTAR: u32 = 0xC000_0082;
+const MSR_CSTAR: u32 = 0xC000_0083;
+const MSR_SFMASK: u32 = 0xC000_0084;
+const MSR_FS_BASE: u32 = 0xC000_0100;
+const MSR_GS_BASE: u32 = 0xC000_0101;
+const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 pub unsafe fn wrmsr(msr: u32, val: u64) {
     let lo = val as u32;
@@ -37,9 +40,12 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
 
 /// Cached physical address of the kernel page table root.
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
 static mut KERNEL_CR3: u64 = 0;
 
+/// User CR3 value saved by syscall_fast_handler for SYSCALL return path.
+/// Written before dispatch, read by inline asm in SYSCALL return.
+#[used]
+#[cfg_attr(target_arch = "x86_64", unsafe(link_section = ".data"))]
 /// Kernel stack pointer for SYSCALL fast entry.
 #[unsafe(no_mangle)]
 static mut SYSCALL_KSP: u64 = 0;
@@ -70,7 +76,11 @@ pub fn init_syscall_msrs() {
         let efer = rdmsr(MSR_EFER);
         wrmsr(MSR_EFER, efer | 1);
         // Set up SYSCALL MSRs
-        wrmsr(MSR_STAR, (0x18u64 << 48) | (0x08u64 << 32));
+        // SYSCALL: CS = STAR[48:63] = 0x08(kcode), SS = 0x10(kdata)
+        // SYSRET:  CS = STAR[48:63]+16 = 0x18→0x1B(ucode), SS = 0x10→0x13(ok in 64-bit)
+        // Both Intel and AMD SYSRET work with this value.
+        let star_val = (0x08u64 << 48) | (0x08u64 << 32);
+        wrmsr(MSR_STAR, star_val);
         wrmsr(MSR_LSTAR, syscall_entry as usize as u64);
         wrmsr(MSR_CSTAR, 0);
         wrmsr(MSR_SFMASK, 1 << 9); // Mask IF on syscall entry
@@ -133,7 +143,7 @@ core::arch::global_asm!(
     ".globl timer_isr_stub",
     ".type timer_isr_stub, @function",
     "timer_isr_stub:",
-    // Save all 15 GP registers
+    // Save all 15 GP registers (matches TrapContext layout)
     "push rax",
     "push rbx",
     "push rcx",
@@ -149,23 +159,12 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    // ── Switch to kernel CR3 ──
-    // Timer ISR fires under user CR3 when running user programs.
-    // Switch to kernel CR3 to ensure all kernel data is accessible.
-    "mov rax, cr3",
-    "push rax", // save user CR3 on stack
-    "lea rax, [rip + KERNEL_CR3_PHYS]",
-    "mov rax, [rax]", // load kernel CR3 value
-    "cmp rax, 0",
-    "je 7f",
-    "mov cr3, rax", // switch to kernel page table
-    "7:",
+    // Call handler. User page tables have kernel mappings (copy_kernel_mappings),
+    // so we don't need to switch CR3. The handler's activate_page_table will
+    // install the correct task's page table after schedule().
     "mov rdi, rsp",
     "call timer_trap_handler",
-    // ── Restore user CR3 ──
-    "pop rax",
-    "mov cr3, rax",
-    // EOI is already sent inside timer_trap_handler (before schedule/sti)
+    // Pop 15 registers
     "pop r15",
     "pop r14",
     "pop r13",
@@ -181,54 +180,119 @@ core::arch::global_asm!(
     "pop rcx",
     "pop rbx",
     "pop rax",
-    // CR3 was already set by timer_trap_handler to the new task's user PT
     "iretq",
     // ─── SYSCALL fast entry (MSR LSTAR) ──────────────────
     ".globl syscall_entry",
     ".type syscall_entry, @function",
     "syscall_entry:",
-    // On entry: rcx=return RIP, r11=return RFLAGS (set by CPU)
-    //           rax=syscall_nr, rdi/rsi/rdx/r10/r8/r9=args
-    //           rsp=user RSP (NOT switched by SYSCALL), Ring 0
+    // On SYSCALL: rcx=return RIP, r11=return RFLAGS (saved by CPU)
+    //             rax=syscall_nr, rdi/rsi/rdx/r10/r8/r9=args
+    //             rsp=user RSP (NOT switched), CPL=0
 
-    // 1. Save user RSP in callee-saved rbx
+    // 1. Save user RSP in callee-saved rbx, switch to kernel stack
     "mov rbx, rsp",
-    // 2. Switch to kernel stack
     "lea rsp, [rip + SYSCALL_KSP]",
     "mov rsp, [rsp]",
-    // 3. Save user CR3 and switch to kernel CR3
-    "mov rax, cr3", // rax = user CR3
-    "push rax",     // [rsp+0x50] user CR3 (on kernel stack)
-    "lea rax, [rip + KERNEL_CR3]",
-    "mov rax, [rax]", // rax = kernel CR3
-    "mov cr3, rax",   // switch to kernel page table
-    // 4. Build register state frame on kernel stack
-    "push rbx", // [rsp+0x48] user RSP
-    "push r11", // [rsp+0x40] user RFLAGS
-    "push rcx", // [rsp+0x38] user RIP
-    "push r9",  // [rsp+0x30] a5
-    "push r8",  // [rsp+0x28] a4
-    "push r10", // [rsp+0x20] a3
-    "push rdx", // [rsp+0x18] a2
-    "push rsi", // [rsp+0x10] a1
-    "push rdi", // [rsp+0x08] a0
-    "push rax", // [rsp+0x00] syscall_nr
-    // 5. Call Rust handler
+    // 2. Disable interrupts — SYSCALL instruction does NOT clear IF,
+    //    and timer ISR uses the same SpinLock (UART) as console_println!
+    //    iretq will restore RFLAGS (with IF=1) on return to user mode.
+    "cli",
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push rbp",
+    // 3. Push syscall args and nr
+    "push r9",  // a5
+    "push r8",  // a4
+    "push r10", // a3
+    "push rdx", // a2
+    "push rsi", // a1
+    "push rdi", // a0
+    "push rax", // syscall_nr
+    // 4. Save user return state
+    "push r11", // user RFLAGS
+    "push rcx", // user RIP
+    "push rbx", // user RSP
+    // 5. Push placeholder for user CR3 (filled by handler)
+    "push 0", // [0] = user CR3 placeholder
+    // Stack layout now (rsp = state_ptr):
+    //   [0]  user_cr3 (filled by handler)
+    //   [1]  rbx (user RSP)
+    //   [2]  rcx (user RIP)
+    //   [3]  r11 (user RFLAGS)
+    //   [4]  rax (syscall_nr)
+    //   [5]  rdi  [6] rsi  [7] rdx  [8] r10  [9] r8  [10] r9
+    //   [11] rbp  [12] r12  [13] r13  [14] r14  [15] r15
+    // 6. Call handler
     "mov rdi, rsp",
     "call syscall_fast_handler",
-    // 6. Return path: rax = return value
-    //    Skip syscall_nr, a0..a5 (8 slots)
-    "add rsp, 8*8",
-    // Restore user RIP and RFLAGS
-    "pop rcx", // user RIP → rcx (for sysretq)
-    "pop r11", // user RFLAGS → r11 (for sysretq)
-    // Restore user RSP
-    "pop rsp", // user RSP → rsp
-    // 7. Restore user CR3
-    "pop rax", // user CR3
+    // 7. Restore user state and return via iretq
+    // First: read saved CR3 from [0] and restore it
+    "mov rax, [rsp]", // rax = user CR3
+    "test rax, rax",
+    "jz 78f",
     "mov cr3, rax",
-    // 8. Return to user: rcx→RIP, r11→RFLAGS (CPU does this)
-    "sysretq",
+    "78:",
+    "add rsp, 8",   // skip user_cr3 slot
+    "pop rbx",      // user RSP
+    "pop rcx",      // user RIP
+    "pop r11",      // user RFLAGS
+    "add rsp, 7*8", // skip rax, rdi, rsi, rdx, r10, r8, r9 (7 pushes)
+    "pop rbp",      // callee-saved
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
+    // Build iretq frame on the kernel stack
+    "mov rdi, rbx", // save user RSP in rdi (scratch)
+    // rax still has the syscall return value from call
+    // Push iretq frame in reverse order: SS, RSP, RFLAGS, CS, RIP
+    // Use immediate push to avoid clobbering rax (return value)
+    "push 0x23", // SS (USER_DATA_SEL)
+    "push rdi",  // RSP (user stack)
+    "push r11",  // RFLAGS
+    "push 0x1b", // CS (USER_CODE_SEL)
+    "push rcx",  // RIP (user code)
+    "iretq",
+    // ─── Page Fault ISR stub (vector 14) ───────────────────
+    // Defined in global_asm! to avoid compiler prologue uncertainty.
+    // CPU pushes: error_code, RIP, CS, RFLAGS, RSP, SS (6 items, 48 bytes)
+    ".globl page_fault_isr_stub",
+    ".type page_fault_isr_stub, @function",
+    "page_fault_isr_stub:",
+    // NO compiler prologue — we control every instruction.
+    // Stack layout after our pushes (high→low):
+    //   SS, RSP, RFLAGS, CS, RIP, error_code, <our 9 saves>
+
+    // Save caller-saved GP registers (9 regs)
+    "push rax",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    // Pass raw stack pointer to handler.
+    // After 9 pushes, the stack contains:
+    //   [rsp+72] error_code  [rsp+80] RIP  [rsp+88] CS
+    //   [rsp+96] RFLAGS  [rsp+104] RSP  [rsp+112] SS
+    "mov rdi, rsp",
+    "call page_fault_handler_raw",
+    // Restore GP registers
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rax",
+    "add rsp, 8", // skip error_code (CPU-pushed)
+    "iretq",
 );
 
 // SYSCALL instruction support is now fully implemented via syscall_entry + syscall_fast_handler.
@@ -238,6 +302,7 @@ unsafe extern "C" {
     fn syscall_isr_stub();
     fn timer_isr_stub();
     fn syscall_entry();
+    fn page_fault_isr_stub();
 }
 
 // ─── Rust handlers called from assembly ──────────────────────
@@ -277,21 +342,31 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
 unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     let _ = ctx;
 
-    // Send EOI early — before any 'sti' that might allow nested interrupts.
-    // If we don't EOI before schedule(), the LAPIC will see the timer vector
-    // as still in-service and may deliver another timer interrupt on 'sti',
-    // causing nested Timer ISR on the same IST stack.
+    // Send EOI early — before any scheduling
     super::lapic::local_eoi();
 
     crate::driver::tty::poll_uart();
     crate::arch::platform::tick_uptime();
-    super::lapic::set_next_timer();
+    // Note: set_next_timer is not needed for periodic mode
+
+    // Use atomic counter for debugging
+    static TICK_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    // schedule() is now safe because timer IDT uses TSS RSP0 (per-task kernel stack)
+    // instead of IST. __switch() saves/restores the correct stack pointer.
     crate::sched::schedule();
 
-    // After schedule(), activate the new task's page table
+    // After schedule(), switch to the target process's page table.
+    // If target_root is 0 (init), reload the kernel CR3 so we don't run
+    // with a dead process's user page table.
     let target_root = crate::process::current_page_table_root();
     if target_root != 0 {
         super::trap::activate_page_table((target_root << 12) as usize);
+    } else {
+        // Init runs with the kernel page table (identity-mapped).
+        let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+        super::trap::activate_page_table(kernel_pt as *const _ as usize);
     }
 
     let ksp = crate::sched::current_kernel_sp();
@@ -306,32 +381,94 @@ unsafe extern "C" fn lapic_local_eoi() {
     super::lapic::local_eoi();
 }
 
+/// Restore user CR3 before SYSCALL return.
+/// Called from SYSCALL entry asm (inline `call restore_user_cr3`).
+/// Timer ISR may have switched CR3 during syscall handling via activate_page_table().
+/// This ensures iretq returns with the correct user page table active.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn restore_user_cr3() {
+    let target_root = crate::process::current_page_table_root();
+    if target_root != 0 {
+        let paddr = (target_root << 12) as u64;
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) paddr);
+        }
+    }
+}
+
 /// Handler for SYSCALL fast entry (via MSR LSTAR).
-/// Stack layout at state_ptr (from syscall_entry):
-///   [0] rax (syscall number)
-///   [1] rdi (a0)
-///   [2] rsi (a1)
-///   [3] rdx (a2)
-///   [4] r10 (a3)
-///   [5] r8  (a4)
-///   [6] r9  (a5)
-///   [7] rcx (user RIP)
-///   [8] r11 (user RFLAGS)
-///   [9] user RSP
-///   [10] user CR3
+/// Stack layout at state_ptr (rsp when called):
+/// The push order: r15, r14, r13, r12, rbp, r9, r8, r10, rdx, rsi, rdi, rax, r11, rcx, rbx
+/// rsp points to LAST pushed = rbx.
+///   [0]  rbx (user RSP)  [1] rcx (user RIP)  [2] r11 (user RFLAGS)
+///   [3]  rax (syscall_nr)  [4] rdi  [5] rsi  [6] rdx  [7] r10  [8] r8  [9] r9
+///   [10] rbp  [11] r12  [12] r13  [13] r14  [14] r15
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
     unsafe {
         let s = state_ptr;
-        let syscall_nr = *s.add(0) as usize;
-        let a0 = *s.add(1) as usize;
-        let a1 = *s.add(2) as usize;
-        let a2 = *s.add(3) as usize;
-        let a3 = *s.add(4) as usize;
-        let a4 = *s.add(5) as usize;
-        let a5 = *s.add(6) as usize;
+        // CR3 was stored at [0] by handler. Return path reads it from there.
+        let user_cr3_slot = s.add(0); // will be filled below
+        let user_rsp = *s.add(1); // rbx
+        let user_rip = *s.add(2); // rcx
+        let user_rflags = *s.add(3); // r11
+        let syscall_nr = *s.add(4); // rax
+        let a0 = *s.add(5); // rdi
+        let a1 = *s.add(6); // rsi
+        let a2 = *s.add(7); // rdx
+        let a3 = *s.add(8); // r10
+        let a4 = *s.add(9); // r8
+        let a5 = *s.add(10); // r9
+        let saved_rbp = *s.add(11); // rbp
+        let saved_r12 = *s.add(12); // r12
+        let saved_r13 = *s.add(13); // r13
+        let saved_r14 = *s.add(14); // r14
+        let saved_r15 = *s.add(15); // r15
 
-        crate::syscall::dispatch(syscall_nr, [a0, a1, a2, a3, a4, a5]) as u64
+        // Save user CR3 on the stack for the return path.
+        // This prevents concurrent SYSCALLs from overwriting a global variable.
+        let target_root = crate::process::current_page_table_root();
+        let cr3_val = if target_root != 0 {
+            (target_root << 12) as u64
+        } else {
+            0
+        };
+        core::ptr::write_volatile(user_cr3_slot as *mut u64, cr3_val);
+
+        // Build a TrapContext on the kernel stack so that linux_clone
+        // can read the parent's full register state.
+        let mut ctx = super::trap::TrapContext {
+            rax: syscall_nr,
+            rbx: user_rsp,
+            rcx: user_rip,
+            rdx: a2,
+            rbp: saved_rbp,
+            rsi: a1,
+            rdi: a0,
+            r8: a4,
+            r9: a5,
+            r10: a3,
+            r11: user_rflags,
+            r12: saved_r12,
+            r13: saved_r13,
+            r14: saved_r14,
+            r15: saved_r15,
+            rip: user_rip,
+            cs: 0x1b, // USER_CODE_SEL
+            rflags: user_rflags,
+            rsp: user_rsp,
+            ss: 0x23, // USER_DATA_SEL
+            kernel_sp: 0,
+            user_cr3: 0,
+            trap_from_user: 1,
+        };
+        crate::process::set_trap_ctx_ptr(&mut ctx as *mut _ as usize);
+
+        let result = crate::syscall::dispatch_syscall_linux(syscall_nr, a0, a1, a2, a3, a4, a5);
+
+        crate::process::set_trap_ctx_ptr(0);
+
+        result
     }
 }
 
@@ -376,12 +513,8 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
 
 extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64) {
     let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
-    crate::console_println!(
-        "[EXCEPTION] GP Fault at {:#x}, err={:#x}, from_user={}",
-        frame.instruction_pointer.as_u64(),
-        err,
-        from_user
-    );
+    // Silent handling: terminate user process or halt kernel
+    // (console_println! in fault context can cause double fault via heap/SpinLock)
     if from_user {
         crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
     } else {
@@ -389,92 +522,119 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
     }
 }
 
-/// Naked stub for Page Fault handler (vector 14).
-/// Switches to kernel CR3 immediately because the PF handler must access
-/// kernel data structures that may not be mapped in the user page table.
-/// Without this, a PF from Ring 3 → Ring 0 runs under user CR3 →
-/// accessing kernel data → nested PF → Double Fault.
+// Page Fault ISR stub is now defined in global_asm! above (page_fault_isr_stub).
+// This avoids compiler prologue uncertainty with non-naked functions.
+
+/// Raw page fault handler called from global_asm! stub.
+/// `stack_ptr` points to the bottom of our 9 saved registers.
+/// CPU frame layout above our saves:
+///   [stack_ptr + 9*8 + 0] error_code
+///   [stack_ptr + 9*8 + 8] RIP
+///   [stack_ptr + 9*8 + 16] CS
+///   [stack_ptr + 9*8 + 24] RFLAGS
+///   [stack_ptr + 9*8 + 32] RSP
+///   [stack_ptr + 9*8 + 40] SS
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn page_fault_isr_stub() {
-    core::arch::asm!(
-        // Balance compiler prologue (push rax). Since this is not a naked
-        // function, the compiler emits `push rax` before our asm! block.
-        "pop rax",
-        // CPU has already pushed: error_code, RIP, CS, RFLAGS, RSP, SS
-        // Save all GP registers
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        // Don't need to save callee-saved (rbx, rbp, r12-r15) since
-        // page_fault_handler_body doesn't modify them
+#[unsafe(no_mangle)]
+unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
+    // IMMEDIATELY capture CR3 before any function call can change it
+    let raw_cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) raw_cr3) };
 
-        // ── Switch to kernel CR3 ──
-        "mov rax, cr3",
-        "push rax",                    // save user CR3 on stack
-        "mov rax, {kcr3}",
-        "cmp rax, 0",
-        "je 5f",
-        "mov cr3, rax",                // switch to kernel page table
-        "5:",
-
-        // Call Rust handler body
-        // RDI = pointer to InterruptStackFrame (skip our saved regs)
-        // RSI = error code (at RSP + 10*8 from our pushes + saved CR3)
-        "mov rdi, rsp",
-        "add rdi, 11*8",               // skip 10 saved regs + saved CR3 → points to error_code
-        "mov rsi, [rdi]",              // error code
-        "add rdi, 8",                  // skip error code → InterruptStackFrame
-        "call {body}",
-
-        // ── Restore user CR3 ──
-        "pop rax",
-        "mov cr3, rax",
-
-        // Restore GP registers
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "add rsp, 8",                  // skip error code
-        "iretq",
-        kcr3 = sym crate::mm::vmm::kernel_cr3,
-        body = sym page_fault_handler_body,
-        options(noreturn)
-    );
-}
-
-/// Page fault handler body (called from naked stub with kernel CR3).
-#[cfg(target_arch = "x86_64")]
-fn page_fault_handler_body(frame: &InterruptStackFrame, _error_code: u64) {
-    // CR3 already switched to kernel by naked stub.
     let fault_addr = x86_64::registers::control::Cr2::read();
     let fault_addr_val = fault_addr.map(|a| a.as_u64()).unwrap_or(0) as usize;
-    let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
+
+    // Read raw CPU-pushed frame values
+    // Read CPU interrupt frame from known stack offsets:
+    // ISR stub pushes 9 regs (9×8 = 72 bytes), then CPU pushed error_code + iretq frame
+    let sp = stack_ptr as usize;
+    let error_code = unsafe { *((sp + 72) as *const u64) };
+    let rip = unsafe { *((sp + 80) as *const u64) };
+    let cs = unsafe { *((sp + 88) as *const u64) };
+    let rflags = unsafe { *((sp + 96) as *const u64) };
+    let rsp_val = unsafe { *((sp + 104) as *const u64) };
+    let ss = unsafe { *((sp + 112) as *const u64) };
+
+    let from_user = cs & 0x3 != 0;
     let page_size = crate::mm::pmm::page_size();
     let page_addr = fault_addr_val & !(page_size - 1);
 
-    // Debug: log page fault
-    crate::console_println!(
-        "[PF] addr={:#x} page={:#x} user={} ip={:#x}",
-        fault_addr_val,
-        page_addr,
-        from_user,
-        frame.instruction_pointer.as_u64()
-    );
+    // Use direct UART I/O (no heap, no SpinLock) for safe debugging.
+    let print_hex = |val: u64| {
+        for shift in [60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0] {
+            let nibble = ((val >> shift) as u8) & 0xF;
+            let c = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+            crate::arch::platform::console_putchar(c);
+        }
+    };
+    let print_str = |s: &[u8]| {
+        for &b in s {
+            crate::arch::platform::console_putchar(b);
+        }
+    };
+
+    // Always print full fault info (both user and kernel)
+    print_str(b"PF:");
+    print_hex(fault_addr_val as u64);
+    print_str(b" ER:");
+    print_hex(error_code);
+    print_str(b" RIP:");
+    print_hex(rip);
+    print_str(b" CS:");
+    print_hex(cs);
+    print_str(b" FL:");
+    print_hex(rflags);
+    print_str(b" RSP:");
+    print_hex(rsp_val);
+    print_str(b" SS:");
+    print_hex(ss);
+    // Print CR3 captured at entry (before any function call)
+    print_str(b" CR3:");
+    print_hex(raw_cr3);
+    // Print first bytes at RIP for instruction identification
+    if from_user {
+        print_str(b" insn:");
+        let rip_ptr = rip as *const u8;
+        for i in 0..8 {
+            let b = unsafe { core::ptr::read_volatile(rip_ptr.add(i)) };
+            print_hex(b as u64);
+        }
+    }
+    crate::arch::platform::console_putchar(b'\n');
+
+    // Print translation result for fault address page
+    let user_pt = super::trap::get_current_user_pt();
+    let translated = crate::mm::vmm::translate_user(user_pt, fault_addr_val & !(page_size - 1));
+    print_str(b" TLB:");
+    match translated {
+        Some(paddr) => print_hex(paddr as u64),
+        None => print_str(b"NONE"),
+    }
+    // Check value at Go's span allocator global (0x4857248)
+    if from_user {
+        let span_ptr_addr = 0x4857248usize;
+        let span_pt = crate::mm::vmm::translate_user(user_pt, span_ptr_addr);
+        match span_pt {
+            Some(paddr) => {
+                let span_val = unsafe { *(paddr as *const u64) };
+                print_str(b" SP:");
+                print_hex(span_val);
+                let span_val2 = unsafe { *((paddr as *const u64).add(1)) };
+                print_str(b" SP8:");
+                print_hex(span_val2);
+            }
+            None => print_str(b" SP:UNMAP"),
+        }
+    }
+
+    crate::arch::platform::console_putchar(b'\n');
 
     let handled = 'handler: {
-        // Try lazy allocation for heap
+        // Lazy allocation for heap
         if from_user
             && fault_addr_val >= crate::process::USER_HEAP_BASE
             && fault_addr_val < crate::process::USER_HEAP_LIMIT
@@ -535,17 +695,41 @@ fn page_fault_handler_body(frame: &InterruptStackFrame, _error_code: u64) {
             break 'handler true;
         }
 
+        // Try lazy allocation for Go's low-address regions (e.g., Go uses memory near 0x400000+)
+        // This handles any user-mode fault in the ELF-loaded region
+        if from_user
+            && fault_addr_val >= 0x400000
+            && fault_addr_val < crate::process::USER_HEAP_BASE
+        {
+            let user_pt = super::trap::get_current_user_pt();
+            if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                    unsafe {
+                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    }
+                    crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
+                    super::trap::flush_tlb_addr(page_addr);
+                    break 'handler true;
+                }
+            }
+            break 'handler true;
+        }
+
         false
     };
 
     if !handled {
-        crate::console_println!(
-            "[EXCEPTION] Page Fault at {:#x}, accessing {:#x}",
-            frame.instruction_pointer.as_u64(),
-            fault_addr_val
-        );
         if from_user {
-            crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
+            // Unhandled user PF → kill the process via schedule_exit
+            let pid = crate::process::current_pid();
+            crate::console_println!(
+                "[PF] Killing pid={} for unhandled PF at {:#x}",
+                pid,
+                fault_addr_val
+            );
+            crate::syscall::sys_exit(99);
+            // If sys_exit returns (shouldn't happen), halt
+            loop {}
         } else {
             loop {}
         }
@@ -553,111 +737,37 @@ fn page_fault_handler_body(frame: &InterruptStackFrame, _error_code: u64) {
 }
 
 /// Naked stub for invalid opcode (#UD) handler.
-/// Used to intercept the `syscall` instruction (0x0F 0x05) which Go binaries use.
-/// We emulate it by calling the syscall dispatcher with the Linux x86_64 ABI
-/// (RAX=syscall_nr, RDI/R10/R8/R9=args) translated to our kernel's ABI.
+/// Since SYSCALL/SYSRET is now properly configured via MSRs, the `syscall`
+/// instruction no longer triggers #UD. This handler is for genuine illegal
+/// instructions (e.g., SSE/AVX instructions when not supported).
+/// Kills the offending user process; halts on kernel-mode #UD.
 unsafe extern "C" fn invalid_opcode_isr_stub() {
     core::arch::asm!(
         // Balance compiler prologue (push rax)
         "pop rax",
-        // Save all general-purpose registers
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-        // At this point: stack has 15 saved regs + return addr
-        // The interrupt frame (pushed by CPU) is above our saved regs:
-        //   RIP, CS, RFLAGS, RSP, SS
-        // But with extern "x86-interrupt" style, there's no error code for #UD.
-
-        // Move CPU interrupt frame pointer into a known register
+        // Get the interrupt frame pointer
+        // CPU pushes: RIP, CS, RFLAGS, RSP, SS (no error code for #UD)
+        // Our stack has: 1 saved reg (rax) + return addr
+        // Total items between rsp and CPU frame = 1
         "mov r15, rsp",
-        "add r15, 15*8",       // skip 15 saved regs to reach interrupt frame
+        "add r15, 1*8",       // skip 1 saved reg to reach interrupt frame
 
-        // Load the faulting instruction address from interrupt frame (RIP)
-        "mov rsi, [r15]",      // rsi = faulting RIP
+        // Check if from user mode (CS & 3)
+        "mov rax, [r15 + 8]",  // CS from interrupt frame
+        "test ax, 3",
+        "jz 2f",               // kernel mode → halt
 
-        // Read the 2 bytes at faulting RIP
-        "movzx eax, word ptr [rsi]",
-        // Check if it's 0x0F05 (syscall instruction)
-        "cmp ax, 0x050F",
-        "jne 3f",              // not syscall → skip to generic handler
+        // User mode: kill the process
+        "mov rdi, 1",          // exit code 1
+        "call {exit}",
 
-        // === Emulate syscall instruction ===
-        // Restore registers that hold syscall args from our saved set
-        "mov rax, [rsp + 0*8]",  // rax = syscall number (saved rax)
-        "mov rdi, [rsp + 10*8]",  // rdi = arg1 (saved rdi, 10th push = index 10)
-        "mov rsi, [rsp + 11*8]",  // rsi = arg2 (saved rsi)
-        "mov rdx, [rsp + 12*8]",  // rdx = arg3 (saved rdx)
-        "mov r10, [rsp + 5*8]",   // r10 = arg4 (saved r10)
-        "mov r8,  [rsp + 7*8]",   // r8  = arg5 (saved r8)
-        "mov r9,  [rsp + 6*8]",   // r9  = arg6 (saved r9)
-
-        // Call syscall handler (Linux x86_64 convention)
-        "call {syscall_handler}",
-        // rax now has return value
-
-        // Store return value in saved rax slot
-        "mov [rsp + 0*8], rax",
-
-        // Advance RIP past the 2-byte syscall instruction
-        "add qword ptr [r15], 2",
-
-        // Restore registers and return
+        // Kernel mode #UD: halt
         "2:",
-        "pop rax",
-        "pop rbx",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop rbp",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-        "iretq",
+        "cli",
+        "hlt",
+        "jmp 2b",              // infinite halt loop
 
-        // === Not a syscall instruction → generic #UD handler ===
-        "3:",
-        // For now, just kill the process or skip
-        // Restore all regs and skip the faulting instruction
-        "pop rax",
-        "pop rbx",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop rbp",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-        // Skip 2 bytes (illegal instruction length)
-        // Actually we can't easily get RIP here without the saved frame.
-        // For now, just iretq (will re-execute and loop).
-        // TODO: proper skip or process termination
-        "iretq",
-        syscall_handler = sym crate::syscall::dispatch_syscall_linux,
+        exit = sym crate::syscall::sys_exit,
         options(noreturn)
     );
 }
@@ -868,13 +978,14 @@ pub fn init() {
             0,      // No IST
         );
 
-        // Timer: naked ISR with CR3 switch, using software IST index 2
-        // (hardware IST=3 → TSS interrupt_stack_table[2])
+        // Timer: naked ISR with CR3 switch, using TSS RSP0 (per-task kernel stack).
+        // No IST — so schedule()/__switch() save/restore the correct kernel stack.
+        // SYSCALL entry uses cli, so timer cannot interrupt syscall handler.
         set_naked_handler(
             &mut idt[TIMER_VECTOR],
             timer_isr_stub as *const () as usize,
-            0x8E00,                      // Base attributes (64-bit interrupt gate, DPL=0, P=1)
-            super::gdt::TIMER_IST_INDEX, // Software IST index 2
+            0x8E00, // Base attributes (64-bit interrupt gate, DPL=0, P=1)
+            0,      // No IST — use TSS RSP0 (per-task kernel stack)
         );
 
         // Keyboard (IRQ1): naked ISR with IST[3]

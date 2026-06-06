@@ -94,9 +94,7 @@ static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
     count: 0,
 });
 
-pub fn init() {
-    crate::console_println!("[sched] Initialized");
-}
+pub fn init() {}
 
 /// Round-Robin among child tasks. When init is running
 /// (current == INIT_SENTINEL), __switch saves init's sp to INIT_TASK_SP then
@@ -154,6 +152,7 @@ pub fn schedule() {
         // Save init's sp to INIT_TASK_SP, switch to child
         let init_sp_ptr = INIT_TASK_SP.as_ptr() as *mut usize;
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+        let _next_sp_val = unsafe { *nxt_ptr };
         unsafe {
             __switch(init_sp_ptr, nxt_ptr);
         }
@@ -167,6 +166,7 @@ pub fn schedule() {
 
     // After __switch returns (possibly on a different task's stack),
     // update TSS.RSP0 so Ring 3 → Ring 0 interrupts use the correct kernel stack.
+    // Also update SYSCALL_KSP so SYSCALL entry uses the same stack.
     #[cfg(target_arch = "x86_64")]
     {
         let proc_idx = crate::process::current_index();
@@ -174,6 +174,7 @@ pub fn schedule() {
             unsafe {
                 crate::arch::gdt::set_kernel_rsp0(kernel_sp as u64);
             }
+            crate::arch::idt::set_syscall_ksp(kernel_sp as u64);
         }
     }
 }
@@ -227,6 +228,11 @@ pub fn schedule_exit() {
 
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     if switch_to_init {
+        let init_sp = unsafe { *INIT_TASK_SP.as_ptr() };
+        crate::console_println!(
+            "[sched_exit] switching to init, INIT_TASK_SP={:#x}",
+            init_sp
+        );
         let init_sp_ptr = INIT_TASK_SP.as_ptr() as *const usize;
         unsafe {
             __switch(cur_ptr, init_sp_ptr);
@@ -238,7 +244,7 @@ pub fn schedule_exit() {
         }
     }
 
-    // Update TSS.RSP0 for the new task
+    // Update TSS.RSP0 and SYSCALL_KSP for the new task
     #[cfg(target_arch = "x86_64")]
     {
         let proc_idx = crate::process::current_index();
@@ -246,6 +252,7 @@ pub fn schedule_exit() {
             unsafe {
                 crate::arch::gdt::set_kernel_rsp0(kernel_sp as u64);
             }
+            crate::arch::idt::set_syscall_ksp(kernel_sp as u64);
         }
     }
 }
@@ -519,22 +526,40 @@ pub fn add_clone_process(
     };
 
     let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
-    let tls_storage_size: usize = 8; // 8 bytes for TLS after TrapContext
-    let switch_frame_size: usize = 7 * 8 + 512; // 6 callee-saved + ret addr + fxsave
+    let tls_storage_size: usize = 8; // 8 bytes for TLS pointer after switch frame
+    // __switch frame layout (same as add_user_process):
+    //   [0..511]   fxsave area (512 bytes)
+    //   [512..519] orig_rsp (points to r15 slot after fxrstor)
+    //   [520..567] r15, r14, r13, r12, rbx, rbp (6 callee-saved × 8)
+    //   [568..575] ret addr
+    // Total: 576 bytes
+    let switch_frame_size: usize = 8 * 8 + 512; // orig_rsp + 6 callee-saved + ret addr + fxsave = 576
     let total_size = ctx_size + tls_storage_size + switch_frame_size;
-    let tls_base = kernel_stack_top - ctx_size - tls_storage_size;
-    let trap_ctx_base = kernel_stack_top - ctx_size;
-    let switch_sp = tls_base - switch_frame_size;
+    // Layout (high → low):
+    //   kernel_stack_top
+    //   TrapContext (ctx_size)
+    //   TLS storage (8 bytes)
+    //   __switch frame (576 bytes)
+    // Align switch_sp to 16 bytes for fxsave64/fxrstor64.
+    let switch_sp = (kernel_stack_top - ctx_size - tls_storage_size - switch_frame_size) & !0xF;
+    let tls_base = switch_sp + switch_frame_size;
+    let trap_ctx_base = tls_base + tls_storage_size;
 
     unsafe {
         core::ptr::write_bytes(switch_sp as *mut u8, 0, total_size);
 
-        // __switch frame: fxsave area at bottom (512 bytes, zeroed above),
-        // then callee-saved (also zeroed), then ret addr at top
-        let sw = switch_sp as *mut usize;
-        *sw.add(512 / 8 + 6) = clone_first_shim as *const () as usize; // ret addr → clone_first_shim
+        // Set MXCSR to power-on default (same as add_user_process)
+        let fxsave_ptr = switch_sp as *mut u8;
+        let mxcsr_ptr = fxsave_ptr.add(24) as *mut u32;
+        *mxcsr_ptr = 0x1F80; // Power-on default: all exceptions masked
 
-        // Store TLS value after TrapContext
+        let sw = switch_sp as *mut usize;
+        // orig_rsp: points to r15 slot so pop r15..rbp + ret works correctly
+        *sw.add(512 / 8) = switch_sp + 520; // orig_rsp → r15 slot
+        // Return address at offset 568 (pop r15..rbp brings RSP here)
+        *sw.add(568 / 8) = clone_first_shim as *const () as usize; // ret addr → clone_first_shim
+
+        // Store TLS value between switch frame and TrapContext
         let tls_ptr = tls_base as *mut usize;
         *tls_ptr = tls;
 

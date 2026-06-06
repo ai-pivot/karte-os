@@ -136,7 +136,7 @@ impl PTE {
 /// Page Table (512 entries, page-aligned)
 #[repr(C, align(4096))]
 pub struct PageTable {
-    entries: [PTE; PTE_COUNT],
+    pub entries: [PTE; PTE_COUNT],
 }
 
 impl PageTable {
@@ -240,13 +240,25 @@ pub fn identity_map_skip(root: &mut PageTable, start: usize, end: usize, flags: 
     let start_page = start & !(PAGE_SIZE - 1);
     let end_page = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let mut addr = start_page;
+    let mut skip_count = 0;
+    let mut map_count = 0;
     while addr < end_page {
         // Only map if not already mapped by ELF loader
         if translate_user(root, addr).is_none() {
             map(root, addr, addr, flags);
+            map_count += 1;
+        } else {
+            skip_count += 1;
         }
         addr += PAGE_SIZE;
     }
+    crate::console_println!(
+        "[idmap_skip] {:#x}-{:#x}: mapped={} skipped={}",
+        start_page,
+        end_page,
+        map_count,
+        skip_count
+    );
 }
 
 /// Identity map using 2MB huge pages (x86_64 only).

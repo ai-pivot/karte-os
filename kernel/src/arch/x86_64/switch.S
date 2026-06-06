@@ -33,6 +33,9 @@
 #   rdi = pointer to current task's saved stack pointer
 #   rsi = pointer to next task's saved stack pointer
 __switch:
+    # ─── CRITICAL: Disable interrupts during context switch ───
+    cli
+
     # ─── SAVE path (current task) ────────────────────────────
     # Save callee-saved registers
     push rbp

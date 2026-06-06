@@ -150,6 +150,11 @@ impl Process {
         // 2. Create independent user page table
         let user_pt = vmm::create_user_page_table();
 
+        // Guard frame between page table and kernel stack:
+        // Timer ISR's TrapContext (184 bytes) can overflow kernel_stack_top by up to
+        // 24 bytes. Without this guard, the overflow would corrupt the page table root frame.
+        let _guard = pmm::alloc_frame();
+
         // 3. Allocate kernel stack (needed before copy_kernel_mappings)
         let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
             .ok_or("Out of memory for kernel stack")?;
@@ -197,30 +202,11 @@ impl Process {
                         );
                     }
 
-                    // Patch: replace `syscall` (0x0F 0x05) with `int 0x80` (0xCD 0x80)
-                    // in executable segments. This makes Go binaries use our int 0x80
-                    // syscall path instead of the SYSCALL instruction.
-                    // The replacement is 2 bytes → 2 bytes, no size change.
-                    #[cfg(target_arch = "x86_64")]
-                    if is_executable {
-                        let base = (frame + dst_offset) as *mut u8;
-                        let patch_len = len;
-                        unsafe {
-                            let mut i = 0usize;
-                            while i + 1 < patch_len {
-                                let b0 = *base.add(i);
-                                let b1 = *base.add(i + 1);
-                                if b0 == 0x0F && b1 == 0x05 {
-                                    // syscall → int 0x80
-                                    *base.add(i) = 0xCD;
-                                    *base.add(i + 1) = 0x80;
-                                    i += 2;
-                                } else {
-                                    i += 1;
-                                }
-                            }
-                        }
-                    }
+                    // NOTE: We used to patch `syscall` (0x0F 0x05) to `int 0x80` (0xCD 0x80)
+                    // here. This is NO LONGER needed since we now have proper MSR-based
+                    // SYSCALL/SYSRET support. The binary's native `syscall` instruction
+                    // works correctly via the LSTAR entry point → dispatch_linux_raw().
+                    let _ = is_executable;
                 }
             }
             if segment.vaddr + segment.mem_size > max_vaddr {
@@ -299,6 +285,12 @@ impl Process {
             .ok_or("Out of memory for kernel stack")?;
         let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * page_size;
 
+        // 0.5 Allocate a guard frame between stack and page table.
+        // Timer ISR's TrapContext (184 bytes) can overflow kernel_stack_top by up to
+        // 24 bytes. If the page table root frame is adjacent to the stack top,
+        // this corruption destroys PML4 entries. The guard frame prevents this.
+        let _guard = pmm::alloc_frame();
+
         // 1. Read ELF header (first 4096 bytes covers header + program headers)
         let header_size = 4096usize;
         let mut header_buf = alloc::vec![0u8; header_size];
@@ -312,6 +304,11 @@ impl Process {
 
         // 3. Create independent user page table
         let user_pt = vmm::create_user_page_table();
+
+        // Guard frame between page table and kernel stack:
+        // Timer ISR's TrapContext (184 bytes) can overflow kernel_stack_top by up to
+        // 24 bytes. Without this guard, the overflow would corrupt the page table root frame.
+        let _guard = pmm::alloc_frame();
 
         // 4. Load ELF segments page-by-page
         let mut max_vaddr = 0usize;
@@ -364,26 +361,10 @@ impl Process {
                         );
                     }
 
-                    // Patch: replace `syscall` (0x0F 0x05) with `int 0x80` (0xCD 0x80)
-                    // in executable segments on x86_64.
-                    #[cfg(target_arch = "x86_64")]
-                    if is_executable {
-                        let base = (frame + dst_offset) as *mut u8;
-                        unsafe {
-                            let mut i = 0usize;
-                            while i + 1 < len {
-                                let b0 = *base.add(i);
-                                let b1 = *base.add(i + 1);
-                                if b0 == 0x0F && b1 == 0x05 {
-                                    *base.add(i) = 0xCD;
-                                    *base.add(i + 1) = 0x80;
-                                    i += 2;
-                                } else {
-                                    i += 1;
-                                }
-                            }
-                        }
-                    }
+                    // NOTE: No longer patching syscall→int 0x80. MSR SYSCALL/SYSRET
+                    // is properly configured. The binary's native `syscall` instruction
+                    // works via LSTAR → dispatch_linux_raw().
+                    let _ = is_executable;
                 }
             }
             if seg.vaddr + seg.mem_size > max_vaddr {
@@ -403,7 +384,102 @@ impl Process {
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 
-        // 7. Store page_table_root as PPN
+        // 7. Set up initial stack with auxiliary vectors for Go runtime
+        // Linux initial stack layout (from high to low address):
+        //   argc (8 bytes) = 0
+        //   argv[0] = NULL
+        //   envp[0] = NULL
+        //   auxv entries: {type, value} pairs (16 bytes each)
+        //   AT_NULL terminator
+        const AT_NULL: usize = 0;
+        const AT_PAGESZ: usize = 6;
+        const AT_ENTRY: usize = 9;
+        const AT_PHDR: usize = 3;
+        const AT_PHENT: usize = 4;
+        const AT_PHNUM: usize = 5;
+        const AT_UID: usize = 11;
+        const AT_EUID: usize = 12;
+        const AT_GID: usize = 13;
+        const AT_EGID: usize = 14;
+        const AT_RANDOM: usize = 25;
+        const AT_SYSINFO_EHDR: usize = 33; // VDSO
+
+        // Write auxv data at USER_STACK_TOP - 8 (top of stack is not used by Go)
+        // We write downward from USER_STACK_TOP - 8
+        let stack_top = USER_STACK_TOP;
+        let phdr_addr = elf_info.phdr_vaddr; // virtual address of program headers
+
+        // Build the initial stack content
+        let auxv_data: [(usize, usize); 12] = [
+            (AT_SYSINFO_EHDR, 0), // No VDSO
+            (AT_PHDR, phdr_addr),
+            (AT_PHENT, elf_info.phent),
+            (AT_PHNUM, elf_info.phnum as usize),
+            (AT_PAGESZ, page_size),
+            (AT_ENTRY, elf_info.entry),
+            (AT_UID, 0),
+            (AT_EUID, 0),
+            (AT_GID, 0),
+            (AT_EGID, 0),
+            (AT_RANDOM, stack_top - 256), // point to random bytes on stack
+            (AT_NULL, 0),
+        ];
+
+        // Calculate total size: argc + argv_null + envp_null + auxv
+        let total_size = 8 + 8 + 8 + auxv_data.len() * 16 + 16; // random bytes
+        let new_rsp = stack_top - total_size;
+        // Align to 16 bytes
+        let new_rsp = new_rsp & !0xF;
+
+        // Helper to write u64 to user stack via physical address
+        // The stack pages are identity-mapped in kernel space
+        unsafe fn write_u64_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u64) {
+            if let Some(frame) = vmm::translate_user(user_pt, addr) {
+                core::ptr::write_volatile(frame as *mut u64, val);
+            }
+        }
+
+        // Write random bytes (16 bytes at stack_top - 256)
+        let random_addr = stack_top - 256;
+        for i in 0..2 {
+            // Simple "random" values — not crypto-quality but Go just needs non-zero
+            unsafe {
+                write_u64_to_user(
+                    user_pt,
+                    random_addr + i * 8,
+                    0x12345678_9ABCDEF0u64.wrapping_add(i as u64 * 0xDEADBEEF),
+                );
+            }
+        }
+
+        // Write from new_rsp upward
+        let mut pos = new_rsp;
+        unsafe {
+            write_u64_to_user(user_pt, pos, 0);
+        }
+        pos += 8; // argc = 0
+        unsafe {
+            write_u64_to_user(user_pt, pos, 0);
+        }
+        pos += 8; // argv[0] = NULL
+        unsafe {
+            write_u64_to_user(user_pt, pos, 0);
+        }
+        pos += 8; // envp[0] = NULL
+        for (atype, avalue) in &auxv_data {
+            unsafe {
+                write_u64_to_user(user_pt, pos, *atype as u64);
+            }
+            pos += 8;
+            unsafe {
+                write_u64_to_user(user_pt, pos, *avalue as u64);
+            }
+            pos += 8;
+        }
+
+        let initial_rsp = new_rsp;
+
+        // 8. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
 
         // 9. Set up initial brk (after loaded segments, aligned to page)
@@ -419,7 +495,7 @@ impl Process {
             ppid: 0, // Set by caller
             page_table_root: page_table_ppn,
             kernel_stack_top,
-            user_stack_top: USER_STACK_TOP,
+            user_stack_top: initial_rsp,
             brk,
             initial_brk: brk,
             entry,

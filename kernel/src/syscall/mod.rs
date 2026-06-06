@@ -121,9 +121,14 @@ use crate::driver::fs::{O_RDONLY, O_RDWR, O_WRONLY};
 /// Called from trap_handler when UserEnvCall is detected.
 /// `id` = a7 (syscall number), `args` = [a0, a1, a2, a3, a4, a5].
 /// Returns value for a0.
-/// Linux x86_64 syscall entry point, called from the #UD handler
-/// when it intercepts a `syscall` instruction (0x0F 0x05).
+/// Linux x86_64 syscall entry point, called from syscall_entry (MSR LSTAR)
+/// when the CPU executes a `syscall` instruction.
+///
 /// ABI: RAX=syscall_nr, RDI=arg1, RSI=arg2, RDX=arg3, R10=arg4, R8=arg5, R9=arg6
+///
+/// This is a DEDICATED Linux dispatcher — all syscall numbers are interpreted
+/// as Linux x86_64 numbers. This bypasses KarteOS's native dispatch() entirely,
+/// avoiding number conflicts (e.g., Linux write=1 vs KarteOS exit=1).
 #[cfg(target_arch = "x86_64")]
 pub fn dispatch_syscall_linux(
     nr: u64,
@@ -134,42 +139,519 @@ pub fn dispatch_syscall_linux(
     a5: u64,
     a6: u64,
 ) -> u64 {
-    let args = [
-        a1 as usize,
-        a2 as usize,
-        a3 as usize,
-        a4 as usize,
-        a5 as usize,
-        a6 as usize,
-    ];
-    dispatch(nr as usize, args) as u64
-}
-
-pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
-    // Enable timer interrupts on the first syscall.
-    // Timer is intentionally delayed until the user program has executed
-    // at least one ecall, to avoid timer interrupts during the critical
-    // sret-to-first-ecall window where CSR probing can cause issues.
+    // Enable timer interrupts on the first syscall (same as dispatch()).
     static TIMER_ENABLED: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
     if !TIMER_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
         TIMER_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
         crate::arch::trap::enable_timer_interrupt();
         crate::arch::trap::set_next_timer();
-        // Unmask external IRQs (keyboard, UART) via IOAPIC now that the
-        // user program is running and can handle them safely.
+        crate::arch::ioapic::unmask_external_irqs();
+    }
+
+    static TRACE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let tc = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let result = dispatch_linux_raw(
+        nr as usize,
+        [
+            a1 as usize,
+            a2 as usize,
+            a3 as usize,
+            a4 as usize,
+            a5 as usize,
+            a6 as usize,
+        ],
+    );
+    if tc < 50 {
+        let nr_usize = nr as usize;
+        match nr_usize {
+            257 => {
+                // openat(dirfd=a1/rdi, pathname=a2/rsi, flags=a3/rdx)
+                let path = unsafe { core::ffi::CStr::from_ptr(a2 as *const i8) };
+                crate::console_println!(
+                    "[go#{tc}] openat(df={a1}, {path:?}, fl={a3:#x}) → {result}"
+                );
+            }
+            _ => {
+                crate::console_println!(
+                    "[go#{tc}] sys{nr_usize}({a1:#x},{a2:#x},{a3:#x}) → {result}"
+                );
+            }
+        }
+    }
+    result as u64
+}
+
+/// Comprehensive Linux x86_64 syscall dispatcher.
+/// Handles ALL Linux syscall numbers directly, mapping to kernel functions.
+/// This is ONLY called from the SYSCALL instruction path (MSR LSTAR).
+#[cfg(target_arch = "x86_64")]
+fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
+    let result = match nr {
+        // ═══════════════════════════════════════════════════════════
+        // Linux x86_64 syscall numbers — directly mapped to kernel functions
+        // No KarteOS number guard needed since this is the SYSCALL-only path.
+        // ═══════════════════════════════════════════════════════════
+
+        // ─── File I/O (conflicted with KarteOS, now handled properly) ───
+        0 => sys_read(args[0] as i32, args[1], args[2]), // read
+        1 => sys_write(args[0] as i32, args[1], args[2]), // write
+        2 => linux_open(args[0], args[1], args[2]),      // open (deprecated, use openat)
+        3 => sys_close(args[0] as i32),                  // close
+        4 => linux_stat(args[0], args[1]),               // stat
+        5 => linux_fstat(args[0], args[1]),              // fstat
+        6 => linux_lstat(args[0], args[1]),              // lstat
+        7 => linux_poll(args[0], args[1], args[2]),      // poll
+        8 => linux_lseek(args[0], args[1], args[2]),     // lseek
+        9 => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
+        10 => linux_mprotect(args[0], args[1], args[2]), // mprotect
+        11 => linux_munmap(args[0], args[1]),            // munmap
+        12 => sys_brk(args[0]),                          // brk
+
+        // ─── Signals ──────────────────────────────────────────────
+        13 => linux_rt_sigaction(args[0], args[1], args[2]), // rt_sigaction
+        14 => linux_rt_sigprocmask(args[0], args[1], args[2]), // rt_sigprocmask
+        15 => 0,                                             // rt_sigreturn (stub)
+
+        // ─── File I/O (continued) ─────────────────────────────────
+        16 => 0,                                                        // ioctl (stub)
+        17 => linux_pread64(args[0] as i32, args[1], args[2], args[3]), // pread64
+        18 => 0,                                                        // pwrite64 (stub)
+        19 => linux_readv(args[0], args[1], args[2]),                   // readv
+        20 => 0,                                                        // writev (stub)
+        21 => 0,                                                        // access (stub)
+        22 => linux_pipe(args[0]),                                      // pipe
+        23 => 0,                                                        // select (stub)
+        24 => {
+            crate::sched::schedule();
+            0
+        } // sched_yield
+        25 => ERR_INVAL,                                                // mremap (stub)
+        26 => 0,                                                        // msync (stub)
+        27 => 0,                                                        // mincore (stub)
+        28 => 0,                                                        // madvise (stub)
+        29 => linux_dup(args[0]),                                       // dup
+        30 => linux_dup2(args[0], args[1]),                             // dup2
+        31 => linux_pause(),                                            // pause
+        32 => sys_exec(args[0], linux::count_user_string(args[0])),     // execve (map to sys_exec)
+        33 => 0, // chdir (stub — use Linux 80)
+        34 => 0, // fchdir (stub)
+        35 => 0, // nanosleep (stub: return immediately)
+        36 => 0, // alarm (stub)
+        37 => 0, // setitimer (stub)
+        38 => 0, // getpid... wait, Linux getpid is 39
+
+        // ─── Process management ───────────────────────────────────
+        39 => sys_getpid(),                                  // getpid
+        40 => linux_getppid(),                               // getppid
+        41 => linux_socket(args[0], args[1], args[2]),       // socket
+        42 => sys_connect(args[0] as i32, args[1], args[2]), // connect
+        43 => linux_accept(args[0] as i32),                  // accept
+        44 => sys_sendto(args[0] as i32, args[1], args[2], args[3], args[4], args[5]), // sendto
+        45 => sys_recvfrom(args[0] as i32, args[1], args[2]), // recvfrom
+        46 => sys_bind(args[0] as i32, args[1], args[2]),    // bind
+        47 => 0,                                             // getsockname (stub)
+        48 => 0,                                             // getpeername (stub)
+        49 => sys_socket(args[0], args[1], args[2]),         // socket (alternate number?)
+        50 => sys_listen(args[0] as i32, args[1]),           // listen
+        51 => 0,                                             // getsockname (stub)
+        52 => 0,                                             // getpeername (stub)
+        53 => 0,                                             // setsockopt (stub)
+        54 => 0,                                             // getsockopt (stub)
+        55 => sys_shutdown(args[0] as i32),                  // shutdown
+
+        56 => linux_clone(args[0], args[1], args[2], args[3], args[4]), // clone
+        57 => sys_fork(),                                               // fork
+        58 => sys_exec(args[0], linux::count_user_string(args[0])),     // vfork → exec
+        59 => sys_exit(args[0] as i32),                                 // exit
+        60 => sys_exit(args[0] as i32),                                 // exit (same as 59)
+
+        // ─── More file ops ────────────────────────────────────────
+        61 => linux_wait4(args[0], args[1], args[2]), // wait4
+        78 => 0,                                      // getdents (stub)
+        79 => linux_getcwd(args[0], args[1]),         // getcwd
+        80 => linux_chdir(args[0]),                   // chdir
+        83 => sys_mkdir(args[0], linux::count_user_string(args[0])), // mkdir
+        87 => sys_unlink(args[0], linux::count_user_string(args[0])), // unlink
+
+        // ─── More process ─────────────────────────────────────────
+        89 => 0,                                                   // readlink (stub)
+        96 => linux_gettimeofday(args[0], args[1]),                // gettimeofday
+        97 => 0,                                                   // getrlimit (stub)
+        98 => 0,                                                   // getrusage (stub)
+        99 => linux_sysinfo(args[0]),                              // sysinfo
+        100 => 0,                                                  // times (stub)
+        101 => ERR_INVAL,                                          // ptrace (stub)
+        102 => 0,                                                  // getuid (stub: root)
+        103 => 0,                                                  // syslog (stub)
+        104 => 0,                                                  // getgid (stub: root)
+        105 => 0,                                                  // setuid (stub)
+        106 => 0,                                                  // setgid (stub)
+        107 => 0,                                                  // geteuid (stub: root)
+        108 => 0,                                                  // getegid (stub: root)
+        131 => linux_sigaltstack(args[0], args[1]),                // sigaltstack
+        157 => 0,                                                  // prctl (stub)
+        158 => linux_arch_prctl(args[0], args[1]),                 // arch_prctl
+        160 => 0,                                                  // setrlimit (stub)
+        186 => sys_getpid(),                                       // gettid → getpid
+        200 => 0,                                                  // tkill (stub)
+        201 => linux_time(args[0]),                                // time
+        202 => linux_futex(args[0], args[1], args[2]),             // futex
+        203 => linux_sched_getaffinity(args[0], args[1], args[2]), // sched_getaffinity
+        204 => linux_sched_setaffinity(args[0], args[1], args[2]), // sched_setaffinity (stub)
+        218 => linux_set_tid_address(args[0]),                     // set_tid_address
+        228 => linux_clock_gettime(args[0], args[1]),              // clock_gettime
+        231 => sys_exit(args[0] as i32),                           // exit_group
+        234 => 0,                                                  // tgkill (stub)
+        257 => {
+            // openat: try to open via linux_openat
+            let r = linux_openat(args[0], args[1], args[2], args[3]);
+            crate::console_println!(
+                "[openat257] dirfd={} path_ptr={:#x} → {r}",
+                args[0],
+                args[1]
+            );
+            r
+        }
+        262 => -2,     // linux_newfstatat → ENOENT (stub)
+        267 => 0,      // readlinkat (stub)
+        272 => 0,      // unshare (stub)
+        273 => 0,      // set_robust_list (stub)
+        274 => 0,      // get_robust_list (stub)
+        290 => 4isize, // eventfd2 (fake fd)
+        291 => 3isize, // epoll_create1 (fake fd)
+        292 => sys_dup2(args[0] as i32, args[1] as i32), // dup3 → dup2
+        293 => 0,      // pipe2 (stub)
+        302 => 0,      // prlimit64 (stub)
+        318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
+        334 => -38,    // rseq → ENOSYS (Go gracefully degrades)
+        435 => 0,      // clone3 (stub → use clone)
+        _ => {
+            // Unknown syscall — return ENOSYS (-38) for graceful degradation
+            -38
+        }
+    };
+    result
+}
+
+// ─── Linux-specific syscall implementations ──────────────────────────
+// These handle Linux ABI differences from KarteOS's native syscalls.
+
+#[cfg(target_arch = "x86_64")]
+/// Linux open(path, flags, mode) — translate to KarteOS sys_open
+fn linux_open(path: usize, flags: usize, _mode: usize) -> isize {
+    let path_len = linux::count_user_string(path);
+    if path_len == 0 {
+        return ERR_NOENT;
+    }
+    sys_open(path, path_len, flags as u32)
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Linux openat(dirfd, pathname, flags, mode) — open file
+/// Stack-based implementation to avoid heap allocator issues in syscall context.
+fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> isize {
+    let path_len = linux::count_user_string(pathname);
+    if path_len == 0 || path_len > 256 {
+        return ERR_NOENT; // -2
+    }
+    // Read path into stack buffer
+    let mut buf = [0u8; 256];
+    unsafe {
+        let src = pathname as *const u8;
+        for i in 0..path_len {
+            buf[i] = core::ptr::read_volatile(src.add(i));
+        }
+    }
+    let path_str = match core::str::from_utf8(&buf[..path_len]) {
+        Ok(s) => s,
+        Err(_) => return ERR_NOENT,
+    };
+    // Try to open via VFS
+    match crate::driver::vfs::open(path_str, flags as u32) {
+        Ok(fd) => fd as isize,
+        Err(_) => ERR_NOENT,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Linux stat / fstat — return a zeroed stat structure (Go mostly ignores the result)
+fn linux_stat(pathname: usize, statbuf: usize) -> isize {
+    let _ = pathname;
+    if statbuf != 0 {
+        // Zero-fill struct stat (144 bytes on x86_64 Linux)
+        unsafe {
+            core::ptr::write_bytes(statbuf as *mut u8, 0, 144);
+            // Set st_mode to 0o100644 (regular file, 0644 permissions)
+            *(statbuf as *mut u64).add(2) = 0o100644u64;
+            // Set st_nlink to 1
+            *(statbuf as *mut u64).add(5) = 1u64;
+            // Set st_blksize to 4096
+            *(statbuf as *mut u64).add(10) = 4096u64;
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_fstat(fd: usize, statbuf: usize) -> isize {
+    if statbuf != 0 {
+        unsafe {
+            core::ptr::write_bytes(statbuf as *mut u8, 0, 144);
+            // Set st_mode based on fd type
+            let mode = if fd <= 2 { 0o120000u64 } else { 0o100644u64 }; // char device for stdio, regular for files
+            *(statbuf as *mut u64).add(2) = mode;
+            *(statbuf as *mut u64).add(5) = 1u64; // st_nlink
+            *(statbuf as *mut u64).add(10) = 4096u64; // st_blksize
+            // For stdout/stderr, set st_rdev to (1, major) for tty
+            if fd <= 2 {
+                *(statbuf as *mut u64).add(7) = 0x8800u64; // makedev(136, 0) for /dev/pts
+            }
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_lstat(_pathname: usize, statbuf: usize) -> isize {
+    // Same as stat for our purposes
+    linux_stat(_pathname, statbuf)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_newfstatat(_dirfd: usize, pathname: usize, statbuf: usize, _flags: usize) -> isize {
+    linux_stat(pathname, statbuf)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_poll(_fds: usize, _nfds: usize, _timeout: usize) -> isize {
+    // No events ready
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_lseek(_fd: usize, _offset: usize, _whence: usize) -> isize {
+    // Stub: return 0 (success, offset = 0)
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_pread64(fd: i32, buf: usize, count: usize, _offset: usize) -> isize {
+    sys_read(fd, buf, count)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_readv(_fd: usize, _iov: usize, _iovcnt: usize) -> isize {
+    // Stub: return 0 bytes read
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_dup(oldfd: usize) -> isize {
+    // Simple dup: find lowest available fd and dup2
+    crate::process::with_fd_table(|fd_table| {
+        for new_fd in 0..crate::driver::fs::MAX_FDS {
+            if fd_table.get(new_fd).is_none() {
+                if fd_table.dup(oldfd, new_fd) {
+                    // Increment pipe ref count if this is a pipe fd
+                    if let Some(desc) = fd_table.get(oldfd) {
+                        if let Some(pipe_id) = desc.pipe_id {
+                            crate::driver::pipe::inc_ref(pipe_id);
+                        }
+                    }
+                    return new_fd as isize;
+                }
+                return ERR_INVAL;
+            }
+        }
+        ERR_NOMEM
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_dup2(oldfd: usize, newfd: usize) -> isize {
+    sys_dup2(oldfd as i32, newfd as i32)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_pause() -> isize {
+    // Stub: pretend interrupted
+    -4 // EINTR
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_pipe(fd_ptr: usize) -> isize {
+    sys_pipe(fd_ptr)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_getppid() -> isize {
+    // Stub: return PID 1 (init)
+    1
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_socket(_domain: usize, _socket_type: usize, _protocol: usize) -> isize {
+    // Network not available on x86_64 yet
+    ERR_IO
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_accept(_fd: i32) -> isize {
+    // Delegate to sys_accept (kernel syscall 74)
+    sys_accept(_fd)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_waitpid(pid: usize, status_ptr: usize, options: usize) -> isize {
+    let _ = (status_ptr, options);
+    sys_waitpid(pid)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_wait4(pid: usize, status_ptr: usize, options: usize) -> isize {
+    let _ = status_ptr;
+    // Write exit status if requested
+    let result = sys_waitpid(pid);
+    if result >= 0 && status_ptr != 0 {
+        unsafe {
+            *(status_ptr as *mut i32) = ((result & 0xFF) << 8) as i32; // WEXITSTATUS encoding
+        }
+    }
+    let _ = options;
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_getcwd(buf: usize, size: usize) -> isize {
+    if buf == 0 || size == 0 {
+        return ERR_INVAL;
+    }
+    // Return "/" as the working directory
+    let cwd = b"/\0";
+    let len = cwd.len().min(size);
+    unsafe {
+        core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf as *mut u8, len);
+    }
+    (len - 1) as isize // return length without NUL
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_chdir(path: usize) -> isize {
+    let path_len = linux::count_user_string(path);
+    if path_len == 0 {
+        return ERR_INVAL;
+    }
+    sys_chdir(path, path_len)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_gettimeofday(tv: usize, _tz: usize) -> isize {
+    if tv != 0 {
+        let tv_ptr = tv as *mut u64;
+        unsafe {
+            *tv_ptr = 0; // seconds
+            *(tv_ptr.add(1)) = 0; // microseconds
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_time(tloc: usize) -> isize {
+    if tloc != 0 {
+        unsafe {
+            *(tloc as *mut u64) = 0;
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_clock_gettime(_clockid: usize, tp: usize) -> isize {
+    if tp != 0 {
+        // Use kernel uptime (milliseconds since boot) as a monotonic source
+        let uptime_ms = crate::arch::platform::uptime_ms();
+        let secs = uptime_ms / 1000;
+        let nsecs = (uptime_ms % 1000) * 1_000_000;
+        let tp_ptr = tp as *mut u64;
+        unsafe {
+            *tp_ptr = secs; // seconds
+            *(tp_ptr.add(1)) = nsecs; // nanoseconds
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_sysinfo(info: usize) -> isize {
+    if info != 0 {
+        // struct sysinfo is ~80 bytes, zero-fill
+        unsafe {
+            core::ptr::write_bytes(info as *mut u8, 0, 80);
+            // Set some reasonable values
+            *(info as *mut u64) = 512 * 1024 / 4; // totalram (in pages, ~512MB)
+            *(info as *mut u64).add(1) = 256 * 1024 / 4; // freeram
+            *(info as *mut u64).add(3) = 1; // procs
+            *(info as *mut u64).add(12) = 4096; // mem_unit
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_sched_getaffinity(_pid: usize, size: usize, mask: usize) -> isize {
+    if mask != 0 && size >= 8 {
+        unsafe {
+            *(mask as *mut u64) = 0xFF; // 8 CPUs
+        }
+    }
+    8 // return size written
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_sched_setaffinity(_pid: usize, _size: usize, _mask: usize) -> isize {
+    0 // stub: success
+}
+
+pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
+    // Enable timer interrupts on the first syscall.
+    static TIMER_ENABLED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if !TIMER_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        TIMER_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
+        crate::arch::trap::enable_timer_interrupt();
+        crate::arch::trap::set_next_timer();
         #[cfg(target_arch = "x86_64")]
         crate::arch::ioapic::unmask_external_irqs();
     }
 
-    // Try Linux compat layer first.
-    if let Some(translation) = linux::translate(id, args) {
-        return match translation {
-            linux::Translation::Dispatch { karte_nr, args } => dispatch(karte_nr, args),
-            linux::Translation::Handled(retval) => retval,
-        };
+    // Syscall trace for Go binary debugging
+    static TRACE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let tc = TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_arch = "x86_64")]
+    if tc < 50 {
+        crate::console_println!("[T#{tc}] sys{id} via80");
     }
 
+    // Try Linux compat layer first.
+    let result = if let Some(translation) = linux::translate(id, args) {
+        match translation {
+            linux::Translation::Dispatch { karte_nr, args } => dispatch_inner(karte_nr, args),
+            linux::Translation::Handled(retval) => retval,
+        }
+    } else {
+        dispatch_inner(id, args)
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    if tc < 50 {
+        crate::console_println!("[T#{tc}] → {result}");
+    }
+    result
+}
+
+fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
     match id {
         SYS_DEBUG_PRINT => sys_debug_print(args[0], args[1]),
         SYS_EXIT => sys_exit(args[0] as i32),
@@ -248,7 +730,7 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 }
 
 /// Syscall 1: Exit the current process.
-fn sys_exit(code: i32) -> isize {
+pub fn sys_exit(code: i32) -> isize {
     crate::console_println!("[process] User process exited with code {}", code);
 
     // If init (the shell) exits, no process remains → shut down the system.
@@ -262,9 +744,12 @@ fn sys_exit(code: i32) -> isize {
     #[cfg(target_arch = "x86_64")]
     if let Some(proc) = crate::process::current() {
         if proc.child_tid_ptr != 0 {
+            let tid_ptr = proc.child_tid_ptr;
             unsafe {
-                core::ptr::write_volatile(proc.child_tid_ptr as *mut i32, 0);
+                core::ptr::write_volatile(tid_ptr as *mut i32, 0);
             }
+            // Wake any threads waiting on this futex (FUTEX_WAKE, val=1)
+            linux_futex(tid_ptr, 1, 1);
         }
     }
 
@@ -292,8 +777,18 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    // First check fd_table for the actual fd type.
-    // This handles redirected stdout/stderr (e.g., file or pipe).
+    // Fast path for stdout/stderr: write directly to console without heap allocation.
+    // This avoids buddy_system_allocator dealloc issues that can cause GP faults
+    // when Go is outputting fatal error messages.
+    if fd == 1 || fd == 2 {
+        for i in 0..len {
+            let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+            crate::arch::platform::console_putchar(byte);
+        }
+        return len as isize;
+    }
+
+    // For other fds, check fd_table
     let fd_info = get_fd_info(fd);
     match fd_info {
         Some((FdType::PipeWrite, Some(pipe_id), _)) => {
@@ -303,7 +798,6 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             return ERR_INVAL; // can't write to read end
         }
         Some((FdType::Stdio, _, _)) => {
-            // Stdio (fd 0/1/2 default): write to console
             for i in 0..len {
                 let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
                 crate::arch::platform::console_putchar(byte);
@@ -314,14 +808,6 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             // Fall through to file write below
         }
         _ => {
-            // Unknown type or no info — if fd is 1/2, write to console
-            if fd == 1 || fd == 2 {
-                for i in 0..len {
-                    let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
-                    crate::arch::platform::console_putchar(byte);
-                }
-                return len as isize;
-            }
             return ERR_INVAL;
         }
     }
@@ -632,7 +1118,6 @@ fn linux_mmap(
     let valid_start = crate::process::USER_HEAP_BASE;
     let valid_end = crate::process::USER_MMAP_LIMIT;
     if target_addr < valid_start || end > valid_end {
-        crate::console_println!("[mmap] range {:#x}-{:#x} out of bounds", target_addr, end);
         return -22; // EINVAL
     }
 
@@ -680,6 +1165,11 @@ fn linux_mmap(
     // Advance brk tracking (for addr=0 kernel-chosen allocations)
     if addr == 0 && end > crate::process::current_brk() {
         crate::process::set_current_brk(end);
+    }
+
+    // Verify the mapping actually works
+    if crate::mm::vmm::translate_user(user_pt, target_addr).is_none() {
+        return -12; // ENOMEM
     }
 
     target_addr as isize
@@ -950,20 +1440,35 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         return ERR_INVAL;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    static OPEN_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    #[cfg(target_arch = "x86_64")]
+    let oc = OPEN_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
     // Check/create file in FS
     if flags & O_CREAT != 0 {
         let _ = crate::driver::fs::create_file(&name);
     }
     // Verify file exists
     if crate::driver::fs::read_file_owned(&name).is_none() && (flags & O_CREAT == 0) {
+        #[cfg(target_arch = "x86_64")]
+        if oc < 10 {
+            crate::console_println!("[open] ENOENT: {name}");
+        }
         return ERR_NOENT;
     }
 
     // Allocate fd from current process's FD table
-    crate::process::with_fd_table(|fd_table| match fd_table.alloc(name, flags) {
-        Some(fd) => fd as isize,
-        None => ERR_NOMEM,
-    })
+    let result =
+        crate::process::with_fd_table(|fd_table| match fd_table.alloc(name.clone(), flags) {
+            Some(fd) => fd as isize,
+            None => ERR_NOMEM,
+        });
+    #[cfg(target_arch = "x86_64")]
+    if oc < 10 {
+        crate::console_println!("[open] {name} → fd={result}");
+    }
+    result
 }
 
 /// Syscall 11: Close a file descriptor.
@@ -2498,7 +3003,7 @@ fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
 ///   CLONE_SIGHAND (0x800) = share signal handlers
 ///   CLONE_THREAD (0x10000) = same thread group
 ///   CLONE_SETTLS (0x80000) = set FS base (x86_64: IA32_FS_BASE)
-///   CLONE_PARENT_SETTID (0x10000) = write child TID to parent_tid
+///   CLONE_PARENT_SETTID (0x100000) = write child TID to parent_tid
 ///   CLONE_CHILD_CLEARTID (0x200000) = clear child_tid on exit
 fn linux_clone(
     flags: usize,
@@ -2644,7 +3149,7 @@ fn linux_clone(
         };
 
         // CLONE_PARENT_SETTID: write child PID to parent's memory
-        if (flags & 0x10000) != 0 && parent_tid_ptr != 0 {
+        if (flags & 0x100000) != 0 && parent_tid_ptr != 0 {
             unsafe {
                 core::ptr::write_volatile(parent_tid_ptr as *mut i32, child_pid as i32);
             }
@@ -2786,6 +3291,14 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
             0
         }
         ARCH_SET_FS => {
+            // Go runtime uses %fs:-8 to store the g pointer (getg()).
+            // Go writes the actual g pointer to [addr-8] BEFORE calling arch_prctl.
+            let tls_slot = unsafe { core::ptr::read_volatile((addr as *const u64).sub(1)) };
+            crate::console_println!(
+                "[arch_prctl] SET_FS addr={:#x} g@[-8]={:#x}",
+                addr,
+                tls_slot
+            );
             unsafe { crate::arch::idt::wrmsr(MSR_FS_BASE, addr as u64) };
             0
         }

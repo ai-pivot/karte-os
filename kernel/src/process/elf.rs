@@ -15,6 +15,8 @@ const EM_MACHINE: u16 = 62; // EM_X86_64
 
 /// PT_LOAD segment type
 const PT_LOAD: u32 = 1;
+/// PT_PHDR segment type (program header table itself)
+const PT_PHDR: u32 = 6;
 
 /// ELF header (64-bit)
 #[repr(C)]
@@ -73,6 +75,12 @@ pub struct ElfInfo {
     pub entry: usize,
     pub segments: [Option<ElfSegmentInfo>; 16],
     pub num_segments: usize,
+    /// Virtual address of program headers (PT_PHDR segment, or 0)
+    pub phdr_vaddr: usize,
+    /// Size of one program header entry (typically 56 bytes for ELF64)
+    pub phent: usize,
+    /// Number of program header entries
+    pub phnum: usize,
 }
 
 impl ElfInfo {
@@ -111,6 +119,7 @@ impl ElfInfo {
 
         let mut segments = [const { None }; 16];
         let mut num_segments = 0usize;
+        let mut phdr_vaddr = 0usize;
 
         for i in 0..phnum {
             if num_segments >= 16 {
@@ -124,7 +133,14 @@ impl ElfInfo {
             let ph: &ProgramHeader =
                 unsafe { &*(data.as_ptr().add(ph_offset) as *const ProgramHeader) };
 
-            if u32::from_le(ph.ptype) == PT_LOAD {
+            let ptype = u32::from_le(ph.ptype);
+
+            if ptype == PT_PHDR {
+                // PT_PHDR tells us the virtual address of the program headers themselves
+                phdr_vaddr = u64::from_le(ph.vaddr) as usize;
+            }
+
+            if ptype == PT_LOAD {
                 segments[num_segments] = Some(ElfSegmentInfo {
                     vaddr: u64::from_le(ph.vaddr) as usize,
                     offset: u64::from_le(ph.offset) as usize,
@@ -140,10 +156,24 @@ impl ElfInfo {
             return Err("ELF: no loadable segments");
         }
 
+        // If no PT_PHDR, compute phdr_vaddr from the first PT_LOAD segment
+        if phdr_vaddr == 0 {
+            if let Some(Some(first_seg)) = segments.get(0) {
+                // phoff is the file offset of program headers.
+                // If first segment loads from file offset 0, phdr_vaddr = first_seg.vaddr + phoff
+                if phoff >= first_seg.offset && first_seg.file_size > 0 {
+                    phdr_vaddr = first_seg.vaddr + (phoff - first_seg.offset);
+                }
+            }
+        }
+
         Ok(Self {
             entry,
             segments,
             num_segments,
+            phdr_vaddr,
+            phent: phentsize,
+            phnum,
         })
     }
 }

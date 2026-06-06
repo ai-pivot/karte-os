@@ -495,6 +495,27 @@ impl FdTable {
         }
     }
 
+    /// Duplicate an fd: copy the descriptor from oldfd to newfd.
+    /// Returns true on success, false on failure (invalid oldfd).
+    pub fn dup(&mut self, oldfd: usize, newfd: usize) -> bool {
+        if newfd >= self.fds.len() {
+            return false;
+        }
+        // Get a clone of the old fd
+        let desc = match self
+            .fds
+            .get(oldfd)
+            .and_then(|opt| opt.as_ref().filter(|f| f.valid))
+            .cloned()
+        {
+            Some(d) => d,
+            None => return false,
+        };
+        // Close newfd if it was open
+        self.fds[newfd] = Some(desc);
+        true
+    }
+
     /// Get a reference to a file descriptor
     pub fn get(&self, fd: usize) -> Option<&FileDescriptor> {
         self.fds

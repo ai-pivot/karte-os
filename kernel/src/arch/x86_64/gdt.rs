@@ -150,19 +150,34 @@ pub fn init_for_cpu(cpu_id: usize) {
 
         let mut gdt = GlobalDescriptorTable::new();
 
-        let code = gdt.append(Descriptor::kernel_code_segment());
-        let data = gdt.append(Descriptor::kernel_data_segment());
-        let user_code = gdt.append(Descriptor::user_code_segment());
-        let user_data = gdt.append(Descriptor::user_data_segment());
+        // IMPORTANT: GDT entry order is critical for SYSCALL/SYSRET compatibility.
+        // Intel SYSRET: CS = STAR[48:63]+16, SS = STAR[48:63]+8 (RPL=3)
+        // AMD SYSRET:   CS = STAR[32:47]+16, SS = STAR[32:47]+8 (RPL=3)
+        // SYSCALL:      CS = STAR[48:63],    SS = STAR[48:63]+8
+        //
+        // With STAR = (0x08<<48)|(0x08<<32):
+        //   SYSCALL: CS=0x08 (kernel code), SS=0x10 (kernel data)
+        //   SYSRET:  CS=0x08+16=0x18 (user code), SS=0x08+8=0x10 (kernel data, OK in 64-bit)
+        //   (SS=0x10|3=0x13 is fine — 64-bit mode skips DPL check for SS)
+        //
+        // GDT layout:
+        //   Entry 1 (0x08): kernel code  ← SYSCALL CS
+        //   Entry 2 (0x10): kernel data  ← SYSCALL SS
+        //   Entry 3 (0x18): user code    ← SYSRET CS = 0x18|3 = 0x1B
+        //   Entry 4 (0x20): user data    ← iretq SS = 0x20|3 = 0x23
+        let code = gdt.append(Descriptor::kernel_code_segment()); // 0x08
+        let data = gdt.append(Descriptor::kernel_data_segment()); // 0x10
+        let user_code = gdt.append(Descriptor::user_code_segment()); // 0x18 → 0x1B with RPL
+        let user_data = gdt.append(Descriptor::user_data_segment()); // 0x20 → 0x23 with RPL
         let tss = unsafe {
             gdt.append(Descriptor::tss_segment(&*core::ptr::addr_of!(
                 PER_CPU_TSS[cpu_id]
             )))
         };
 
-        // Cache selector values (same for all CPUs since GDT layout is identical)
-        USER_CODE_SEL.store(user_code.0, Ordering::Relaxed);
-        USER_DATA_SEL.store(user_data.0, Ordering::Relaxed);
+        // Cache selector values with RPL=3 for Ring 3 user mode
+        USER_CODE_SEL.store(user_code.0 | 3, Ordering::Relaxed); // 0x18|3 = 0x1B
+        USER_DATA_SEL.store(user_data.0 | 3, Ordering::Relaxed); // 0x20|3 = 0x23
         KCODE_SEL.store(code.0, Ordering::Relaxed);
         crate::console_println!(
             "[GDT] code={:#x} data={:#x} user_code={:#x} user_data={:#x} tss={:#x}",

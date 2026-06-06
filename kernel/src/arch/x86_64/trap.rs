@@ -147,12 +147,9 @@ pub fn trap_return_user_addr() -> usize {
 ///
 /// The kernel metadata fields (kernel_sp, user_cr3, trap_from_user) are at
 /// higher addresses and are never touched by the pop/iretq sequence.
+/// Return from trap to user mode.
 ///
-/// # CR3 switching
-///
-/// If `user_cr3` is non-zero, we switch to the user page table before iretq.
-/// This is set only for a task's very first entry into U-mode (via
-/// `add_user_process`). Normal trap returns leave it 0.
+/// Expects a TrapContext on the stack (set up by `add_user_process`). Normal trap returns leave it 0.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn trap_return_user() {
@@ -191,9 +188,9 @@ pub unsafe extern "C" fn trap_return_user() {
             // PML4 table (already shifted by callers), so we use it directly.
             "cli",
             "cmp qword ptr [rsp + 0x30], 0",
-            "je 2f",                 // skip if user_cr3 == 0
-            "mov rax, [rsp + 0x30]", // rax = physical address of PML4
-            "mov cr3, rax",          // switch to user page table
+            "je 2f", // skip if user_cr3 == 0
+            "mov rax, [rsp + 0x30]",
+            "mov cr3, rax", // switch to user page table
             "2:",
             // ── Return to Ring 3 ──
             "iretq",
@@ -378,13 +375,13 @@ pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
 
 /// Activate a page table by writing to CR3.
 pub fn activate_page_table(root_paddr: usize) {
-    let phys = PhysAddr::new(root_paddr as u64);
-    let new_frame = PhysFrame::containing_address(phys);
-    let (current_frame, _) = Cr3::read();
-    if current_frame != new_frame {
-        unsafe {
-            Cr3::write(new_frame, x86_64::registers::control::Cr3Flags::empty());
-        }
+    // Direct CR3 write — bypass x86_64 crate to avoid any PhysFrame issues
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {0}",
+            in(reg) root_paddr as u64,
+            options(nostack, preserves_flags)
+        );
     }
 }
 
