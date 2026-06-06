@@ -222,9 +222,17 @@ pub fn init_for_cpu(cpu_id: usize) {
 ///
 /// # Safety
 /// The caller must ensure `kernel_stack_top` points to valid, accessible memory.
+/// Physical address of PER_CPU_TSS[0].privilege_stack_table[0].
+/// Used by trap_return_user asm to directly update TSS.RSP0 without calling Rust.
+#[cfg(target_arch = "x86_64")]
+pub static mut TSS_RSP0_ADDR: u64 = 0;
+
 pub unsafe fn set_kernel_rsp0(kernel_stack_top: u64) {
     let cpu_id = crate::arch::smp::current_hart().min(MAX_CPUS - 1);
     unsafe {
         PER_CPU_TSS[cpu_id].privilege_stack_table[0] = x86_64::VirtAddr::new(kernel_stack_top);
+        // Store address for trap_return_user asm (direct TSS write)
+        let rsp0_ptr = core::ptr::addr_of_mut!(PER_CPU_TSS[0].privilege_stack_table[0]);
+        TSS_RSP0_ADDR = rsp0_ptr as u64;
     }
 }

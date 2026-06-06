@@ -162,15 +162,24 @@ pub fn dispatch_syscall_linux(
             a6 as usize,
         ],
     );
-    // Trace key syscalls for debugging
+    // Trace non-init process syscalls
     let nr_usize = nr as usize;
-    if nr_usize == 56 || nr_usize == 202 || nr_usize == 60 || nr_usize == 1 {
+    let cur_pid = crate::process::current_pid();
+    if cur_pid >= 2
+        && nr_usize != 228
+        && nr_usize != 35
+        && nr_usize != 9
+        && nr_usize != 28
+        && nr_usize != 157
+    {
         crate::console_println!(
-            "[trace] sys{}({:#x}) → {} (tc={})",
+            "[P{}T#{}] sys{}({:#x},{:#x}) → {}",
+            cur_pid,
+            _tc,
             nr_usize,
             a1 as usize,
-            result,
-            _tc
+            a2 as usize,
+            result
         );
     }
     result as u64

@@ -163,7 +163,7 @@ pub fn schedule() {
             #[cfg(target_arch = "x86_64")]
             {
                 let next_sp = unsafe { *nxt_ptr };
-                let tc_base = next_sp + 576 + 8;
+                let tc_base = next_sp + 576; // No TLS storage - TrapContext directly after switch frame
                 let tc = tc_base as *const crate::arch::trap::TrapContext;
                 crate::console_println!("[sched→{}] sp={:#x} rip={:#x}", next, next_sp, unsafe {
                     (*tc).rip
@@ -478,16 +478,16 @@ unsafe extern "C" fn clone_first_shim() -> ! {
     unsafe {
         core::arch::naked_asm!(
             // RSP = trap_ctx_base (TrapContext starts here).
-            // Set FS_BASE for TLS from TrapContext.rdi (saved TLS pointer).
-            // rdi is at TrapContext offset 48 = [rsp + 48].
-            "mov rax, [rsp + 48]",     // TrapContext.rdi = TLS address
+            // Set FS_BASE for TLS from TrapContext.r15 (offset 112 = 14*8)
+            "mov rax, [rsp + 112]",
             "cmp rax, 0",
             "je 2f",
-            "mov ecx, 0xC0000100",     // IA32_FS_BASE MSR
+            "mov ecx, 0xC0000100",
             "mov rdx, rax",
             "shr rdx, 32",
             "wrmsr",
             "2:",
+            // Jump to trap_return_user (pop 15 regs + iretq)
             "jmp {handler}",
             handler = sym trap_return_user,
         );
@@ -531,7 +531,7 @@ pub fn add_clone_process(
     };
 
     let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
-    let tls_storage_size: usize = 8; // 8 bytes for TLS pointer after switch frame
+    let tls_storage_size: usize = 0; // No TLS storage - same layout as add_user_process
     // __switch frame layout (same as add_user_process):
     //   [0..511]   fxsave area (512 bytes)
     //   [512..519] orig_rsp (points to r15 slot after fxrstor)
@@ -564,16 +564,14 @@ pub fn add_clone_process(
         // Return address at offset 568 (pop r15..rbp brings RSP here)
         *sw.add(568 / 8) = first_task_shim as *const () as usize; // ret addr → first_task_shim (same as normal process)
 
-        // Store TLS value between switch frame and TrapContext
-        let tls_ptr = tls_base as *mut usize;
-        *tls_ptr = tls;
+        // No TLS storage - TLS is passed via TrapContext.r15
 
         // Build TrapContext as a copy of parent's, with modifications for child
         let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
         *ctx = parent_ctx.clone();
         // Modifications for clone child:
         (*ctx).rax = 0; // Child returns 0 from clone
-        (*ctx).rdi = tls as u64; // Save TLS pointer for clone_first_shim to set FS_BASE
+        (*ctx).r15 = tls as u64; // Save TLS pointer for clone_first_shim to set FS_BASE
         (*ctx).rsp = new_user_sp as u64; // Use new user stack
         (*ctx).kernel_sp = kernel_stack_top as u64;
         (*ctx).user_cr3 = user_cr3 as u64; // Set for CR3 switch on first entry
