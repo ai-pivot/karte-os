@@ -477,71 +477,19 @@ pub fn add_user_process(
 unsafe extern "C" fn clone_first_shim() -> ! {
     unsafe {
         core::arch::naked_asm!(
-            // RSP = tls_base = switch_sp + 576.
-            // TLS value at [rsp]. TrapContext at [rsp + 8].
-            //
-            // Set up TLS/FS_BASE, then set RSP to TrapContext start.
-            // Pop 15 GP regs (matches TrapContext layout), then handle CR3 + iretq.
-            "mov rax, [rsp]",           // Read TLS pointer from tls_base
+            // RSP = trap_ctx_base (TrapContext starts here).
+            // Set FS_BASE for TLS from TrapContext.rdi (saved TLS pointer).
+            // rdi is at TrapContext offset 48 = [rsp + 48].
+            "mov rax, [rsp + 48]",     // TrapContext.rdi = TLS address
             "cmp rax, 0",
             "je 2f",
-            "mov ecx, 0xC0000100",      // IA32_FS_BASE MSR
+            "mov ecx, 0xC0000100",     // IA32_FS_BASE MSR
             "mov rdx, rax",
             "shr rdx, 32",
             "wrmsr",
             "2:",
-            "add rsp, 8",               // Skip TLS, RSP now at TrapContext start
-            // Debug: verify TrapContext.rip at [rsp+120] before popping
-            "mov rax, [rsp + 120]",     // TrapContext.rip (offset 15*8=120)
-            "mov [{rip_global}], rax",
-            "mov rax, [rsp]",           // TrapContext.rax
-            "mov [{rax_global}], rax",
-            // Pop 15 GP registers from TrapContext
-            "pop rax",                  // TrapContext.rax
-            "pop rbx",                  // TrapContext.rbx
-            "pop rcx",                  // TrapContext.rcx
-            "pop rdx",                  // TrapContext.rdx
-            "pop rbp",                  // TrapContext.rbp
-            "pop rsi",                  // TrapContext.rsi
-            "pop rdi",                  // TrapContext.rdi
-            "pop r8",                   // TrapContext.r8
-            "pop r9",                   // TrapContext.r9
-            "pop r10",                  // TrapContext.r10
-            "pop r11",                  // TrapContext.r11
-            "pop r12",                  // TrapContext.r12
-            "pop r13",                  // TrapContext.r13
-            "pop r14",                  // TrapContext.r14
-            "pop r15",                  // TrapContext.r15
-            // RSP now at iretq frame: rip, cs, rflags, rsp, ss, kernel_sp, user_cr3, trap_from_user
-            // Inline the CR3 switch + iretq (same as trap_return_user but without extra function call)
-            "cli",
-            "cmp qword ptr [rsp + 0x30], 0",  // user_cr3 at offset 48 from iretq frame start
-            "je 3f",
-            "mov rax, [rsp + 0x30]",
-            "mov cr3, rax",
-            "3:",
-            // Debug: save final state before iretq
-            "mov rax, [rsp]",
-            "mov [{rip_global}], rax",
-            "mov rax, [rsp + 0x18]",
-            "mov [{rax_global}], rax",
-            "mov [{rsp_global}], rsp",
-            // CRITICAL: After __switch, CR3 may be stale/wrong because
-            // __switch's ret jumps here instead of returning to timer ISR
-            // which would normally restore CR3. Must restore kernel CR3.
-            "mov rax, [{kcr3}]",
-            "mov cr3, rax",
-            // Now check if we need to switch to user CR3 for iretq
-            "cmp qword ptr [rsp + 0x30], 0",
-            "je 4f",
-            "mov rax, [rsp + 0x30]",
-            "mov cr3, rax",
-            "4:",
-            "iretq",
-            kcr3 = sym crate::arch::idt::KERNEL_CR3_PHYS,
-            rax_global = sym crate::arch::idt::CLONE_DBG_RAX,
-            rip_global = sym crate::arch::idt::CLONE_DBG_RIP,
-            rsp_global = sym crate::arch::idt::CLONE_DBG_RSPVAL,
+            "jmp {handler}",
+            handler = sym trap_return_user,
         );
     }
 }
@@ -614,7 +562,7 @@ pub fn add_clone_process(
         // orig_rsp: points to r15 slot so pop r15..rbp + ret works correctly
         *sw.add(512 / 8) = switch_sp + 520; // orig_rsp → r15 slot
         // Return address at offset 568 (pop r15..rbp brings RSP here)
-        *sw.add(568 / 8) = clone_first_shim as *const () as usize; // ret addr → clone_first_shim
+        *sw.add(568 / 8) = first_task_shim as *const () as usize; // ret addr → first_task_shim (same as normal process)
 
         // Store TLS value between switch frame and TrapContext
         let tls_ptr = tls_base as *mut usize;
@@ -625,9 +573,10 @@ pub fn add_clone_process(
         *ctx = parent_ctx.clone();
         // Modifications for clone child:
         (*ctx).rax = 0; // Child returns 0 from clone
+        (*ctx).rdi = tls as u64; // Save TLS pointer for clone_first_shim to set FS_BASE
         (*ctx).rsp = new_user_sp as u64; // Use new user stack
         (*ctx).kernel_sp = kernel_stack_top as u64;
-        (*ctx).user_cr3 = 0; // Skip CR3 switch - CLONE_VM shares page table
+        (*ctx).user_cr3 = user_cr3 as u64; // Set for CR3 switch on first entry
         (*ctx).trap_from_user = 1;
 
         // Verify TrapContext physical mapping in user page table
