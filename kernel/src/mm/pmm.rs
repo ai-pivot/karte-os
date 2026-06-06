@@ -87,11 +87,15 @@ impl FrameAllocator {
     fn debug_init_info(&self, kernel_end: usize, start: usize, managed_start: usize, end: usize) {
         crate::console_println!(
             "[pmm] kernel_end={:#x} start={:#x} managed_start={:#x} end={:#x}",
-            kernel_end, start, managed_start, end
+            kernel_end,
+            start,
+            managed_start,
+            end
         );
         crate::console_println!(
             "[pmm] total_frames={} managed_frames={} bitmap_words={} bitmap_frames={}",
-            (end - start) / PAGE_SIZE, self.total_frames, 
+            (end - start) / PAGE_SIZE,
+            self.total_frames,
             ((end - start) / PAGE_SIZE + 63) / 64,
             (managed_start - start + PAGE_SIZE - 1) / PAGE_SIZE
         );
@@ -117,7 +121,8 @@ impl FrameAllocator {
             if self.bitmap[word] & (1u64 << bit) == 0 {
                 self.bitmap[word] |= 1u64 << bit;
                 self.next_free = i + 1;
-                return Some(self.start + i * PAGE_SIZE);
+                let addr = self.start + i * PAGE_SIZE;
+                return Some(addr);
             }
         }
         None
@@ -181,12 +186,24 @@ pub fn init() {
 /// Called from kmain after parsing multiboot2 info.
 #[cfg(target_arch = "x86_64")]
 pub fn init_with_size(mem_size: usize) {
-    unsafe { MEMORY_SIZE = mem_size; }
+    unsafe {
+        MEMORY_SIZE = mem_size;
+    }
     let allocator = FrameAllocator::new();
     let available_mb = allocator.total_frames * PAGE_SIZE / 1024 / 1024;
     *FRAME_ALLOCATOR.lock() = Some(allocator);
-    crate::console_println!("[pmm] Initialized: {} MB available (total RAM: {} MB)",
-        available_mb, mem_size / 1024 / 1024);
+    crate::console_println!(
+        "[pmm] Initialized: {} MB available (total RAM: {} MB)",
+        available_mb,
+        mem_size / 1024 / 1024
+    );
+}
+
+/// Return the total physical memory size (end address).
+/// Used by copy_kernel_mappings to identity-map the full kernel address space.
+#[cfg(target_arch = "x86_64")]
+pub fn total_memory() -> usize {
+    MEMORY_START + unsafe { MEMORY_SIZE }
 }
 
 pub fn alloc_frame() -> Option<usize> {

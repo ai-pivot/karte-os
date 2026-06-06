@@ -208,8 +208,6 @@ pub fn init_for_cpu(cpu_id: usize) {
 /// # Safety
 /// The caller must ensure `kernel_stack_top` points to valid, accessible memory.
 pub unsafe fn set_kernel_rsp0(kernel_stack_top: u64) {
-    // Determine which CPU we're on by checking which TSS has been loaded.
-    // Simple approach: use LAPIC ID to index into per-CPU TSS array.
     let cpu_id = crate::arch::smp::current_hart().min(MAX_CPUS - 1);
     unsafe {
         PER_CPU_TSS[cpu_id].privilege_stack_table[0] = x86_64::VirtAddr::new(kernel_stack_top);

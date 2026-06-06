@@ -126,9 +126,9 @@ _start:
 
     debug_char P
 
-    # ── Enable PAE ──
+    # ── Enable PAE, OSFXSR (SSE), OSXMMEXCPT (SIMD exceptions) ──
     movl %cr4, %eax
-    orl $(1 << 5), %eax
+    orl $((1 << 5) | (1 << 9) | (1 << 10)), %eax
     movl %eax, %cr4
 
     # ── Load CR3 ──
@@ -150,9 +150,10 @@ _start:
 
     debug_char G
 
-    # ── Enable paging ──
+    # ── Enable paging + clear CR0.EM/TS, set CR0.MP for SSE ──
     movl %cr0, %eax
-    orl $((1 << 31) | (1 << 0)), %eax
+    orl $((1 << 31) | (1 << 0) | (1 << 1)), %eax   # PG | PE | MP
+    andl $~((1 << 2) | (1 << 3)), %eax               # clear EM, TS
     movl %eax, %cr0
 
     # ── Far jump to 64-bit code ──

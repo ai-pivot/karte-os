@@ -392,21 +392,35 @@ pub fn add_user_process(
         //           +544: r12
         //           +536: r13
         //           +528: r14
-        //           +520: r15
-        //           +0..+519: fxsave area (512 bytes)
+        //           +520: r15          ← orig_rsp points here
+        //           +512: orig_rsp     ← saved original RSP for restore
+        //           +0..+511: fxsave area (512 bytes)
         //           +0   ← switch_sp (TASK_SPS[tid])
         //
-        // __switch: fxrstor → pop r15..rbp → ret → first_task_shim
+        // __switch restore: fxrstor → mov rsp,[rsp+512] (orig_rsp) →
+        //                   pop r15..rbp → ret → first_task_shim
         let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
-        let switch_frame_size: usize = 7 * 8 + 512; // 6 callee-saved + ret addr + fxsave
-        let trap_ctx_base = kernel_stack_top - ctx_size;
-        let switch_sp = trap_ctx_base - switch_frame_size;
+        let switch_frame_size: usize = 8 * 8 + 512; // orig_rsp + 6 callee-saved + ret addr + fxsave = 576
+        // Align switch_sp to 16 bytes so fxsave64/fxrstor64 doesn't #GP.
+        // TrapContext sits above the switch frame, aligned to 8 bytes.
+        let switch_sp = (kernel_stack_top - ctx_size - switch_frame_size) & !0xF;
+        let trap_ctx_base = switch_sp + switch_frame_size;
         unsafe {
             core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + switch_frame_size);
-            // __switch frame: fxsave area at bottom (512 bytes, zeroed above),
-            // then callee-saved (also zeroed), then ret addr at top
+            // Write a valid fxsave image: zeroed is fine but MXCSR must have
+            // reserved bits clear (it does, since it's zero). However, some
+            // emulators/QEMU may be stricter. Set MXCSR to the power-on default
+            // (0x1F80) to be safe.
+            let fxsave_ptr = switch_sp as *mut u8;
+            // MXCSR is at fxsave offset 24 (32-bit field)
+            let mxcsr_ptr = fxsave_ptr.add(24) as *mut u32;
+            *mxcsr_ptr = 0x1F80; // Power-on default: all exceptions masked
             let sw = switch_sp as *mut usize;
-            *sw.add(512 / 8 + 6) = first_task_shim as *const () as usize; // ret addr
+            // orig_rsp: after __switch loads this, pop r15..rbp (48 bytes) then
+            // ret pops the return address. So orig_rsp must point at the r15 slot.
+            *sw.add(512 / 8) = switch_sp + 520; // orig_rsp → r15 slot
+            // Return address at offset 568 (pop r15..rbp brings RSP to 568)
+            *sw.add(568 / 8) = first_task_shim as *const () as usize; // ret addr
             // Build TrapContext
             let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
             (*ctx).rip = entry as u64;
@@ -427,14 +441,14 @@ pub fn add_user_process(
     if tid >= sched.count {
         sched.count = tid + 1;
     }
-    // Mark the new task as Running and set current to it.
-    // Without this, the first timer ISR would see current == INIT_SENTINEL
-    // and save init's timer-ISR stack into INIT_TASK_SP. On child exit,
-    // restoring that stale RSP leads to Double Fault.
+    // Mark the new task as Ready (NOT Running). The child will be dispatched
+    // when init calls schedule() via sys_waitpid or sys_read.
     if let Some(ref mut t) = sched.tasks[tid] {
-        t.state = TaskState::Running;
+        t.state = TaskState::Ready;
     }
-    sched.current = tid;
+    // Do NOT set sched.current = tid here! Init is still running.
+    // sched.current remains INIT_SENTINEL so that schedule() takes the
+    // switch_from_init path and correctly saves init's RSP to INIT_TASK_SP.
     Some(tid)
 }
 

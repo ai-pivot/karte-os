@@ -98,14 +98,19 @@ impl RamFileSystem {
     pub fn new_initialized() -> Self {
         let mut fs = Self::new();
 
-        fs.write_static("hello", include_bytes!("../../../user/hello.elf"))
-            .unwrap();
-        fs.write_static("heap_test", include_bytes!("../../../user/heap_test.elf"))
-            .unwrap();
-        fs.write_static("file_test", include_bytes!("../../../user/file_test.elf"))
-            .unwrap();
-        fs.write_static("spawn_test", include_bytes!("../../../user/spawn_test.elf"))
-            .unwrap();
+        // Assembly test programs are RISC-V only
+        #[cfg(target_arch = "riscv64")]
+        {
+            fs.write_static("hello", include_bytes!("../../../user/hello.elf"))
+                .unwrap();
+            fs.write_static("heap_test", include_bytes!("../../../user/heap_test.elf"))
+                .unwrap();
+            fs.write_static("file_test", include_bytes!("../../../user/file_test.elf"))
+                .unwrap();
+            fs.write_static("spawn_test", include_bytes!("../../../user/spawn_test.elf"))
+                .unwrap();
+        }
+
         fs.write_static("shell", include_bytes!("../../../user/shell.elf"))
             .unwrap();
         fs.write_static("init", include_bytes!("../../../user/shell.elf"))

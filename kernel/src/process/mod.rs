@@ -113,33 +113,23 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
 
     #[cfg(target_arch = "x86_64")]
     {
-        unsafe extern "C" {
-            static _ekernel: u8;
-        }
-        // Map kernel code/data into user page table.
-        // CRITICAL: only map the actual kernel binary range, NOT the entire
-        // 0x100000-0x20000000 region. Large user programs (e.g. Go binaries)
-        // use virtual addresses >= 0x400000 which would overlap with a broad
-        // identity mapping, causing copy_kernel_mappings to overwrite user
-        // page table entries with kernel identity mappings.
-        let kernel_end = unsafe { &_ekernel as *const u8 as usize };
-        // Round up to page boundary
-        let kernel_end_page = (kernel_end + 4095) & !4095;
-        vmm::identity_map(user_pt, 0x10_0000, kernel_end_page, vmm::PTEFlags::KRWX);
-        // Map VGA text buffer at 0xB8000 (2 pages to cover potential overflow)
+        // Identity-map from 1MB to end of physical RAM, but SKIP any pages
+        // already mapped by the ELF loader. This preserves user program
+        // virtual addresses (e.g., xbot at 0x400000+) while still providing
+        // access to kernel code, heap, and data structures.
+        let ram_end = crate::mm::pmm::total_memory();
+        vmm::identity_map_skip(user_pt, 0x10_0000, ram_end, vmm::PTEFlags::KRWX);
+
+        // Map VGA text buffer at 0xB8000 (2 pages)
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xB9000, 0xB9000, vmm::PTEFlags::KRW);
         // Map LAPIC/IOAPIC MMIO
         vmm::map(user_pt, 0xFEE0_0000, 0xFEE0_0000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xFEC0_0000, 0xFEC0_0000, vmm::PTEFlags::KRW);
-        // Map PCI MMIO region (AHCI BAR5 is typically in this range)
-        vmm::identity_map(user_pt, 0xF000_0000, 0x1_0000_0000, vmm::PTEFlags::KRW);
+        // Map PCI MMIO region
+        vmm::identity_map_2mb(user_pt, 0xF000_0000, 0x1_0000_0000, vmm::PTEFlags::KRW);
 
         // Map kernel stack pages into user page table.
-        // CRITICAL: first_enter_user switches CR3 before iretq. The iretq
-        // frame is built on the kernel stack, so the stack pages MUST be
-        // mapped in the user page table for iretq to read the frame.
-        // Without this, CR3 switch makes the kernel stack inaccessible → PF.
         let kstack_base = kernel_stack_top - KERNEL_STACK_PAGES * 4096;
         for addr in (kstack_base..kernel_stack_top).step_by(4096) {
             vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
@@ -303,11 +293,6 @@ impl Process {
         let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
             .ok_or("Out of memory for kernel stack")?;
         let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * page_size;
-        crate::console_println!(
-            "[elf] kstack_base={:#x} kstack_top={:#x}",
-            kstack_base,
-            kernel_stack_top
-        );
 
         // 1. Read ELF header (first 4096 bytes covers header + program headers)
         let header_size = 4096usize;
@@ -333,16 +318,6 @@ impl Process {
             let page_end = (seg_vaddr_end + page_size - 1) & !(page_size - 1);
             let is_executable = seg.flags & 1 != 0; // PF_X
             let num_pages = (page_end - page_start) / page_size;
-            crate::console_println!(
-                "[elf] seg {}: vaddr={:#x}-{:#x} pages={} filesz={:#x} memsz={:#x} flags={:#x}",
-                seg_idx,
-                seg_vaddr_start,
-                seg_vaddr_end,
-                num_pages,
-                seg.file_size,
-                seg.mem_size,
-                seg.flags
-            );
 
             for vaddr in (page_start..page_end).step_by(page_size) {
                 // Check if already mapped (multiple segments may share a page)

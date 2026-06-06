@@ -1016,7 +1016,14 @@ fn sys_waitpid(pid: usize) -> isize {
             crate::sched::remove_task(child_idx);
             exit_code as isize
         }
-        None => WAIT_AGAIN, // Child still running
+        None => {
+            // Child still running — yield CPU so the child can execute.
+            // Without this, a busy-waiting parent (e.g., shell wait_for loop)
+            // monopolizes the CPU in kernel mode (cli prevents timer ISR),
+            // and the child is never scheduled.
+            crate::sched::schedule();
+            WAIT_AGAIN
+        }
     }
 }
 

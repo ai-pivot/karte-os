@@ -108,17 +108,16 @@ core::arch::global_asm!(
     "push rdi",
     "push rax", // [1] placeholder for return value
     "push rax", // [0] syscall number
-    // Enable interrupts during handler execution so Timer ISR can fire.
-    // We will cli before restoring registers to prevent Timer ISR nesting
-    // during pop/iretq (which would clobber the iretq frame on RSP0).
-    "sti",
+    // IMPORTANT: Do NOT enable interrupts (sti) here!
+    // The Timer ISR shares the RSP0 kernel stack (via IST). If it fires
+    // between sti and the call below, its pushes will clobber our
+    // saved registers on the stack, corrupting syscall arguments.
+    // Instead, iretq will restore IF from the user-mode RFLAGS on
+    // the CPU-pushed iretq frame (user has IF=1), re-enabling
+    // interrupts when we return to Ring 3.
     "mov rdi, rsp",
     "call syscall_handler_impl",
-    // Disable interrupts before restoring registers. This prevents Timer ISR
-    // from nesting during pop/iretq, which would use the same RSP0 stack and
-    // clobber the CPU-pushed iretq frame (RIP, CS, RFLAGS, RSP, SS).
-    "cli",
-    // Store return value at slot [1] (offset 8) — NOT slot [7]
+    // Store return value at slot [1] (offset 8)
     "mov [rsp + 8], rax",
     "add rsp, 8", // skip [0] (syscall nr)
     "pop rax",    // [1] (return value)
@@ -129,7 +128,6 @@ core::arch::global_asm!(
     "pop r9",     // [6]
     "pop r10",    // [7]
     "pop r11",    // [8]
-    // No sti here! iretq restores IF from RFLAGS on stack (user had IF=1).
     "iretq",
     // ─── Timer ISR stub ──────────────────────────────────
     ".globl timer_isr_stub",
@@ -350,7 +348,9 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
     // Switch to kernel CR3 for reliable output
     let kcr3 = crate::mm::vmm::kernel_cr3();
     if kcr3 != 0 {
-        unsafe { core::arch::asm!("mov cr3, {}", in(reg) kcr3); }
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) kcr3);
+        }
     }
     // WARNING: The InterruptStackFrame fields are shifted by 8 bytes relative
     // to the actual CPU push order. The `error_code` parameter contains the
@@ -365,7 +365,11 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
     let actual_ss = frame.stack_pointer.as_u64();
     crate::console_println!(
         "[DF] RIP={:#x} CS={:#x} RSP={:#x} SS={:#x} RFLAGS={:#x}",
-        actual_rip, actual_cs, actual_rsp, actual_ss, actual_rflags
+        actual_rip,
+        actual_cs,
+        actual_rsp,
+        actual_ss,
+        actual_rflags
     );
     loop {}
 }
@@ -393,6 +397,9 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn page_fault_isr_stub() {
     core::arch::asm!(
+        // Balance compiler prologue (push rax). Since this is not a naked
+        // function, the compiler emits `push rax` before our asm! block.
+        "pop rax",
         // CPU has already pushed: error_code, RIP, CS, RFLAGS, RSP, SS
         // Save all GP registers
         "push rax",
@@ -557,6 +564,9 @@ extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
 /// can cause stack corruption on `iretq`.
 unsafe extern "C" fn keyboard_isr_stub() {
     core::arch::asm!(
+        // Balance compiler prologue (push rax). Since this is not a naked
+        // function, the compiler emits `push rax` before our asm! block.
+        "pop rax",
         // Save callee-saved registers
         "push r15",
         "push r14",
@@ -588,6 +598,9 @@ unsafe extern "C" fn keyboard_isr_stub() {
 /// Naked stub for COM1 UART ISR (IRQ4). Uses IST[4] for stack isolation.
 unsafe extern "C" fn com1_isr_stub() {
     core::arch::asm!(
+        // Balance compiler prologue (push rax). Since this is not a naked
+        // function, the compiler emits `push rax` before our asm! block.
+        "pop rax",
         "push r15",
         "push r14",
         "push r13",

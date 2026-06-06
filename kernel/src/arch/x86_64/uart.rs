@@ -30,15 +30,16 @@ impl ComPort {
             let mut fifo_ctrl = Port::<u8>::new(self.base + 2);
             let mut line_ctrl = Port::<u8>::new(self.base + 3);
             let mut modem_ctrl = Port::<u8>::new(self.base + 4);
+            let mut line_status = Port::<u8>::new(self.base + 5);
 
-            // Disable all interrupts
+            // Disable all interrupts first
             int_enable.write(0x00);
 
             // Enable DLAB (set baud rate divisor)
             line_ctrl.write(0x80);
-            // Set divisor to 1 (115200 baud) — QEMU ignores this but we set it
-            data.write(0x01); // DLL (divisor latch low)
-            int_enable.write(0x00); // DLH (divisor latch high)
+            // Set divisor to 1 (115200 baud)
+            data.write(0x01);
+            int_enable.write(0x00); // DLH
 
             // 8 bits, no parity, one stop bit (8N1), disable DLAB
             line_ctrl.write(0x03);
@@ -51,6 +52,13 @@ impl ComPort {
 
             // Enable receiver data available interrupt
             int_enable.write(0x01);
+
+            // Verify: read LSR to confirm UART is responsive
+            let lsr = line_status.read();
+            // Read data register to drain any stale bytes
+            if lsr & 0x01 != 0 {
+                let _ = data.read();
+            }
         }
     }
 
@@ -110,11 +118,27 @@ pub fn putchar(c: u8) {
 }
 
 /// Read a byte from COM1 (non-blocking).
+/// Returns `None` if no data is available.
 pub fn getchar() -> Option<u8> {
-    COM1.lock().get_char()
+    unsafe {
+        // Read LSR directly via inline assembly to bypass any Port abstraction issues
+        let lsr: u8;
+        core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1_BASE + 5u16);
+        if lsr & 0x01 != 0 {
+            let data: u8;
+            core::arch::asm!("in al, dx", out("al") data, in("dx") COM1_BASE);
+            Some(data)
+        } else {
+            None
+        }
+    }
 }
 
 /// Check if COM1 has incoming data.
 pub fn has_data() -> bool {
-    COM1.lock().has_data()
+    unsafe {
+        let lsr: u8;
+        core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1_BASE + 5u16);
+        lsr & 0x01 != 0
+    }
 }

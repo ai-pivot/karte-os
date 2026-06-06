@@ -187,10 +187,12 @@ pub unsafe extern "C" fn trap_return_user() {
             // ── Switch to user page table if user_cr3 is set ──
             // CR3 write implicitly flushes the TLB (non-global pages).
             // cli ensures no interrupt fires between CR3 write and iretq.
+            // NOTE: user_cr3 is stored as the full physical address of the
+            // PML4 table (already shifted by callers), so we use it directly.
             "cli",
             "cmp qword ptr [rsp + 0x30], 0",
             "je 2f",                 // skip if user_cr3 == 0
-            "mov rax, [rsp + 0x30]", // load user_cr3 (physical address of user PT root)
+            "mov rax, [rsp + 0x30]", // rax = physical address of PML4
             "mov cr3, rax",          // switch to user page table
             "2:",
             // ── Return to Ring 3 ──

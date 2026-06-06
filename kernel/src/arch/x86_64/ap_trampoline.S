@@ -49,9 +49,9 @@ pm_entry:
     mov (trampoline_cr3 - ap_trampoline_start), %eax
     mov %eax, %cr3
 
-    # Enable PAE (CR4.PAE = bit 5)
+    # Enable PAE (CR4.PAE = bit 5), OSFXSR (bit 9), OSXMMEXCPT (bit 10)
     mov %cr4, %eax
-    or $(1 << 5), %eax
+    or $((1 << 5) | (1 << 9) | (1 << 10)), %eax
     mov %eax, %cr4
 
     # Enable long mode (EFER.LME = bit 8)
@@ -60,9 +60,10 @@ pm_entry:
     or $(1 << 8), %eax
     wrmsr
 
-    # Enable paging (CR0.PG = bit 31)
+    # Enable paging + clear CR0.EM/TS, set CR0.MP for SSE
     mov %cr0, %eax
-    or $(1 << 31), %eax
+    or $((1 << 31) | (1 << 1)), %eax   # PG | MP
+    and $~((1 << 2) | (1 << 3)), %eax   # clear EM, TS
     mov %eax, %cr0
 
     # Far jump to 64-bit long mode code

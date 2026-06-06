@@ -146,6 +146,31 @@ impl IoApic {
         self.write_redir_entry(irq, entry);
     }
 
+    /// Set IRQ redirection entry with explicit destination APIC ID.
+    pub fn set_irq_with_dest(
+        &self,
+        irq: u8,
+        vector: u8,
+        masked: bool,
+        level_triggered: bool,
+        active_low: bool,
+        dest_apic_id: u32,
+    ) {
+        let mut entry: u64 = vector as u64;
+        entry |= ENTRY_FIXED as u64;
+        if level_triggered {
+            entry |= ENTRY_LEVEL_TRIGGERED as u64;
+        }
+        if active_low {
+            entry |= ENTRY_ACTIVE_LOW as u64;
+        }
+        if masked {
+            entry |= ENTRY_MASKED as u64;
+        }
+        entry |= (dest_apic_id as u64) << 56;
+        self.write_redir_entry(irq, entry);
+    }
+
     /// Mask (disable) an IRQ pin.
     pub fn mask_irq(&self, irq: u8) {
         let entry = self.read_redir_entry(irq);
@@ -187,11 +212,13 @@ impl IoApic {
 
     /// Unmask external device IRQs (keyboard, UART) after the system is ready.
     pub fn unmask_external_irqs(&self) {
+        let bsp_id = crate::arch::lapic::lapic_id();
+
         // Unmask IRQ 1: Keyboard (edge-triggered, active-high)
-        self.set_irq(1, super::idt::KEYBOARD_VECTOR, false, false, false);
+        self.set_irq_with_dest(1, super::idt::KEYBOARD_VECTOR, false, false, false, bsp_id);
 
         // Unmask IRQ 4: COM1 UART (edge-triggered, active-high)
-        self.set_irq(4, super::idt::COM1_VECTOR, false, false, false);
+        self.set_irq_with_dest(4, super::idt::COM1_VECTOR, false, false, false, bsp_id);
 
         crate::console_println!(
             "[ioapic] Unmasked IRQ1(keyboard) → v{}, IRQ4(COM1) → v{}",

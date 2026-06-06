@@ -468,6 +468,11 @@ unsafe fn execute_single(cmd: &[u8]) -> isize {
     if redir_stdin >= 0 { syscall2(SYS_CLOSE, redir_stdin as usize, 0); }
     if redir_stdout >= 0 { syscall2(SYS_CLOSE, redir_stdout as usize, 0); }
 
+    // Wait for the child process to finish before returning to the shell prompt.
+    if pid > 0 {
+        wait_for(pid);
+    }
+
     pid
 }
 
@@ -482,9 +487,8 @@ unsafe fn execute_pipeline(cmds: &[Option<&[u8]>; MAX_CMDS_IN_PIPE]) {
     if cmd_count == 1 {
         let cmd = cmds[0].unwrap();
         let pid = execute_single(cmd);
-        if pid >= 0 {
-            wait_for(pid);
-        } else {
+        // execute_single already calls wait_for internally
+        if pid < 0 {
             let (name, _) = split_first(cmd);
             print(b"command not found: ");
             println(trim(name));

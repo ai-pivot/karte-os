@@ -46,7 +46,10 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             // Total RAM = 1MB (below) + mem_upper_kb KB (above).
             // Leave 2MB for kernel/code start area.
             let total_ram = 1024 * 1024 + (mem_upper_kb as usize) * 1024;
-            crate::console_println!("[init] Multiboot2 memory: {} MB total", total_ram / 1024 / 1024);
+            crate::console_println!(
+                "[init] Multiboot2 memory: {} MB total",
+                total_ram / 1024 / 1024
+            );
             mm::pmm::init_with_size(total_ram - 0x0020_0000);
         } else {
             mm::pmm::init();
@@ -270,9 +273,11 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 // Shell is always the init process. xbot-cli-static and other
                 // programs are loaded from ext4 at runtime via shell's exec command.
                 if crate::driver::ext4::has_ext4() {
-                    crate::console_println!("[init] ext4 ready, xbot-cli-static available for exec");
+                    crate::console_println!(
+                        "[init] ext4 ready, xbot-cli-static available for exec"
+                    );
                 }
-                process::Process::from_elf(include_bytes!("../../user/shell.elf"))
+                process::Process::from_elf(include_bytes!("../../shell-x86_64.elf"))
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
