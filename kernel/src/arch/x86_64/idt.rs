@@ -72,9 +72,9 @@ pub fn cache_kernel_cr3() {
 
 pub fn init_syscall_msrs() {
     unsafe {
-        // Enable SYSCALL/SYSRET in EFER (bit 0 = SCE)
+        // Enable SYSCALL/SYSRET (SCE=bit0) and No-Execute (NXE=bit11) in EFER
         let efer = rdmsr(MSR_EFER);
-        wrmsr(MSR_EFER, efer | 1);
+        wrmsr(MSR_EFER, efer | (1 << 0) | (1 << 11));
         // Set up SYSCALL MSRs
         // SYSCALL: CS = STAR[48:63] = 0x08(kcode), SS = 0x10(kdata)
         // SYSRET:  CS = STAR[48:63]+16 = 0x18→0x1B(ucode), SS = 0x10→0x13(ok in 64-bit)
@@ -228,12 +228,16 @@ core::arch::global_asm!(
     "mov rdi, rsp",
     "call syscall_fast_handler",
     // 7. Restore user state and return via iretq
-    // First: read saved CR3 from [0] and restore it
-    "mov rax, [rsp]", // rax = user CR3
+    // Save return value (rax) before CR3 restore clobbers it
+    "push rax",
+    // Read saved CR3 from [rsp+8] (below the push we just did)
+    "mov rax, [rsp + 8]", // rax = user CR3
     "test rax, rax",
     "jz 78f",
     "mov cr3, rax",
     "78:",
+    // Restore return value
+    "pop rax",
     "add rsp, 8",   // skip user_cr3 slot
     "pop rbx",      // user RSP
     "pop rcx",      // user RIP

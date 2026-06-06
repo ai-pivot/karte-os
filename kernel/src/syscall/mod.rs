@@ -297,8 +297,8 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
         200 => 0,                                                  // tkill (stub)
         201 => linux_time(args[0]),                                // time
         202 => linux_futex(args[0], args[1], args[2]),             // futex
-        203 => linux_sched_getaffinity(args[0], args[1], args[2]), // sched_getaffinity
-        204 => linux_sched_setaffinity(args[0], args[1], args[2]), // sched_setaffinity (stub)
+        203 => linux_sched_setaffinity(args[0], args[1], args[2]), // sched_setaffinity (stub)
+        204 => linux_sched_getaffinity(args[0], args[1], args[2]), // sched_getaffinity
         218 => linux_set_tid_address(args[0]),                     // set_tid_address
         228 => linux_clock_gettime(args[0], args[1]),              // clock_gettime
         231 => sys_exit(args[0] as i32),                           // exit_group
@@ -1045,6 +1045,14 @@ fn linux_mmap(
     if len == 0 {
         return -22; // EINVAL
     }
+    #[cfg(target_arch = "x86_64")]
+    crate::console_println!(
+        "[mmap] addr={:#x} len={:#x} prot={} flags={:#x}",
+        addr,
+        len,
+        prot,
+        flags
+    );
 
     let page_size = crate::mm::pmm::page_size();
     let aligned_len = (len + page_size - 1) & !(page_size - 1);
@@ -1118,8 +1126,17 @@ fn linux_mmap(
     let valid_start = crate::process::USER_HEAP_BASE;
     let valid_end = crate::process::USER_MMAP_LIMIT;
     if target_addr < valid_start || end > valid_end {
+        #[cfg(target_arch = "x86_64")]
+        crate::console_println!(
+            "[mmap] REJECT target={:#x} not in [{:#x},{:#x})",
+            target_addr,
+            valid_start,
+            valid_end
+        );
         return -22; // EINVAL
     }
+    #[cfg(target_arch = "x86_64")]
+    crate::console_println!("[mmap] target_addr={:#x} end={:#x}", target_addr, end);
 
     // Determine PTE flags from prot
     let pte_flags = prot_to_pte_flags(prot);
@@ -1148,7 +1165,25 @@ fn linux_mmap(
                     core::ptr::write_bytes(frame as *mut u8, 0, page_size);
                 }
             }
+            #[cfg(target_arch = "x86_64")]
+            crate::console_println!(
+                "[mmap] map vaddr={:#x} -> frame={:#x} pte_flags={:#x}",
+                vaddr,
+                frame,
+                pte_flags.bits()
+            );
             crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
+            // Verify the mapping was created
+            #[cfg(target_arch = "x86_64")]
+            if let Some(paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+                crate::console_println!(
+                    "[mmap] verified: vaddr={:#x} -> paddr={:#x}",
+                    vaddr,
+                    paddr
+                );
+            } else {
+                crate::console_println!("[mmap] FAILED to verify mapping for vaddr={:#x}", vaddr);
+            }
         } else if flags & MAP_FIXED != 0 {
             // Page was already mapped but MAP_FIXED means we should remap
             // This case is handled by needs_map above
