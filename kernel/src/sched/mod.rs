@@ -228,11 +228,6 @@ pub fn schedule_exit() {
 
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     if switch_to_init {
-        let init_sp = unsafe { *INIT_TASK_SP.as_ptr() };
-        crate::console_println!(
-            "[sched_exit] switching to init, INIT_TASK_SP={:#x}",
-            init_sp
-        );
         let init_sp_ptr = INIT_TASK_SP.as_ptr() as *const usize;
         unsafe {
             __switch(cur_ptr, init_sp_ptr);

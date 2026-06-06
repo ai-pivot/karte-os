@@ -150,7 +150,7 @@ pub fn dispatch_syscall_linux(
     }
 
     static TRACE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let tc = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let _tc = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let result = dispatch_linux_raw(
         nr as usize,
         [
@@ -162,23 +162,6 @@ pub fn dispatch_syscall_linux(
             a6 as usize,
         ],
     );
-    if tc < 50 {
-        let nr_usize = nr as usize;
-        match nr_usize {
-            257 => {
-                // openat(dirfd=a1/rdi, pathname=a2/rsi, flags=a3/rdx)
-                let path = unsafe { core::ffi::CStr::from_ptr(a2 as *const i8) };
-                crate::console_println!(
-                    "[go#{tc}] openat(df={a1}, {path:?}, fl={a3:#x}) → {result}"
-                );
-            }
-            _ => {
-                crate::console_println!(
-                    "[go#{tc}] sys{nr_usize}({a1:#x},{a2:#x},{a3:#x}) → {result}"
-                );
-            }
-        }
-    }
     result as u64
 }
 
@@ -289,6 +272,7 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
         106 => 0,                                                  // setgid (stub)
         107 => 0,                                                  // geteuid (stub: root)
         108 => 0,                                                  // getegid (stub: root)
+        72 => 2,                                                   // fcntl F_GETFL stub: O_RDWR
         131 => linux_sigaltstack(args[0], args[1]),                // sigaltstack
         157 => 0,                                                  // prctl (stub)
         158 => linux_arch_prctl(args[0], args[1]),                 // arch_prctl
@@ -1045,98 +1029,68 @@ fn linux_mmap(
     if len == 0 {
         return -22; // EINVAL
     }
-    #[cfg(target_arch = "x86_64")]
-    crate::console_println!(
-        "[mmap] addr={:#x} len={:#x} prot={} flags={:#x}",
-        addr,
-        len,
-        prot,
-        flags
-    );
 
     let page_size = crate::mm::pmm::page_size();
     let aligned_len = (len + page_size - 1) & !(page_size - 1);
 
-    // Use current process page table
-    let user_pt = crate::arch::trap::get_current_user_pt();
+    // Bump allocator for mmap addresses.
+    // This avoids O(n*p) search for large PROT_NONE reservations (Go heap arenas).
+    static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
 
-    let target_addr = if addr == 0 || (flags & MAP_FIXED != 0) {
-        if addr == 0 {
-            // Kernel chooses address: find first free region in mmap area
-            let mmap_base = crate::process::USER_MMAP_BASE;
-            let needed_pages = aligned_len / page_size;
-            let mut candidate = mmap_base;
-            'outer: loop {
-                for i in 0..needed_pages {
-                    let vaddr = candidate + i * page_size;
-                    if vaddr >= crate::process::USER_MMAP_LIMIT {
-                        return -12; // ENOMEM
-                    }
-                    if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
-                        candidate = vaddr + page_size;
-                        continue 'outer;
-                    }
-                }
-                break 'outer;
-            }
-            candidate
-        } else {
-            // MAP_FIXED or addr != 0: use the provided address (page-aligned)
-            addr & !(page_size - 1)
-        }
-    } else {
-        // addr != 0 without MAP_FIXED: try at addr, but don't overwrite
+    let target_addr = if addr != 0 && (flags & 0x10) != 0 {
+        // MAP_FIXED at specific address
+        addr & !(page_size - 1)
+    } else if addr != 0 {
+        // Hint address: use it if valid
         let aligned_addr = addr & !(page_size - 1);
-        // Check if the region is free
-        let mut all_free = true;
-        for i in 0..(aligned_len / page_size) {
-            let vaddr = aligned_addr + i * page_size;
-            if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
-                all_free = false;
-                break;
-            }
-        }
-        if all_free {
+        if aligned_addr >= crate::process::USER_MMAP_BASE {
             aligned_addr
         } else {
-            // Fall back to kernel-chosen address
-            let mmap_base = crate::process::USER_MMAP_BASE;
-            let needed_pages = aligned_len / page_size;
-            let mut candidate = mmap_base;
-            'outer2: loop {
-                for i in 0..needed_pages {
-                    let vaddr = candidate + i * page_size;
-                    if vaddr >= crate::process::USER_MMAP_LIMIT {
-                        return -12; // ENOMEM
-                    }
-                    if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
-                        candidate = vaddr + page_size;
-                        continue 'outer2;
-                    }
-                }
-                break 'outer2;
+            0 // Will use bump allocator below
+        }
+    } else {
+        0 // Kernel chooses
+    };
+
+    let target_addr = if target_addr != 0 {
+        target_addr
+    } else {
+        // Bump allocator
+        loop {
+            let base = NEXT_MMAP_ADDR.load(core::sync::atomic::Ordering::Relaxed);
+            let candidate = if base < crate::process::USER_MMAP_BASE {
+                crate::process::USER_MMAP_BASE
+            } else {
+                base
+            };
+            let end_addr = candidate.checked_add(aligned_len).unwrap_or(0);
+            if end_addr > crate::process::USER_MMAP_LIMIT || end_addr == 0 {
+                return -12; // ENOMEM
             }
-            candidate
+            if NEXT_MMAP_ADDR
+                .compare_exchange(
+                    base,
+                    end_addr,
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break candidate;
+            }
         }
     };
 
-    let end = target_addr + aligned_len;
+    // Use current process page table
+    let user_pt = crate::arch::trap::get_current_user_pt();
 
-    // Validate range
-    let valid_start = crate::process::USER_HEAP_BASE;
-    let valid_end = crate::process::USER_MMAP_LIMIT;
-    if target_addr < valid_start || end > valid_end {
-        #[cfg(target_arch = "x86_64")]
-        crate::console_println!(
-            "[mmap] REJECT target={:#x} not in [{:#x},{:#x})",
-            target_addr,
-            valid_start,
-            valid_end
-        );
-        return -22; // EINVAL
+    // PROT_NONE (prot=0): just reserve virtual address space, don't allocate frames.
+    if prot == 0 {
+        return target_addr as isize;
     }
-    #[cfg(target_arch = "x86_64")]
-    crate::console_println!("[mmap] target_addr={:#x} end={:#x}", target_addr, end);
+
+    let end = target_addr + aligned_len;
 
     // Determine PTE flags from prot
     let pte_flags = prot_to_pte_flags(prot);
@@ -1165,27 +1119,7 @@ fn linux_mmap(
                     core::ptr::write_bytes(frame as *mut u8, 0, page_size);
                 }
             }
-            #[cfg(target_arch = "x86_64")]
-            crate::console_println!(
-                "[mmap] map vaddr={:#x} -> frame={:#x} pte_flags={:#x}",
-                vaddr,
-                frame,
-                pte_flags.bits()
-            );
             crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
-            // Verify the mapping was created
-            #[cfg(target_arch = "x86_64")]
-            if let Some(paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
-                crate::console_println!(
-                    "[mmap] verified: vaddr={:#x} -> paddr={:#x}",
-                    vaddr,
-                    paddr
-                );
-            } else {
-                crate::console_println!("[mmap] FAILED to verify mapping for vaddr={:#x}", vaddr);
-            }
-        } else if flags & MAP_FIXED != 0 {
-            // Page was already mapped but MAP_FIXED means we should remap
             // This case is handled by needs_map above
         } else {
             // Page already exists, update its flags to match prot
