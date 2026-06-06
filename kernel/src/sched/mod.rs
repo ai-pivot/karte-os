@@ -160,6 +160,15 @@ pub fn schedule() {
         let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
         unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let next_sp = unsafe { *nxt_ptr };
+                let tc_base = next_sp + 576 + 8;
+                let tc = tc_base as *const crate::arch::trap::TrapContext;
+                crate::console_println!("[sched→{}] sp={:#x} rip={:#x}", next, next_sp, unsafe {
+                    (*tc).rip
+                });
+            }
             __switch(cur_ptr, nxt_ptr);
         }
     }
@@ -468,18 +477,71 @@ pub fn add_user_process(
 unsafe extern "C" fn clone_first_shim() -> ! {
     unsafe {
         core::arch::naked_asm!(
-            // Read TLS value stored right after TrapContext
-            "mov rax, [rsp + 0xB8]",
+            // RSP = tls_base = switch_sp + 576.
+            // TLS value at [rsp]. TrapContext at [rsp + 8].
+            //
+            // Set up TLS/FS_BASE, then set RSP to TrapContext start.
+            // Pop 15 GP regs (matches TrapContext layout), then handle CR3 + iretq.
+            "mov rax, [rsp]",           // Read TLS pointer from tls_base
             "cmp rax, 0",
             "je 2f",
-            // Set IA32_FS_BASE MSR (0xC0000100)
-            "mov rcx, 0xC0000100",
+            "mov ecx, 0xC0000100",      // IA32_FS_BASE MSR
+            "mov rdx, rax",
+            "shr rdx, 32",
             "wrmsr",
             "2:",
-            // Fall through to trap_return_user
-            "mov rdi, rsp",
-            "jmp {handler}",
-            handler = sym trap_return_user,
+            "add rsp, 8",               // Skip TLS, RSP now at TrapContext start
+            // Debug: verify TrapContext.rip at [rsp+120] before popping
+            "mov rax, [rsp + 120]",     // TrapContext.rip (offset 15*8=120)
+            "mov [{rip_global}], rax",
+            "mov rax, [rsp]",           // TrapContext.rax
+            "mov [{rax_global}], rax",
+            // Pop 15 GP registers from TrapContext
+            "pop rax",                  // TrapContext.rax
+            "pop rbx",                  // TrapContext.rbx
+            "pop rcx",                  // TrapContext.rcx
+            "pop rdx",                  // TrapContext.rdx
+            "pop rbp",                  // TrapContext.rbp
+            "pop rsi",                  // TrapContext.rsi
+            "pop rdi",                  // TrapContext.rdi
+            "pop r8",                   // TrapContext.r8
+            "pop r9",                   // TrapContext.r9
+            "pop r10",                  // TrapContext.r10
+            "pop r11",                  // TrapContext.r11
+            "pop r12",                  // TrapContext.r12
+            "pop r13",                  // TrapContext.r13
+            "pop r14",                  // TrapContext.r14
+            "pop r15",                  // TrapContext.r15
+            // RSP now at iretq frame: rip, cs, rflags, rsp, ss, kernel_sp, user_cr3, trap_from_user
+            // Inline the CR3 switch + iretq (same as trap_return_user but without extra function call)
+            "cli",
+            "cmp qword ptr [rsp + 0x30], 0",  // user_cr3 at offset 48 from iretq frame start
+            "je 3f",
+            "mov rax, [rsp + 0x30]",
+            "mov cr3, rax",
+            "3:",
+            // Debug: save final state before iretq
+            "mov rax, [rsp]",
+            "mov [{rip_global}], rax",
+            "mov rax, [rsp + 0x18]",
+            "mov [{rax_global}], rax",
+            "mov [{rsp_global}], rsp",
+            // CRITICAL: After __switch, CR3 may be stale/wrong because
+            // __switch's ret jumps here instead of returning to timer ISR
+            // which would normally restore CR3. Must restore kernel CR3.
+            "mov rax, [{kcr3}]",
+            "mov cr3, rax",
+            // Now check if we need to switch to user CR3 for iretq
+            "cmp qword ptr [rsp + 0x30], 0",
+            "je 4f",
+            "mov rax, [rsp + 0x30]",
+            "mov cr3, rax",
+            "4:",
+            "iretq",
+            kcr3 = sym crate::arch::idt::KERNEL_CR3_PHYS,
+            rax_global = sym crate::arch::idt::CLONE_DBG_RAX,
+            rip_global = sym crate::arch::idt::CLONE_DBG_RIP,
+            rsp_global = sym crate::arch::idt::CLONE_DBG_RSPVAL,
         );
     }
 }
@@ -565,8 +627,30 @@ pub fn add_clone_process(
         (*ctx).rax = 0; // Child returns 0 from clone
         (*ctx).rsp = new_user_sp as u64; // Use new user stack
         (*ctx).kernel_sp = kernel_stack_top as u64;
-        (*ctx).user_cr3 = user_cr3 as u64; // Set for first entry (switches CR3)
+        (*ctx).user_cr3 = 0; // Skip CR3 switch - CLONE_VM shares page table
         (*ctx).trap_from_user = 1;
+
+        // Verify TrapContext physical mapping in user page table
+        let tc_page = (trap_ctx_base as usize) & !0xFFF;
+        let user_pt = crate::arch::trap::get_current_user_pt();
+        let tc_phys = crate::mm::vmm::translate_user(user_pt, tc_page);
+        crate::console_println!(
+            "[clone] tc_page={:#x} maps_to={:?} (should be {:#x})",
+            tc_page,
+            tc_phys,
+            tc_page
+        );
+
+        // Verify TrapContext after setup
+        let verify_ctx = trap_ctx_base as *const crate::arch::trap::TrapContext;
+        crate::console_println!(
+            "[clone] child: switch_sp={:#x} trap_ctx={:#x} rip={:#x} rsp={:#x} cr3={:#x}",
+            switch_sp,
+            trap_ctx_base,
+            unsafe { (*verify_ctx).rip },
+            unsafe { (*verify_ctx).rsp },
+            unsafe { (*verify_ctx).user_cr3 }
+        );
     }
 
     TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);

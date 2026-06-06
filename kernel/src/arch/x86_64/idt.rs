@@ -49,13 +49,16 @@ static mut KERNEL_CR3: u64 = 0;
 /// Kernel stack pointer for SYSCALL fast entry.
 #[unsafe(no_mangle)]
 static mut SYSCALL_KSP: u64 = 0;
+pub static mut CLONE_DBG_RAX: u64 = 0;
+pub static mut CLONE_DBG_RIP: u64 = 0;
+pub static mut CLONE_DBG_RSPVAL: u64 = 0;
 
 /// Kernel CR3 physical address, used by Timer ISR for CR3 switching.
 #[used]
 #[cfg_attr(target_arch = "x86_64", unsafe(link_section = ".data"))]
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
-static mut KERNEL_CR3_PHYS: u64 = 0;
+pub static mut KERNEL_CR3_PHYS: u64 = 0;
 
 pub fn set_syscall_ksp(ksp: u64) {
     unsafe {
@@ -609,6 +612,18 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         }
     }
     crate::arch::platform::console_putchar(b'\n');
+    // Print clone debug values
+    {
+        let (dr, dri) = unsafe { (CLONE_DBG_RAX, CLONE_DBG_RIP) };
+        print_str(b" DBG_RAX:");
+        print_hex(dr);
+        print_str(b" DBG_RIP:");
+        print_hex(dri);
+        let drsp = unsafe { CLONE_DBG_RSPVAL };
+        print_str(b" DBG_RSP:");
+        print_hex(drsp);
+        crate::arch::platform::console_putchar(b'\n');
+    }
 
     // Print translation result for fault address page
     let user_pt = super::trap::get_current_user_pt();
@@ -723,18 +738,33 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     };
 
     if !handled {
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3);
+        }
+        let (dbg_rax, dbg_rip) = unsafe { (CLONE_DBG_RAX, CLONE_DBG_RIP) };
         if from_user {
-            // Unhandled user PF → kill the process via schedule_exit
             let pid = crate::process::current_pid();
             crate::console_println!(
-                "[PF] Killing pid={} for unhandled PF at {:#x}",
+                "[PF] pid={} fault={:#x} err={:#x} CR3={:#x} dbg_rax={:#x} dbg_rip={:#x}",
                 pid,
-                fault_addr_val
+                fault_addr_val,
+                error_code,
+                cr3,
+                dbg_rax,
+                dbg_rip
             );
             crate::syscall::sys_exit(99);
-            // If sys_exit returns (shouldn't happen), halt
             loop {}
         } else {
+            crate::console_println!(
+                "[PF] KERNEL fault={:#x} err={:#x} CR3={:#x} dbg_rax={:#x} dbg_rip={:#x}",
+                fault_addr_val,
+                error_code,
+                cr3,
+                dbg_rax,
+                dbg_rip
+            );
             loop {}
         }
     }

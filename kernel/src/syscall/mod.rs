@@ -162,6 +162,17 @@ pub fn dispatch_syscall_linux(
             a6 as usize,
         ],
     );
+    // Trace key syscalls for debugging
+    let nr_usize = nr as usize;
+    if nr_usize == 56 || nr_usize == 202 || nr_usize == 60 || nr_usize == 1 {
+        crate::console_println!(
+            "[trace] sys{}({:#x}) → {} (tc={})",
+            nr_usize,
+            a1 as usize,
+            result,
+            _tc
+        );
+    }
     result as u64
 }
 
@@ -3010,6 +3021,15 @@ fn linux_clone(
     }
     #[cfg(target_arch = "x86_64")]
     let parent_ctx = unsafe { &*(parent_ctx_ptr as *const crate::arch::trap::TrapContext) };
+
+    #[cfg(target_arch = "x86_64")]
+    crate::console_println!(
+        "[clone] parent_ctx: rip={:#x} rsp={:#x} rax={:#x} cr3_ptr={:#x}",
+        parent_ctx.rip,
+        parent_ctx.rsp,
+        parent_ctx.rax,
+        parent_ctx_ptr
+    );
 
     #[cfg(not(target_arch = "x86_64"))]
     {
