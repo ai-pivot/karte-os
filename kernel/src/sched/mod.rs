@@ -478,7 +478,7 @@ unsafe extern "C" fn clone_first_shim() -> ! {
     unsafe {
         core::arch::naked_asm!(
             // RSP = trap_ctx_base (TrapContext starts here).
-            // Set FS_BASE for TLS from TrapContext.r15 (offset 112 = 14*8)
+            // 1. Set FS_BASE for TLS from TrapContext.r15 (offset 112)
             "mov rax, [rsp + 112]",
             "cmp rax, 0",
             "je 2f",
