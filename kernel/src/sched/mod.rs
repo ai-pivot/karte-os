@@ -115,6 +115,13 @@ pub fn schedule() {
         // when a child is running, scan starting after it (round-robin).
         let start = if init_running { 0 } else { current + 1 };
         let mut next = INIT_SENTINEL;
+        crate::console_println!(
+            "[sched] cur={} init={} count={} start={}",
+            current,
+            init_running,
+            count,
+            start
+        );
         for i in 0..count {
             let candidate = (start + i) % count;
             if let Some(ref t) = sched.tasks[candidate] {
@@ -160,26 +167,6 @@ pub fn schedule() {
         let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
         unsafe {
-            #[cfg(target_arch = "x86_64")]
-            {
-                let next_sp = unsafe { *nxt_ptr };
-                let tc_base = next_sp + 576;
-                let tc = tc_base as *const crate::arch::trap::TrapContext;
-                // Set TSS.RSP0 to next task's kernel_sp BEFORE __switch.
-                let next_ksp = unsafe { (*tc).kernel_sp };
-                crate::console_println!("[sched→{}] ksp={:#x}", next, next_ksp);
-                if next_ksp != 0 {
-                    crate::arch::gdt::set_kernel_rsp0(next_ksp);
-                }
-            }
-            // Set TSS.RSP0 to next task's kernel_sp BEFORE __switch.
-            // Use next_proc_idx (process table index), NOT next (task slot index).
-            #[cfg(target_arch = "x86_64")]
-            if let Some(ksp) = crate::process::get_kernel_sp(next_proc_idx) {
-                unsafe {
-                    crate::arch::gdt::set_kernel_rsp0(ksp as u64);
-                }
-            }
             __switch(cur_ptr, nxt_ptr);
         }
     }
@@ -503,8 +490,8 @@ unsafe extern "C" fn clone_first_shim() -> ! {
     unsafe {
         core::arch::naked_asm!(
             // RSP = trap_ctx_base (TrapContext starts here).
-            // 1. Set FS_BASE for TLS from TrapContext.r15 (offset 112)
-            "mov rax, [rsp + 112]",
+            // 1. Set FS_BASE for TLS — r15 was loaded by __switch RESTORE
+            "mov rax, r15",
             "cmp rax, 0",
             "je 2f",
             "mov ecx, 0xC0000100",
@@ -587,7 +574,7 @@ pub fn add_clone_process(
         // orig_rsp: points to r15 slot so pop r15..rbp + ret works correctly
         *sw.add(512 / 8) = switch_sp + 520; // orig_rsp → r15 slot
         // Return address at offset 568 (pop r15..rbp brings RSP here)
-        *sw.add(568 / 8) = first_task_shim as *const () as usize; // ret addr → first_task_shim (same as normal process)
+        *sw.add(568 / 8) = clone_first_shim as *const () as usize; // ret addr → clone_first_shim (sets TLS via wrmsr)
 
         // No TLS storage - TLS is passed via TrapContext.r15
 
@@ -596,7 +583,8 @@ pub fn add_clone_process(
         *ctx = parent_ctx.clone();
         // Modifications for clone child:
         (*ctx).rax = 0; // Child returns 0 from clone
-        (*ctx).r15 = tls as u64; // Save TLS pointer for clone_first_shim to set FS_BASE
+        // Don't overwrite TrapContext.r15 — keep parent's original value.
+        // TLS is passed via switch frame's r15 slot (read by __switch RESTORE into r15 register).
         (*ctx).rsp = new_user_sp as u64; // Use new user stack
         (*ctx).kernel_sp = kernel_stack_top as u64;
         (*ctx).user_cr3 = user_cr3 as u64; // Set for CR3 switch on first entry
@@ -616,11 +604,14 @@ pub fn add_clone_process(
         // Verify TrapContext after setup
         let verify_ctx = trap_ctx_base as *const crate::arch::trap::TrapContext;
         crate::console_println!(
-            "[clone] child: switch_sp={:#x} trap_ctx={:#x} rip={:#x} rsp={:#x} cr3={:#x}",
-            switch_sp,
-            trap_ctx_base,
+            "[clone] rip={:#x} rsp={:#x} rax={:#x} r9(g)={:#x} r12(fn)={:#x} r13(m)={:#x} rsi(stack)={:#x} cr3={:#x}",
             unsafe { (*verify_ctx).rip },
             unsafe { (*verify_ctx).rsp },
+            unsafe { (*verify_ctx).rax },
+            unsafe { (*verify_ctx).r9 },
+            unsafe { (*verify_ctx).r12 },
+            unsafe { (*verify_ctx).r13 },
+            unsafe { (*verify_ctx).rsi },
             unsafe { (*verify_ctx).user_cr3 }
         );
     }
@@ -633,6 +624,7 @@ pub fn add_clone_process(
     if tid >= sched.count {
         sched.count = tid + 1;
     }
+    crate::console_println!("[clone_add] tid={} count={}", tid, sched.count);
     Some(tid)
 }
 

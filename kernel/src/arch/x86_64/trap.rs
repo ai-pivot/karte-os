@@ -181,6 +181,17 @@ pub unsafe extern "C" fn trap_return_user() {
             //   +40: kernel_sp  (+0x28)
             //   +48: user_cr3   (+0x30) ← per-process page table root
 
+            // ── Update TSS.RSP0 before returning to Ring 3 ──
+            // kernel_sp is at rsp+0x28 (after 15 pops, rsp points to iretq frame).
+            // This ensures timer ISR uses the correct kernel stack for each task.
+            "mov rax, [rsp + 0x28]",          // rax = kernel_sp
+            "cmp rax, 0",
+            "je 3f",                          // skip if kernel_sp == 0
+            "mov rcx, [rip + {tss_rsp0_addr}]", // rcx = &TSS.RSP0
+            "test rcx, rcx",
+            "jz 3f",                          // skip if TSS_RSP0_ADDR == 0
+            "mov [rcx], rax",                 // TSS.RSP0 = kernel_sp
+            "3:",
             // ── Switch to user page table if user_cr3 is set ──
             // CR3 write implicitly flushes the TLB (non-global pages).
             // cli ensures no interrupt fires between CR3 write and iretq.
@@ -192,8 +203,21 @@ pub unsafe extern "C" fn trap_return_user() {
             "mov rax, [rsp + 0x30]",
             "mov cr3, rax", // switch to user page table
             "2:",
+            // ── Verify RIP before iretq ──
+            // If RIP is suspiciously high (>0x100000000), print a debug marker
+            // using UART MMIO (direct write, no locks)
+            "mov rax, [rsp]",            // rax = RIP from TrapContext
+            "shr rax, 32",
+            "cmp rax, 0",
+            "je 4f",                     // RIP < 4GB, probably OK
+            // RIP > 4GB — write '!' to UART as warning
+            "mov dx, 0x3f8",
+            "mov al, 0x21",              // '!'
+            "out dx, al",
+            "4:",
             // ── Return to Ring 3 ──
             "iretq",
+            tss_rsp0_addr = sym super::super::gdt::TSS_RSP0_ADDR,
         );
     }
 }

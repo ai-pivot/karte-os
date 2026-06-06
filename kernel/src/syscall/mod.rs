@@ -2998,10 +2998,18 @@ fn linux_clone(
     flags: usize,
     stack: usize,
     parent_tid_ptr: usize,
-    tls: usize,
-    child_tid_ptr: usize,
+    child_tid_ptr: usize, // r10 = 4th arg = child_tid (NOT tls!)
+    tls: usize,           // r8 = 5th arg = tls
 ) -> isize {
     let is_vm_shared = (flags & 0x100) != 0; // CLONE_VM
+    crate::console_println!(
+        "[linux_clone] flags={:#x} stack={:#x} ptid={:#x} ctid={:#x} tls={:#x}",
+        flags,
+        stack,
+        parent_tid_ptr,
+        child_tid_ptr,
+        tls
+    );
 
     // Get parent's trap context (saved by trap_handler before dispatch)
     #[cfg(target_arch = "x86_64")]

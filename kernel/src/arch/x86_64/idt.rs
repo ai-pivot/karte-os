@@ -602,6 +602,8 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     // Print CR3 captured at entry (before any function call)
     print_str(b" CR3:");
     print_hex(raw_cr3);
+    print_str(b" PID:");
+    print_hex(crate::process::current_pid() as u64);
     // Print first bytes at RIP for instruction identification
     if from_user {
         print_str(b" insn:");
