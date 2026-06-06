@@ -233,9 +233,14 @@ impl Process {
         copy_kernel_mappings(user_pt, kernel_stack_top);
 
         // 5. Map user stack in user page table (URW, no execute)
+        // Map from USER_STACK_TOP downward for USER_STACK_PAGES.
+        // The page containing USER_STACK_TOP itself MUST be mapped because
+        // Go/C entry code reads [rsp] where rsp = USER_STACK_TOP initially.
         for i in 0..USER_STACK_PAGES {
+            let vaddr = (USER_STACK_TOP - i * pmm::page_size()) & !(pmm::page_size() - 1);
             let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
-            let vaddr = USER_STACK_TOP - (i + 1) * pmm::page_size();
+            // Always map, even if identity_map already covered this address
+            // (user stack needs URW flags, not kernel-only KRWX)
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 
@@ -390,9 +395,11 @@ impl Process {
         copy_kernel_mappings(user_pt, kernel_stack_top);
 
         // 6. Map user stack in user page table (URW, no execute)
+        // Map from USER_STACK_TOP downward for USER_STACK_PAGES.
+        // Include the page containing USER_STACK_TOP itself (Go/C reads [rsp] on entry).
         for i in 0..USER_STACK_PAGES {
             let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
-            let vaddr = USER_STACK_TOP - (i + 1) * page_size;
+            let vaddr = (USER_STACK_TOP - i * pmm::page_size()) & !(pmm::page_size() - 1);
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 

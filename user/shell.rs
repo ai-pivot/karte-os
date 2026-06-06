@@ -600,9 +600,9 @@ unsafe extern "C" fn _start() -> ! {
             execute_pipeline(&cmds);
         } else {
             let pid = execute_single(cmd);
-            if pid >= 0 {
-                wait_for(pid);
-            } else {
+            // execute_single already calls wait_for internally for launched children.
+            // Only handle the "command not found" case here.
+            if pid < 0 {
                 let (name, _) = split_first(cmd);
                 print(b"command not found: ");
                 println(trim(name));

@@ -121,6 +121,30 @@ use crate::driver::fs::{O_RDONLY, O_RDWR, O_WRONLY};
 /// Called from trap_handler when UserEnvCall is detected.
 /// `id` = a7 (syscall number), `args` = [a0, a1, a2, a3, a4, a5].
 /// Returns value for a0.
+/// Linux x86_64 syscall entry point, called from the #UD handler
+/// when it intercepts a `syscall` instruction (0x0F 0x05).
+/// ABI: RAX=syscall_nr, RDI=arg1, RSI=arg2, RDX=arg3, R10=arg4, R8=arg5, R9=arg6
+#[cfg(target_arch = "x86_64")]
+pub fn dispatch_syscall_linux(
+    nr: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+) -> u64 {
+    let args = [
+        a1 as usize,
+        a2 as usize,
+        a3 as usize,
+        a4 as usize,
+        a5 as usize,
+        a6 as usize,
+    ];
+    dispatch(nr as usize, args) as u64
+}
+
 pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
     // Enable timer interrupts on the first syscall.
     // Timer is intentionally delayed until the user program has executed

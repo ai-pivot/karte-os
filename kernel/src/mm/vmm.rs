@@ -197,6 +197,17 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
 
         let ppn = entry.ppn();
         table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+
+        // x86_64: ensure non-leaf entries have User bit for Ring 3 page walks.
+        // identity_map_skip creates entries without User bit; we must add it
+        // when mapping user-accessible pages (e.g., user stack).
+        #[cfg(target_arch = "x86_64")]
+        {
+            let raw = entry.0;
+            if (raw & PTEFlags::USER.bits()) == 0 && flags.contains(PTEFlags::USER) {
+                entry.0 = raw | PTEFlags::USER.bits();
+            }
+        }
     }
 
     // Level 0: leaf entry
@@ -208,7 +219,6 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // x86_64 leaf: just physical addr | flags (don't add extra WRITABLE here)
         table.entries[vpn] = PTE(((ppn as u64) << 12) | flags.bits());
     }
 }
