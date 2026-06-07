@@ -187,9 +187,10 @@ impl Ext4BlockGroup {
         let block_id = first_data_block as usize + dsc_id + 1;
         let offset = (bgid % dsc_cnt) * desc_size;
 
-        let data = unsafe {
-            core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4BlockGroup>())
-        };
+        // Only write desc_size bytes — writing size_of::<Ext4BlockGroup>() (64 bytes)
+        // when desc_size=32 would overwrite the next descriptor's data!
+        let write_len = core::cmp::min(size_of::<Ext4BlockGroup>(), desc_size);
+        let data = unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, write_len) };
         block_device.write_offset(block_id * BLOCK_SIZE + offset, data);
     }
 

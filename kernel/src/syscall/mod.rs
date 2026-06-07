@@ -1212,6 +1212,7 @@ fn linux_mmap(
         s
     };
     if len == 0 {
+        crate::console_println!("[mmap] EINVAL: len=0");
         return -22; // EINVAL
     }
 
@@ -1251,6 +1252,12 @@ fn linux_mmap(
             };
             let end_addr = candidate.checked_add(aligned_len).unwrap_or(0);
             if end_addr > crate::process::USER_MMAP_LIMIT || end_addr == 0 {
+                crate::console_println!(
+                    "[mmap] ENOMEM: candidate={:#x} end={:#x} len={:#x}",
+                    candidate,
+                    end_addr,
+                    aligned_len
+                );
                 return -12; // ENOMEM
             }
             if NEXT_MMAP_ADDR
@@ -1266,6 +1273,22 @@ fn linux_mmap(
             }
         }
     };
+
+    // Debug: log first few mmap calls
+    static MMAP_DEBUG_COUNT: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    let debug_count = MMAP_DEBUG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if debug_count < 30 {
+        crate::console_println!(
+            "[mmap] #{} addr={:#x} len={:#x} prot={} flags={:#x} -> {:#x}",
+            debug_count,
+            addr,
+            len,
+            prot,
+            flags,
+            target_addr
+        );
+    }
 
     // Switch to kernel CR3 for safe page table access
     #[cfg(target_arch = "x86_64")]
@@ -3821,14 +3844,16 @@ fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) 
 
     let resolved = crate::syscall::resolve_path(path_str);
     match crate::driver::fs::create_dir(&resolved) {
-        Ok(()) => 0,
+        Ok(()) => {
+            crate::console_println!("[mkdirat] '{}' OK", resolved);
+            0
+        }
         Err(()) => {
-            // create_dir may fail due to ext4 bugs.
-            // Check if the directory actually exists — if so, return EEXIST.
-            // If not, return 0 (pretend success) so the caller proceeds.
+            crate::console_println!("[mkdirat] create_dir '{}' failed", resolved);
+            // Check if the directory actually exists
             match crate::driver::fs::lookup_path(&resolved) {
-                Some(_) => -17, // EEXIST — directory/file exists
-                None => 0,      // Doesn't exist but create_dir failed — pretend success
+                Some(_) => -17, // EEXIST
+                None => 0,      // pretend success
             }
         }
     }
