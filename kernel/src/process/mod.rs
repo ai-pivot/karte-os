@@ -300,14 +300,18 @@ impl Process {
         for s in &argv_strs {
             argv_ptrs.push(str_pos);
             for &b in s {
-                unsafe { write_byte_to_user(user_pt, str_pos, b); }
+                unsafe {
+                    write_byte_to_user(user_pt, str_pos, b);
+                }
                 str_pos += 1;
             }
         }
         for s in &envp_strs {
             envp_ptrs.push(str_pos);
             for &b in s {
-                unsafe { write_byte_to_user(user_pt, str_pos, b); }
+                unsafe {
+                    write_byte_to_user(user_pt, str_pos, b);
+                }
                 str_pos += 1;
             }
         }
@@ -328,8 +332,8 @@ impl Process {
 
         let auxv_data: [(usize, usize); 12] = [
             (AT_SYSINFO_EHDR, 0),
-            (AT_PHDR, 0),     // from_elf doesn't have phdr vaddr readily available
-            (AT_PHENT, 56),   // default for 64-bit ELF
+            (AT_PHDR, 0),   // from_elf doesn't have phdr vaddr readily available
+            (AT_PHENT, 56), // default for 64-bit ELF
             (AT_PHNUM, elf.loadable_segments.len() as usize),
             (AT_PAGESZ, page_size),
             (AT_ENTRY, elf.entry),
@@ -346,24 +350,38 @@ impl Process {
         let metadata_start = (strings_start - metadata_size) & !0xF;
 
         let mut pos = metadata_start;
-        unsafe { write_u64_to_user(user_pt, pos, argc as u64); }
+        unsafe {
+            write_u64_to_user(user_pt, pos, argc as u64);
+        }
         pos += 8;
         for &ptr in &argv_ptrs {
-            unsafe { write_u64_to_user(user_pt, pos, ptr as u64); }
+            unsafe {
+                write_u64_to_user(user_pt, pos, ptr as u64);
+            }
             pos += 8;
         }
-        unsafe { write_u64_to_user(user_pt, pos, 0); }
+        unsafe {
+            write_u64_to_user(user_pt, pos, 0);
+        }
         pos += 8;
         for &ptr in &envp_ptrs {
-            unsafe { write_u64_to_user(user_pt, pos, ptr as u64); }
+            unsafe {
+                write_u64_to_user(user_pt, pos, ptr as u64);
+            }
             pos += 8;
         }
-        unsafe { write_u64_to_user(user_pt, pos, 0); }
+        unsafe {
+            write_u64_to_user(user_pt, pos, 0);
+        }
         pos += 8;
         for (atype, avalue) in &auxv_data {
-            unsafe { write_u64_to_user(user_pt, pos, *atype as u64); }
+            unsafe {
+                write_u64_to_user(user_pt, pos, *atype as u64);
+            }
             pos += 8;
-            unsafe { write_u64_to_user(user_pt, pos, *avalue as u64); }
+            unsafe {
+                write_u64_to_user(user_pt, pos, *avalue as u64);
+            }
             pos += 8;
         }
 
@@ -627,7 +645,9 @@ impl Process {
         for s in &argv_strs {
             argv_ptrs.push(str_pos);
             for &b in s {
-                unsafe { write_byte_to_user(user_pt, str_pos, b); }
+                unsafe {
+                    write_byte_to_user(user_pt, str_pos, b);
+                }
                 str_pos += 1;
             }
         }
@@ -635,7 +655,9 @@ impl Process {
         for s in &envp_strs {
             envp_ptrs.push(str_pos);
             for &b in s {
-                unsafe { write_byte_to_user(user_pt, str_pos, b); }
+                unsafe {
+                    write_byte_to_user(user_pt, str_pos, b);
+                }
                 str_pos += 1;
             }
         }
@@ -676,32 +698,46 @@ impl Process {
         let mut pos = initial_rsp;
 
         // argc
-        unsafe { write_u64_to_user(user_pt, pos, argc as u64); }
+        unsafe {
+            write_u64_to_user(user_pt, pos, argc as u64);
+        }
         pos += 8;
 
         // argv pointers
         for &ptr in &argv_ptrs {
-            unsafe { write_u64_to_user(user_pt, pos, ptr as u64); }
+            unsafe {
+                write_u64_to_user(user_pt, pos, ptr as u64);
+            }
             pos += 8;
         }
         // argv NULL terminator
-        unsafe { write_u64_to_user(user_pt, pos, 0); }
+        unsafe {
+            write_u64_to_user(user_pt, pos, 0);
+        }
         pos += 8;
 
         // envp pointers
         for &ptr in &envp_ptrs {
-            unsafe { write_u64_to_user(user_pt, pos, ptr as u64); }
+            unsafe {
+                write_u64_to_user(user_pt, pos, ptr as u64);
+            }
             pos += 8;
         }
         // envp NULL terminator
-        unsafe { write_u64_to_user(user_pt, pos, 0); }
+        unsafe {
+            write_u64_to_user(user_pt, pos, 0);
+        }
         pos += 8;
 
         // auxv entries
         for (atype, avalue) in &auxv_data {
-            unsafe { write_u64_to_user(user_pt, pos, *atype as u64); }
+            unsafe {
+                write_u64_to_user(user_pt, pos, *atype as u64);
+            }
             pos += 8;
-            unsafe { write_u64_to_user(user_pt, pos, *avalue as u64); }
+            unsafe {
+                write_u64_to_user(user_pt, pos, *avalue as u64);
+            }
             pos += 8;
         }
 

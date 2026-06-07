@@ -145,14 +145,18 @@ fn read_user_envp(ptr_array: usize) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, all
 }
 
 /// Convert per-process env BTreeMap to envp Vec for initial stack.
-fn env_to_envp(env: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
+fn env_to_envp(
+    env: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
+) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
     env.iter()
         .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
         .collect()
 }
 
 /// Merge global env into per-process env BTreeMap.
-fn merge_global_env(env: &mut alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>) {
+fn merge_global_env(
+    env: &mut alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
+) {
     let global_vars = crate::env::list_all();
     for (k, v) in global_vars {
         env.entry(k).or_insert(v);
@@ -308,7 +312,7 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
         29 => linux_dup(args[0]),                                       // dup
         30 => linux_dup2(args[0], args[1]),                             // dup2
         31 => linux_pause(),                                            // pause
-        32 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]),     // execve(path, argv, envp)
+        32 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]), // execve(path, argv, envp)
         33 => 0, // chdir (stub — use Linux 80)
         34 => 0, // fchdir (stub)
         35 => 0, // nanosleep (stub: return immediately)
@@ -337,9 +341,9 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
 
         56 => linux_clone(args[0], args[1], args[2], args[3], args[4]), // clone
         57 => sys_fork(),                                               // fork
-        58 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]),     // vfork → execve
-        59 => sys_exit(args[0] as i32),                                 // exit
-        60 => sys_exit(args[0] as i32),                                 // exit (same as 59)
+        58 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]), // vfork → execve
+        59 => sys_exit(args[0] as i32),                                               // exit
+        60 => sys_exit(args[0] as i32), // exit (same as 59)
 
         // ─── More file ops ────────────────────────────────────────
         61 => linux_wait4(args[0], args[1], args[2]), // wait4
@@ -1271,7 +1275,8 @@ fn linux_mmap(
     }
 
     if crate::process::current_pid() >= 2 {
-        crate::klog!(DEBUG,
+        crate::klog!(
+            DEBUG,
             "[mmap] → {:#x} len={:#x} prot={}({}) flags={:#x}",
             target_addr,
             len,
@@ -1886,9 +1891,8 @@ fn sys_getenv(key: usize, key_len: usize, buf: usize, buf_len: usize) -> isize {
     let key_str = alloc::string::String::from_utf8(kbuf).unwrap_or_default();
 
     // First check per-process env, then fall back to global env
-    let val_opt: Option<alloc::string::String> = {
-        crate::process::current().and_then(|p| p.env.get(&key_str).cloned())
-    };
+    let val_opt: Option<alloc::string::String> =
+        { crate::process::current().and_then(|p| p.env.get(&key_str).cloned()) };
     let val = match val_opt {
         Some(v) => v,
         None => match crate::env::get(&key_str) {
@@ -2293,12 +2297,19 @@ fn sys_exec(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> i
     // Build envp Vec for initial stack
     let envp = env_to_envp(&proc_env);
 
-    crate::klog!(DEBUG, "[exec] Loading '{}' argc={} envp_count={}...", name, argv.len(), envp.len());
+    crate::klog!(
+        DEBUG,
+        "[exec] Loading '{}' argc={} envp_count={}...",
+        name,
+        argv.len(),
+        envp.len()
+    );
 
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
     let mut proc = if crate::driver::ext4::has_ext4() {
         match crate::driver::ext4::read_file_range(&name) {
-            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn, argv, envp) {
+            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn, argv, envp)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     crate::klog!(DEBUG, "[exec] Streaming ELF load failed: {}", e);
@@ -2830,10 +2841,16 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         let bytes = args_str.as_bytes();
         let mut start = 0;
         while start < bytes.len() {
-            while start < bytes.len() && bytes[start] == b' ' { start += 1; }
-            if start >= bytes.len() { break; }
+            while start < bytes.len() && bytes[start] == b' ' {
+                start += 1;
+            }
+            if start >= bytes.len() {
+                break;
+            }
             let mut end = start;
-            while end < bytes.len() && bytes[end] != b' ' { end += 1; }
+            while end < bytes.len() && bytes[end] != b' ' {
+                end += 1;
+            }
             argv.push(bytes[start..end].to_vec());
             start = end;
         }
@@ -2855,7 +2872,8 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
     // Load ELF from filesystem — try streaming loader from ext4 first
     let mut proc = if crate::driver::ext4::has_ext4() {
         match crate::driver::ext4::read_file_range(&name) {
-            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn, argv, envp) {
+            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn, argv, envp)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     crate::console_println!(
@@ -3236,7 +3254,8 @@ fn linux_clone(
     tls: usize,           // r8 = 5th arg = tls
 ) -> isize {
     let is_vm_shared = (flags & 0x100) != 0; // CLONE_VM
-    crate::klog!(DEBUG,
+    crate::klog!(
+        DEBUG,
         "[linux_clone] flags={:#x} stack={:#x} ptid={:#x} ctid={:#x} tls={:#x}",
         flags,
         stack,
