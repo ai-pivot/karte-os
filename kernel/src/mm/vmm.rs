@@ -405,7 +405,11 @@ pub fn unmap_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
             // Don't unmap huge pages
             return None;
         }
-        table = unsafe { &mut *((entry.ppn() << 12) as *mut PageTable) };
+        let ppn = entry.ppn();
+        if ppn == 0 {
+            return None;
+        }
+        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
     }
     let vpn = PageTable::vpn(vaddr, 0);
     let entry = table.entries[vpn];
