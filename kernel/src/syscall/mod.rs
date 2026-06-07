@@ -2261,6 +2261,8 @@ fn sys_exec(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> i
         return ERR_INVAL;
     }
 
+    crate::klog!(DEBUG, "[exec] name='{}' argv_ptr={:#x} envp_ptr={:#x}", name, argv_ptr, envp_ptr);
+
     // Read argv from user space
     let argv = if argv_ptr != 0 {
         read_user_argv(argv_ptr)
