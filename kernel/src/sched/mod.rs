@@ -75,11 +75,21 @@ const INIT_SENTINEL: usize = MAX_TASKS;
 const INIT_PROC_IDX: usize = 0;
 
 static TASK_SPS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
+/// Which task slot is currently running (updated by schedule() before __switch).
+/// After __switch returns, this reflects the task we just switched TO
+/// (may have been updated by another schedule() invocation in between).
+pub(crate) static CURRENT_RUNNING: AtomicUsize = AtomicUsize::new(MAX_TASKS);
+/// Mapping from process table index to scheduler slot.
+/// Needed because process_idx != scheduler_slot in general.
+static PROC_TO_SLOT: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(MAX_TASKS) }; MAX_TASKS];
+/// Initial TASK_SPS values saved by add_user_process / add_clone_process.
+/// Used by schedule_exit() to detect tasks that were never context-switched out.
+static INITIAL_TASK_SP: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
 
 /// Per-task kernel stack tops for RSP0/TSS update in schedule().
 /// Stored when task is created (add_user_process/add_clone_process).
 #[cfg(target_arch = "x86_64")]
-static TASK_KSTACK: [core::sync::atomic::AtomicU64; MAX_TASKS] =
+pub(crate) static TASK_KSTACK: [core::sync::atomic::AtomicU64; MAX_TASKS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_TASKS];
 
 /// Pending RSP0 value for clone_first_shim (set by add_clone_process).
@@ -165,6 +175,27 @@ pub fn schedule() {
         (init_running, current, next, next_proc_idx)
     };
 
+    // Save current task's FS_BASE before context switch
+    // Note: init has no slot, don't save when switching from init
+    #[cfg(target_arch = "x86_64")]
+    if !switch_from_init {
+        let save_idx = current;
+        if save_idx < MAX_TASKS {
+            let fs_base: u64;
+            unsafe {
+                core::arch::asm!(
+                    "rdmsr",
+                    "shl rdx, 32",
+                    "or rdx, rax",
+                    out("edx") fs_base,
+                    out("eax") _,
+                    in("ecx") 0xC0000100u32,
+                );
+            }
+            TASK_FS_BASE[save_idx].store(fs_base, Ordering::Relaxed);
+        }
+    }
+
     if switch_from_init {
         // Save init's sp to INIT_TASK_SP, switch to child
         let init_sp_ptr = INIT_TASK_SP.as_ptr() as *mut usize;
@@ -174,6 +205,11 @@ pub fn schedule() {
             __switch(init_sp_ptr, nxt_ptr);
         }
     } else {
+        // Mark the next task as running BEFORE __switch.
+        // After __switch returns (possibly on a different invocation's stack),
+        // we read CURRENT_RUNNING to know which task we actually are.
+        CURRENT_RUNNING.store(next, Ordering::Relaxed);
+
         let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
         unsafe {
@@ -182,17 +218,32 @@ pub fn schedule() {
     }
 
     // After __switch returns (possibly on a different task's stack),
-    // update SYSCALL_KSP and TSS.RSP0 using per-task kernel stack.
+    // use CURRENT_RUNNING to identify which task we actually are now.
+    // (The local `next` variable may be stale — it was set in a different
+    //  schedule() invocation before this task was switched out.)
     #[cfg(target_arch = "x86_64")]
     {
-        let current = next;
+        let current = CURRENT_RUNNING.load(Ordering::Relaxed);
         if current < MAX_TASKS {
             let kernel_sp = TASK_KSTACK[current].load(Ordering::Relaxed);
             if kernel_sp != 0 {
                 crate::arch::idt::set_syscall_ksp(kernel_sp as u64);
                 // Update TSS.RSP0 — use VirtAddr::new_truncate (no panic)
                 unsafe {
-                    crate::arch::gdt::set_kernel_rsp0_for_cpu(0, kernel_sp);
+                    crate::arch::gdt::set_kernel_rsp0_for_cpu(0, kernel_sp as u64);
+                }
+            }
+            // Restore FS_BASE for this task (critical for Go TLS / getg())
+            let fs_base = TASK_FS_BASE[current].load(Ordering::Relaxed);
+            if fs_base != 0 {
+                unsafe {
+                    // Write IA32_FS_BASE MSR (0xC0000100)
+                    core::arch::asm!(
+                        "wrmsr",
+                        in("ecx") 0xC0000100u32,
+                        in("edx") (fs_base >> 32) as u32,
+                        in("eax") (fs_base & 0xFFFFFFFF) as u32,
+                    );
                 }
             }
         }
@@ -246,6 +297,29 @@ pub fn schedule_exit() {
         }
     };
 
+    // Save current task's FS_BASE before context switch
+    #[cfg(target_arch = "x86_64")]
+    {
+        let save_idx = current;
+        if save_idx < MAX_TASKS {
+            let fs_base: u64;
+            unsafe {
+                core::arch::asm!(
+                    "rdmsr",
+                    "shl rdx, 32",
+                    "or rdx, rax",
+                    out("edx") fs_base,
+                    out("eax") _,
+                    in("ecx") 0xC0000100u32,
+                );
+            }
+            TASK_FS_BASE[save_idx].store(fs_base, Ordering::Relaxed);
+        }
+    }
+
+    // Mark the next task as running BEFORE __switch.
+    CURRENT_RUNNING.store(next, Ordering::Relaxed);
+
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     if switch_to_init {
         let init_sp_ptr = INIT_TASK_SP.as_ptr() as *const usize;
@@ -254,20 +328,61 @@ pub fn schedule_exit() {
         }
     } else {
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
-        // Set TSS.RSP0 to next task's kernel_sp BEFORE __switch.
-        #[cfg(target_arch = "x86_64")]
-        if let Some(ksp) = crate::process::get_kernel_sp(next_proc_idx) {}
-        unsafe {
-            __switch(cur_ptr, nxt_ptr);
+        // Check if the next task has been properly saved by a Timer ISR context switch.
+        // If TASK_SPS[next] still equals the initial value from add_clone_process,
+        // the task's kernel stack TrapContext has likely been overwritten by SYSCALL handler
+        // pushes. Switching to it would load corrupted data → kernel crash.
+        // Fall back to init in this case.
+        let nxt_sp = TASK_SPS[next].load(Ordering::Relaxed);
+        let initial_sp = INITIAL_TASK_SP[next].load(Ordering::Relaxed);
+        if initial_sp != 0 && nxt_sp == initial_sp {
+            crate::console_println!("[EXIT] Task {} never saved, switching to init", next);
+            // Mark the unsaved task as exited too
+            {
+                let mut sched = SCHEDULER.lock();
+                if let Some(ref mut t) = sched.tasks[next] {
+                    t.state = TaskState::Exited;
+                }
+            }
+            let init_sp_ptr = INIT_TASK_SP.as_ptr() as *const usize;
+            unsafe {
+                __switch(cur_ptr, init_sp_ptr);
+            }
+        } else {
+            unsafe {
+                __switch(cur_ptr, nxt_ptr);
+            }
         }
     }
 
     // Update TSS.RSP0 and SYSCALL_KSP for the new task
     #[cfg(target_arch = "x86_64")]
     {
-        let proc_idx = crate::process::current_index();
+        let proc_idx = if switch_to_init {
+            INIT_PROC_IDX
+        } else {
+            next_proc_idx
+        };
         if let Some(kernel_sp) = crate::process::get_kernel_sp(proc_idx) {
             crate::arch::idt::set_syscall_ksp(kernel_sp as u64);
+            unsafe {
+                crate::arch::gdt::set_kernel_rsp0_for_cpu(0, kernel_sp as u64);
+            }
+        }
+        // Restore FS_BASE for the new task (critical for Go TLS / getg())
+        let task_idx = CURRENT_RUNNING.load(Ordering::Relaxed);
+        if task_idx < MAX_TASKS {
+            let fs_base = TASK_FS_BASE[task_idx].load(Ordering::Relaxed);
+            if fs_base != 0 {
+                unsafe {
+                    core::arch::asm!(
+                        "wrmsr",
+                        in("ecx") 0xC0000100u32,
+                        in("edx") (fs_base >> 32) as u32,
+                        in("eax") (fs_base & 0xFFFFFFFF) as u32,
+                    );
+                }
+            }
         }
     }
 }
@@ -326,6 +441,16 @@ pub fn schedule_block() {
         (current, next, next_proc_idx)
     };
 
+    // Mark the next task as running BEFORE __switch.
+    CURRENT_RUNNING.store(next, Ordering::Relaxed);
+
+    // Save FS_BASE for the current task (critical for Go TLS / getg())
+    #[cfg(target_arch = "x86_64")]
+    {
+        let msr_val = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
+        TASK_FS_BASE[current].store(msr_val, Ordering::Relaxed);
+    }
+
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
     // Set TSS.RSP0 to next task's kernel_sp BEFORE __switch.
@@ -333,6 +458,24 @@ pub fn schedule_block() {
     if let Some(ksp) = crate::process::get_kernel_sp(next_proc_idx) {}
     unsafe {
         __switch(cur_ptr, nxt_ptr);
+    }
+
+    // After __switch returns (possibly on a different task's stack),
+    // update SYSCALL_KSP, TSS.RSP0, and FS_BASE for the new task.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let current = CURRENT_RUNNING.load(Ordering::Relaxed);
+        if current < MAX_TASKS {
+            let kernel_sp = TASK_KSTACK[current].load(Ordering::Relaxed);
+            if kernel_sp != 0 {
+                crate::arch::idt::set_syscall_ksp(kernel_sp as u64);
+                unsafe {
+                    crate::arch::gdt::set_kernel_rsp0_for_cpu(0, kernel_sp as u64);
+                }
+            }
+        }
+        let saved = TASK_FS_BASE[current].load(Ordering::Relaxed);
+        unsafe { crate::arch::idt::wrmsr(0xC0000100, saved) };
     }
 }
 
@@ -403,6 +546,8 @@ pub fn add_user_process(
             *ctx.add(35) = user_satp; // user_satp: switch to this page table before sret
         }
         TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
+        INITIAL_TASK_SP[tid].store(switch_sp, Ordering::Relaxed);
+        PROC_TO_SLOT[process_idx].store(tid, Ordering::Relaxed);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -459,6 +604,8 @@ pub fn add_user_process(
             crate::arch::idt::set_syscall_ksp(kernel_stack_top as u64);
         }
         TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
+        INITIAL_TASK_SP[tid].store(switch_sp, Ordering::Relaxed);
+        PROC_TO_SLOT[process_idx].store(tid, Ordering::Relaxed);
         #[cfg(target_arch = "x86_64")]
         TASK_KSTACK[tid].store(kernel_stack_top as u64, Ordering::Relaxed);
     }
@@ -503,14 +650,18 @@ unsafe extern "C" fn clone_first_shim() -> ! {
             //   +0x28: kernel_sp  +0x30: user_cr3  +0x38: trap_from_user
             "cli",
 
-            // 1. Set TSS.RSP0 from PENDING_RSP0
-            "mov rax, [rip + {pending_rsp0}]",
+            // 1. Set TSS.RSP0 and SYSCALL_KSP from r14 (kernel_stack_top)
+            // r14 was loaded by __switch RESTORE from per-task switch frame slot 528
+            // (no longer uses global PENDING_RSP0 — avoids race with multiple clones)
+            "mov rax, r14",
             "test rax, rax",
             "jz 1f",
             "mov rcx, [rip + {tss_addr}]",
             "test rcx, rcx",
             "jz 1f",
             "mov [rcx], rax",
+            // Also set SYSCALL_KSP to the same value
+            "mov [rip + {syscall_ksp}], rax",
             "1:",
 
             // 2. Set FS_BASE from r15 (loaded by __switch RESTORE)
@@ -548,12 +699,13 @@ unsafe extern "C" fn clone_first_shim() -> ! {
             "mov rbx, [rsp + 0x10]", // rflags
             "mov rdx, [rsp + 0x18]", // user rsp
             "mov rdi, [rsp + 0x20]", // ss
-            "mov rsi, [rsp + 0x30]", // user_cr3 (DON'T clobber rax!)
+            // Use r10 for user_cr3 — Go needs R8=mp, R9=gp, R12=fn from clone SYSCALL
+            "mov r10, [rsp + 0x30]", // user_cr3 (MUST NOT use r8 — Go's mp pointer!)
 
             // 5. Switch CR3 if user_cr3 != 0
-            "cmp rsi, 0",
+            "cmp r10, 0",
             "je 3f",
-            "mov rax, rsi",
+            "mov rax, r10",
             "mov cr3, rax",
             "3:",
 
@@ -570,7 +722,7 @@ unsafe extern "C" fn clone_first_shim() -> ! {
             "iretq",
 
             tss_addr = sym crate::arch::gdt::TSS_RSP0_ADDR,
-            pending_rsp0 = sym PENDING_RSP0,
+            syscall_ksp = sym crate::arch::idt::SYSCALL_KSP,
         );
     }
 }
@@ -646,7 +798,8 @@ pub fn add_clone_process(
         // Return address at offset 568 (pop r15..rbp brings RSP here)
         *sw.add(568 / 8) = clone_first_shim as *const () as usize; // ret addr → clone_first_shim (sets TLS via wrmsr)
 
-        // No TLS storage - TLS is passed via TrapContext.r15
+        // r14 = kernel_stack_top (for clone_first_shim to set RSP0 + SYSCALL_KSP)
+        *sw.add(528 / 8) = kernel_stack_top;
 
         // Build TrapContext as a copy of parent's, with modifications for child
         let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
@@ -661,9 +814,12 @@ pub fn add_clone_process(
         // load this into r15 register (overwriting __switch's r15). Both paths
         // need to agree on the TLS value.
         (*ctx).r15 = tls as u64;
+        // Debug: print R8=mp, R9=gp, R12=fn from parent's TrapContext
     }
 
     TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
+    INITIAL_TASK_SP[tid].store(switch_sp, Ordering::Relaxed);
+    PROC_TO_SLOT[process_idx].store(tid, Ordering::Relaxed);
     #[cfg(target_arch = "x86_64")]
     {
         TASK_KSTACK[tid].store(kernel_stack_top as u64, Ordering::Relaxed);
@@ -702,6 +858,13 @@ pub fn set_task_fs_base(task_idx: usize, val: u64) {
     if task_idx < MAX_TASKS {
         TASK_FS_BASE[task_idx].store(val, core::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Get the current scheduler slot (may differ from process table index).
+#[cfg(target_arch = "x86_64")]
+pub fn current_sched_slot() -> usize {
+    let proc_idx = crate::process::current_index();
+    PROC_TO_SLOT[proc_idx].load(Ordering::Relaxed)
 }
 
 pub fn current_kernel_sp() -> usize {

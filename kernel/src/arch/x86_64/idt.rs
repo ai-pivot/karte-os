@@ -48,7 +48,14 @@ static mut KERNEL_CR3: u64 = 0;
 #[cfg_attr(target_arch = "x86_64", unsafe(link_section = ".data"))]
 /// Kernel stack pointer for SYSCALL fast entry.
 #[unsafe(no_mangle)]
-static mut SYSCALL_KSP: u64 = 0;
+pub(crate) static mut SYSCALL_KSP: u64 = 0;
+/// Temporarily saved original rbx (clobbered by user RSP during SYSCALL entry).
+#[unsafe(no_mangle)]
+static mut SYSCALL_SAVED_RBX: u64 = 0;
+/// Temporarily saved R11 (user RFLAGS) during SYSCALL entry — r11 used as scratch
+/// for per-task kernel stack lookup before being pushed to the kernel stack.
+#[unsafe(no_mangle)]
+static mut SYSCALL_SAVED_R11: u64 = 0;
 pub static mut CLONE_DBG_RAX: u64 = 0;
 pub static mut CLONE_DBG_RIP: u64 = 0;
 pub static mut CLONE_DBG_RSPVAL: u64 = 0;
@@ -192,7 +199,8 @@ core::arch::global_asm!(
     //             rax=syscall_nr, rdi/rsi/rdx/r10/r8/r9=args
     //             rsp=user RSP (NOT switched), CPL=0
 
-    // 1. Save user RSP in callee-saved rbx, switch to kernel stack
+    // 1. Save original rbx (will be clobbered by user RSP), then save user RSP
+    "mov [rip + SYSCALL_SAVED_RBX], rbx",
     "mov rbx, rsp",
     "lea rsp, [rip + SYSCALL_KSP]",
     "mov rsp, [rsp]",
@@ -260,15 +268,16 @@ core::arch::global_asm!(
     "pop r14",
     "pop r15",
     // Build iretq frame on the kernel stack
-    "mov rdi, rbx", // save user RSP in rdi (scratch)
-    // rax still has the syscall return value from call
-    // Push iretq frame in reverse order: SS, RSP, RFLAGS, CS, RIP
-    // Use immediate push to avoid clobbering rax (return value)
+    // Push directly from registers (rbx=user RSP, rcx=user RIP, r11=RFLAGS)
+    // Do NOT use `mov rdi, rbx` — that would clobber original rdi!
     "push 0x23", // SS (USER_DATA_SEL)
-    "push rdi",  // RSP (user stack)
+    "push rbx",  // RSP (user stack, in rbx)
     "push r11",  // RFLAGS
     "push 0x1b", // CS (USER_CODE_SEL)
     "push rcx",  // RIP (user code)
+    // Restore original rbx (clobbered by user RSP during entry)
+    // iretq reads from stack, so register values don't matter after push
+    "mov rbx, [rip + SYSCALL_SAVED_RBX]",
     "iretq",
     // ─── Page Fault ISR stub (vector 14) ───────────────────
     // Defined in global_asm! to avoid compiler prologue uncertainty.
@@ -435,6 +444,12 @@ unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
         let saved_r14 = *s.add(14); // r14
         let saved_r15 = *s.add(15); // r15
 
+        // Read original rbx from global (saved before clobbering with user RSP)
+        let saved_rbx: u64;
+        unsafe {
+            core::arch::asm!("mov {}, [rip + SYSCALL_SAVED_RBX]", out(reg) saved_rbx);
+        }
+
         // Save user CR3 on the stack for the return path.
         // This prevents concurrent SYSCALLs from overwriting a global variable.
         let target_root = crate::process::current_page_table_root();
@@ -449,7 +464,7 @@ unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
         // can read the parent's full register state.
         let mut ctx = super::trap::TrapContext {
             rax: syscall_nr,
-            rbx: user_rsp,
+            rbx: saved_rbx, // ✅ original rbx (not user RSP)
             rcx: user_rip,
             rdx: a2,
             rbp: saved_rbp,
@@ -474,7 +489,12 @@ unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
         };
         crate::process::set_trap_ctx_ptr(&mut ctx as *mut _ as usize);
 
+        // Debug: trace r14 for clone syscall to diagnose "morestack on g0"
+        if syscall_nr == 56 && crate::process::current_pid() >= 2 {}
+
         let result = crate::syscall::dispatch_syscall_linux(syscall_nr, a0, a1, a2, a3, a4, a5);
+
+        if syscall_nr == 56 && crate::process::current_pid() >= 2 {}
 
         crate::process::set_trap_ctx_ptr(0);
 
@@ -607,6 +627,23 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     print_hex(raw_cr3);
     print_str(b" PID:");
     print_hex(crate::process::current_pid() as u64);
+    // Print RSP0 (TSS.RSP0) for kernel stack debugging
+    print_str(b" RSP0:");
+    {
+        let rsp0_ptr = crate::arch::gdt::TSS_RSP0_ADDR;
+        if rsp0_ptr != 0 {
+            let rsp0_val = unsafe { *(rsp0_ptr as *const u64) };
+            print_hex(rsp0_val);
+        } else {
+            print_str(b"N/A");
+        }
+    }
+    // Print FS_BASE (critical for Go TLS / getg())
+    print_str(b" FSB:");
+    {
+        let fsb = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
+        print_hex(fsb);
+    }
     // Print first bytes at RIP for instruction identification
     if from_user {
         print_str(b" insn:");
@@ -658,6 +695,13 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     crate::arch::platform::console_putchar(b'\n');
 
     let handled = 'handler: {
+        // Only handle "page not present" faults (error_code bit 0 = 0).
+        // If page is present but has wrong permissions (NX, etc), fall through to termination.
+        if error_code & 1 != 0 {
+            // Page is present — this is a permission fault (NX, RO write, etc), not a missing page.
+            break 'handler false;
+        }
+
         // Lazy allocation for heap
         if from_user
             && fault_addr_val >= crate::process::USER_HEAP_BASE
@@ -762,11 +806,20 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             crate::syscall::sys_exit(99);
             loop {}
         } else {
+            // Read RSP0 for debugging
+            let mut rsp0: u64 = 0;
+            unsafe {
+                let rsp0_ptr = crate::arch::gdt::TSS_RSP0_ADDR;
+                if rsp0_ptr != 0 {
+                    rsp0 = *(rsp0_ptr as *const u64);
+                }
+            }
             crate::console_println!(
-                "[PF] KERNEL fault={:#x} err={:#x} CR3={:#x} dbg_rax={:#x} dbg_rip={:#x}",
+                "[PF] KERNEL fault={:#x} err={:#x} CR3={:#x} RSP0={:#x} dbg_rax={:#x} dbg_rip={:#x}",
                 fault_addr_val,
                 error_code,
                 cr3,
+                rsp0,
                 dbg_rax,
                 dbg_rip
             );

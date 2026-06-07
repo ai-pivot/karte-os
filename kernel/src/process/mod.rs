@@ -25,8 +25,8 @@ pub const USER_HEAP_LIMIT: usize = 0x2000_0000; // 256MB heap (brk)
 pub const USER_MMAP_BASE: usize = 0x2000_0000;
 pub const USER_MMAP_LIMIT: usize = 0x8000_0000_0000; // 8TB mmap region for Go heap arenas
 pub const USER_STACK_TOP: usize = 0x8000_0000; // 2GB — top of user stack
-pub const USER_STACK_BASE: usize = 0x7FC0_0000; // 4MB stack
-pub const USER_STACK_PAGES: usize = 64; // 256 KB actual stack (lazy-allocated on fault)
+pub const USER_STACK_BASE: usize = 0x7F00_0000; // 16MB stack region (address space)
+pub const USER_STACK_PAGES: usize = 512; // 2 MB pre-mapped stack (Go g0 needs ~1MB+)
 pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack
 
 /// Process identifier allocator

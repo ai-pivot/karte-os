@@ -1011,15 +1011,18 @@ fn sys_getpid() -> isize {
 /// When addr=0, allocates from a per-process mmap region that grows upward
 /// from USER_MMAP_BASE. This matches Linux behavior where mmap returns
 /// addresses in a dedicated region (not overlapping brk).
-fn sys_mmap(addr: usize, len: usize, _flags: usize) -> isize {
+fn sys_mmap(addr: usize, len: usize, flags: usize) -> isize {
     if len == 0 {
         return ERR_INVAL;
     }
+    // Extract prot from mmap flags (lower 3 bits encode protection)
+    // Go passes full mmap2 args: (addr, len, prot, flags, fd, offset)
+    // sys_mmap receives the first 3 args from the syscall dispatch
     linux_mmap(
         addr,
         len,
-        3,    /* PROT_READ|PROT_WRITE */
-        0x22, /* MAP_PRIVATE|MAP_ANONYMOUS */
+        flags, // prot bits passed from Go
+        0x22,  /* MAP_PRIVATE|MAP_ANONYMOUS */
         usize::MAX,
         0,
     )
@@ -1046,6 +1049,22 @@ fn linux_mmap(
     _fd: usize,
     _offset: usize,
 ) -> isize {
+    let _prot_str = |p: usize| -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        if p == 0 {
+            s.push_str("NONE");
+        }
+        if p & 1 != 0 {
+            s.push_str("R");
+        }
+        if p & 2 != 0 {
+            s.push_str("W");
+        }
+        if p & 4 != 0 {
+            s.push_str("X");
+        }
+        s
+    };
     if len == 0 {
         return -22; // EINVAL
     }
@@ -1159,6 +1178,17 @@ fn linux_mmap(
     // Verify the mapping actually works
     if crate::mm::vmm::translate_user(user_pt, target_addr).is_none() {
         return -12; // ENOMEM
+    }
+
+    if crate::process::current_pid() >= 2 {
+        crate::console_println!(
+            "[mmap] → {:#x} len={:#x} prot={}({}) flags={:#x}",
+            target_addr,
+            len,
+            _prot_str(prot),
+            prot,
+            flags
+        );
     }
 
     target_addr as isize
@@ -3152,10 +3182,10 @@ fn linux_clone(
             None => return ERR_NOMEM,
         };
 
-        // Save FS_BASE for the child process (lock-free, for context switch restore)
+        // Save FS_BASE for the child process (use scheduler slot, NOT process index!)
         #[cfg(target_arch = "x86_64")]
         {
-            crate::sched::set_task_fs_base(child_idx, tls as u64);
+            crate::sched::set_task_fs_base(tid, tls as u64);
         }
 
         // CLONE_PARENT_SETTID: write child PID to parent's memory
@@ -3303,10 +3333,10 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
         ARCH_SET_FS => {
             // Go runtime uses %fs:-8 to store the g pointer (getg()).
             // Go writes the actual g pointer to [addr-8] BEFORE calling arch_prctl.
+            let slot = crate::sched::current_sched_slot();
             unsafe { crate::arch::idt::wrmsr(MSR_FS_BASE, addr as u64) };
-            // Save to per-task array for context switch restore (lock-free)
-            let proc_idx = crate::process::current_index();
-            crate::sched::set_task_fs_base(proc_idx, addr as u64);
+            // Save to per-task array for context switch restore (use scheduler slot!)
+            crate::sched::set_task_fs_base(slot, addr as u64);
             0
         }
         ARCH_GET_FS => {
