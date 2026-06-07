@@ -477,8 +477,12 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
     match crate::driver::vfs::open(path_str, our_flags as u32) {
         Ok(fd) => fd as isize,
         Err(_) => {
-            // If O_CREAT and path starts with .xbot, fake success
-            if has_creat && path_str.starts_with(".xbot") {
+            // If O_CREAT, VFS failed, and path is in a virtual directory, create fake fd
+            let is_virtual = path_str.starts_with(".xbot")
+                || path_str.starts_with("/.xbot")
+                || path_str.contains("xbot.db")
+                || path_str.contains(".db");
+            if has_creat && is_virtual {
                 crate::console_println!("[openat] fake create '{}' flags={:#x}", path_str, flags);
                 crate::process::with_fd_table(|fd_table| {
                     match fd_table.alloc_fake_fd(alloc::format!("{}", path_str), our_flags as u32) {
@@ -1255,7 +1259,8 @@ const MAP_ANONYMOUS: usize = 0x20;
 /// Global lock for mmap/mprotect — prevents race conditions when multiple
 /// CLONE_VM threads concurrently modify the shared page table.
 #[cfg(target_arch = "x86_64")]
-static MMAP_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static MMAP_LOCK: crate::sync::int_spinlock::IntSpinLock<()> =
+    crate::sync::int_spinlock::IntSpinLock::new(());
 
 fn linux_mmap(
     addr: usize,
