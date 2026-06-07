@@ -121,18 +121,52 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Identity-map from 1MB to end of physical RAM, but SKIP any pages
-        // already mapped by the ELF loader. This preserves user program
-        // virtual addresses (e.g., xbot at 0x400000+) while still providing
-        // access to kernel code, heap, and data structures.
-        // Identity-map from 1MB up to the end of ELF-loaded segments (max_vaddr),
-        // NOT the entire physical RAM. Identity-mapping beyond max_vaddr would
-        // conflict with the user stack (USER_STACK_BASE..USER_STACK_TOP) and
-        // mmap regions. Stack pages and mmap pages are separately mapped later.
-        // Only identity-map up to max_vaddr (end of ELF segments + heap), and
-        // only if it's within the safe range (below USER_STACK_BASE).
-        let safe_ram_end = crate::mm::pmm::total_memory();
-        vmm::identity_map_skip(user_pt, 0x10_0000, safe_ram_end, vmm::PTEFlags::URWX);
+        // Copy kernel's identity map (2MB huge pages at PD level with PS=1)
+        // to the user page table. This establishes identity-mapped access to
+        // all physical memory using 2MB huge pages, avoiding the 4KB-PTE
+        // bootstrapping problem (where PT tables created at high physical
+        // addresses aren't yet identity-mapped themselves).
+        //
+        // Each kernel PD table is copied independently: we create a new PD
+        // table, clone kernel PD entries, and add USER bit. This keeps kernel
+        // and user page tables fully isolated (no shared tables).
+        let kernel_pt = vmm::get_kernel_page_table();
+        let ke = kernel_pt.entries[0];
+        if ke.is_valid() {
+            let kernel_pdp = unsafe { &mut *((ke.ppn() << 12) as *mut vmm::PageTable) };
+            let user_pml4 = &mut user_pt.entries[0];
+            let user_pdp_ppn = if user_pml4.is_valid() {
+                user_pml4.ppn()
+            } else {
+                let new_pdp = vmm::PageTable::zeroed();
+                let ppn = (new_pdp as *const vmm::PageTable as usize) >> 12;
+                let flags = vmm::PTEFlags::PRESENT.bits()
+                    | vmm::PTEFlags::WRITABLE.bits()
+                    | vmm::PTEFlags::USER.bits();
+                *user_pml4 = vmm::PTE(((ppn as u64) << 12) | flags);
+                ppn
+            };
+            let user_pdp = unsafe { &mut *((user_pdp_ppn << 12) as *mut vmm::PageTable) };
+            let user_flag = vmm::PTEFlags::USER.bits();
+            for i in 0..512 {
+                let kpe = kernel_pdp.entries[i];
+                if kpe.is_valid() && !user_pdp.entries[i].is_valid() {
+                    let kernel_pd = unsafe { &mut *((kpe.ppn() << 12) as *mut vmm::PageTable) };
+                    let new_pd = vmm::PageTable::zeroed();
+                    let new_pd_ppn = (new_pd as *const vmm::PageTable as usize) >> 12;
+                    for j in 0..512 {
+                        let pd_entry = kernel_pd.entries[j];
+                        if pd_entry.is_valid() {
+                            new_pd.entries[j] = vmm::PTE(pd_entry.0 | user_flag);
+                        }
+                    }
+                    let pd_flags = vmm::PTEFlags::PRESENT.bits()
+                        | vmm::PTEFlags::WRITABLE.bits()
+                        | vmm::PTEFlags::USER.bits();
+                    user_pdp.entries[i] = vmm::PTE(((new_pd_ppn as u64) << 12) | pd_flags);
+                }
+            }
+        }
 
         // Map VGA text buffer at 0xB8000 (2 pages)
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
@@ -178,8 +212,14 @@ impl Process {
             .ok_or("Out of memory for kernel stack")?;
         let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * pmm::page_size();
 
-        // 4. Load ELF segments into user page table FIRST
-        // (before copy_kernel_mappings, so identity mappings don't interfere)
+        // 4. Copy kernel identity map (2MB huge pages) BEFORE loading ELF.
+        // This establishes identity-mapped access to physical memory using the
+        // kernel's existing 2MB huge pages. ELF loading can then split these
+        // huge pages as needed for 4KB mappings.
+        copy_kernel_mappings(user_pt, kernel_stack_top);
+
+        // 5. Load ELF segments into user page table. map() will split any
+        // 2MB huge pages (PS=1) that overlap with ELF segment addresses.
         let mut max_vaddr = 0usize;
         for segment in &elf.loadable_segments {
             let page_size = pmm::page_size();
@@ -232,11 +272,7 @@ impl Process {
             }
         }
 
-        // 4. Copy kernel mappings AFTER loading ELF segments
-        // (identity mappings must not interfere with ELF segment mapping)
-        copy_kernel_mappings(user_pt, kernel_stack_top);
-
-        // 5. Map user stack in user page table (URW, no execute)
+        // 6. Map user stack in user page table (URW, no execute)
         // Map from USER_STACK_TOP downward for USER_STACK_PAGES.
         // The page containing USER_STACK_TOP itself MUST be mapped because
         // Go/C entry code reads [rsp] where rsp = USER_STACK_TOP initially.
@@ -481,7 +517,14 @@ impl Process {
         // 24 bytes. Without this guard, the overflow would corrupt the page table root frame.
         let _guard = pmm::alloc_frame();
 
-        // 4. Load ELF segments page-by-page
+        // 4. Copy kernel identity map (2MB huge pages) BEFORE loading ELF.
+        // This establishes identity-mapped access to physical memory using the
+        // kernel's existing 2MB huge pages. ELF loading can then split these
+        // huge pages as needed for 4KB mappings.
+        copy_kernel_mappings(user_pt, kernel_stack_top);
+
+        // 5. Load ELF segments page-by-page. map() will split any 2MB huge
+        // pages (PS=1) that overlap with ELF segment addresses.
         let mut max_vaddr = 0usize;
         for seg_idx in 0..elf_info.num_segments {
             let seg = elf_info.segments[seg_idx].as_ref().unwrap();
@@ -542,9 +585,6 @@ impl Process {
                 max_vaddr = seg.vaddr + seg.mem_size;
             }
         }
-
-        // 5. Copy kernel mappings AFTER loading ELF segments
-        copy_kernel_mappings(user_pt, kernel_stack_top);
 
         // 6. Map user stack in user page table (URW, no execute)
         // Map from USER_STACK_TOP downward for USER_STACK_PAGES.

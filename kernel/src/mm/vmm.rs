@@ -195,6 +195,42 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
             }
         }
 
+        #[cfg(target_arch = "x86_64")]
+        if entry.flags().contains(PTEFlags::PS) {
+            // Huge page at this level — must split to create a 4KB entry.
+            // This happens when ELF loading (or mmap) needs 4KB granularity
+            // within a 2MB (or 1GB) identity-mapped huge page from the kernel.
+            let huge_ppn = entry.ppn();
+            let huge_paddr = huge_ppn << 12;
+            let sub_page_size = if level == 2 {
+                1 << 21 // 2MB for PDP-level (1GB) huge page → split into 512 2MB PD entries
+            } else {
+                1 << 12 // 4KB for PD-level (2MB) huge page → split into 512 4KB PT entries
+            };
+            let new_table = PageTable::zeroed();
+            let new_ppn = (new_table as *const PageTable as usize) >> 12;
+            for i in 0..512 {
+                let sub_paddr = huge_paddr + i * sub_page_size;
+                let sub_flags: u64 = if sub_page_size > 4096 {
+                    // Next-level entry: create 2MB pages with PS=1
+                    (PTEFlags::PRESENT.bits() | PTEFlags::WRITABLE.bits()
+                        | PTEFlags::USER.bits() | PTEFlags::PS.bits()) as u64
+                } else {
+                    // Leaf 4KB entry: use flags from original huge page, minus PS
+                    entry.0 & !(PTEFlags::PS.bits() as u64)
+                };
+                new_table.entries[i] = PTE(((sub_paddr >> 12) as u64) << 12 | sub_flags);
+            }
+            // Replace huge page entry with pointer to new page table
+            let new_entry_flags = PTEFlags::PRESENT.bits()
+                | PTEFlags::WRITABLE.bits()
+                | PTEFlags::USER.bits();
+            *entry = PTE(((new_ppn as u64) << 12) | new_entry_flags);
+            // Continue traversal into the new table
+            table = unsafe { &mut *((new_ppn << 12) as *mut PageTable) };
+            continue;
+        }
+
         let ppn = entry.ppn();
         table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
 
