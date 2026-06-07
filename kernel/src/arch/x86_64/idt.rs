@@ -724,11 +724,9 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
 
     let handled = 'handler: {
         // Only handle "page not present" faults (error_code bit 0 = 0).
-        // If page is present but has wrong permissions (NX, etc), fall through to termination.
-        if error_code & 1 != 0 {
-            // Page is present — this is a permission fault (NX, RO write, etc), not a missing page.
-            break 'handler false;
-        }
+        // If page is present but has wrong permissions (NX, RO write, etc),
+        // the handlers below may fix it via mprotect. Only fail if no handler
+        // was able to resolve the fault.
 
         // Lazy allocation for heap
         if from_user
@@ -749,6 +747,10 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                     }
                     break 'handler true;
                 }
+            } else if error_code & 1 == 1 {
+                crate::mm::vmm::mprotect_user(user_pt, page_addr, crate::mm::vmm::PTEFlags::URW);
+                super::trap::flush_tlb_addr(page_addr);
+                break 'handler true;
             }
             break 'handler true;
         }
@@ -768,6 +770,10 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                     super::trap::flush_tlb_addr(page_addr);
                     break 'handler true;
                 }
+            } else if error_code & 1 == 1 {
+                crate::mm::vmm::mprotect_user(user_pt, page_addr, crate::mm::vmm::PTEFlags::URW);
+                super::trap::flush_tlb_addr(page_addr);
+                break 'handler true;
             }
             break 'handler true;
         }
@@ -779,6 +785,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         {
             let user_pt = super::trap::get_current_user_pt();
             if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                // Page not present → allocate and map
                 if let Some(frame) = crate::mm::pmm::alloc_frame() {
                     unsafe {
                         core::ptr::write_bytes(frame as *mut u8, 0, page_size);
@@ -787,6 +794,19 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                     super::trap::flush_tlb_addr(page_addr);
                     break 'handler true;
                 }
+            } else if error_code & 1 == 1 {
+                // Page IS present but wrong permissions (e.g. read-only).
+                // Update PTE flags to match the request (write → add Write bit).
+                let needed_flags = if error_code & 2 != 0 {
+                    // Write fault: need W bit
+                    crate::mm::vmm::PTEFlags::URW
+                } else {
+                    // Read fault: need R bit (already present)
+                    crate::mm::vmm::PTEFlags::URW
+                };
+                crate::mm::vmm::mprotect_user(user_pt, page_addr, needed_flags);
+                super::trap::flush_tlb_addr(page_addr);
+                break 'handler true;
             }
             break 'handler true;
         }

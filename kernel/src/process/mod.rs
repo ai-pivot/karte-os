@@ -25,7 +25,7 @@ pub const USER_CODE_BASE: usize = 0x0000_0000;
 pub const USER_CODE_LIMIT: usize = 0x1000_0000; // 256MB for code+data
 pub const USER_HEAP_BASE: usize = 0x1000_0000;
 pub const USER_HEAP_LIMIT: usize = 0x2000_0000; // 256MB heap (brk)
-pub const USER_MMAP_BASE: usize = 0x2000_0000;
+pub const USER_MMAP_BASE: usize = 0x2000_0000; // 512MB — above identity map (max 512MB), below stack
 pub const USER_MMAP_LIMIT: usize = 0x8000_0000_0000; // 8TB mmap region for Go heap arenas
 pub const USER_STACK_TOP: usize = 0x8000_0000; // 2GB — top of user stack
 pub const USER_STACK_BASE: usize = 0x7F00_0000; // 16MB stack region (address space)
@@ -125,8 +125,14 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
         // already mapped by the ELF loader. This preserves user program
         // virtual addresses (e.g., xbot at 0x400000+) while still providing
         // access to kernel code, heap, and data structures.
-        let ram_end = crate::mm::pmm::total_memory();
-        vmm::identity_map_skip(user_pt, 0x10_0000, ram_end, vmm::PTEFlags::KRWX);
+        // Identity-map from 1MB up to the end of ELF-loaded segments (max_vaddr),
+        // NOT the entire physical RAM. Identity-mapping beyond max_vaddr would
+        // conflict with the user stack (USER_STACK_BASE..USER_STACK_TOP) and
+        // mmap regions. Stack pages and mmap pages are separately mapped later.
+        // Only identity-map up to max_vaddr (end of ELF segments + heap), and
+        // only if it's within the safe range (below USER_STACK_BASE).
+        let safe_ram_end = core::cmp::min(crate::mm::pmm::total_memory(), 0x2000_0000usize);
+        vmm::identity_map_skip(user_pt, 0x10_0000, safe_ram_end, vmm::PTEFlags::KRWX);
 
         // Map VGA text buffer at 0xB8000 (2 pages)
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);

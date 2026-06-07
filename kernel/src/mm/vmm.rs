@@ -187,12 +187,44 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
             #[cfg(target_arch = "x86_64")]
             {
                 // x86_64 non-leaf: Present + Writable + User
-                // User bit is required so Ring 3 can traverse to leaf entries
                 *entry = PTE(((ppn as u64) << 12)
                     | PTEFlags::PRESENT.bits()
                     | PTEFlags::WRITABLE.bits()
                     | PTEFlags::USER.bits());
             }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if entry.flags().contains(PTEFlags::PS) {
+            // Huge page at this level — must split into smaller entries.
+            // This happens when identity-mapped 2MB huge pages conflict
+            // with mmap's 4KB granularity. Allocate a new page table and
+            // populate it with entries derived from the huge page.
+            let huge_ppn = entry.ppn();
+            let huge_paddr = huge_ppn << 12;
+            let new_table = PageTable::zeroed();
+            let new_table_ppn = (new_table as *const PageTable as usize) >> 12;
+            let sub_page_size = 1 << (12 + 9 * (level - 1)); // 4KB for level 1, 2MB for level 2
+            let num_entries = 512;
+            for i in 0..num_entries {
+                let sub_paddr = huge_paddr + i * sub_page_size;
+                let sub_ppn = sub_paddr >> 12;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    new_table.entries[i] = PTE(
+                        ((sub_ppn as u64) << 12)
+                            | PTEFlags::PRESENT.bits()
+                            | PTEFlags::WRITABLE.bits()
+                            | PTEFlags::USER.bits(),
+                    );
+                }
+            }
+            // Replace the huge page entry with a pointer to the new page table
+            let new_flags = PTEFlags::PRESENT.bits() | PTEFlags::WRITABLE.bits() | PTEFlags::USER.bits();
+            *entry = PTE(((new_table_ppn as u64) << 12) | new_flags);
+            // Continue traversal with the new table
+            table = unsafe { &mut *((new_table_ppn << 12) as *mut PageTable) };
+            continue;
         }
 
         let ppn = entry.ppn();
@@ -367,7 +399,7 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
     let mut table = root;
     for level in (1..PT_LEVELS).rev() {
         let vpn = PageTable::vpn(vaddr, level);
-        let entry = table.entries[vpn];
+        let entry = &mut table.entries[vpn];
         if !entry.is_valid() {
             return None;
         }
@@ -383,7 +415,7 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
         table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
     }
     let vpn = PageTable::vpn(vaddr, 0);
-    let entry = table.entries[vpn];
+    let entry = &mut table.entries[vpn];
     if !entry.is_valid() {
         return None;
     }
@@ -396,7 +428,7 @@ pub fn unmap_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
     let mut table = root;
     for level in (1..PT_LEVELS).rev() {
         let vpn = PageTable::vpn(vaddr, level);
-        let entry = table.entries[vpn];
+        let entry = &mut table.entries[vpn];
         if !entry.is_valid() {
             return None;
         }
@@ -408,7 +440,7 @@ pub fn unmap_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
         table = unsafe { &mut *((entry.ppn() << 12) as *mut PageTable) };
     }
     let vpn = PageTable::vpn(vaddr, 0);
-    let entry = table.entries[vpn];
+    let entry = &mut table.entries[vpn];
     if !entry.is_valid() {
         return None;
     }
@@ -424,14 +456,33 @@ pub fn mprotect_user(root: &mut PageTable, vaddr: usize, flags: PTEFlags) -> boo
     let mut table = root;
     for level in (1..PT_LEVELS).rev() {
         let vpn = PageTable::vpn(vaddr, level);
-        let entry = table.entries[vpn];
+        let entry = &mut table.entries[vpn];
         if !entry.is_valid() {
             return false;
         }
-        table = unsafe { &mut *((entry.ppn() << 12) as *mut PageTable) };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if entry.flags().contains(PTEFlags::PS) {
+                // Huge page at this level — update flags directly in this entry
+                let ppn = entry.ppn();
+                table.entries[vpn] = PTE(((ppn as u64) << 12) | flags.bits() | PTEFlags::PS.bits());
+                return true;
+            }
+            // Non-leaf entries must have USER bit for Ring 3 page walks.
+            // Identity-mapped pages have USER=0; we must add it here.
+            let raw = entry.0;
+            if (raw & PTEFlags::USER.bits()) == 0 && flags.contains(PTEFlags::USER) {
+                entry.0 = raw | PTEFlags::USER.bits();
+            }
+        }
+        let ppn = entry.ppn();
+        if ppn == 0 {
+            return false; // corrupted entry
+        }
+        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
     }
     let vpn = PageTable::vpn(vaddr, 0);
-    let entry = table.entries[vpn];
+    let entry = &mut table.entries[vpn];
     if !entry.is_valid() {
         return false;
     }
