@@ -88,6 +88,77 @@ pub const ERR_IO: isize = -4;
 
 extern crate alloc;
 
+/// Read a null-terminated user string from the given address.
+/// Returns the string as a Vec<u8> (without the null terminator).
+fn read_user_string(addr: usize) -> Option<alloc::vec::Vec<u8>> {
+    let mut buf = alloc::vec::Vec::new();
+    for i in 0..4096 {
+        let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+        if byte == 0 {
+            return Some(buf);
+        }
+        buf.push(byte);
+    }
+    Some(buf) // max 4096 bytes, return what we have
+}
+
+/// Read an argv-style pointer array from user space.
+/// `ptr_array` is the address of a null-terminated array of `*const u8` pointers.
+/// Each pointer points to a null-terminated string.
+fn read_user_argv(ptr_array: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+    let mut result = alloc::vec::Vec::new();
+    for i in 0..256 {
+        let ptr = unsafe { core::ptr::read_volatile((ptr_array + i * 8) as *const usize) };
+        if ptr == 0 {
+            break;
+        }
+        if let Some(s) = read_user_string(ptr) {
+            result.push(s);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Read an envp-style pointer array from user space.
+/// Each pointer points to a "KEY=VALUE" null-terminated string.
+fn read_user_envp(ptr_array: usize) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
+    let mut result = alloc::vec::Vec::new();
+    for i in 0..256 {
+        let ptr = unsafe { core::ptr::read_volatile((ptr_array + i * 8) as *const usize) };
+        if ptr == 0 {
+            break;
+        }
+        if let Some(s) = read_user_string(ptr) {
+            // Split at first '='
+            if let Some(eq_pos) = s.iter().position(|&b| b == b'=') {
+                let key = s[..eq_pos].to_vec();
+                let val = s[eq_pos + 1..].to_vec();
+                result.push((key, val));
+            }
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Convert per-process env BTreeMap to envp Vec for initial stack.
+fn env_to_envp(env: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
+    env.iter()
+        .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+        .collect()
+}
+
+/// Merge global env into per-process env BTreeMap.
+fn merge_global_env(env: &mut alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>) {
+    let global_vars = crate::env::list_all();
+    for (k, v) in global_vars {
+        env.entry(k).or_insert(v);
+    }
+}
+
 // ─── Linux signal state (for Go runtime compatibility) ────────────
 
 /// Signal handler table: maps signal number to handler address.
@@ -237,7 +308,7 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
         29 => linux_dup(args[0]),                                       // dup
         30 => linux_dup2(args[0], args[1]),                             // dup2
         31 => linux_pause(),                                            // pause
-        32 => sys_exec(args[0], linux::count_user_string(args[0])),     // execve (map to sys_exec)
+        32 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]),     // execve(path, argv, envp)
         33 => 0, // chdir (stub — use Linux 80)
         34 => 0, // fchdir (stub)
         35 => 0, // nanosleep (stub: return immediately)
@@ -266,7 +337,7 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
 
         56 => linux_clone(args[0], args[1], args[2], args[3], args[4]), // clone
         57 => sys_fork(),                                               // fork
-        58 => sys_exec(args[0], linux::count_user_string(args[0])),     // vfork → exec
+        58 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]),     // vfork → execve
         59 => sys_exit(args[0] as i32),                                 // exit
         60 => sys_exit(args[0] as i32),                                 // exit (same as 59)
 
@@ -670,7 +741,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_OPEN => sys_open(args[0], args[1], args[2] as u32),
         SYS_CLOSE => sys_close(args[0] as i32),
         SYS_SPAWN => sys_spawn(args[0], args[1]),
-        SYS_EXEC => sys_exec(args[0], args[1]),
+        SYS_EXEC => sys_exec(args[0], args[1], args[2], args[3]),
         SYS_EXEC_FD => sys_exec_fd(args[0], args[1], args[2] as i32, args[3] as i32),
         SYS_WAITPID => sys_waitpid(args[0]),
         SYS_LS => sys_ls(args[0], args[1]),
@@ -1788,6 +1859,13 @@ fn sys_setenv(key: usize, key_len: usize, val: usize, val_len: usize) -> isize {
     }
     let val_str = alloc::string::String::from_utf8(vbuf).unwrap_or_default();
 
+    // Update per-process env
+    crate::process::update_current(|proc_opt| {
+        if let Some(proc) = proc_opt {
+            proc.env.insert(key_str.clone(), val_str.clone());
+        }
+    });
+    // Also update global env for backward compat (e.g., shell's CMD_ARGS, CWD)
     crate::env::set(&key_str, &val_str);
     0
 }
@@ -1807,19 +1885,26 @@ fn sys_getenv(key: usize, key_len: usize, buf: usize, buf_len: usize) -> isize {
     }
     let key_str = alloc::string::String::from_utf8(kbuf).unwrap_or_default();
 
-    match crate::env::get(&key_str) {
-        Some(val) => {
-            if buf != 0 && buf_len > 0 {
-                let copy_len = core::cmp::min(val.len(), buf_len);
-                for i in 0..copy_len {
-                    unsafe { core::ptr::write_volatile((buf + i) as *mut u8, val.as_bytes()[i]) };
-                }
-                copy_len as isize
-            } else {
-                val.len() as isize
-            }
+    // First check per-process env, then fall back to global env
+    let val_opt: Option<alloc::string::String> = {
+        crate::process::current().and_then(|p| p.env.get(&key_str).cloned())
+    };
+    let val = match val_opt {
+        Some(v) => v,
+        None => match crate::env::get(&key_str) {
+            Some(v) => v,
+            None => return -1,
+        },
+    };
+
+    if buf != 0 && buf_len > 0 {
+        let copy_len = core::cmp::min(val.len(), buf_len);
+        for i in 0..copy_len {
+            unsafe { core::ptr::write_volatile((buf + i) as *mut u8, val.as_bytes()[i]) };
         }
-        None => -1,
+        copy_len as isize
+    } else {
+        val.len() as isize
     }
 }
 
@@ -1835,7 +1920,11 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
 
     // Load ELF data from filesystem (FAT32 first, then RamFS)
     let proc = match crate::driver::fs::read_file_owned(file_name) {
-        Some(data) => match crate::process::Process::from_elf(&data) {
+        Some(data) => match crate::process::Process::from_elf(
+            &data,
+            alloc::vec![file_name.as_bytes().to_vec()],
+            alloc::vec![],
+        ) {
             Ok(p) => p,
             Err(e) => {
                 crate::klog!(DEBUG, "[spawn] Failed to create process: {}", e);
@@ -2144,7 +2233,7 @@ fn sys_shutdown(_fd: i32) -> isize {
 /// Syscall 32: Execute (spawn) a program by file path.
 /// `path` = pointer to file path string, `path_len` = length.
 /// Returns child PID on success, or negative error code.
-fn sys_exec(path: usize, path_len: usize) -> isize {
+fn sys_exec(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     if path == 0 || path_len == 0 || path_len > 256 {
         return ERR_INVAL;
     }
@@ -2168,12 +2257,48 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    crate::klog!(DEBUG, "[exec] Loading '{}'...", name);
+    // Read argv from user space
+    let argv = if argv_ptr != 0 {
+        read_user_argv(argv_ptr)
+    } else {
+        // Default: argv[0] = program name
+        alloc::vec![name.as_bytes().to_vec()]
+    };
+
+    // Read envp from user space and build per-process env
+    let mut proc_env: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String> =
+        if envp_ptr != 0 {
+            let envp_entries = read_user_envp(envp_ptr);
+            envp_entries
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        alloc::string::String::from_utf8_lossy(k).into_owned(),
+                        alloc::string::String::from_utf8_lossy(v).into_owned(),
+                    )
+                })
+                .collect()
+        } else {
+            // Inherit current process's env (or global env for init)
+            let current = crate::process::current();
+            if let Some(p) = current {
+                p.env.clone()
+            } else {
+                let mut env = alloc::collections::BTreeMap::new();
+                merge_global_env(&mut env);
+                env
+            }
+        };
+
+    // Build envp Vec for initial stack
+    let envp = env_to_envp(&proc_env);
+
+    crate::klog!(DEBUG, "[exec] Loading '{}' argc={} envp_count={}...", name, argv.len(), envp.len());
 
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
-    let proc = if crate::driver::ext4::has_ext4() {
+    let mut proc = if crate::driver::ext4::has_ext4() {
         match crate::driver::ext4::read_file_range(&name) {
-            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn) {
+            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn, argv, envp) {
                 Ok(p) => p,
                 Err(e) => {
                     crate::klog!(DEBUG, "[exec] Streaming ELF load failed: {}", e);
@@ -2182,8 +2307,18 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
             },
             None => {
                 // File not found on ext4, try fallback
+                let argv2 = if let Some(pos) = name.rfind('/') {
+                    let mut v = argv.clone();
+                    // Update argv[0] to just the basename if it was a path
+                    if v.is_empty() {
+                        v.push(name[pos + 1..].as_bytes().to_vec());
+                    }
+                    v
+                } else {
+                    argv.clone()
+                };
                 match crate::driver::fs::read_file_owned(&name) {
-                    Some(data) => match crate::process::Process::from_elf(&data) {
+                    Some(data) => match crate::process::Process::from_elf(&data, argv2, envp) {
                         Ok(p) => p,
                         Err(e) => {
                             crate::klog!(DEBUG, "[exec] Failed to create process: {}", e);
@@ -2200,7 +2335,7 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
     } else {
         // No ext4 — use traditional loader (FAT32 + RamFS)
         match crate::driver::fs::read_file_owned(&name) {
-            Some(data) => match crate::process::Process::from_elf(&data) {
+            Some(data) => match crate::process::Process::from_elf(&data, argv, envp) {
                 Ok(p) => p,
                 Err(e) => {
                     crate::klog!(DEBUG, "[exec] Failed to create process: {}", e);
@@ -2213,6 +2348,9 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
             }
         }
     };
+
+    // Set per-process env
+    proc.env = proc_env;
 
     let child_pid = proc.pid;
     let entry = proc.entry;
@@ -2684,10 +2822,40 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         return ERR_INVAL;
     };
 
+    // Build argv from CMD_ARGS env var (for backward compat with .S programs)
+    let args_str = crate::env::get("CMD_ARGS").unwrap_or_default();
+    let mut argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec![name.as_bytes().to_vec()];
+    if !args_str.is_empty() {
+        // Split CMD_ARGS by spaces into argv[1..]
+        let bytes = args_str.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            while start < bytes.len() && bytes[start] == b' ' { start += 1; }
+            if start >= bytes.len() { break; }
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b' ' { end += 1; }
+            argv.push(bytes[start..end].to_vec());
+            start = end;
+        }
+    }
+
+    // Build envp from per-process env (or global env for init)
+    let proc_env = {
+        let current = crate::process::current();
+        if let Some(p) = current {
+            p.env.clone()
+        } else {
+            let mut env = alloc::collections::BTreeMap::new();
+            merge_global_env(&mut env);
+            env
+        }
+    };
+    let envp = env_to_envp(&proc_env);
+
     // Load ELF from filesystem — try streaming loader from ext4 first
     let mut proc = if crate::driver::ext4::has_ext4() {
         match crate::driver::ext4::read_file_range(&name) {
-            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn) {
+            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn, argv, envp) {
                 Ok(p) => p,
                 Err(e) => {
                     crate::console_println!(
@@ -2701,7 +2869,11 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
             None => {
                 // File not found on ext4, try fallback
                 match crate::driver::fs::read_file_owned(&name) {
-                    Some(data) => match crate::process::Process::from_elf(&data) {
+                    Some(data) => match crate::process::Process::from_elf(
+                        &data,
+                        alloc::vec![name.as_bytes().to_vec()],
+                        alloc::vec![],
+                    ) {
                         Ok(p) => p,
                         Err(e) => {
                             crate::klog!(DEBUG, "[exec] Failed to parse ELF '{}': {}", name, e);
@@ -2715,7 +2887,11 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
     } else {
         // No ext4 — use traditional loader
         match crate::driver::fs::read_file_owned(&name) {
-            Some(data) => match crate::process::Process::from_elf(&data) {
+            Some(data) => match crate::process::Process::from_elf(
+                &data,
+                alloc::vec![name.as_bytes().to_vec()],
+                alloc::vec![],
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     crate::klog!(DEBUG, "[exec] Failed to parse ELF '{}': {}", name, e);
@@ -2725,6 +2901,9 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
             None => return ERR_NOENT,
         }
     };
+
+    // Set per-process env
+    proc.env = proc_env;
 
     // Apply fd redirections: copy parent's fd entries to child
     if redir_stdin >= 0 || redir_stdout >= 0 {
@@ -2909,7 +3088,7 @@ fn sys_fork() -> isize {
     // Clone fd table
     let fd_table = current.fd_table.clone();
 
-    // Create child process
+    // Create child process (env is inherited from parent)
     let child = crate::process::Process {
         pid: child_pid,
         ppid: current.pid,
@@ -2928,6 +3107,7 @@ fn sys_fork() -> isize {
         clone_tls: 0,
         child_tid_ptr: 0,
         fs_base: 0,
+        env: current.env.clone(),
     };
 
     // Register child
@@ -3181,6 +3361,7 @@ fn linux_clone(
                 0
             },
             fs_base: 0,
+            env: parent_proc.env.clone(),
         };
 
         let child_idx = match crate::process::add_process(child) {

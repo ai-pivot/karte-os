@@ -277,11 +277,11 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                         "[init] ext4 ready, xbot-cli-static available for exec"
                     );
                 }
-                process::Process::from_elf(include_bytes!("../../shell-x86_64.elf"))
+                process::Process::from_elf(include_bytes!("../../shell-x86_64.elf"), alloc::vec![b"shell".to_vec()], alloc::vec![])
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                process::Process::from_elf(include_bytes!("../../user/shell.elf"))
+                process::Process::from_elf(include_bytes!("../../user/shell.elf"), alloc::vec![b"shell".to_vec()], alloc::vec![])
             }
         };
 

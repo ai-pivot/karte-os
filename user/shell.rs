@@ -167,25 +167,80 @@ fn wait_for(pid: isize) -> i32 {
     }
 }
 
+/// Build an argv pointer array on the stack and call sys_exec.
+/// argv_ptr points to a null-terminated array of pointers to null-terminated strings.
+/// envp_ptr points to a null-terminated array of pointers to "KEY=VALUE" strings.
 unsafe fn launch(cmd: &[u8], arg: &[u8], redir_stdin: i32, redir_stdout: i32) -> isize {
+    // Still set CMD_ARGS for backward compat with .S programs
     syscall4(SYS_SETENV, b"CMD_ARGS".as_ptr() as usize, 8, arg.as_ptr() as usize, arg.len());
 
+    // Build argv: [cmd, arg_parts..., NULL]
+    // Max 32 args, each string up to 256 bytes
+    const MAX_ARGV: usize = 32;
+    const MAX_ARG_LEN: usize = 256;
+    let mut argv_buf: [[u8; MAX_ARG_LEN]; MAX_ARGV] = [[0; MAX_ARG_LEN]; MAX_ARGV];
+    let mut argv_lens: [usize; MAX_ARGV] = [0; MAX_ARGV];
+    let mut argc: usize = 0;
+
+    // argv[0] = command name
+    {
+        let l = cmd.len().min(MAX_ARG_LEN - 1);
+        core::ptr::copy_nonoverlapping(cmd.as_ptr(), argv_buf[0].as_mut_ptr(), l);
+        argv_buf[0][l] = 0;
+        argv_lens[0] = l + 1; // include null
+        argc = 1;
+    }
+
+    // Split arg by spaces into argv[1..]
+    if !arg.is_empty() {
+        let mut start = 0;
+        let arg_bytes = arg;
+        while start < arg_bytes.len() && argc < MAX_ARGV {
+            while start < arg_bytes.len() && arg_bytes[start] == b' ' { start += 1; }
+            if start >= arg_bytes.len() { break; }
+            let mut end = start;
+            while end < arg_bytes.len() && arg_bytes[end] != b' ' { end += 1; }
+            let l = (end - start).min(MAX_ARG_LEN - 1);
+            core::ptr::copy_nonoverlapping(
+                arg_bytes[start..].as_ptr(),
+                argv_buf[argc].as_mut_ptr(),
+                l,
+            );
+            argv_buf[argc][l] = 0;
+            argv_lens[argc] = l + 1;
+            argc += 1;
+            start = end;
+        }
+    }
+
+    // Build argv pointer array (on stack)
+    let mut argv_ptrs: [*const u8; MAX_ARGV + 1] = [core::ptr::null(); MAX_ARGV + 1];
+    for i in 0..argc {
+        argv_ptrs[i] = argv_buf[i].as_ptr();
+    }
+    argv_ptrs[argc] = core::ptr::null(); // NULL terminator
+
+    // Build envp from current environment variables
+    // We pass envp_ptr = 0 to tell the kernel to inherit from current process
+    // (kernel will use per-process env)
+    let envp_ptr: usize = 0;
+
     if redir_stdin >= 0 || redir_stdout >= 0 {
-        // Try exec with fd redirection
+        // Try exec with fd redirection (still uses CMD_ARGS internally)
         let pid = syscall4(SYS_EXEC_FD, cmd.as_ptr() as usize, cmd.len(), redir_stdin as usize, redir_stdout as usize);
         if pid >= 0 { return pid; }
-        // PATH search
-        let pid = search_path_exec_fd(cmd, redir_stdin, redir_stdout);
+        // PATH search with fd redirection
+        let pid = search_path_exec_fd_argv(cmd, argv_ptrs.as_ptr(), envp_ptr, redir_stdin, redir_stdout);
         if pid >= 0 { return pid; }
         return -1;
     }
 
-    // Try exact path
-    let pid = syscall2(SYS_EXEC, cmd.as_ptr() as usize, cmd.len());
+    // Try exact path with argv
+    let pid = syscall4(SYS_EXEC, cmd.as_ptr() as usize, cmd.len(), argv_ptrs.as_ptr() as usize, envp_ptr);
     if pid >= 0 { return pid; }
 
-    // PATH search
-    let pid = search_path_exec(cmd);
+    // PATH search with argv
+    let pid = search_path_exec_argv(cmd, argv_ptrs.as_ptr(), envp_ptr);
     if pid >= 0 { return pid; }
 
     -1
@@ -236,6 +291,61 @@ unsafe fn search_path_exec(cmd: &[u8]) -> isize {
         if p > 0 && p < 511 { full[p] = b'/'; p += 1; }
         for &b in cmd { if p < 511 { full[p] = b; p += 1; } }
         let pid = syscall2(SYS_EXEC, full.as_ptr() as usize, p);
+        if pid >= 0 { return pid; }
+
+        start = if end < len && path_buf[end] == b':' { end + 1 } else { end };
+    }
+    -1
+}
+
+/// PATH search with argv pointer array for sys_exec.
+unsafe fn search_path_exec_argv(cmd: &[u8], argv_ptrs: *const *const u8, envp_ptr: usize) -> isize {
+    let path_buf = match getenv(b"PATH") {
+        Some(b) => b,
+        None => return -1,
+    };
+    let mut start = 0;
+    let len = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+    loop {
+        if start >= len { break; }
+        let mut end = start;
+        while end < len && path_buf[end] != b':' { end += 1; }
+        let dir = &path_buf[start..end];
+
+        let mut full = [0u8; 512];
+        let mut p = 0;
+        for &b in dir { if p < 511 { full[p] = b; p += 1; } }
+        if p > 0 && p < 511 { full[p] = b'/'; p += 1; }
+        for &b in cmd { if p < 511 { full[p] = b; p += 1; } }
+        let pid = syscall4(SYS_EXEC, full.as_ptr() as usize, p, argv_ptrs as usize, envp_ptr);
+        if pid >= 0 { return pid; }
+
+        start = if end < len && path_buf[end] == b':' { end + 1 } else { end };
+    }
+    -1
+}
+
+/// PATH search with fd redirection and argv for sys_exec_fd.
+unsafe fn search_path_exec_fd_argv(cmd: &[u8], argv_ptrs: *const *const u8, envp_ptr: usize, redir_stdin: i32, redir_stdout: i32) -> isize {
+    let _ = (argv_ptrs, envp_ptr); // sys_exec_fd uses CMD_ARGS internally
+    let path_buf = match getenv(b"PATH") {
+        Some(b) => b,
+        None => return -1,
+    };
+    let mut start = 0;
+    let len = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+    loop {
+        if start >= len { break; }
+        let mut end = start;
+        while end < len && path_buf[end] != b':' { end += 1; }
+        let dir = &path_buf[start..end];
+
+        let mut full = [0u8; 512];
+        let mut p = 0;
+        for &b in dir { if p < 511 { full[p] = b; p += 1; } }
+        if p > 0 && p < 511 { full[p] = b'/'; p += 1; }
+        for &b in cmd { if p < 511 { full[p] = b; p += 1; } }
+        let pid = syscall4(SYS_EXEC_FD, full.as_ptr() as usize, p, redir_stdin as usize, redir_stdout as usize);
         if pid >= 0 { return pid; }
 
         start = if end < len && path_buf[end] == b':' { end + 1 } else { end };

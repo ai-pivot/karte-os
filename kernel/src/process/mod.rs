@@ -2,6 +2,9 @@
 
 pub mod elf;
 
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex;
@@ -84,6 +87,9 @@ pub struct Process {
     /// Child TID pointer for CLONE_CHILD_CLEARTID.
     /// When this process exits, kernel writes 0 to this address.
     pub child_tid_ptr: usize,
+    /// Per-process environment variables.
+    /// Inherited from parent on fork/clone, replaced on execve with envp.
+    pub env: BTreeMap<String, String>,
 }
 
 /// Copy kernel identity mappings into a user page table.
@@ -145,7 +151,11 @@ impl Process {
     /// User ELF segments are loaded at their original virtual addresses.
     /// The kernel identity-maps only its own code region (0..4MB), so user
     /// segments starting at 0x400000+ don't conflict.
-    pub fn from_elf(elf_data: &[u8]) -> Result<Self, &'static str> {
+    pub fn from_elf(
+        elf_data: &[u8],
+        argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+        envp: alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)>,
+    ) -> Result<Self, &'static str> {
         // 1. Parse ELF
         let elf = elf::ElfFile::parse(elf_data)?;
 
@@ -232,11 +242,137 @@ impl Process {
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 
-        // 6. Store page_table_root as PPN
+        // 6. Build initial stack (same layout as from_elf_streaming)
+        let stack_top = USER_STACK_TOP;
+        let page_size = pmm::page_size();
+
+        unsafe fn write_u64_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u64) {
+            if let Some(frame) = vmm::translate_user(user_pt, addr) {
+                core::ptr::write_volatile(frame as *mut u64, val);
+            }
+        }
+        unsafe fn write_byte_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u8) {
+            if let Some(frame) = vmm::translate_user(user_pt, addr) {
+                core::ptr::write_volatile(frame as *mut u8, val);
+            }
+        }
+
+        // Random bytes at stack_top - 16
+        let random_addr = stack_top - 16;
+        unsafe {
+            write_u64_to_user(user_pt, random_addr, 0x12345678_9ABCDEF0u64);
+            write_u64_to_user(user_pt, random_addr + 8, 0xDEADBEEF_FEEDFACEu64);
+        }
+
+        // Build envp strings: "KEY=VALUE\0"
+        let envp_strs: alloc::vec::Vec<alloc::vec::Vec<u8>> = envp
+            .iter()
+            .map(|(k, v)| {
+                let mut s = alloc::vec::Vec::new();
+                s.extend_from_slice(k);
+                s.push(b'=');
+                s.extend_from_slice(v);
+                s.push(0);
+                s
+            })
+            .collect();
+
+        let argv_strs: alloc::vec::Vec<alloc::vec::Vec<u8>> = argv
+            .iter()
+            .map(|s| {
+                let mut v = s.clone();
+                if v.last() != Some(&0) {
+                    v.push(0);
+                }
+                v
+            })
+            .collect();
+
+        let strings_size: usize = argv_strs.iter().map(|s| s.len()).sum::<usize>()
+            + envp_strs.iter().map(|s| s.len()).sum::<usize>();
+
+        let strings_start = random_addr - strings_size;
+
+        let mut argv_ptrs: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut envp_ptrs: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut str_pos = strings_start;
+
+        for s in &argv_strs {
+            argv_ptrs.push(str_pos);
+            for &b in s {
+                unsafe { write_byte_to_user(user_pt, str_pos, b); }
+                str_pos += 1;
+            }
+        }
+        for s in &envp_strs {
+            envp_ptrs.push(str_pos);
+            for &b in s {
+                unsafe { write_byte_to_user(user_pt, str_pos, b); }
+                str_pos += 1;
+            }
+        }
+
+        // Auxv
+        const AT_NULL: usize = 0;
+        const AT_PAGESZ: usize = 6;
+        const AT_ENTRY: usize = 9;
+        const AT_PHDR: usize = 3;
+        const AT_PHENT: usize = 4;
+        const AT_PHNUM: usize = 5;
+        const AT_UID: usize = 11;
+        const AT_EUID: usize = 12;
+        const AT_GID: usize = 13;
+        const AT_EGID: usize = 14;
+        const AT_RANDOM: usize = 25;
+        const AT_SYSINFO_EHDR: usize = 33;
+
+        let auxv_data: [(usize, usize); 12] = [
+            (AT_SYSINFO_EHDR, 0),
+            (AT_PHDR, 0),     // from_elf doesn't have phdr vaddr readily available
+            (AT_PHENT, 56),   // default for 64-bit ELF
+            (AT_PHNUM, elf.loadable_segments.len() as usize),
+            (AT_PAGESZ, page_size),
+            (AT_ENTRY, elf.entry),
+            (AT_UID, 0),
+            (AT_EUID, 0),
+            (AT_GID, 0),
+            (AT_EGID, 0),
+            (AT_RANDOM, random_addr),
+            (AT_NULL, 0),
+        ];
+
+        let argc = argv_ptrs.len();
+        let metadata_size = 8 + (argc + 1) * 8 + (envp_ptrs.len() + 1) * 8 + auxv_data.len() * 16;
+        let metadata_start = (strings_start - metadata_size) & !0xF;
+
+        let mut pos = metadata_start;
+        unsafe { write_u64_to_user(user_pt, pos, argc as u64); }
+        pos += 8;
+        for &ptr in &argv_ptrs {
+            unsafe { write_u64_to_user(user_pt, pos, ptr as u64); }
+            pos += 8;
+        }
+        unsafe { write_u64_to_user(user_pt, pos, 0); }
+        pos += 8;
+        for &ptr in &envp_ptrs {
+            unsafe { write_u64_to_user(user_pt, pos, ptr as u64); }
+            pos += 8;
+        }
+        unsafe { write_u64_to_user(user_pt, pos, 0); }
+        pos += 8;
+        for (atype, avalue) in &auxv_data {
+            unsafe { write_u64_to_user(user_pt, pos, *atype as u64); }
+            pos += 8;
+            unsafe { write_u64_to_user(user_pt, pos, *avalue as u64); }
+            pos += 8;
+        }
+
+        let initial_rsp = metadata_start;
+
+        // 7. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
 
         // 8. Set up initial brk (after loaded segments, aligned to page)
-        let page_size = pmm::page_size();
         let initial_brk = (max_vaddr + page_size - 1) & !(page_size - 1);
         let brk = core::cmp::max(initial_brk, USER_HEAP_BASE);
 
@@ -250,7 +386,7 @@ impl Process {
             ppid: 0, // Set by caller (kmain sets 0 for init, sys_spawn sets parent pid)
             page_table_root: page_table_ppn,
             kernel_stack_top,
-            user_stack_top: USER_STACK_TOP,
+            user_stack_top: initial_rsp,
             brk,
             initial_brk: brk,
             entry: elf.entry,
@@ -263,6 +399,7 @@ impl Process {
             clone_tls: 0,
             child_tid_ptr: 0,
             fs_base: 0,
+            env: BTreeMap::new(),
         })
     }
 
@@ -277,7 +414,14 @@ impl Process {
     ///
     /// `read_fn(offset, buf)` should fill `buf` with file data starting
     /// at `offset`, returning Ok(bytes_read) or Err on failure.
-    pub fn from_elf_streaming<F>(read_fn: F) -> Result<Self, &'static str>
+    ///
+    /// `argv` is a list of argument strings (e.g., ["ls", "-l", "/"]).
+    /// `envp` is a list of (key, value) environment variable pairs.
+    pub fn from_elf_streaming<F>(
+        read_fn: F,
+        argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+        envp: alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)>,
+    ) -> Result<Self, &'static str>
     where
         F: Fn(usize, &mut [u8]) -> Result<usize, ()>,
     {
@@ -387,13 +531,20 @@ impl Process {
             vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
         }
 
-        // 7. Set up initial stack with auxiliary vectors for Go runtime
-        // Linux initial stack layout (from high to low address):
-        //   argc (8 bytes) = 0
-        //   argv[0] = NULL
-        //   envp[0] = NULL
-        //   auxv entries: {type, value} pairs (16 bytes each)
-        //   AT_NULL terminator
+        // 7. Set up initial stack with Linux execve layout:
+        //
+        // High addresses (near USER_STACK_TOP):
+        //   random bytes (16B)
+        //   strings area (argv strings + envp strings, each \0 terminated)
+        //   padding (align to 16)
+        //   auxv entries (16B each) + AT_NULL
+        //   envp NULL terminator
+        //   envp[n-1] ... envp[0] (8B pointers to strings)
+        //   argv NULL terminator
+        //   argv[argc-1] ... argv[0] (8B pointers to strings)
+        //   argc (8B) ← RSP points here
+        // Low addresses
+
         const AT_NULL: usize = 0;
         const AT_PAGESZ: usize = 6;
         const AT_ENTRY: usize = 9;
@@ -407,12 +558,89 @@ impl Process {
         const AT_RANDOM: usize = 25;
         const AT_SYSINFO_EHDR: usize = 33; // VDSO
 
-        // Write auxv data at USER_STACK_TOP - 8 (top of stack is not used by Go)
-        // We write downward from USER_STACK_TOP - 8
         let stack_top = USER_STACK_TOP;
-        let phdr_addr = elf_info.phdr_vaddr; // virtual address of program headers
+        let phdr_addr = elf_info.phdr_vaddr;
 
-        // Build the initial stack content
+        // Helper to write u64 to user stack via physical address
+        unsafe fn write_u64_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u64) {
+            if let Some(frame) = vmm::translate_user(user_pt, addr) {
+                core::ptr::write_volatile(frame as *mut u64, val);
+            }
+        }
+
+        // Helper to write a byte to user stack
+        unsafe fn write_byte_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u8) {
+            if let Some(frame) = vmm::translate_user(user_pt, addr) {
+                core::ptr::write_volatile(frame as *mut u8, val);
+            }
+        }
+
+        // ── Phase 1: Write string data near the top of the stack ──
+        // We write strings from stack_top - 16 (after 16B random) downward.
+        // Track each string's address for the pointer arrays.
+
+        // Write random bytes first (16 bytes at stack_top - 16)
+        let random_addr = stack_top - 16;
+        unsafe {
+            write_u64_to_user(user_pt, random_addr, 0x12345678_9ABCDEF0u64);
+            write_u64_to_user(user_pt, random_addr + 8, 0xDEADBEEF_FEEDFACEu64);
+        }
+
+        // Build envp strings: "KEY=VALUE\0"
+        // We'll first compute the total string area size, then write from top down.
+        let envp_strs: alloc::vec::Vec<alloc::vec::Vec<u8>> = envp
+            .iter()
+            .map(|(k, v)| {
+                let mut s = alloc::vec::Vec::new();
+                s.extend_from_slice(k);
+                s.push(b'=');
+                s.extend_from_slice(v);
+                s.push(0); // null terminator
+                s
+            })
+            .collect();
+
+        // argv strings: each null-terminated
+        let argv_strs: alloc::vec::Vec<alloc::vec::Vec<u8>> = argv
+            .iter()
+            .map(|s| {
+                let mut v = s.clone();
+                if v.last() != Some(&0) {
+                    v.push(0);
+                }
+                v
+            })
+            .collect();
+
+        // Calculate total string area size
+        let strings_size: usize = argv_strs.iter().map(|s| s.len()).sum::<usize>()
+            + envp_strs.iter().map(|s| s.len()).sum::<usize>();
+
+        // String area starts at: random_addr - strings_size
+        let strings_start = random_addr - strings_size;
+
+        // Write strings and record their addresses
+        let mut argv_ptrs: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut envp_ptrs: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut str_pos = strings_start;
+
+        for s in &argv_strs {
+            argv_ptrs.push(str_pos);
+            for &b in s {
+                unsafe { write_byte_to_user(user_pt, str_pos, b); }
+                str_pos += 1;
+            }
+        }
+
+        for s in &envp_strs {
+            envp_ptrs.push(str_pos);
+            for &b in s {
+                unsafe { write_byte_to_user(user_pt, str_pos, b); }
+                str_pos += 1;
+            }
+        }
+
+        // ── Phase 2: Calculate and write the metadata area below strings ──
         let auxv_data: [(usize, usize); 12] = [
             (AT_SYSINFO_EHDR, 0), // No VDSO
             (AT_PHDR, phdr_addr),
@@ -424,63 +652,58 @@ impl Process {
             (AT_EUID, 0),
             (AT_GID, 0),
             (AT_EGID, 0),
-            (AT_RANDOM, stack_top - 256), // point to random bytes on stack
+            (AT_RANDOM, random_addr), // point to random bytes
             (AT_NULL, 0),
         ];
 
-        // Calculate total size: argc + argv_null + envp_null + auxv
-        let total_size = 8 + 8 + 8 + auxv_data.len() * 16 + 16; // random bytes
-        let new_rsp = stack_top - total_size;
+        let argc = argv_ptrs.len();
+        // Layout from low to high:
+        //   argc (8)
+        //   argv[0..argc] (argc * 8)
+        //   argv NULL (8)
+        //   envp[0..n] (n * 8)
+        //   envp NULL (8)
+        //   auxv (12 * 16 = 192)
+        let metadata_size = 8 + (argc + 1) * 8 + (envp_ptrs.len() + 1) * 8 + auxv_data.len() * 16;
+
+        let metadata_end = strings_start;
+        let metadata_start = metadata_end - metadata_size;
         // Align to 16 bytes
-        let new_rsp = new_rsp & !0xF;
+        let metadata_start = metadata_start & !0xF;
+        let initial_rsp = metadata_start;
 
-        // Helper to write u64 to user stack via physical address
-        // The stack pages are identity-mapped in kernel space
-        unsafe fn write_u64_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u64) {
-            if let Some(frame) = vmm::translate_user(user_pt, addr) {
-                core::ptr::write_volatile(frame as *mut u64, val);
-            }
-        }
+        // Write metadata from initial_rsp upward
+        let mut pos = initial_rsp;
 
-        // Write random bytes (16 bytes at stack_top - 256)
-        let random_addr = stack_top - 256;
-        for i in 0..2 {
-            // Simple "random" values — not crypto-quality but Go just needs non-zero
-            unsafe {
-                write_u64_to_user(
-                    user_pt,
-                    random_addr + i * 8,
-                    0x12345678_9ABCDEF0u64.wrapping_add(i as u64 * 0xDEADBEEF),
-                );
-            }
-        }
+        // argc
+        unsafe { write_u64_to_user(user_pt, pos, argc as u64); }
+        pos += 8;
 
-        // Write from new_rsp upward
-        let mut pos = new_rsp;
-        unsafe {
-            write_u64_to_user(user_pt, pos, 0);
+        // argv pointers
+        for &ptr in &argv_ptrs {
+            unsafe { write_u64_to_user(user_pt, pos, ptr as u64); }
+            pos += 8;
         }
-        pos += 8; // argc = 0
-        unsafe {
-            write_u64_to_user(user_pt, pos, 0);
+        // argv NULL terminator
+        unsafe { write_u64_to_user(user_pt, pos, 0); }
+        pos += 8;
+
+        // envp pointers
+        for &ptr in &envp_ptrs {
+            unsafe { write_u64_to_user(user_pt, pos, ptr as u64); }
+            pos += 8;
         }
-        pos += 8; // argv[0] = NULL
-        unsafe {
-            write_u64_to_user(user_pt, pos, 0);
-        }
-        pos += 8; // envp[0] = NULL
+        // envp NULL terminator
+        unsafe { write_u64_to_user(user_pt, pos, 0); }
+        pos += 8;
+
+        // auxv entries
         for (atype, avalue) in &auxv_data {
-            unsafe {
-                write_u64_to_user(user_pt, pos, *atype as u64);
-            }
+            unsafe { write_u64_to_user(user_pt, pos, *atype as u64); }
             pos += 8;
-            unsafe {
-                write_u64_to_user(user_pt, pos, *avalue as u64);
-            }
+            unsafe { write_u64_to_user(user_pt, pos, *avalue as u64); }
             pos += 8;
         }
-
-        let initial_rsp = new_rsp;
 
         // 8. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
@@ -511,6 +734,7 @@ impl Process {
             clone_tls: 0,
             child_tid_ptr: 0,
             fs_base: 0,
+            env: BTreeMap::new(),
         })
     }
 }
