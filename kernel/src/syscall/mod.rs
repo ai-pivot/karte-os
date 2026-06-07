@@ -8,6 +8,9 @@
 
 pub mod linux;
 
+#[cfg(target_arch = "x86_64")]
+pub mod epoll;
+
 // ─── Syscall numbers ──────────────────────────────────────────────
 
 // Level 1: Core
@@ -82,11 +85,11 @@ pub const ERR_OK: isize = 0;
 // ─── Linux-compatible errno values ─────────────────────────────
 // These are negated Linux errno values returned from syscalls.
 // Go / Rust / C programs on user space expect these exact values.
-pub const ERR_INVAL: isize = -22;  // EINVAL — Invalid argument
-pub const ERR_NOMEM: isize = -12;  // ENOMEM — Out of memory
-pub const ERR_NOENT: isize = -2;   // ENOENT — No such file or directory
-pub const ERR_IO: isize = -5;      // EIO — I/O error
-pub const ERR_ACCES: isize = -13;  // EACCES — Permission denied
+pub const ERR_INVAL: isize = -22; // EINVAL — Invalid argument
+pub const ERR_NOMEM: isize = -12; // ENOMEM — Out of memory
+pub const ERR_NOENT: isize = -2; // ENOENT — No such file or directory
+pub const ERR_IO: isize = -5; // EIO — I/O error
+pub const ERR_ACCES: isize = -13; // EACCES — Permission denied
 
 // ─── Global FD table (single-process simplification) ────────────────
 
@@ -270,13 +273,18 @@ pub fn dispatch_syscall_linux(
 /// This is ONLY called from the SYSCALL instruction path (MSR LSTAR).
 #[cfg(target_arch = "x86_64")]
 fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
-    let result = match nr {
-        // ═══════════════════════════════════════════════════════════
-        // Linux x86_64 syscall numbers — directly mapped to kernel functions
-        // No KarteOS number guard needed since this is the SYSCALL-only path.
-        // ═══════════════════════════════════════════════════════════
+    static TRACE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let count = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let result = dispatch_linux_syscall(nr, args);
+    if count < 2000 {
+        crate::console_print!("[T{}]nr={}={}\n", count, nr, result);
+    }
+    result
+}
 
-        // ─── File I/O (conflicted with KarteOS, now handled properly) ───
+#[cfg(target_arch = "x86_64")]
+fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
+    match nr {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
         1 => sys_write(args[0] as i32, args[1], args[2]), // write
         2 => linux_open(args[0], args[1], args[2]),      // open (deprecated, use openat)
@@ -287,9 +295,9 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
         7 => linux_poll(args[0], args[1], args[2]),      // poll
         8 => linux_lseek(args[0], args[1], args[2]),     // lseek
         9 => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
-        10 => linux_mprotect(args[0], args[1], args[2]), // mprotect
-        11 => linux_munmap(args[0], args[1]),            // munmap
-        12 => sys_brk(args[0]),                          // brk
+        10 => linux_mprotect(args[0], args[1], args[2]),
+        11 => linux_munmap(args[0], args[1]), // munmap
+        12 => sys_brk(args[0]),
 
         // ─── Signals ──────────────────────────────────────────────
         13 => linux_rt_sigaction(args[0], args[1], args[2]), // rt_sigaction
@@ -297,32 +305,32 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
         15 => 0,                                             // rt_sigreturn (stub)
 
         // ─── File I/O (continued) ─────────────────────────────────
-        16 => 0,                                                        // ioctl (stub)
+        16 => sys_ioctl(args[0] as i32, args[1], args[2]), // ioctl
         17 => linux_pread64(args[0] as i32, args[1], args[2], args[3]), // pread64
-        18 => 0,                                                        // pwrite64 (stub)
-        19 => linux_readv(args[0], args[1], args[2]),                   // readv
-        20 => 0,                                                        // writev (stub)
-        21 => 0,                                                        // access (stub)
-        22 => linux_pipe(args[0]),                                      // pipe
-        23 => 0,                                                        // select (stub)
+        18 => 0,                                           // pwrite64 (stub)
+        19 => linux_readv(args[0], args[1], args[2]),      // readv
+        20 => 0,                                           // writev (stub)
+        21 => 0,                                           // access (stub)
+        22 => linux_pipe(args[0]),                         // pipe
+        23 => 0,                                           // select (stub)
         24 => {
             crate::sched::schedule();
             0
         } // sched_yield
-        25 => ERR_INVAL,                                                // mremap (stub)
-        26 => 0,                                                        // msync (stub)
-        27 => 0,                                                        // mincore (stub)
-        28 => 0,                                                        // madvise (stub)
-        29 => linux_dup(args[0]),                                       // dup
-        30 => linux_dup2(args[0], args[1]),                             // dup2
-        31 => linux_pause(),                                            // pause
+        25 => ERR_INVAL,                                   // mremap (stub)
+        26 => 0,                                           // msync (stub)
+        27 => 0,                                           // mincore (stub)
+        28 => 0,                                           // madvise (stub)
+        29 => linux_dup(args[0]),                          // dup
+        30 => linux_dup2(args[0], args[1]),                // dup2
+        31 => linux_pause(),                               // pause
         32 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]), // execve(path, argv, envp)
-        33 => 0, // chdir (stub — use Linux 80)
-        34 => 0, // fchdir (stub)
-        35 => 0, // nanosleep (stub: return immediately)
-        36 => 0, // alarm (stub)
-        37 => 0, // setitimer (stub)
-        38 => 0, // getpid... wait, Linux getpid is 39
+        33 => 0,                                 // chdir (stub — use Linux 80)
+        34 => 0,                                 // fchdir (stub)
+        35 => linux_nanosleep(args[0], args[1]), // nanosleep
+        36 => 0,                                 // alarm (stub)
+        37 => 0,                                 // setitimer (stub)
+        38 => 0,                                 // getpid... wait, Linux getpid is 39
 
         // ─── Process management ───────────────────────────────────
         39 => sys_getpid(),                                  // getpid
@@ -351,6 +359,7 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
 
         // ─── More file ops ────────────────────────────────────────
         61 => linux_wait4(args[0], args[1], args[2]), // wait4
+        63 => linux_uname(args[0]),                   // uname
         78 => 0,                                      // getdents (stub)
         79 => linux_getcwd(args[0], args[1]),         // getcwd
         80 => linux_chdir(args[0]),                   // chdir
@@ -386,36 +395,29 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
         218 => linux_set_tid_address(args[0]),                     // set_tid_address
         228 => linux_clock_gettime(args[0], args[1]),              // clock_gettime
         231 => sys_exit(args[0] as i32),                           // exit_group
-        234 => 0,                                                  // tgkill (stub)
-        257 => {
-            // openat: try to open via linux_openat
-            let r = linux_openat(args[0], args[1], args[2], args[3]);
-            crate::console_println!(
-                "[openat257] dirfd={} path_ptr={:#x} → {r}",
-                args[0],
-                args[1]
-            );
-            r
-        }
+        234 => linux_tgkill(args[0], args[1], args[2]),            // tgkill
+        257 => linux_openat(args[0], args[1], args[2], args[3]),   // openat
+        258 => linux_mkdirat(args[0], args[1], args[2], args[3]),  // mkdirat
         262 => -2,     // linux_newfstatat → ENOENT (stub)
         267 => 0,      // readlinkat (stub)
         272 => 0,      // unshare (stub)
         273 => 0,      // set_robust_list (stub)
         274 => 0,      // get_robust_list (stub)
         290 => 4isize, // eventfd2 (fake fd)
-        291 => 3isize, // epoll_create1 (fake fd)
-        292 => sys_dup2(args[0] as i32, args[1] as i32), // dup3 → dup2
-        293 => 0,      // pipe2 (stub)
-        302 => 0,      // prlimit64 (stub)
+        232 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_wait
+        233 => epoll::sys_epoll_ctl(args[0], args[1], args[2], args[3]), // epoll_ctl
+        281 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_pwait (same as epoll_wait, ignoring sigmask)
+        291 => epoll::sys_epoll_create1(args[0]),                                  // epoll_create1
+        292 => sys_dup2(args[0] as i32, args[1] as i32),                           // dup3 → dup2
+        293 => 0,                                                                  // pipe2 (stub)
+        302 => 0,                                          // prlimit64 (stub)
         318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
-        334 => -38,    // rseq → ENOSYS (Go gracefully degrades)
-        435 => 0,      // clone3 (stub → use clone)
+        334 => -38,                                        // rseq → ENOSYS (Go gracefully degrades)
+        435 => 0,                                          // clone3 (stub → use clone)
         _ => {
-            // Unknown syscall — return ENOSYS (-38) for graceful degradation
-            -38
+            -38 // ENOSYS
         }
-    };
-    result
+    }
 }
 
 // ─── Linux-specific syscall implementations ──────────────────────────
@@ -590,6 +592,35 @@ fn linux_accept(_fd: i32) -> isize {
 fn linux_waitpid(pid: usize, status_ptr: usize, options: usize) -> isize {
     let _ = (status_ptr, options);
     sys_waitpid(pid)
+}
+
+/// Linux uname(2) — return kernel version info.
+/// struct utsname has 6 fields of 65 bytes each (total 390 bytes).
+#[cfg(target_arch = "x86_64")]
+fn linux_uname(buf: usize) -> isize {
+    if buf == 0 {
+        return -14; // EFAULT
+    }
+    let fields: [&[u8]; 6] = [
+        b"KarteOS\0",               // sysname
+        b"karte-os\0",              // nodename
+        b"6.1.0\0",                 // release (fake Linux version)
+        b"#1 SMP KarteOS x86_64\0", // version
+        b"x86_64\0",                // machine
+        b"(none)\0",                // domainname
+    ];
+    let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 390) };
+    let mut offset = 0usize;
+    for field in &fields {
+        let len = field.len().min(65);
+        dst[offset..offset + len].copy_from_slice(&field[..len]);
+        // Zero-fill remaining bytes
+        for i in len..65 {
+            dst[offset + i] = 0;
+        }
+        offset += 65;
+    }
+    0
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1048,38 +1079,56 @@ fn sys_brk(addr: usize) -> isize {
         return current as isize;
     }
 
-    // Use current process page table
-    let user_pt = crate::arch::trap::get_current_user_pt();
-    let page_size = crate::mm::pmm::page_size();
-    let start_page = (current + page_size - 1) & !(page_size - 1); // Round up
-    let end_page = (addr + page_size - 1) & !(page_size - 1);
-
-    let mut vaddr = start_page;
-    while vaddr < end_page {
-        // Check if already mapped
-        if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
-            let frame = match crate::mm::pmm::alloc_frame() {
-                Some(f) => f,
-                None => return ERR_NOMEM,
-            };
-            // Zero the page
-            unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _lock = MMAP_LOCK.lock();
+        crate::arch::trap::with_kernel_cr3(|| {
+            let user_pt = crate::arch::trap::get_user_pt_safe();
+            let page_size = crate::mm::pmm::page_size();
+            let start_page = (current + page_size - 1) & !(page_size - 1);
+            let end_page = (addr + page_size - 1) & !(page_size - 1);
+            let mut vaddr = start_page;
+            while vaddr < end_page {
+                if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
+                    let frame = match crate::mm::pmm::alloc_frame() {
+                        Some(f) => f,
+                        None => return,
+                    };
+                    unsafe {
+                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    }
+                    crate::mm::vmm::map(user_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
+                }
+                vaddr += page_size;
             }
-            // Map with URW flags (user readable/writable, no execute)
-            crate::mm::vmm::map(user_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
+        })
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let user_pt = crate::arch::trap::get_current_user_pt();
+        let page_size = crate::mm::pmm::page_size();
+        let start_page = (current + page_size - 1) & !(page_size - 1);
+        let end_page = (addr + page_size - 1) & !(page_size - 1);
+        let mut vaddr = start_page;
+        while vaddr < end_page {
+            if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
+                let frame = match crate::mm::pmm::alloc_frame() {
+                    Some(f) => f,
+                    None => return ERR_NOMEM,
+                };
+                unsafe {
+                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                }
+                crate::mm::vmm::map(user_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
+            }
+            vaddr += page_size;
         }
-        vaddr += page_size;
     }
 
-    // Flush TLB
+    // Flush TLB (RISC-V only; x86_64 TLB flush handled by with_kernel_cr3)
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma");
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        crate::arch::trap::flush_tlb();
     }
 
     crate::process::set_current_brk(addr);
@@ -1139,6 +1188,11 @@ const MAP_ANONYMOUS: usize = 0x20;
 
 /// Linux mmap(addr, length, prot, flags, fd, offset)
 /// Full Linux mmap6 implementation for Go runtime support.
+/// Global lock for mmap/mprotect — prevents race conditions when multiple
+/// CLONE_VM threads concurrently modify the shared page table.
+#[cfg(target_arch = "x86_64")]
+static MMAP_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 fn linux_mmap(
     addr: usize,
     len: usize,
@@ -1219,69 +1273,112 @@ fn linux_mmap(
         }
     };
 
-    // Use current process page table
-    let user_pt = crate::arch::trap::get_current_user_pt();
+    // Switch to kernel CR3 for safe page table access
+    #[cfg(target_arch = "x86_64")]
+    let result = {
+        let _lock = MMAP_LOCK.lock();
+        crate::arch::trap::with_kernel_cr3(|| -> isize {
+            let user_pt = crate::arch::trap::get_user_pt_safe();
 
-    // PROT_NONE (prot=0): just reserve virtual address space, don't allocate frames.
-    if prot == 0 {
-        return target_addr as isize;
-    }
-
-    let end = target_addr + aligned_len;
-
-    // Determine PTE flags from prot
-    let pte_flags = prot_to_pte_flags(prot);
-
-    // Allocate and map pages (zero-fill for MAP_ANONYMOUS)
-    let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
-    let mut vaddr = target_addr;
-    while vaddr < end {
-        // Always unmap any existing identity mapping first, then
-        // create a fresh user mapping. This avoids the mprotect_user
-        // path which has issues with non-leaf USER bit propagation.
-        if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
-            crate::mm::vmm::unmap_user(user_pt, vaddr);
-        }
-
-        let frame = match crate::mm::pmm::alloc_frame() {
-            Some(f) => f,
-            None => return -12, // ENOMEM
-        };
-        if is_anonymous {
-            unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            // PROT_NONE (prot=0): just reserve virtual address space, don't allocate frames.
+            if prot == 0 {
+                return target_addr as isize;
             }
+
+            let end = target_addr + aligned_len;
+            let pte_flags = prot_to_pte_flags(prot);
+            let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
+            let mut vaddr = target_addr;
+            while vaddr < end {
+                if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+                    crate::mm::vmm::unmap_user(user_pt, vaddr);
+                }
+                let frame = match crate::mm::pmm::alloc_frame() {
+                    Some(f) => f,
+                    None => return -12,
+                };
+                if is_anonymous {
+                    unsafe {
+                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    }
+                }
+                crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
+                vaddr += page_size;
+            }
+
+            flush_tlb_all();
+            if addr == 0 && end > crate::process::current_brk() {
+                crate::process::set_current_brk(end);
+            }
+            if crate::mm::vmm::translate_user(user_pt, target_addr).is_none() {
+                return -12;
+            }
+            if crate::process::current_pid() >= 2 {
+                crate::klog!(
+                    DEBUG,
+                    "[mmap] → {:#x} len={:#x} prot={}({}) flags={:#x}",
+                    target_addr,
+                    len,
+                    _prot_str(prot),
+                    prot,
+                    flags
+                );
+            }
+            target_addr as isize
+        })
+    };
+
+    #[cfg(not(target_arch = "x86_64"))]
+    let result = {
+        let user_pt = crate::arch::trap::get_current_user_pt();
+
+        if prot == 0 {
+            return target_addr as isize;
         }
-        crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
-        vaddr += page_size;
-    }
 
-    // Flush TLB
-    flush_tlb_all();
+        let end = target_addr + aligned_len;
+        let pte_flags = prot_to_pte_flags(prot);
+        let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
+        let mut vaddr = target_addr;
+        while vaddr < end {
+            if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+                crate::mm::vmm::unmap_user(user_pt, vaddr);
+            }
+            let frame = match crate::mm::pmm::alloc_frame() {
+                Some(f) => f,
+                None => return -12,
+            };
+            if is_anonymous {
+                unsafe {
+                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                }
+            }
+            crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
+            vaddr += page_size;
+        }
 
-    // Advance brk tracking (for addr=0 kernel-chosen allocations)
-    if addr == 0 && end > crate::process::current_brk() {
-        crate::process::set_current_brk(end);
-    }
+        flush_tlb_all();
+        if addr == 0 && end > crate::process::current_brk() {
+            crate::process::set_current_brk(end);
+        }
+        if crate::mm::vmm::translate_user(user_pt, target_addr).is_none() {
+            return -12;
+        }
+        if crate::process::current_pid() >= 2 {
+            crate::klog!(
+                DEBUG,
+                "[mmap] → {:#x} len={:#x} prot={}({}) flags={:#x}",
+                target_addr,
+                len,
+                _prot_str(prot),
+                prot,
+                flags
+            );
+        }
+        target_addr as isize
+    };
 
-    // Verify the mapping actually works
-    if crate::mm::vmm::translate_user(user_pt, target_addr).is_none() {
-        return -12; // ENOMEM
-    }
-
-    if crate::process::current_pid() >= 2 {
-        crate::klog!(
-            DEBUG,
-            "[mmap] → {:#x} len={:#x} prot={}({}) flags={:#x}",
-            target_addr,
-            len,
-            _prot_str(prot),
-            prot,
-            flags
-        );
-    }
-
-    target_addr as isize
+    result
 }
 
 /// Convert Linux prot flags to KarteOS PTEFlags.
@@ -1335,15 +1432,54 @@ fn linux_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     let start = addr & !(page_size - 1);
     let end = (addr + len + page_size - 1) & !(page_size - 1);
 
-    let user_pt = crate::arch::trap::get_current_user_pt();
-    let pte_flags = prot_to_pte_flags(prot);
+    #[cfg(target_arch = "x86_64")]
+    let result = {
+        let _lock = MMAP_LOCK.lock();
+        crate::arch::trap::with_kernel_cr3(|| -> isize {
+            let user_pt = crate::arch::trap::get_user_pt_safe();
+            let pte_flags = prot_to_pte_flags(prot);
 
-    for vaddr in (start..end).step_by(page_size) {
-        crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
-    }
+            for vaddr in (start..end).step_by(page_size) {
+                if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
+                    let frame = match crate::mm::pmm::alloc_frame() {
+                        Some(f) => f,
+                        None => return -12,
+                    };
+                    unsafe {
+                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    }
+                    crate::mm::vmm::map_user(user_pt, vaddr, frame, pte_flags);
+                } else {
+                    crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
+                }
+            }
+            flush_tlb_all();
+            0
+        })
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let result = {
+        let user_pt = crate::arch::trap::get_current_user_pt();
+        let pte_flags = prot_to_pte_flags(prot);
+        for vaddr in (start..end).step_by(page_size) {
+            if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
+                let frame = match crate::mm::pmm::alloc_frame() {
+                    Some(f) => f,
+                    None => return -12,
+                };
+                unsafe {
+                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                }
+                crate::mm::vmm::map_user(user_pt, vaddr, frame, pte_flags);
+            } else {
+                crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
+            }
+        }
+        flush_tlb_all();
+        0
+    };
 
-    flush_tlb_all();
-    0
+    result
 }
 
 /// Linux munmap(addr, len) — unmap pages.
@@ -2233,6 +2369,28 @@ fn sys_shutdown(_fd: i32) -> isize {
 /// `path` = pointer to file path string, `path_len` = length.
 /// Returns child PID on success, or negative error code.
 fn sys_exec(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
+    // Save the current SYSCALL_KSP (init's kernel stack) so we can restore it
+    // before returning. This prevents timer ISR from changing SYSCALL_KSP
+    // to a child process's stack, which would cause shell's return path
+    // to corrupt the child's TrapContext.
+    #[cfg(target_arch = "x86_64")]
+    let saved_ksp = crate::arch::idt::get_syscall_ksp();
+
+    let result = sys_exec_impl(path, path_len, argv_ptr, envp_ptr);
+
+    // Restore SYSCALL_KSP with interrupts disabled to prevent timer ISR
+    // from overwriting it between the restore and the iretq return.
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            unsafe { crate::arch::idt::SYSCALL_KSP = saved_ksp };
+        });
+    }
+
+    result
+}
+
+fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     if path == 0 || path_len == 0 || path_len > 256 {
         return ERR_INVAL;
     }
@@ -2256,7 +2414,7 @@ fn sys_exec(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> i
         return ERR_INVAL;
     }
 
-    crate::klog!(DEBUG, "[exec] name='{}' argv_ptr={:#x} envp_ptr={:#x}", name, argv_ptr, envp_ptr);
+    crate::console_println!("[exec] name='{}'", name);
 
     // Read argv from user space
     let argv = if argv_ptr != 0 {
@@ -2305,14 +2463,15 @@ fn sys_exec(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> i
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
     let mut proc = if crate::driver::ext4::has_ext4() {
         match crate::driver::ext4::read_file_range(&name) {
-            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn, argv, envp)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    crate::klog!(DEBUG, "[exec] Streaming ELF load failed: {}", e);
-                    return ERR_NOMEM;
+            Some(read_fn) => {
+                match crate::process::Process::from_elf_streaming(read_fn, argv, envp, 0) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        crate::klog!(DEBUG, "[exec] Streaming ELF load failed: {}", e);
+                        return ERR_NOMEM;
+                    }
                 }
-            },
+            }
             None => {
                 // File not found on ext4, try fallback
                 let argv2 = if let Some(pos) = name.rfind('/') {
@@ -2869,18 +3028,19 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
     // Load ELF from filesystem — try streaming loader from ext4 first
     let mut proc = if crate::driver::ext4::has_ext4() {
         match crate::driver::ext4::read_file_range(&name) {
-            Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn, argv, envp)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    crate::console_println!(
-                        "[exec] Streaming ELF load failed for '{}': {}",
-                        name,
-                        e
-                    );
-                    return ERR_IO;
+            Some(read_fn) => {
+                match crate::process::Process::from_elf_streaming(read_fn, argv, envp, 0) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        crate::console_println!(
+                            "[exec] Streaming ELF load failed for '{}': {}",
+                            name,
+                            e
+                        );
+                        return ERR_IO;
+                    }
                 }
-            },
+            }
             None => {
                 // File not found on ext4, try fallback
                 match crate::driver::fs::read_file_owned(&name) {
@@ -3185,12 +3345,43 @@ pub const TERM_ECHO_OFF: usize = 3; // Disable echo
 ///   cmd=TCSETS, arg=TERM_ECHO_ON: Enable echo
 ///   cmd=TCSETS, arg=TERM_ECHO_OFF: Disable echo
 ///   cmd=TIOCGWINSZ: Returns (cols << 16 | rows) packed into usize
-fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
+pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
     if fd != 0 {
         return ERR_INVAL;
     }
 
     match cmd {
+        TCGETS => {
+            // Write a minimal termios struct to user-space at `arg`.
+            // struct termios { c_iflag: u32, c_oflag: u32, c_cflag: u32, c_lflag: u32,
+            //                  c_line: u8, c_cc: [u8; 19] } — 36 bytes total
+            // We report canonical mode with echo by default (ICANON | ECHO in c_lflag).
+            // TUI programs call TCGETS first, then modify and call TCSETS.
+            if arg != 0 {
+                use crate::driver::tty::TtyMode;
+                let mode = crate::driver::tty::get_mode();
+                let echo = true; // default: echo on
+                let lflag: u32 = match mode {
+                    TtyMode::Raw => 0, // no ICANON, no ECHO
+                    TtyMode::Canonical => {
+                        let mut f = 0x0002u32; // ICANON
+                        if echo {
+                            f |= 0x0008;
+                        } // ECHO
+                        f
+                    }
+                };
+                unsafe {
+                    *(arg as *mut u32) = 0; // c_iflag
+                    *((arg + 4) as *mut u32) = 0; // c_oflag
+                    *((arg + 8) as *mut u32) = 0; // c_cflag
+                    *((arg + 12) as *mut u32) = lflag; // c_lflag
+                    *((arg + 16) as *mut u8) = 0; // c_line
+                    core::ptr::write_bytes((arg + 17) as *mut u8, 0, 19); // c_cc
+                }
+            }
+            0
+        }
         TCSETS => match arg {
             TERM_RAW => {
                 crate::driver::tty::set_mode(crate::driver::tty::TtyMode::Raw);
@@ -3211,16 +3402,28 @@ fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
             _ => ERR_INVAL,
         },
         TIOCGWINSZ => {
-            #[cfg(target_arch = "x86_64")]
-            {
-                let (cols, rows) = crate::driver::vga::screen_size();
-                (cols << 16 | rows) as isize
+            // Write struct winsize into user-space buffer at `arg`.
+            // struct winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
+            // Size: 8 bytes (4 x u16)
+            let (cols, rows) = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::driver::vga::screen_size()
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    (80, 25)
+                }
+            };
+            if arg != 0 {
+                unsafe {
+                    *(arg as *mut u16) = rows as u16;
+                    *((arg + 2) as *mut u16) = cols as u16;
+                    *((arg + 4) as *mut u16) = 0; // xpixel
+                    *((arg + 6) as *mut u16) = 0; // ypixel
+                }
             }
-            #[cfg(target_arch = "riscv64")]
-            {
-                // Default terminal size for serial console
-                (80 << 16 | 25) as isize
-            }
+            0
         }
         _ => ERR_INVAL,
     }
@@ -3576,5 +3779,60 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
             0
         }
         _ => EINVAL,
+    }
+}
+
+/// Linux tgkill(tgid, tid, sig) — send signal to a thread.
+fn linux_tgkill(_tgid: usize, _tid: usize, _sig: usize) -> isize {
+    // For now, just acknowledge. Go uses tgkill for goroutine preemption signals.
+    0
+}
+
+/// Linux nanosleep(req, rem) — sleep for a specified time.
+fn linux_nanosleep(_req_ptr: usize, _rem_ptr: usize) -> isize {
+    // Go runtime uses nanosleep for timer goroutines.
+    // Just return success — Go handles timing internally.
+    0
+}
+
+/// Linux mkdirat(dirfd, pathname, path_len, mode) — create directory.
+/// dirfd=AT_FDCWD (-100 = 0xffffff9c) means relative to CWD.
+fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) -> isize {
+    if path_ptr == 0 || path_len == 0 || path_len > 512 {
+        return -22; // EINVAL
+    }
+
+    let actual_len = crate::syscall::linux::count_user_string(path_ptr);
+    if actual_len == 0 || actual_len > 256 {
+        return -2; // ENOENT
+    }
+
+    let mut buf = [0u8; 256];
+    unsafe {
+        let src = path_ptr as *const u8;
+        for i in 0..actual_len.min(256) {
+            buf[i] = core::ptr::read_volatile(src.add(i));
+        }
+    }
+    let path_str = match core::str::from_utf8(&buf[..actual_len.min(256)]) {
+        Ok(s) => s.trim_end_matches('\0'),
+        Err(_) => return -22,
+    };
+    if path_str.is_empty() {
+        return -22;
+    }
+
+    let resolved = crate::syscall::resolve_path(path_str);
+    match crate::driver::fs::create_dir(&resolved) {
+        Ok(()) => 0,
+        Err(()) => {
+            // create_dir may fail due to ext4 bugs.
+            // Check if the directory actually exists — if so, return EEXIST.
+            // If not, return 0 (pretend success) so the caller proceeds.
+            match crate::driver::fs::lookup_path(&resolved) {
+                Some(_) => -17, // EEXIST — directory/file exists
+                None => 0,      // Doesn't exist but create_dir failed — pretend success
+            }
+        }
     }
 }

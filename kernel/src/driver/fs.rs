@@ -349,6 +349,20 @@ pub fn create_dir(name: &str) -> Result<(), ()> {
     }
 }
 
+/// Check if a path exists in the filesystem.
+pub fn lookup_path(name: &str) -> Option<u64> {
+    if crate::driver::ext4::has_ext4() {
+        crate::driver::ext4::lookup_path(name)
+    } else {
+        let fs = FS.lock();
+        if fs.read(name).is_some() {
+            Some(1)
+        } else {
+            None
+        }
+    }
+}
+
 /// Delete a file from ext4 and RamFS.
 pub fn delete_file(name: &str) -> Result<(), ()> {
     let mut any_ok = false;

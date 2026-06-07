@@ -61,6 +61,12 @@ cargo build --release -p karte-os-kernel  # 3. Build kernel (must be zero error)
 make test                             # 4. Run tests (must be ALL PASSED)
 ```
 
+## Coding Conventions
+
+- **DRY (Don't Repeat Yourself)**: Abstract common patterns into helper functions. Example: CR3 switch for page table operations → use a single `with_kernel_cr3(closure)` helper instead of copy-pasting save/switch/restore at every call site. If you find yourself writing the same 5+ lines in multiple places, extract it.
+- **Always check full output**: When QEMU test output goes to a file, **read the entire file** (or at least the tail) before forming hypotheses. Never assume what happened based on partial grep results. A single `tail -40` can save 30 minutes of misdiagnosis.
+- **Empirical evidence first**: Do not analyze based on assumptions. If a PF loop occurs, add targeted diagnostics (print PTE values, CR3, frame addresses) to verify the hypothesis before attempting fixes. Every fix should be preceded by evidence of the root cause.
+
 **Common CI failure causes:**
 - `include_bytes!("../../user/hello.elf")` requires `user/hello.elf` to exist → always build user programs first
 - `cargo fmt` differences → always run `cargo fmt` before commit
@@ -221,6 +227,11 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **x86_64 SMP**: `arch/x86_64/smp.rs` implements multi-core boot via LAPIC INIT/SIPI IPIs. AP trampoline (`ap_trampoline.S`) at 0x7000 transitions real→protected→long mode. Per-CPU GDT+TSS (indexed by CPU ID, MAX_CPUS=4). Shared IDT (build once, load per-CPU). `start_secondary_harts(total)` starts APs; each runs `secondary_cpu_entry()` → GDT init → LAPIC init → timer → schedule loop.
 - **x86_64 syscall ISR `sti`**: `syscall_isr_stub` (int 0x80) MUST NOT use `sti` between push registers and `call syscall_handler_impl`. The Timer ISR uses IST (shared across all syscalls on the same CPU). If `sti` enables interrupts and the Timer ISR fires before `call`, the Timer ISR's IST pushes overwrite the syscall's saved registers on the IST stack, corrupting syscall arguments. Instead, keep interrupts disabled throughout the syscall handler; `iretq` restores IF from user-mode RFLAGS (IF=1) when returning to Ring 3.
 - **x86_64 UART input via `-serial stdio`**: QEMU's `-serial stdio` mode does NOT reliably deliver stdin data to the UART RX FIFO via polling (`getchar()`). Use Unix socket chardev (`-chardev socket,id=serial0,path=/tmp/serial.sock,server=on,wait=off -serial chardev:serial0`) for reliable UART input. The COM1 ISR (IRQ4 via IOAPIC) works correctly with the socket chardev but may not trigger with `-serial stdio`.
+- **x86_64 boot identity mapping range**: boot.S P2 table MUST cover ALL physical memory (256×2MB = 512MB for QEMU `-m 512M`). Originally only 64 entries (128MB) caused `map()` to access unmapped PT frames via identity mapping → GP fault or corrupt data.
+- **x86_64 CR3 switching for page table ops**: User page table's identity mapping entries get overwritten during ELF loading. When `map()` accesses PT frames via identity mapping under user CR3, it may read ELF data instead of PT structures. **Fix**: Switch to kernel CR3 (clean identity mapping) before any `map()`/`translate_user()`/`unmap_user()` call on user page tables, switch back after. This applies to PF handler lazy allocation AND syscall paths (mmap/mprotect/brk). Use the `with_kernel_cr3()` helper — do NOT inline CR3 switch logic at every call site.
+- **x86_64 `current_page_table_root()` vs `current_page_table_ppn()`**: Two different mechanisms to get the page table root. `current_page_table_root()` uses lock-free `AtomicUsize` (safe from trap handlers). `current_page_table_ppn()` uses `PROCESS_TABLE.lock()` (NOT safe from trap handlers, may deadlock). **Always use `current_page_table_root()`** in trap handlers and PF handler. The locked version is only for non-interrupt contexts.
+- **x86_64 ELF identity map corruption**: When `translate_user()` returns a frame where `frame == vaddr` (identity mapping from `copy_kernel_mappings`), `map()` or `write_bytes` will corrupt that physical frame. Always check and skip identity-mapped frames, allocating new ones instead. This prevents ELF data from overwriting critical structures (CR3, PT tables, kernel stack) that share physical addresses within the ELF vaddr range.
+- **x86_64 Go binary support**: Go runtime (e.g., xbot-cli-static ~69MB) requires: `mmap` (PROT_NONE reservation + PROT_RW allocation), `mprotect`, `brk`, `openat` (for `/proc/version`, `/etc/...`), `write`. Go panics with "failed to determine kernel version" if `openat` for version info returns ENOENT — need to implement `uname` syscall or fake `/proc/version` to proceed further.
 
 ## Knowledge Files
 

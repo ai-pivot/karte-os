@@ -85,10 +85,10 @@ _start:
     leal boot_p3_table - .Lget_pc(%ebp), %eax
     movl %ecx, (%eax)
 
-    # P2: 64 × 2MB huge pages covering 0..128MB
+    # P2: 256 × 2MB huge pages covering 0..512MB
     leal boot_p2_table - .Lget_pc(%ebp), %edi
     movl $0, %ecx
-    movl $64, %edx
+    movl $256, %edx
 .fill_loop:
     movl %ecx, %eax
     orl $0x00000083, %eax

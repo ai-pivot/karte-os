@@ -92,6 +92,18 @@ static INITIAL_TASK_SP: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) 
 pub(crate) static TASK_KSTACK: [core::sync::atomic::AtomicU64; MAX_TASKS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_TASKS];
 
+/// Get the kernel stack top of the currently scheduled task.
+/// Returns None if init (shell) is running (init has no TCB).
+#[cfg(target_arch = "x86_64")]
+pub fn current_kernel_stack() -> Option<u64> {
+    let sched = SCHEDULER.lock();
+    if sched.current < MAX_TASKS {
+        Some(TASK_KSTACK[sched.current].load(Ordering::Relaxed))
+    } else {
+        None
+    }
+}
+
 /// Pending RSP0 value for clone_first_shim (set by add_clone_process).
 /// This avoids the need to read TrapContext.kernel_sp which may have
 /// incorrect offset due to __switch RSP alignment.
@@ -201,8 +213,23 @@ pub fn schedule() {
         let init_sp_ptr = INIT_TASK_SP.as_ptr() as *mut usize;
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
         let _next_sp_val = unsafe { *nxt_ptr };
+        // NOTE: Do NOT change SYSCALL_KSP here! SYSCALL_KSP is used by the
+        // currently executing code (init's syscall handler). Changing it would
+        // cause subsequent stack pushes to land on the child's kernel stack,
+        // corrupting the child's TrapContext. Instead, SYSCALL_KSP is set in
+        // trap_return_user just before returning to user mode.
         unsafe {
             __switch(init_sp_ptr, nxt_ptr);
+        }
+        // After __switch returns (init was switched back), ensure SYSCALL_KSP
+        // points to init's stack
+        #[cfg(target_arch = "x86_64")]
+        {
+            let ksp = crate::arch::idt::INIT_SYSCALL_KSP.load(Ordering::Relaxed);
+            unsafe { crate::arch::idt::SYSCALL_KSP = ksp };
+            unsafe {
+                crate::arch::gdt::set_kernel_rsp0_for_cpu(0, ksp);
+            };
         }
     } else {
         // Mark the next task as running BEFORE __switch.
@@ -623,7 +650,9 @@ pub fn add_user_process(
             (*ctx).kernel_sp = kernel_stack_top as u64;
             (*ctx).user_cr3 = user_satp as u64;
             (*ctx).trap_from_user = 1;
-            crate::arch::idt::set_syscall_ksp(kernel_stack_top as u64);
+            // Write magic values for debug
+            (*ctx).r15 = 0xDEADBEEF_CAFEBABEu64;
+            (*ctx).r14 = 0x12345678_87654321u64;
         }
         TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
         INITIAL_TASK_SP[tid].store(switch_sp, Ordering::Relaxed);

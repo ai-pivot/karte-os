@@ -68,7 +68,6 @@ impl Ext4 {
     pub fn create(&self, parent: u32, name: &str, inode_mode: u16) -> Result<Ext4InodeRef> {
         let mut parent_inode_ref = self.get_inode_ref(parent);
 
-        // let mut child_inode_ref = self.create_inode(inode_mode)?;
         let init_child_ref = self.create_inode(inode_mode)?;
 
         self.write_back_inode_without_csum(&init_child_ref);

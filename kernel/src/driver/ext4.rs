@@ -408,9 +408,10 @@ mod riscv_impl {
             fs.lookup(ROOT_INODE as u64, parent_path)
                 .map_err(|_| "ext4: parent directory not found")?
         };
-        fs.create_dir(parent_inode, dir_name)
-            .map_err(|_| "ext4 create_dir failed")?;
-        Ok(())
+        match fs.create_dir(parent_inode, dir_name) {
+            Ok(_) => Ok(()),
+            Err(_) => Err("ext4 create_dir failed"),
+        }
     }
 
     pub fn delete_file(name: &str) -> Result<(), &'static str> {
@@ -862,11 +863,20 @@ mod x86_64_impl {
             ROOT_INODE as u64
         } else {
             fs.lookup(ROOT_INODE as u64, parent_path)
-                .map_err(|_| "ext4: parent directory not found")?
+                .map_err(|e| "ext4: parent directory not found")?
         };
-        fs.create_dir(parent_inode, dir_name)
-            .map_err(|_| "ext4 create_dir failed")?;
-        Ok(())
+        match fs.create_dir(parent_inode, dir_name) {
+            Ok(_inode) => Ok(()),
+            Err(e) => {
+                crate::console_println!(
+                    "[ext4] create_dir '{}' in inode {} failed: {:?}",
+                    dir_name,
+                    parent_inode,
+                    e
+                );
+                Err("ext4 create_dir failed")
+            }
+        }
     }
 
     pub fn delete_file(name: &str) -> Result<(), &'static str> {

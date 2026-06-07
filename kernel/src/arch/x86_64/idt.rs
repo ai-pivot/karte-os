@@ -49,6 +49,9 @@ static mut KERNEL_CR3: u64 = 0;
 /// Kernel stack pointer for SYSCALL fast entry.
 #[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_KSP: u64 = 0;
+/// Saved init (shell) SYSCALL_KSP value, restored when timer ISR switches back to init.
+pub(crate) static INIT_SYSCALL_KSP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 /// Temporarily saved original rbx (clobbered by user RSP during SYSCALL entry).
 #[unsafe(no_mangle)]
 static mut SYSCALL_SAVED_RBX: u64 = 0;
@@ -67,11 +70,39 @@ pub static mut CLONE_DBG_RSPVAL: u64 = 0;
 #[unsafe(no_mangle)]
 pub static mut KERNEL_CR3_PHYS: u64 = 0;
 
+/// Get kernel CR3 physical address. Safe to call from trap handlers.
+/// Global tick counter for timekeeping
+static TICK_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Get current tick count (incremented by timer ISR ~100Hz)
+pub fn get_tick_count() -> usize {
+    TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn get_kernel_cr3_phys() -> usize {
+    unsafe { KERNEL_CR3_PHYS as usize }
+}
+
+/// Get approximate time in milliseconds since boot.
+/// Based on timer interrupt tick count (~100Hz = 10ms per tick).
+pub fn get_time_ms() -> u64 {
+    let tick = TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    tick as u64 * 10 // ~10ms per tick
+}
+
 pub fn set_syscall_ksp(ksp: u64) {
     unsafe {
         SYSCALL_KSP = ksp;
         KERNEL_CR3_PHYS = crate::mm::vmm::kernel_cr3();
     }
+    // Save the first call (init/shell) as the default for init
+    if INIT_SYSCALL_KSP.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        INIT_SYSCALL_KSP.store(ksp, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn get_syscall_ksp() -> u64 {
+    unsafe { SYSCALL_KSP }
 }
 
 pub fn cache_kernel_cr3() {
@@ -373,13 +404,25 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     crate::arch::platform::tick_uptime();
     // Note: set_next_timer is not needed for periodic mode
 
-    // Use atomic counter for debugging
-    static TICK_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    // Increment global tick counter
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     // schedule() is now safe because timer IDT uses TSS RSP0 (per-task kernel stack)
     // instead of IST. __switch() saves/restores the correct stack pointer.
     crate::sched::schedule();
+
+    // After schedule(), update SYSCALL_KSP to the current task's kernel stack.
+    // This ensures the next syscall uses the correct per-task stack.
+    // When init (shell) is running, restore to init's original SYSCALL_KSP.
+    if let Some(ksp) = crate::sched::current_kernel_stack() {
+        unsafe { crate::arch::idt::SYSCALL_KSP = ksp };
+    } else {
+        // Init is running — restore SYSCALL_KSP to init's kernel stack
+        unsafe {
+            crate::arch::idt::SYSCALL_KSP =
+                crate::arch::idt::INIT_SYSCALL_KSP.load(core::sync::atomic::Ordering::Relaxed)
+        };
+    }
 
     // After schedule(), switch to the target process's page table.
     // If target_root is 0 (init), reload the kernel CR3 so we don't run
@@ -543,39 +586,65 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
 
 extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64) {
     let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
-    if from_user {
-        crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
-    } else {
-        // Kernel-mode GP fault — print diagnostic and halt.
-        // Must NOT use console_println! (SpinLock can cause double fault).
-        // Use raw UART/VGA output.
-        let rip = frame.instruction_pointer.as_u64();
-        let cs = frame.code_segment.0 as u64;
-        let rsp = frame.stack_pointer.as_u64();
-        crate::arch::platform::console_putchar(b'\n');
-        crate::arch::platform::console_putchar(b'[');
-        crate::arch::platform::console_putchar(b'G');
-        crate::arch::platform::console_putchar(b'P');
-        crate::arch::platform::console_putchar(b']');
-        crate::arch::platform::console_putchar(b' ');
-        // Print RIP, CS, RSP, error code, and key registers
-        for &ch in b"RIP=" { crate::arch::platform::console_putchar(ch); }
+    let rip = frame.instruction_pointer.as_u64();
+    let rsp = frame.stack_pointer.as_u64();
+    // Print diagnostic for ALL GP faults (user and kernel)
+    {
         let mut print_hex = |mut v: u64| {
             for _ in 0..16 {
                 let nibble = ((v >> 60) & 0xF) as u8;
-                let ch = if nibble < 10 { b'0' + nibble } else { b'a' + (nibble - 10) };
+                let ch = if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'a' + (nibble - 10)
+                };
                 crate::arch::platform::console_putchar(ch);
                 v <<= 4;
             }
         };
+        let mut print_str = |s: &[u8]| {
+            for &ch in s {
+                crate::arch::platform::console_putchar(ch);
+            }
+        };
+        print_str(b"\n[GP] ");
+        print_str(if from_user { b"USER" } else { b"KERN" });
+        print_str(b" RIP=");
         print_hex(rip);
-        for &ch in b" RBX=" { crate::arch::platform::console_putchar(ch); }
-        { let rbx: u64; unsafe { core::arch::asm!("mov {}, rbx", out(reg) rbx) }; print_hex(rbx); }
-        for &ch in b" R10=" { crate::arch::platform::console_putchar(ch); }
-        { let r10: u64; unsafe { core::arch::asm!("mov {}, r10", out(reg) r10) }; print_hex(r10); }
-        for &ch in b" ERR=" { crate::arch::platform::console_putchar(ch); }
+        print_str(b" RSP=");
+        print_hex(rsp);
+        print_str(b" ERR=");
         print_hex(err);
-        for &ch in b"\n" { crate::arch::platform::console_putchar(ch); }
+        {
+            let rbx: u64;
+            unsafe { core::arch::asm!("mov {}, rbx", out(reg) rbx) };
+            print_str(b" RBX=");
+            print_hex(rbx);
+        }
+        {
+            let rax: u64;
+            unsafe { core::arch::asm!("mov {}, rax", out(reg) rax) };
+            print_str(b" RAX=");
+            print_hex(rax);
+        }
+        {
+            let rcx: u64;
+            unsafe { core::arch::asm!("mov {}, rcx", out(reg) rcx) };
+            print_str(b" RCX=");
+            print_hex(rcx);
+        }
+        {
+            let rdx: u64;
+            unsafe { core::arch::asm!("mov {}, rdx", out(reg) rdx) };
+            print_str(b" RDX=");
+            print_hex(rdx);
+        }
+        print_str(b"\n");
+    }
+    if from_user {
+        // Terminate the user process
+        crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
+    } else {
         loop {}
     }
 }
@@ -617,116 +686,27 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     let page_size = crate::mm::pmm::page_size();
     let page_addr = fault_addr_val & !(page_size - 1);
 
-    // Use direct UART I/O (no heap, no SpinLock) for safe debugging.
-    let print_hex = |val: u64| {
-        for shift in [60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12, 8, 4, 0] {
-            let nibble = ((val >> shift) as u8) & 0xF;
-            let c = if nibble < 10 {
-                b'0' + nibble
-            } else {
-                b'a' + nibble - 10
-            };
-            crate::arch::platform::console_putchar(c);
-        }
-    };
-    let print_str = |s: &[u8]| {
-        for &b in s {
-            crate::arch::platform::console_putchar(b);
-        }
-    };
-
-    // Always print full fault info (both user and kernel)
-    print_str(b"PF:");
-    print_hex(fault_addr_val as u64);
-    print_str(b" ER:");
-    print_hex(error_code);
-    print_str(b" RIP:");
-    print_hex(rip);
-    print_str(b" CS:");
-    print_hex(cs);
-    print_str(b" FL:");
-    print_hex(rflags);
-    print_str(b" RSP:");
-    print_hex(rsp_val);
-    print_str(b" SS:");
-    print_hex(ss);
-    // Print CR3 captured at entry (before any function call)
-    print_str(b" CR3:");
-    print_hex(raw_cr3);
-    print_str(b" PID:");
-    print_hex(crate::process::current_pid() as u64);
-    // Print RSP0 (TSS.RSP0) for kernel stack debugging
-    print_str(b" RSP0:");
-    {
-        let rsp0_ptr = crate::arch::gdt::TSS_RSP0_ADDR;
-        if rsp0_ptr != 0 {
-            let rsp0_val = unsafe { *(rsp0_ptr as *const u64) };
-            print_hex(rsp0_val);
-        } else {
-            print_str(b"N/A");
-        }
-    }
-    // Print FS_BASE (critical for Go TLS / getg())
-    print_str(b" FSB:");
-    {
-        let fsb = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
-        print_hex(fsb);
-    }
-    // Print first bytes at RIP for instruction identification
-    if from_user {
-        print_str(b" insn:");
-        let rip_ptr = rip as *const u8;
-        for i in 0..8 {
-            let b = unsafe { core::ptr::read_volatile(rip_ptr.add(i)) };
-            print_hex(b as u64);
-        }
-    }
-    crate::arch::platform::console_putchar(b'\n');
-    // Print clone debug values
-    {
-        let (dr, dri) = unsafe { (CLONE_DBG_RAX, CLONE_DBG_RIP) };
-        print_str(b" DBG_RAX:");
-        print_hex(dr);
-        print_str(b" DBG_RIP:");
-        print_hex(dri);
-        let drsp = unsafe { CLONE_DBG_RSPVAL };
-        print_str(b" DBG_RSP:");
-        print_hex(drsp);
-        crate::arch::platform::console_putchar(b'\n');
+    // Print concise PF info
+    if !from_user {
+        crate::console_println!(
+            "[PF] KERN addr={:#x} rip={:#x} cr3={:#x}",
+            fault_addr_val,
+            rip,
+            raw_cr3
+        );
+    } else {
+        crate::console_println!(
+            "[PF] USER addr={:#x} rip={:#x} pid={}",
+            fault_addr_val,
+            rip,
+            crate::process::current_pid()
+        );
     }
 
-    // Print translation result for fault address page
-    let user_pt = super::trap::get_current_user_pt();
-    let translated = crate::mm::vmm::translate_user(user_pt, fault_addr_val & !(page_size - 1));
-    print_str(b" TLB:");
-    match translated {
-        Some(paddr) => print_hex(paddr as u64),
-        None => print_str(b"NONE"),
-    }
-    // Check value at Go's span allocator global (0x4857248)
-    if from_user {
-        let span_ptr_addr = 0x4857248usize;
-        let span_pt = crate::mm::vmm::translate_user(user_pt, span_ptr_addr);
-        match span_pt {
-            Some(paddr) => {
-                let span_val = unsafe { *(paddr as *const u64) };
-                print_str(b" SP:");
-                print_hex(span_val);
-                let span_val2 = unsafe { *((paddr as *const u64).add(1)) };
-                print_str(b" SP8:");
-                print_hex(span_val2);
-            }
-            None => print_str(b" SP:UNMAP"),
-        }
-    }
-
-    crate::arch::platform::console_putchar(b'\n');
-
+    // Handle user-mode page faults with lazy allocation
     let handled = 'handler: {
         // Only handle "page not present" faults (error_code bit 0 = 0).
-        // If page is present but has wrong permissions (NX, etc), fall through to termination.
         if error_code & 1 != 0 {
-            // Page is present — this is a permission fault (NX, RO write, etc), not a missing page.
             break 'handler false;
         }
 
@@ -735,21 +715,30 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             && fault_addr_val >= crate::process::USER_HEAP_BASE
             && fault_addr_val < crate::process::USER_HEAP_LIMIT
         {
-            let user_pt = super::trap::get_current_user_pt();
-            if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
-                if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                    unsafe {
-                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            super::trap::with_kernel_cr3(|| {
+                let user_pt = super::trap::get_user_pt_safe();
+                let needs_alloc = match crate::mm::vmm::translate_user(user_pt, page_addr) {
+                    None => true,
+                    Some(f) => f == page_addr,
+                };
+                if needs_alloc {
+                    if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                        unsafe {
+                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                        }
+                        crate::mm::vmm::map(
+                            user_pt,
+                            page_addr,
+                            frame,
+                            crate::mm::vmm::PTEFlags::URW,
+                        );
+                        let new_brk = page_addr + page_size;
+                        if new_brk > crate::process::current_brk() {
+                            crate::process::set_current_brk(new_brk);
+                        }
                     }
-                    crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                    super::trap::flush_tlb_addr(page_addr);
-                    let new_brk = page_addr + page_size;
-                    if new_brk > crate::process::current_brk() {
-                        crate::process::set_current_brk(new_brk);
-                    }
-                    break 'handler true;
                 }
-            }
+            });
             break 'handler true;
         }
 
@@ -758,17 +747,22 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             && fault_addr_val >= crate::process::USER_STACK_BASE
             && fault_addr_val < crate::process::USER_STACK_TOP
         {
-            let user_pt = super::trap::get_current_user_pt();
-            if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
-                if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                    unsafe {
-                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            super::trap::with_kernel_cr3(|| {
+                let user_pt = super::trap::get_user_pt_safe();
+                if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                    if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                        unsafe {
+                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                        }
+                        crate::mm::vmm::map(
+                            user_pt,
+                            page_addr,
+                            frame,
+                            crate::mm::vmm::PTEFlags::URW,
+                        );
                     }
-                    crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                    super::trap::flush_tlb_addr(page_addr);
-                    break 'handler true;
                 }
-            }
+            });
             break 'handler true;
         }
 
@@ -777,17 +771,15 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             && fault_addr_val >= crate::process::USER_MMAP_BASE
             && fault_addr_val < crate::process::USER_MMAP_LIMIT
         {
-            let user_pt = super::trap::get_current_user_pt();
-            if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+            super::trap::with_kernel_cr3(|| {
+                let user_pt = super::trap::get_user_pt_safe();
                 if let Some(frame) = crate::mm::pmm::alloc_frame() {
                     unsafe {
                         core::ptr::write_bytes(frame as *mut u8, 0, page_size);
                     }
                     crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                    super::trap::flush_tlb_addr(page_addr);
-                    break 'handler true;
                 }
-            }
+            });
             break 'handler true;
         }
 
@@ -804,7 +796,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                         core::ptr::write_bytes(frame as *mut u8, 0, page_size);
                     }
                     crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                    super::trap::flush_tlb_addr(page_addr);
+                    super::trap::flush_tlb();
                     break 'handler true;
                 }
             }

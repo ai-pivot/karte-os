@@ -191,6 +191,8 @@ pub unsafe extern "C" fn trap_return_user() {
             "test rcx, rcx",
             "jz 3f",                          // skip if TSS_RSP0_ADDR == 0
             "mov [rcx], rax",                 // TSS.RSP0 = kernel_sp
+            // Also update SYSCALL_KSP so the next SYSCALL uses this task's kernel stack
+            "mov [rip + {syscall_ksp}], rax", // SYSCALL_KSP = kernel_sp
             "3:",
             // ── Switch to user page table if user_cr3 is set ──
             // CR3 write implicitly flushes the TLB (non-global pages).
@@ -203,21 +205,10 @@ pub unsafe extern "C" fn trap_return_user() {
             "mov rax, [rsp + 0x30]",
             "mov cr3, rax", // switch to user page table
             "2:",
-            // ── Verify RIP before iretq ──
-            // If RIP is suspiciously high (>0x100000000), print a debug marker
-            // using UART MMIO (direct write, no locks)
-            "mov rax, [rsp]",            // rax = RIP from TrapContext
-            "shr rax, 32",
-            "cmp rax, 0",
-            "je 4f",                     // RIP < 4GB, probably OK
-            // RIP > 4GB — write '!' to UART as warning
-            "mov dx, 0x3f8",
-            "mov al, 0x21",              // '!'
-            "out dx, al",
-            "4:",
             // ── Return to Ring 3 ──
             "iretq",
             tss_rsp0_addr = sym super::super::gdt::TSS_RSP0_ADDR,
+            syscall_ksp = sym super::super::idt::SYSCALL_KSP,
         );
     }
 }
@@ -386,10 +377,10 @@ pub fn read_page_table_root() -> usize {
 }
 
 /// Get the current process's page table.
-/// Returns a mutable reference to the kernel page table
-/// (x86_64 uses identity-mapped kernel page table as base).
+/// Returns a mutable reference to the user page table.
+/// Uses the lock-free CURRENT_PAGE_TABLE_ROOT (safe from trap handlers).
 pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
-    let ppn = crate::process::current_page_table_ppn();
+    let ppn = crate::process::current_page_table_root();
     if ppn == 0 {
         crate::mm::vmm::get_kernel_page_table()
     } else {
@@ -412,6 +403,42 @@ pub fn activate_page_table(root_paddr: usize) {
 /// Flush the entire TLB.
 pub fn flush_tlb() {
     x86_64::instructions::tlb::flush_all();
+}
+
+/// Execute a closure with kernel CR3 active, then restore user CR3.
+/// This is necessary for page table operations (map/translate/unmap) on the
+/// user page table, because the user CR3's identity mapping may have been
+/// overwritten by ELF loading. Kernel CR3 always has a clean identity mapping.
+///
+/// Returns the closure's result.
+pub fn with_kernel_cr3<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let cr3 = x86_64::registers::control::Cr3::read();
+    let user_cr3 = cr3.0.start_address().as_u64() as usize;
+    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
+    let need_switch = user_cr3 != kernel_cr3;
+    if need_switch {
+        activate_page_table(kernel_cr3);
+    }
+    let result = f();
+    if need_switch {
+        activate_page_table(user_cr3);
+        flush_tlb();
+    }
+    result
+}
+
+/// Get the user page table reference via kernel CR3 (safe for PT operations).
+/// Use this instead of `get_current_user_pt()` when you need to call map/unmap/translate.
+pub fn get_user_pt_safe() -> &'static mut crate::mm::vmm::PageTable {
+    let ppn = crate::process::current_page_table_root();
+    if ppn == 0 {
+        crate::mm::vmm::get_kernel_page_table()
+    } else {
+        unsafe { &mut *((ppn << 12) as *mut crate::mm::vmm::PageTable) }
+    }
 }
 
 /// Flush a single virtual address from the TLB.

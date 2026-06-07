@@ -299,32 +299,75 @@ impl ExtentNode {
             NodeData::Root(root_data) => {
                 let header = self.header;
                 let mut l = 1;
-                let mut r = header.entries_count as usize - 1;
+                let mut r = header.entries_count as usize;
+                if r == 0 {
+                    return None;
+                }
+                r -= 1;
+                // Bounds check: max valid index = (root_data.len() - 3) / 3
+                let max_idx = root_data.len().saturating_sub(3) / 3;
+                if r > max_idx {
+                    r = max_idx;
+                }
+                if l > r {
+                    return None;
+                }
+
                 while l <= r {
                     let m = l + (r - l) / 2;
                     let idx = 3 + m * 3;
+                    if idx + 3 > root_data.len() {
+                        break;
+                    }
                     let ext = Ext4Extent::load_from_u32(&root_data[idx..]);
                     if lblock < ext.first_block {
+                        if m == 0 {
+                            break;
+                        }
                         r = m - 1;
                     } else {
                         l = m + 1;
                     }
                 }
+                if l == 0 {
+                    return None;
+                }
                 let idx = 3 + (l - 1) * 3;
+                if idx + 3 > root_data.len() {
+                    return None;
+                }
                 let ext = Ext4Extent::load_from_u32(&root_data[idx..]);
 
                 Some((ext, l - 1))
             }
             NodeData::Internal(internal_data) => {
                 let mut l = 1;
-                let mut r = (self.header.entries_count - 1) as usize;
+                let mut r = (self.header.entries_count as usize).saturating_sub(1);
+                // Bounds check
+                let ext_size = size_of::<Ext4Extent>();
+                let max_r = internal_data
+                    .len()
+                    .saturating_sub(size_of::<Ext4ExtentHeader>() + ext_size)
+                    / ext_size;
+                if r > max_r {
+                    r = max_r;
+                }
+                if l > r {
+                    return None;
+                }
 
                 while l <= r {
                     let m = l + (r - l) / 2;
                     let offset = size_of::<Ext4ExtentHeader>() + m * size_of::<Ext4Extent>();
+                    if offset + size_of::<Ext4Extent>() > internal_data.len() {
+                        break;
+                    }
                     let mut ext = Ext4Extent::load_from_u8_mut(&mut internal_data[offset..]);
 
                     if lblock < ext.first_block {
+                        if m == 0 {
+                            break;
+                        }
                         r = m - 1;
                     } else {
                         l = m + 1; // Otherwise, move to the right half
@@ -353,9 +396,30 @@ impl ExtentNode {
                 let mut l = 1; // Skip the first index
                 let mut r = self.header.entries_count as usize - 1;
 
+                // Clamp r based on actual available data to prevent out-of-bounds access.
+                // The header.entries_count may contain stale/invalid values for newly
+                // created inodes whose extent tree hasn't been fully initialized.
+                let entry_size = size_of::<Ext4ExtentIndex>() / 4;
+                let max_entries = if entry_size > 0 {
+                    indexes.len() / entry_size
+                } else {
+                    0
+                };
+                if r >= max_entries {
+                    r = if max_entries > 1 {
+                        max_entries - 1
+                    } else {
+                        return None;
+                    };
+                }
+                // Also ensure l is valid
+                if l > r {
+                    return None;
+                }
+
                 while l <= r {
                     let m = l + (r - l) / 2;
-                    let offset = m * size_of::<Ext4ExtentIndex>() / 4; // Convert to u32 offset
+                    let offset = m * entry_size;
                     let extent_index = Ext4ExtentIndex::load_from_u32(&indexes[offset..]);
 
                     if lblock < extent_index.first_block {
