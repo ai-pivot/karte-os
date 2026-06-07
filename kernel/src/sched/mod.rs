@@ -405,7 +405,7 @@ pub fn mark_current_exited() {
 }
 
 pub fn schedule_block() {
-    let (current, next, next_proc_idx) = {
+    let (switch_to_init, current, next, next_proc_idx) = {
         let mut sched = SCHEDULER.lock();
         let current = sched.current;
         if current >= sched.count {
@@ -425,48 +425,54 @@ pub fn schedule_block() {
                 }
             }
         }
-        if next == current {
-            return;
-        }
 
-        if let Some(ref mut t) = sched.tasks[next] {
-            t.state = TaskState::Running;
+        if next == current {
+            // No other Ready child — switch back to init to avoid busy-loop.
+            // The blocked task will be re-scheduled when wake_task() is called.
+            sched.current = INIT_SENTINEL;
+            (true, current, 0usize, 0usize)
+        } else {
+            if let Some(ref mut t) = sched.tasks[next] {
+                t.state = TaskState::Running;
+            }
+            sched.current = next;
+            let next_proc_idx = sched.task_to_process[next];
+            crate::process::set_current_index(next_proc_idx);
+            crate::process::set_current_page_table_root(crate::process::get_page_table_root(
+                next_proc_idx,
+            ));
+            (false, current, next, next_proc_idx)
         }
-        sched.current = next;
-        let next_proc_idx = sched.task_to_process[next];
-        crate::process::set_current_index(next_proc_idx);
-        crate::process::set_current_page_table_root(crate::process::get_page_table_root(
-            next_proc_idx,
-        ));
-        (current, next, next_proc_idx)
     };
 
-    // Mark the next task as running BEFORE __switch.
-    CURRENT_RUNNING.store(next, Ordering::Relaxed);
-
-    // Save FS_BASE for the current task (critical for Go TLS / getg())
+    // Save FS_BASE for the current task
     #[cfg(target_arch = "x86_64")]
     {
         let msr_val = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
         TASK_FS_BASE[current].store(msr_val, Ordering::Relaxed);
     }
 
-    let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
-    let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
-    // Set TSS.RSP0 to next task's kernel_sp BEFORE __switch.
-    #[cfg(target_arch = "x86_64")]
-    if let Some(ksp) = crate::process::get_kernel_sp(next_proc_idx) {}
-    unsafe {
-        __switch(cur_ptr, nxt_ptr);
+    if switch_to_init {
+        // Switch from blocked child to init
+        let init_sp_ptr = INIT_TASK_SP.as_ptr() as *mut usize;
+        unsafe {
+            __switch(&TASK_SPS[current] as *const AtomicUsize as *mut usize, init_sp_ptr);
+        }
+    } else {
+        CURRENT_RUNNING.store(next, Ordering::Relaxed);
+        let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
+        let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+        unsafe {
+            __switch(cur_ptr, nxt_ptr);
+        }
     }
 
-    // After __switch returns (possibly on a different task's stack),
-    // update SYSCALL_KSP, TSS.RSP0, and FS_BASE for the new task.
+    // After __switch returns — update per-task state
     #[cfg(target_arch = "x86_64")]
     {
-        let current = CURRENT_RUNNING.load(Ordering::Relaxed);
-        if current < MAX_TASKS {
-            let kernel_sp = TASK_KSTACK[current].load(Ordering::Relaxed);
+        let cur = CURRENT_RUNNING.load(Ordering::Relaxed);
+        if cur < MAX_TASKS {
+            let kernel_sp = TASK_KSTACK[cur].load(Ordering::Relaxed);
             if kernel_sp != 0 {
                 crate::arch::idt::set_syscall_ksp(kernel_sp as u64);
                 unsafe {
@@ -474,7 +480,7 @@ pub fn schedule_block() {
                 }
             }
         }
-        let saved = TASK_FS_BASE[current].load(Ordering::Relaxed);
+        let saved = TASK_FS_BASE[cur].load(Ordering::Relaxed);
         unsafe { crate::arch::idt::wrmsr(0xC0000100, saved) };
     }
 }
