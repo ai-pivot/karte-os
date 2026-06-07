@@ -372,43 +372,49 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         87 => sys_unlink(args[0], linux::count_user_string(args[0])), // unlink
 
         // ─── More process ─────────────────────────────────────────
-        89 => 0,                                                   // readlink (stub)
-        96 => linux_gettimeofday(args[0], args[1]),                // gettimeofday
-        97 => 0,                                                   // getrlimit (stub)
-        98 => 0,                                                   // getrusage (stub)
-        99 => linux_sysinfo(args[0]),                              // sysinfo
-        100 => 0,                                                  // times (stub)
-        101 => ERR_INVAL,                                          // ptrace (stub)
-        102 => 0,                                                  // getuid (stub: root)
-        103 => 0,                                                  // syslog (stub)
-        104 => 0,                                                  // getgid (stub: root)
-        105 => 0,                                                  // setuid (stub)
-        106 => 0,                                                  // setgid (stub)
-        107 => 0,                                                  // geteuid (stub: root)
-        108 => 0,                                                  // getegid (stub: root)
-        72 => 2,                                                   // fcntl F_GETFL stub: O_RDWR
-        131 => linux_sigaltstack(args[0], args[1]),                // sigaltstack
-        157 => 0,                                                  // prctl (stub)
-        158 => linux_arch_prctl(args[0], args[1]),                 // arch_prctl
-        160 => 0,                                                  // setrlimit (stub)
-        186 => sys_getpid(),                                       // gettid → getpid
-        200 => 0,                                                  // tkill (stub)
-        201 => linux_time(args[0]),                                // time
-        202 => linux_futex(args[0], args[1], args[2]),             // futex
+        89 => 0,                                    // readlink (stub)
+        96 => linux_gettimeofday(args[0], args[1]), // gettimeofday
+        97 => 0,                                    // getrlimit (stub)
+        98 => 0,                                    // getrusage (stub)
+        99 => linux_sysinfo(args[0]),               // sysinfo
+        100 => 0,                                   // times (stub)
+        101 => ERR_INVAL,                           // ptrace (stub)
+        102 => 0,                                   // getuid (stub: root)
+        103 => 0,                                   // syslog (stub)
+        104 => 0,                                   // getgid (stub: root)
+        105 => 0,                                   // setuid (stub)
+        106 => 0,                                   // setgid (stub)
+        107 => 0,                                   // geteuid (stub: root)
+        108 => 0,                                   // getegid (stub: root)
+        72 => 2,                                    // fcntl F_GETFL stub: O_RDWR
+        77 => {
+            // ftruncate(fd, length) — for SQLite WAL, return success for fake fds
+            let fd = args[0] as i32;
+            let fd_info = get_fd_info(fd);
+            if fd_info.is_some() { 0 } else { ERR_INVAL }
+        }
+        131 => linux_sigaltstack(args[0], args[1]), // sigaltstack
+        157 => 0,                                   // prctl (stub)
+        158 => linux_arch_prctl(args[0], args[1]),  // arch_prctl
+        160 => 0,                                   // setrlimit (stub)
+        186 => sys_getpid(),                        // gettid → getpid
+        200 => 0,                                   // tkill (stub)
+        201 => linux_time(args[0]),                 // time
+        202 => linux_futex(args[0], args[1], args[2]), // futex
         203 => linux_sched_setaffinity(args[0], args[1], args[2]), // sched_setaffinity (stub)
         204 => linux_sched_getaffinity(args[0], args[1], args[2]), // sched_getaffinity
-        218 => linux_set_tid_address(args[0]),                     // set_tid_address
-        228 => linux_clock_gettime(args[0], args[1]),              // clock_gettime
-        231 => sys_exit(args[0] as i32),                           // exit_group
-        234 => linux_tgkill(args[0], args[1], args[2]),            // tgkill
-        257 => linux_openat(args[0], args[1], args[2], args[3]),   // openat
-        258 => linux_mkdirat(args[0], args[1], args[2], args[3]),  // mkdirat
-        262 => -2,     // linux_newfstatat → ENOENT (stub)
-        267 => 0,      // readlinkat (stub)
-        272 => 0,      // unshare (stub)
-        273 => 0,      // set_robust_list (stub)
-        274 => 0,      // get_robust_list (stub)
-        290 => 4isize, // eventfd2 (fake fd)
+        218 => linux_set_tid_address(args[0]),      // set_tid_address
+        228 => linux_clock_gettime(args[0], args[1]), // clock_gettime
+        231 => sys_exit(args[0] as i32),            // exit_group
+        234 => linux_tgkill(args[0], args[1], args[2]), // tgkill
+        257 => linux_openat(args[0], args[1], args[2], args[3]), // openat
+        258 => linux_mkdirat(args[0], args[1], args[2], args[3]), // mkdirat
+        262 => -2,                                  // linux_newfstatat → ENOENT (stub)
+        267 => 0,                                   // readlinkat (stub)
+        272 => 0,                                   // unshare (stub)
+        273 => 0,                                   // set_robust_list (stub)
+        274 => 0,                                   // get_robust_list (stub)
+        290 => 4isize,                              // eventfd2 (fake fd)
         232 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_wait
         233 => epoll::sys_epoll_ctl(args[0], args[1], args[2], args[3]), // epoll_ctl
         281 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_pwait (same as epoll_wait, ignoring sigmask)
@@ -416,9 +422,11 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         292 => sys_dup2(args[0] as i32, args[1] as i32),                           // dup3 → dup2
         293 => 0,                                                                  // pipe2 (stub)
         302 => 0,                                          // prlimit64 (stub)
+        285 => 0, // fallocate → success (SQLite WAL needs this)
+        302 => 0, // prctl → success
         318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
-        334 => -38,                                        // rseq → ENOSYS (Go gracefully degrades)
-        435 => 0,                                          // clone3 (stub → use clone)
+        334 => -38, // rseq → ENOSYS (Go gracefully degrades)
+        435 => 0, // clone3 (stub → use clone)
         _ => {
             -38 // ENOSYS
         }
@@ -473,8 +481,7 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
             if has_creat && path_str.starts_with(".xbot") {
                 crate::console_println!("[openat] fake create '{}' flags={:#x}", path_str, flags);
                 crate::process::with_fd_table(|fd_table| {
-                    match fd_table.alloc_stdio_fd(alloc::format!("{}", path_str), our_flags as u32)
-                    {
+                    match fd_table.alloc_fake_fd(alloc::format!("{}", path_str), our_flags as u32) {
                         Some(fd) => fd as isize,
                         None => ERR_NOENT,
                     }
@@ -970,11 +977,18 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             return ERR_INVAL; // can't write to read end
         }
         Some((FdType::Stdio, _, _)) => {
+            // Stdio: write to console
             for i in 0..len {
                 let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
                 crate::arch::platform::console_putchar(byte);
             }
             return len as isize;
+        }
+        Some((FdType::FakeFile(_), _, _)) => {
+            // FakeFile: write to in-memory buffer
+            return crate::process::with_fd_table(|fd_table| {
+                fd_table.fake_write(fd, buf, len).unwrap_or(len as isize)
+            });
         }
         Some((FdType::File, _, _)) => {
             // Fall through to file write below
@@ -1051,6 +1065,12 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         }
         Some((FdType::File, _, _)) => {
             // Fall through to file read below
+        }
+        Some((FdType::FakeFile(_), _, _)) => {
+            // FakeFile: read from in-memory buffer
+            return crate::process::with_fd_table(|fd_table| {
+                fd_table.fake_read(fd, buf, len).unwrap_or(0)
+            });
         }
         _ => {
             // Unknown type — if fd == 0, use TTY
@@ -2929,7 +2949,7 @@ fn get_fd_info(fd: i32) -> Option<(FdType, Option<usize>, alloc::string::String)
     crate::process::with_fd_table(|fd_table| {
         fd_table
             .get(fd as usize)
-            .map(|f| (f.fd_type, f.pipe_id, f.name.clone()))
+            .map(|f| (f.fd_type.clone(), f.pipe_id, f.name.clone()))
     })
 }
 

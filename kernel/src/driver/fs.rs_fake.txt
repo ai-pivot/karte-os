@@ -1,0 +1,50 @@
+
+    /// Write to a FakeFile fd. Returns bytes written.
+    pub fn fake_write(&mut self, fd: i32, buf: usize, len: usize) -> Option<isize> {
+        if let Some(Some(desc)) = self.fds.get_mut(fd as usize) {
+            if let FdType::FakeFile(ref mut data) = desc.fd_type {
+                let pos = desc.pos;
+                let end = pos + len;
+                if end > data.len() {
+                    data.resize(end, 0);
+                }
+                for i in 0..len {
+                    data[pos + i] = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+                }
+                desc.pos = end;
+                return Some(len as isize);
+            }
+        }
+        None
+    }
+
+    /// Read from a FakeFile fd. Returns bytes read.
+    pub fn fake_read(&mut self, fd: i32, buf: usize, len: usize) -> Option<isize> {
+        if let Some(Some(desc)) = self.fds.get(fd as usize) {
+            if let FdType::FakeFile(ref data) = desc.fd_type {
+                let pos = desc.pos;
+                let available = if pos < data.len() { data.len() - pos } else { 0 };
+                let to_read = core::cmp::min(len, available);
+                for i in 0..to_read {
+                    unsafe { core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i]) };
+                }
+                // Update pos
+                if let Some(Some(desc)) = self.fds.get_mut(fd as usize) {
+                    desc.pos = pos + to_read;
+                }
+                return Some(to_read as isize);
+            }
+        }
+        None
+    }
+
+    /// Truncate a FakeFile fd to the specified size.
+    pub fn fake_truncate(&mut self, fd: i32, size: usize) -> bool {
+        if let Some(Some(desc)) = self.fds.get_mut(fd as usize) {
+            if let FdType::FakeFile(ref mut data) = desc.fd_type {
+                data.resize(size, 0);
+                return true;
+            }
+        }
+        false
+    }

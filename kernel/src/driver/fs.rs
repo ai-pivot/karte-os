@@ -390,7 +390,7 @@ pub const O_TRUNC: u32 = 0x200;
 pub const O_APPEND: u32 = 0x400;
 
 /// File descriptor type — distinguishes regular files from pipe endpoints.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum FdType {
     /// Standard I/O (stdin/stdout/stderr) — routes to TTY/UART unless overridden.
     Stdio,
@@ -400,6 +400,8 @@ pub enum FdType {
     PipeRead,
     /// Pipe write endpoint.
     PipeWrite,
+    /// Fake file with in-memory buffer — for virtual files (.xbot/*).
+    FakeFile(alloc::vec::Vec<u8>),
 }
 
 /// A file descriptor entry — wraps an in-memory file with seek position
@@ -492,6 +494,94 @@ impl FdTable {
             }
         }
         None
+    }
+
+    /// Allocate a fake fd with in-memory buffer for virtual files (.xbot/*).
+    pub fn alloc_fake_fd(&mut self, name: String, flags: u32) -> Option<usize> {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = Some(FileDescriptor {
+                    name,
+                    pos: 0,
+                    flags,
+                    valid: true,
+                    fd_type: FdType::FakeFile(alloc::vec![]),
+                    pipe_id: None,
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Write to a FakeFile fd. Returns bytes written.
+    pub fn fake_write(&mut self, fd: i32, buf: usize, len: usize) -> Option<isize> {
+        let slot = self.fds.get_mut(fd as usize)?;
+        let desc = slot.as_mut()?;
+        let data = match &mut desc.fd_type {
+            FdType::FakeFile(d) => d,
+            _ => return None,
+        };
+        let pos = desc.pos;
+        let end = pos + len;
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        for i in 0..len {
+            data[pos + i] = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+        }
+        desc.pos = end;
+        Some(len as isize)
+    }
+
+    /// Read from a FakeFile fd. Returns bytes read.
+    pub fn fake_read(&mut self, fd: i32, buf: usize, len: usize) -> Option<isize> {
+        // First get pos and to_read
+        let (pos, to_read) = {
+            let slot = self.fds.get(fd as usize)?;
+            let desc = slot.as_ref()?;
+            match &desc.fd_type {
+                FdType::FakeFile(data) => {
+                    let pos = desc.pos;
+                    let avail = if pos < data.len() {
+                        data.len() - pos
+                    } else {
+                        0
+                    };
+                    (pos, core::cmp::min(len, avail))
+                }
+                _ => return None,
+            }
+        };
+        // Copy data
+        {
+            let slot = self.fds.get(fd as usize)?;
+            let desc = slot.as_ref()?;
+            if let FdType::FakeFile(data) = &desc.fd_type {
+                for i in 0..to_read {
+                    unsafe { core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i]) };
+                }
+            }
+        }
+        // Update pos
+        if let Some(Some(desc)) = self.fds.get_mut(fd as usize) {
+            desc.pos = pos + to_read;
+        }
+        Some(to_read as isize)
+    }
+
+    /// Truncate a FakeFile fd to specified size.
+    pub fn fake_truncate(&mut self, fd: i32, size: usize) -> bool {
+        if let Some(Some(desc)) = self.fds.get_mut(fd as usize) {
+            if let FdType::FakeFile(ref mut data) = desc.fd_type {
+                data.resize(size, 0);
+                if desc.pos > size {
+                    desc.pos = size;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Allocate a pipe fd. Used by sys_pipe.
