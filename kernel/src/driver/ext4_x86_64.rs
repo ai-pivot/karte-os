@@ -12,7 +12,6 @@ use ext4_rs::{BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_INODE_MODE_FILE, 
 use crate::driver::vfs::{FileSystem, VfsDirEntry, VfsError, VfsFileType, VfsMetadata};
 
 const SECTOR_SIZE: usize = 512;
-const SECTORS_PER_BLOCK: usize = BLOCK_SIZE / SECTOR_SIZE;
 
 static READ_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -257,15 +256,11 @@ fn split_last_component(path: &str) -> (&str, &str) {
 pub fn init() -> Result<(), &'static str> {
     match Ext4Fs::new() {
         Ok(fs) => {
-            crate::console_println!("[ext4] Filesystem opened successfully");
             *EXT4_FS.lock() = Some(fs);
             EXT4_AVAILABLE.store(true, Ordering::SeqCst);
             Ok(())
         }
-        Err(e) => {
-            crate::console_println!("[ext4] Failed to open filesystem: {}", e);
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -298,7 +293,6 @@ pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result
     let guard = EXT4_FS.lock();
     let fs = guard.as_ref()?;
     let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
-    let inode_val = inode;
     drop(guard);
 
     Some(move |offset: usize, buf: &mut [u8]| -> Result<usize, ()> {
@@ -307,7 +301,7 @@ pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result
         }
         let guard = EXT4_FS.lock();
         let fs = guard.as_ref().ok_or(())?;
-        fs.read_file(inode_val, offset, buf).map_err(|_| ())
+        fs.read_file(inode, offset, buf).map_err(|_| ())
     })
 }
 

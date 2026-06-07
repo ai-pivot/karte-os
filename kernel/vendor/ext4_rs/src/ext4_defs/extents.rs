@@ -298,76 +298,41 @@ impl ExtentNode {
         match &mut self.data {
             NodeData::Root(root_data) => {
                 let header = self.header;
+                // When entries_count == 1, there's only one extent — return it directly.
+                // The binary search logic below assumes l=1, r=count-1, which gives
+                // l > r when count=1, so we handle count <= 1 specially.
+                if header.entries_count <= 1 {
+                    let ext = Ext4Extent::load_from_u32(&root_data[3..]);
+                    return Some((ext, 0));
+                }
                 let mut l = 1;
-                let mut r = header.entries_count as usize;
-                if r == 0 {
-                    return None;
-                }
-                r -= 1;
-                // Bounds check: max valid index = (root_data.len() - 3) / 3
-                let max_idx = root_data.len().saturating_sub(3) / 3;
-                if r > max_idx {
-                    r = max_idx;
-                }
-                if l > r {
-                    return None;
-                }
+                let mut r = header.entries_count as usize - 1;
 
                 while l <= r {
                     let m = l + (r - l) / 2;
                     let idx = 3 + m * 3;
-                    if idx + 3 > root_data.len() {
-                        break;
-                    }
                     let ext = Ext4Extent::load_from_u32(&root_data[idx..]);
                     if lblock < ext.first_block {
-                        if m == 0 {
-                            break;
-                        }
                         r = m - 1;
                     } else {
                         l = m + 1;
                     }
                 }
-                if l == 0 {
-                    return None;
-                }
                 let idx = 3 + (l - 1) * 3;
-                if idx + 3 > root_data.len() {
-                    return None;
-                }
                 let ext = Ext4Extent::load_from_u32(&root_data[idx..]);
 
                 Some((ext, l - 1))
             }
             NodeData::Internal(internal_data) => {
                 let mut l = 1;
-                let mut r = (self.header.entries_count as usize).saturating_sub(1);
-                // Bounds check
-                let ext_size = size_of::<Ext4Extent>();
-                let max_r = internal_data
-                    .len()
-                    .saturating_sub(size_of::<Ext4ExtentHeader>() + ext_size)
-                    / ext_size;
-                if r > max_r {
-                    r = max_r;
-                }
-                if l > r {
-                    return None;
-                }
+                let mut r = (self.header.entries_count - 1) as usize;
 
                 while l <= r {
                     let m = l + (r - l) / 2;
                     let offset = size_of::<Ext4ExtentHeader>() + m * size_of::<Ext4Extent>();
-                    if offset + size_of::<Ext4Extent>() > internal_data.len() {
-                        break;
-                    }
                     let mut ext = Ext4Extent::load_from_u8_mut(&mut internal_data[offset..]);
 
                     if lblock < ext.first_block {
-                        if m == 0 {
-                            break;
-                        }
                         r = m - 1;
                     } else {
                         l = m + 1; // Otherwise, move to the right half

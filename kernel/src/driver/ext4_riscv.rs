@@ -12,10 +12,19 @@ use ext4_rs::{BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_INODE_MODE_FILE, 
 use crate::driver::vfs::{FileSystem, VfsDirEntry, VfsError, VfsFileType, VfsMetadata};
 
 const SECTOR_SIZE: usize = 512;
-const SECTORS_PER_BLOCK: usize = BLOCK_SIZE / SECTOR_SIZE;
 
 static READ_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn block_read(sector: usize, buf: &mut [u8]) -> Result<(), &'static str> {
+    READ_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::driver::virtio::read_block(sector, buf)
+}
+
+fn block_write(sector: usize, buf: &[u8]) -> Result<(), &'static str> {
+    WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::driver::virtio::write_block(sector, buf)
+}
 
 pub struct KarteBlockDevice;
 
@@ -35,7 +44,7 @@ impl Ext4BlockDevice for KarteBlockDevice {
         let mut sector_idx = 0;
         while buf_pos < BLOCK_SIZE {
             let mut sector = [0u8; SECTOR_SIZE];
-            match crate::driver::virtio::read_block(base_sector + sector_idx, &mut sector) {
+            match block_read(base_sector + sector_idx, &mut sector) {
                 Ok(()) => {
                     let src_start = if sector_idx == 0 { skip } else { 0 };
                     let src_end = SECTOR_SIZE;
@@ -63,14 +72,14 @@ impl Ext4BlockDevice for KarteBlockDevice {
                 core::cmp::min(SECTOR_SIZE - sector_offset, data.len() - data_pos);
 
             let mut sector = [0u8; SECTOR_SIZE];
-            if crate::driver::virtio::read_block(sector_idx, &mut sector).is_err() {
+            if block_read(sector_idx, &mut sector).is_err() {
                 return;
             }
 
             sector[sector_offset..sector_offset + bytes_in_sector]
                 .copy_from_slice(&data[data_pos..data_pos + bytes_in_sector]);
 
-            if crate::driver::virtio::write_block(sector_idx, &sector).is_err() {
+            if block_write(sector_idx, &sector).is_err() {
                 return;
             }
 
@@ -239,15 +248,11 @@ fn split_last_component(path: &str) -> (&str, &str) {
 pub fn init() -> Result<(), &'static str> {
     match Ext4Fs::new() {
         Ok(fs) => {
-            crate::console_println!("[ext4] Filesystem opened successfully");
             *EXT4_FS.lock() = Some(fs);
             EXT4_AVAILABLE.store(true, Ordering::SeqCst);
             Ok(())
         }
-        Err(e) => {
-            crate::console_println!("[ext4] Failed to open filesystem: {}", e);
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -280,7 +285,6 @@ pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result
     let guard = EXT4_FS.lock();
     let fs = guard.as_ref()?;
     let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
-    let inode_val = inode;
     drop(guard);
 
     Some(move |offset: usize, buf: &mut [u8]| -> Result<usize, ()> {
@@ -289,7 +293,7 @@ pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result
         }
         let guard = EXT4_FS.lock();
         let fs = guard.as_ref().ok_or(())?;
-        fs.read_file(inode_val, offset, buf).map_err(|_| ())
+        fs.read_file(inode, offset, buf).map_err(|_| ())
     })
 }
 
@@ -411,7 +415,7 @@ pub fn delete_file(name: &str) -> Result<(), &'static str> {
 #[cfg(feature = "test_mode")]
 pub fn run_tests() {
     crate::console_println!("");
-    crate::console_println!("── ext4 Tests (x86_64) ──");
+    crate::console_println!("── ext4 Tests (RISC-V) ──");
 
     crate::test::run_test("ext4_read_count", || {
         let count = READ_COUNT.load(Ordering::SeqCst);
