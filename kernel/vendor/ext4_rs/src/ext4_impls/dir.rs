@@ -148,12 +148,22 @@ impl Ext4 {
                     if !de.unused() {
                         entries.push(de);
                     }
+                    if de.entry_len() == 0 {
+                        break;
+                    }
                     offset += de.entry_len() as usize;
                 }
+            } else {
+                // find_extent failed for this block — skip
+                // This can happen if extent tree is corrupted or block is not allocated
             }
 
             // go ot next block
             iblock += 1;
+            // Safety check: prevent infinite loop on very large files
+            if iblock > 100000 {
+                break;
+            }
         }
         entries
     }

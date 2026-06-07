@@ -2462,10 +2462,20 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
 
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
     let mut proc = if crate::driver::ext4::has_ext4() {
-        match crate::driver::ext4::read_file_range(&name) {
+        crate::console_println!("[exec] trying ext4 streaming for '{}'...", name);
+        let read_opt = crate::driver::ext4::read_file_range(&name);
+        crate::console_println!(
+            "[exec] read_file_range returned {}",
+            if read_opt.is_some() { "Some" } else { "None" }
+        );
+        match read_opt {
             Some(read_fn) => {
+                crate::console_println!("[exec] got read_fn, loading ELF...");
                 match crate::process::Process::from_elf_streaming(read_fn, argv, envp, 0) {
-                    Ok(p) => p,
+                    Ok(p) => {
+                        crate::console_println!("[exec] ELF loaded OK entry={:#x}", p.entry);
+                        p
+                    }
                     Err(e) => {
                         crate::klog!(DEBUG, "[exec] Streaming ELF load failed: {}", e);
                         return ERR_NOMEM;
