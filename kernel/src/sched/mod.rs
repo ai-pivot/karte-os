@@ -496,9 +496,14 @@ unsafe extern "C" fn clone_first_shim() -> ! {
         core::arch::naked_asm!(
             // RSP = TrapContext base (after __switch: pop r15..rbp + ret)
             // Self-contained: does NOT use trap_return_user.
+            //
+            // TrapContext layout (15 pop reveals this):
+            //   +0x00: rip        +0x08: cs      +0x10: rflags
+            //   +0x18: user_rsp   +0x20: ss
+            //   +0x28: kernel_sp  +0x30: user_cr3  +0x38: trap_from_user
             "cli",
 
-            // 1. Set TSS.RSP0 from PENDING_RSP0 (set by add_clone_process)
+            // 1. Set TSS.RSP0 from PENDING_RSP0
             "mov rax, [rip + {pending_rsp0}]",
             "test rax, rax",
             "jz 1f",
@@ -535,18 +540,33 @@ unsafe extern "C" fn clone_first_shim() -> ! {
             "pop r14",
             "pop r15",
 
-            // 4. Switch CR3 to user page table (skip if 0)
-            // After 15 pops, rsp points to iretq frame:
-            //   +0x00: rip, +0x08: cs, +0x10: rflags, +0x18: rsp, +0x20: ss
-            //   +0x28: kernel_sp, +0x30: user_cr3, +0x38: trap_from_user
-            "cmp qword ptr [rsp + 0x30], 0",
+            // 4. Now RSP points to: rip, cs, rflags, rsp, ss, kernel_sp, user_cr3, trap_from_user
+            //    Read iretq frame and CR3 BEFORE switching page tables.
+            //    Use registers that don't conflict with 15 pop values.
+            "mov r14, [rsp + 0x00]",  // rip
+            "mov r15, [rsp + 0x08]",  // cs
+            "mov rbx, [rsp + 0x10]", // rflags
+            "mov rdx, [rsp + 0x18]", // user rsp
+            "mov rdi, [rsp + 0x20]", // ss
+            "mov rsi, [rsp + 0x30]", // user_cr3 (DON'T clobber rax!)
+
+            // 5. Switch CR3 if user_cr3 != 0
+            "cmp rsi, 0",
             "je 3f",
-            "mov rax, [rsp + 0x30]",
+            "mov rax, rsi",
             "mov cr3, rax",
             "3:",
 
-            // 5. iretq (pops rip, cs, rflags, rsp, ss from stack)
-            "add rsp, 0x28",   // skip kernel_sp, user_cr3, trap_from_user
+            // 6. Restore rax = 0 (child return value from clone)
+            "xor rax, rax",
+
+            // 7. Restore user RSP and iretq
+            "mov rsp, rdx",
+            "push rdi",    // ss
+            "push rdx",    // rsp
+            "push rbx",    // rflags
+            "push r15",    // cs
+            "push r14",    // rip
             "iretq",
 
             tss_addr = sym crate::arch::gdt::TSS_RSP0_ADDR,
@@ -633,12 +653,14 @@ pub fn add_clone_process(
         *ctx = parent_ctx.clone();
         // Modifications for clone child:
         (*ctx).rax = 0; // Child returns 0 from clone
-        // Don't overwrite TrapContext.r15 — keep parent's original value.
-        // TLS is passed via switch frame's r15 slot (read by __switch RESTORE into r15 register).
         (*ctx).rsp = new_user_sp as u64; // Use new user stack
         (*ctx).kernel_sp = kernel_stack_top as u64;
         (*ctx).user_cr3 = user_cr3 as u64; // Set for CR3 switch on first entry
         (*ctx).trap_from_user = 1;
+        // Set TrapContext.r15 = TLS value. clone_first_shim's pop r15 will
+        // load this into r15 register (overwriting __switch's r15). Both paths
+        // need to agree on the TLS value.
+        (*ctx).r15 = tls as u64;
     }
 
     TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
