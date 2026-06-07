@@ -388,10 +388,18 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         108 => 0,                                   // getegid (stub: root)
         72 => 2,                                    // fcntl F_GETFL stub: O_RDWR
         77 => {
-            // ftruncate(fd, length) — for SQLite WAL, return success for fake fds
+            // ftruncate(fd, length) — truncate FakeFile or return success for real files
             let fd = args[0] as i32;
-            let fd_info = get_fd_info(fd);
-            if fd_info.is_some() { 0 } else { ERR_INVAL }
+            let length = args[1];
+            crate::process::with_fd_table(|fd_table| {
+                if fd_table.fake_truncate(fd, length) {
+                    0
+                } else if get_fd_info(fd).is_some() {
+                    0 // Real file — pretend success
+                } else {
+                    ERR_INVAL
+                }
+            })
         }
         131 => linux_sigaltstack(args[0], args[1]), // sigaltstack
         157 => 0,                                   // prctl (stub)
@@ -472,18 +480,24 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
     let linux_creat = 0x40;
     let has_creat = (flags & linux_creat) != 0;
 
+    // Debug: log all openat calls
+    crate::console_println!("[openat] '{}' flags={:#x}", path_str, flags);
+
     // Try VFS open with converted flags
     let our_flags = if has_creat { 0x100 } else { 0 } | (flags & 0x600); // keep O_TRUNC/O_APPEND
     match crate::driver::vfs::open(path_str, our_flags as u32) {
         Ok(fd) => fd as isize,
         Err(_) => {
-            // If O_CREAT, VFS failed, and path is in a virtual directory, create fake fd
+            // If VFS failed, create fake fd for virtual paths
             let is_virtual = path_str.starts_with(".xbot")
                 || path_str.starts_with("/.xbot")
-                || path_str.contains("xbot.db")
-                || path_str.contains(".db");
-            if has_creat && is_virtual {
-                crate::console_println!("[openat] fake create '{}' flags={:#x}", path_str, flags);
+                || path_str.starts_with("/proc")
+                || path_str.starts_with("/sys")
+                || path_str.starts_with("/etc")
+                || path_str.starts_with("/dev")
+                || path_str.starts_with("/run");
+            if has_creat || is_virtual {
+                crate::console_println!("[openat] fake '{}' flags={:#x}", path_str, flags);
                 crate::process::with_fd_table(|fd_table| {
                     match fd_table.alloc_fake_fd(alloc::format!("{}", path_str), our_flags as u32) {
                         Some(fd) => fd as isize,
