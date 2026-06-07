@@ -399,15 +399,17 @@ pub fn create_directory(name: &str) -> Result<(), &'static str> {
 
     let mut ext4 = fs.ext4.lock();
 
-    crate::console_println!("[ext4] create dir '{}' parent={}", dir_name, parent_inode);
-
-    match ext4.create(parent_inode as u32, dir_name, 0o40755 as u16) {
-        Ok(inode_ref) => {
-            crate::console_println!("[ext4] created inode={}", inode_ref.inode_num);
+    match ext4.create(parent_inode as u32, dir_name, 0o40777 as u16) {
+        Ok(_ref) => {
+            crate::console_println!(
+                "[ext4] dir '{}' created (inode={})",
+                dir_name,
+                _ref.inode_num
+            );
             Ok(())
         }
         Err(_) => {
-            crate::console_println!("[ext4] create failed");
+            crate::console_println!("[ext4] create '{}' failed", dir_name);
             Err("ext4 create_dir failed")
         }
     }

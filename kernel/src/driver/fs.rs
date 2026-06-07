@@ -476,6 +476,24 @@ impl FdTable {
         None
     }
 
+    /// Allocate a fake fd for virtual files (writes go to UART/null).
+    pub fn alloc_stdio_fd(&mut self, name: String, flags: u32) -> Option<usize> {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = Some(FileDescriptor {
+                    name,
+                    pos: 0,
+                    flags,
+                    valid: true,
+                    fd_type: FdType::Stdio,
+                    pipe_id: None,
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Allocate a pipe fd. Used by sys_pipe.
     pub fn alloc_pipe_fd(&mut self, pipe_id: usize, is_read: bool) -> Option<usize> {
         for (i, slot) in self.fds.iter_mut().enumerate() {

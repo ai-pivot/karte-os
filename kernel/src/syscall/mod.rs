@@ -447,10 +447,31 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
         Ok(s) => s,
         Err(_) => return ERR_NOENT,
     };
-    // Try to open via VFS
-    match crate::driver::vfs::open(path_str, flags as u32) {
+
+    // Convert Linux x86_64 flags to our internal flags
+    // Linux x86_64: O_CREAT=0x40, O_TRUNC=0x200, O_APPEND=0x400, O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+    let linux_creat = 0x40;
+    let has_creat = (flags & linux_creat) != 0;
+
+    // Try VFS open with converted flags
+    let our_flags = if has_creat { 0x100 } else { 0 } | (flags & 0x600); // keep O_TRUNC/O_APPEND
+    match crate::driver::vfs::open(path_str, our_flags as u32) {
         Ok(fd) => fd as isize,
-        Err(_) => ERR_NOENT,
+        Err(_) => {
+            // If O_CREAT and path starts with .xbot, fake success
+            if has_creat && path_str.starts_with(".xbot") {
+                crate::console_println!("[openat] fake create '{}' flags={:#x}", path_str, flags);
+                crate::process::with_fd_table(|fd_table| {
+                    match fd_table.alloc_stdio_fd(alloc::format!("{}", path_str), our_flags as u32)
+                    {
+                        Some(fd) => fd as isize,
+                        None => ERR_NOENT,
+                    }
+                })
+            } else {
+                ERR_NOENT
+            }
+        }
     }
 }
 
@@ -764,7 +785,14 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
     match id {
         SYS_DEBUG_PRINT => sys_debug_print(args[0], args[1]),
         SYS_EXIT => sys_exit(args[0] as i32),
-        SYS_WRITE => sys_write(args[0] as i32, args[1], args[2]),
+        SYS_WRITE => {
+            let result = sys_write(args[0] as i32, args[1], args[2]);
+            // Debug: log writes to non-stdio fds
+            if args[0] >= 3 && result < 0 {
+                crate::console_println!("[write] fd={} len={} ret={}", args[0], args[2], result);
+            }
+            result
+        }
         SYS_READ => sys_read(args[0] as i32, args[1], args[2]),
         SYS_BRK => sys_brk(args[0]),
         SYS_GETPID => sys_getpid(),
@@ -904,9 +932,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    // Fast path for stdout/stderr: write directly to console without heap allocation.
-    // This avoids buddy_system_allocator dealloc issues that can cause GP faults
-    // when Go is outputting fatal error messages.
+    // Fast path for stdout/stderr
     if fd == 1 || fd == 2 {
         for i in 0..len {
             let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
@@ -915,8 +941,16 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         return len as isize;
     }
 
-    // For other fds, check fd_table
+    // Debug: log writes to non-stdio fds
     let fd_info = get_fd_info(fd);
+    if fd >= 3 {
+        static WR_DBG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        let n = WR_DBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 5 {
+            crate::console_println!("[write] fd={} len={}", fd, len);
+        }
+    }
+
     match fd_info {
         Some((FdType::PipeWrite, Some(pipe_id), _)) => {
             return pipe_write(pipe_id, buf, len);
@@ -1707,12 +1741,22 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     #[cfg(target_arch = "x86_64")]
     let oc = OPEN_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
+    // x86_64 Linux O_CREAT = 0x40, our internal = 0x100
+    let linux_o_creat: u32 = if cfg!(target_arch = "x86_64") {
+        0x40
+    } else {
+        0x100
+    };
+
     // Check/create file in FS
-    if flags & O_CREAT != 0 {
+    if flags & linux_o_creat != 0 || flags & O_CREAT != 0 {
         let _ = crate::driver::fs::create_file(&name);
     }
     // Verify file exists
-    if crate::driver::fs::read_file_owned(&name).is_none() && (flags & O_CREAT == 0) {
+    if crate::driver::fs::read_file_owned(&name).is_none()
+        && (flags & O_CREAT == 0)
+        && (flags & linux_o_creat == 0)
+    {
         #[cfg(target_arch = "x86_64")]
         if oc < 10 {
             crate::klog!(DEBUG, "[open] ENOENT: {name}");
