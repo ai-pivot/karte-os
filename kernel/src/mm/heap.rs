@@ -8,7 +8,7 @@ use super::pmm;
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
 
 // 4MB heap — ext4 filesystem metadata requires significant memory.
-const HEAP_PAGES: usize = 1024; // 1024 * 4KB = 4MB heap
+const HEAP_PAGES: usize = 4096; // 1024 * 4KB = 4MB heap
 
 static mut HEAP_START: usize = 0;
 static mut HEAP_SIZE: usize = 0;

@@ -543,11 +543,39 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
 
 extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64) {
     let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
-    // Silent handling: terminate user process or halt kernel
-    // (console_println! in fault context can cause double fault via heap/SpinLock)
     if from_user {
         crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
     } else {
+        // Kernel-mode GP fault — print diagnostic and halt.
+        // Must NOT use console_println! (SpinLock can cause double fault).
+        // Use raw UART/VGA output.
+        let rip = frame.instruction_pointer.as_u64();
+        let cs = frame.code_segment.0 as u64;
+        let rsp = frame.stack_pointer.as_u64();
+        crate::arch::platform::console_putchar(b'\n');
+        crate::arch::platform::console_putchar(b'[');
+        crate::arch::platform::console_putchar(b'G');
+        crate::arch::platform::console_putchar(b'P');
+        crate::arch::platform::console_putchar(b']');
+        crate::arch::platform::console_putchar(b' ');
+        // Print RIP, CS, RSP, error code, and key registers
+        for &ch in b"RIP=" { crate::arch::platform::console_putchar(ch); }
+        let mut print_hex = |mut v: u64| {
+            for _ in 0..16 {
+                let nibble = ((v >> 60) & 0xF) as u8;
+                let ch = if nibble < 10 { b'0' + nibble } else { b'a' + (nibble - 10) };
+                crate::arch::platform::console_putchar(ch);
+                v <<= 4;
+            }
+        };
+        print_hex(rip);
+        for &ch in b" RBX=" { crate::arch::platform::console_putchar(ch); }
+        { let rbx: u64; unsafe { core::arch::asm!("mov {}, rbx", out(reg) rbx) }; print_hex(rbx); }
+        for &ch in b" R10=" { crate::arch::platform::console_putchar(ch); }
+        { let r10: u64; unsafe { core::arch::asm!("mov {}, r10", out(reg) r10) }; print_hex(r10); }
+        for &ch in b" ERR=" { crate::arch::platform::console_putchar(ch); }
+        print_hex(err);
+        for &ch in b"\n" { crate::arch::platform::console_putchar(ch); }
         loop {}
     }
 }

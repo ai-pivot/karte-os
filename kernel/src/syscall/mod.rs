@@ -79,10 +79,14 @@ pub const LINUX_SET_TID_ADDRESS: usize = 115;
 // ─── Error codes ──────────────────────────────────────────────────
 
 pub const ERR_OK: isize = 0;
-pub const ERR_INVAL: isize = -1;
-pub const ERR_NOMEM: isize = -2;
-pub const ERR_NOENT: isize = -3; // No such file or directory
-pub const ERR_IO: isize = -4;
+// ─── Linux-compatible errno values ─────────────────────────────
+// These are negated Linux errno values returned from syscalls.
+// Go / Rust / C programs on user space expect these exact values.
+pub const ERR_INVAL: isize = -22;  // EINVAL — Invalid argument
+pub const ERR_NOMEM: isize = -12;  // ENOMEM — Out of memory
+pub const ERR_NOENT: isize = -2;   // ENOENT — No such file or directory
+pub const ERR_IO: isize = -5;      // EIO — I/O error
+pub const ERR_ACCES: isize = -13;  // EACCES — Permission denied
 
 // ─── Global FD table (single-process simplification) ────────────────
 
@@ -1253,6 +1257,7 @@ fn linux_mmap(
                 }
             }
             crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
+            crate::klog!(TRACE, "[mmap] mapped vaddr={:#x} paddr={:#x} pt_root={}", vaddr, frame, crate::process::current_page_table_root());
             // This case is handled by needs_map above
         } else {
             // Page already exists, update its flags to match prot
