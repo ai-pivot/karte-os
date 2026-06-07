@@ -23,7 +23,7 @@ MOUNT="/tmp/karteos-mnt"
 cmd_init() {
     echo "Creating ${SIZE}MB ext4 disk image: $DISK"
     dd if=/dev/zero of="$DISK" bs=1M count="$SIZE" status=progress
-    mkfs.ext4 -b 4096 -L karteos "$DISK"
+    mkfs.ext4 -O ^64bit -O ^has_journal -O ^metadata_csum -O ^flex_bg -O ^extra_isize -b 4096 -L karteos "$DISK"
     echo "Done. ext4 filesystem created (block size: 4096)."
 }
 

@@ -768,7 +768,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_READ => sys_read(args[0] as i32, args[1], args[2]),
         SYS_BRK => sys_brk(args[0]),
         SYS_GETPID => sys_getpid(),
-        SYS_MMAP => sys_mmap(args[0], args[1], args[2]),
+        SYS_MMAP => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYS_PIPE => sys_pipe(args[0]),
         SYS_DUP2 => sys_dup2(args[0] as i32, args[1] as i32),
         SYS_OPEN => sys_open(args[0], args[1], args[2] as u32),
