@@ -82,6 +82,12 @@ static TASK_SPS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_
 static TASK_KSTACK: [core::sync::atomic::AtomicU64; MAX_TASKS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_TASKS];
 
+/// Pending RSP0 value for clone_first_shim (set by add_clone_process).
+/// This avoids the need to read TrapContext.kernel_sp which may have
+/// incorrect offset due to __switch RSP alignment.
+#[cfg(target_arch = "x86_64")]
+static PENDING_RSP0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Per-task FS_BASE values for TLS. Lock-free, used in Timer ISR for wrmsr restore.
 #[cfg(target_arch = "x86_64")]
 static TASK_FS_BASE: [core::sync::atomic::AtomicU64; MAX_TASKS] =
@@ -488,23 +494,23 @@ pub fn add_user_process(
 unsafe extern "C" fn clone_first_shim() -> ! {
     unsafe {
         core::arch::naked_asm!(
-            // RSP = trap_ctx_base (TrapContext starts here).
-            // CRITICAL: Disable interrupts to prevent Timer ISR from overwriting
-            // the TrapContext on this kernel stack before we return to user mode.
+            // RSP = TrapContext base (set by __switch RESTORE).
+            // We do NOT use trap_return_user because it reads TrapContext.kernel_sp
+            // from [rsp+0x28] which has an offset error due to __switch RSP alignment.
+            // Instead, we handle everything here: set RSP0, FS_BASE, CR3, then iretq.
             "cli",
-            // 0. Update TSS.RSP0 from TrapContext.kernel_sp (offset 0xA0 = 160)
-            // This is essential: __switch returned here (not to schedule()), so
-            // schedule()'s "after __switch" RSP0 update didn't execute.
-            // Without this, the Timer ISR would use the wrong kernel stack.
-            "mov rax, [rsp + 0xa0]",     // rax = TrapContext.kernel_sp
+
+            // 1. Set TSS.RSP0 from PENDING_RSP0 (set by add_clone_process)
+            "mov rax, [rip + {pending_rsp0}]",
             "test rax, rax",
-            "jz 3f",
-            "mov rcx, [rip + {tss_addr}]", // rcx = TSS_RSP0_ADDR (pointer to RSP0)
+            "jz 1f",
+            "mov rcx, [rip + {tss_addr}]",
             "test rcx, rcx",
-            "jz 3f",
-            "mov [rcx], rax",              // write kernel_sp to TSS.RSP0
-            "3:",
-            // 1. Set FS_BASE for TLS — r15 was loaded by __switch RESTORE
+            "jz 1f",
+            "mov [rcx], rax",
+            "1:",
+
+            // 2. Set FS_BASE from r15 (loaded by __switch RESTORE)
             "mov rax, r15",
             "cmp rax, 0",
             "je 2f",
@@ -513,10 +519,40 @@ unsafe extern "C" fn clone_first_shim() -> ! {
             "shr rdx, 32",
             "wrmsr",
             "2:",
-            // Jump to trap_return_user (pop 15 regs + iretq)
-            "jmp {handler}",
-            handler = sym trap_return_user,
+
+            // 3. Pop 15 GP regs from TrapContext
+            "pop rax",
+            "pop rbx",
+            "pop rcx",
+            "pop rdx",
+            "pop rbp",
+            "pop rsi",
+            "pop rdi",
+            "pop r8",
+            "pop r9",
+            "pop r10",
+            "pop r11",
+            "pop r12",
+            "pop r13",
+            "pop r14",
+            "pop r15",
+
+            // 4. Switch CR3 to user page table (skip if 0)
+            // After 15 pops, rsp points to iretq frame:
+            //   +0x00: rip, +0x08: cs, +0x10: rflags, +0x18: rsp, +0x20: ss
+            //   +0x28: kernel_sp, +0x30: user_cr3, +0x38: trap_from_user
+            "cmp qword ptr [rsp + 0x30], 0",
+            "je 3f",
+            "mov rax, [rsp + 0x30]",
+            "mov cr3, rax",
+            "3:",
+
+            // 5. iretq (pops rip, cs, rflags, rsp, ss from stack)
+            "add rsp, 0x28",   // skip kernel_sp, user_cr3, trap_from_user (3 * 8 = 24)
+            "iretq",
+
             tss_addr = sym crate::arch::gdt::TSS_RSP0_ADDR,
+            pending_rsp0 = sym PENDING_RSP0,
         );
     }
 }
@@ -588,7 +624,7 @@ pub fn add_clone_process(
         let sw = switch_sp as *mut usize;
         // orig_rsp: points to r15 slot so pop r15..rbp + ret works correctly
         *sw.add(512 / 8) = switch_sp + 520; // orig_rsp → r15 slot
-        *sw.add(520 / 8) = tls; // r15 = TLS (clone_first_shim reads r15 to set FS_BASE)
+        *sw.add(520 / 8) = tls; // r15 = TLS
         // Return address at offset 568 (pop r15..rbp brings RSP here)
         *sw.add(568 / 8) = clone_first_shim as *const () as usize; // ret addr → clone_first_shim (sets TLS via wrmsr)
 
@@ -605,38 +641,14 @@ pub fn add_clone_process(
         (*ctx).kernel_sp = kernel_stack_top as u64;
         (*ctx).user_cr3 = user_cr3 as u64; // Set for CR3 switch on first entry
         (*ctx).trap_from_user = 1;
-        crate::console_println!(
-            "[clone] r13={:#x} r9={:#x} r12={:#x}",
-            unsafe { (*ctx).r13 },
-            unsafe { (*ctx).r9 },
-            unsafe { (*ctx).r12 }
-        );
-        let tc_page = (trap_ctx_base as usize) & !0xFFF;
-        let user_pt = crate::arch::trap::get_current_user_pt();
-        let tc_phys = crate::mm::vmm::translate_user(user_pt, tc_page);
-        crate::console_println!(
-            "[clone] tc_page={:#x} maps_to={:?} (should be {:#x})",
-            tc_page,
-            tc_phys,
-            tc_page
-        );
-        let verify_ctx = trap_ctx_base as *const crate::arch::trap::TrapContext;
-        crate::console_println!(
-            "[clone] rip={:#x} rsp={:#x} rax={:#x} r9(g)={:#x} r12(fn)={:#x} r13(m)={:#x} rsi(stack)={:#x} cr3={:#x}",
-            unsafe { (*verify_ctx).rip },
-            unsafe { (*verify_ctx).rsp },
-            unsafe { (*verify_ctx).rax },
-            unsafe { (*verify_ctx).r9 },
-            unsafe { (*verify_ctx).r12 },
-            unsafe { (*verify_ctx).r13 },
-            unsafe { (*verify_ctx).rsi },
-            unsafe { (*verify_ctx).user_cr3 }
-        );
     }
 
     TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);
     #[cfg(target_arch = "x86_64")]
-    TASK_KSTACK[tid].store(kernel_stack_top as u64, Ordering::Relaxed);
+    {
+        TASK_KSTACK[tid].store(kernel_stack_top as u64, Ordering::Relaxed);
+        PENDING_RSP0.store(kernel_stack_top as u64, Ordering::Relaxed);
+    }
 
     let tcb = TaskControlBlock::new(tid);
     sched.tasks[tid] = Some(tcb);
