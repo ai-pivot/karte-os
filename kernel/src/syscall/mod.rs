@@ -1808,10 +1808,24 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         let _ = crate::driver::fs::create_file(&name);
     }
     // Verify file exists
-    if crate::driver::fs::read_file_owned(&name).is_none()
-        && (flags & O_CREAT == 0)
-        && (flags & linux_o_creat == 0)
-    {
+    if crate::driver::fs::read_file_owned(&name).is_none() {
+        // Check if virtual path or O_CREAT — use FakeFile
+        let is_virtual = name.starts_with(".xbot")
+            || name.starts_with("/.xbot")
+            || name.starts_with("/proc")
+            || name.starts_with("/sys")
+            || name.starts_with("/etc")
+            || name.starts_with("/dev")
+            || name.starts_with("/run");
+        if is_virtual || (flags & O_CREAT != 0) || (flags & linux_o_creat != 0) {
+            return crate::process::with_fd_table(|fd_table| {
+                match fd_table.alloc_fake_fd(name.clone(), flags) {
+                    Some(fd) => fd as isize,
+                    None => ERR_NOMEM,
+                }
+            });
+        }
+
         #[cfg(target_arch = "x86_64")]
         if oc < 10 {
             crate::klog!(DEBUG, "[open] ENOENT: {name}");
