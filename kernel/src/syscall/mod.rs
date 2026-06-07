@@ -735,6 +735,13 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 
 /// Syscall 1: Exit the current process.
 pub fn sys_exit(code: i32) -> isize {
+    // Disable interrupts to prevent Timer ISR from preempting us mid-exit.
+    // If we get preempted after marking ourselves exited but before killing
+    // clone children, those children will keep running and crash (PF at
+    // address 0x2461 after their page table is invalidated).
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("cli") };
+
     crate::console_println!("[process] User process exited with code {}", code);
 
     // If init (the shell) exits, no process remains → shut down the system.
