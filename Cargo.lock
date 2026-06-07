@@ -21,15 +21,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
-name = "buddy_system_allocator"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1af5a01adeeade54c9f5060300227a8ee64c05b6376f28e9b8ee3b72dd2056f"
-dependencies = [
- "spin 0.10.0",
-]
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,19 +140,28 @@ name = "karte-os-kernel"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
- "buddy_system_allocator",
  "ext4_rs",
+ "linked_list_allocator",
  "log",
  "raw-cpuid 11.6.0",
  "riscv",
  "riscv-rt",
  "sbi",
  "smoltcp",
- "spin 0.12.0",
+ "spin",
  "starry-fatfs",
  "uart_16550",
  "virtio-drivers",
  "x86_64",
+]
+
+[[package]]
+name = "linked_list_allocator"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
+dependencies = [
+ "spinning_top",
 ]
 
 [[package]]
@@ -351,15 +351,18 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
-
-[[package]]
-name = "spin"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1527984ca054dfca79333baec451042863f485fbee01b7bf6d911de915cac865"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
+name = "spinning_top"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b9eb1a2f4c41445a3a0ff9abc5221c5fcd28e1f13cd7c0397706f9ac938ddb0"
 dependencies = [
  "lock_api",
 ]

@@ -1,11 +1,11 @@
 // kernel/src/mm/heap.rs — Kernel Heap Allocator
 
-use buddy_system_allocator::LockedHeap;
+use linked_list_allocator::LockedHeap;
 
 use super::pmm;
 
 #[global_allocator]
-static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
+static HEAP_ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 // 4MB heap — ext4 filesystem metadata requires significant memory.
 const HEAP_PAGES: usize = 4096; // 1024 * 4KB = 4MB heap
@@ -32,7 +32,7 @@ pub fn init() {
         HEAP_SIZE = HEAP_PAGES * pmm::page_size();
         HEAP_ALLOCATOR
             .lock()
-            .init(heap_start, HEAP_PAGES * pmm::page_size());
+            .init(heap_start as *mut u8, HEAP_PAGES * pmm::page_size());
     }
 
     crate::console_println!(
