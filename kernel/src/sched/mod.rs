@@ -494,10 +494,8 @@ pub fn add_user_process(
 unsafe extern "C" fn clone_first_shim() -> ! {
     unsafe {
         core::arch::naked_asm!(
-            // RSP = TrapContext base (set by __switch RESTORE).
-            // We do NOT use trap_return_user because it reads TrapContext.kernel_sp
-            // from [rsp+0x28] which has an offset error due to __switch RSP alignment.
-            // Instead, we handle everything here: set RSP0, FS_BASE, CR3, then iretq.
+            // RSP = TrapContext base (after __switch: pop r15..rbp + ret)
+            // Self-contained: does NOT use trap_return_user.
             "cli",
 
             // 1. Set TSS.RSP0 from PENDING_RSP0 (set by add_clone_process)
@@ -548,7 +546,7 @@ unsafe extern "C" fn clone_first_shim() -> ! {
             "3:",
 
             // 5. iretq (pops rip, cs, rflags, rsp, ss from stack)
-            "add rsp, 0x28",   // skip kernel_sp, user_cr3, trap_from_user (3 * 8 = 24)
+            "add rsp, 0x28",   // skip kernel_sp, user_cr3, trap_from_user
             "iretq",
 
             tss_addr = sym crate::arch::gdt::TSS_RSP0_ADDR,

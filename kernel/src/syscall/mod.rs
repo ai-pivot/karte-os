@@ -3041,13 +3041,9 @@ fn linux_clone(
     let parent_ctx = unsafe { &*(parent_ctx_ptr as *const crate::arch::trap::TrapContext) };
 
     #[cfg(target_arch = "x86_64")]
-    crate::console_println!(
-        "[clone] parent_ctx: rip={:#x} rsp={:#x} rax={:#x} cr3_ptr={:#x}",
-        parent_ctx.rip,
-        parent_ctx.rsp,
-        parent_ctx.rax,
-        parent_ctx_ptr
-    );
+    {
+        let _ = &parent_ctx;
+    }
 
     #[cfg(not(target_arch = "x86_64"))]
     {
