@@ -891,11 +891,9 @@ pub fn kill_clone_children(parent_pid: usize) {
         for (i, proc_opt) in table.iter().enumerate() {
             if let Some(p) = proc_opt {
                 if p.ppid == parent_pid {
-                    crate::console_println!("[kill] idx={} pid={} ppid={} state={:?} — {}", i, p.pid, p.ppid, p.state,
-                        if p.state == ProcessState::Running { "KILL" } else { "skip" });
-                    if p.state == ProcessState::Running {
-                        indices_to_kill.push(i);
-                    }
+                    crate::console_println!("[kill] idx={} pid={} ppid={} state={:?}", i, p.pid, p.ppid, p.state);
+                    // Kill regardless of state (Running, Ready, Blocked)
+                    indices_to_kill.push(i);
                 }
             }
         }
