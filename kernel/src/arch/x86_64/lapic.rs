@@ -205,3 +205,22 @@ pub fn send_startup_ipi(target_apic_id: u32, vector: u8) {
         lapic_write(0x300, 0x00004600 | vector as u32);
     }
 }
+
+/// Broadcast a reschedule IPI to all other cores.
+/// Sends a fixed interrupt (vector 0x20 = timer vector) to all cores
+/// except self, triggering an immediate schedule() on each core.
+/// This ensures clone child threads marked Exited are immediately
+/// descheduled on all cores.
+pub fn broadcast_reschedule() {
+    let my_id = lapic_id();
+    // Send to all-but-self using shorthand (destination field = 0)
+    // ICR: Delivery Mode=Fixed (000), Destination Mode=Physical (0),
+    // Delivery Status=Idle, Level=Assert, Trigger=Edge,
+    // Shorthand=All Except Self (011), Vector=0x20 (Timer)
+    unsafe {
+        lapic_write(0x310, 0); // destination = 0 (ignored for shorthand)
+        lapic_write(0x300, 0x000C4020); // shorthand=all except self, vector=0x20
+    }
+    // Read ICR low to wait for delivery
+    unsafe { let _ = lapic_read(0x300); }
+}

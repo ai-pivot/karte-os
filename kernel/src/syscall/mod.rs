@@ -735,13 +735,27 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 
 /// Syscall 1: Exit the current process.
 pub fn sys_exit(code: i32) -> isize {
-    // Disable interrupts to prevent Timer ISR from preempting us mid-exit.
-    // If we get preempted after marking ourselves exited but before killing
-    // clone children, those children will keep running and crash (PF at
-    // address 0x2461 after their page table is invalidated).
-    #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("cli") };
+    // ═══════════════════════════════════════════════════════════════
+    // CRITICAL: Kill all clone children FIRST, before any I/O or
+    // operations that could be preempted by Timer ISR.
+    //
+    // On SMP, other cores may be running clone child threads right now.
+    // On single core, Timer ISR can preempt us between any two instructions.
+    // We must mark children Exited atomically so schedule() on ANY core
+    // will never resume them after this point.
+    // ═══════════════════════════════════════════════════════════════
 
+    // 1. Atomically kill all clone child threads (marks both process
+    //    table AND scheduler task as Exited). After this, no core's
+    //    schedule() will ever pick up these threads again.
+    let my_pid = crate::process::current_pid();
+    crate::process::kill_clone_children(my_pid);
+
+    // 2. Mark ourselves as Exited in the scheduler
+    crate::sched::mark_current_exited();
+    crate::process::set_exit_code(code as usize);
+
+    // 3. Now safe to do I/O — children are dead, won't interfere
     crate::console_println!("[process] User process exited with code {}", code);
 
     // If init (the shell) exits, no process remains → shut down the system.
@@ -759,12 +773,9 @@ pub fn sys_exit(code: i32) -> isize {
             unsafe {
                 core::ptr::write_volatile(tid_ptr as *mut i32, 0);
             }
-            // Wake any threads waiting on this futex (FUTEX_WAKE, val=1)
             linux_futex(tid_ptr, 1, 1);
         }
     }
-
-    crate::process::set_exit_code(code as usize);
 
     // Wake parent if waiting
     let my_idx = crate::process::current_index();
@@ -773,16 +784,8 @@ pub fn sys_exit(code: i32) -> isize {
         crate::sched::wake_task(parent_idx);
     }
 
-    // Kill all clone child threads (same thread group).
-    // Go uses CLONE_THREAD; when the thread group leader exits,
-    // all threads must be terminated.
-    let my_pid = crate::process::current_pid();
-    crate::process::kill_clone_children(my_pid);
-
-    // Mark this child task as exited in the scheduler
-    crate::sched::mark_current_exited();
-
-    // Try to switch to another ready child task (or back to init).
+    // 4. Switch to another ready child task (or back to init).
+    //    No Exited clone children can be scheduled.
     crate::sched::schedule_exit();
 
     0

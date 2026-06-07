@@ -920,4 +920,8 @@ pub fn kill_clone_children(parent_pid: usize) {
         // may have been freed when the thread group leader exited.
         crate::sched::mark_task_exited_by_proc(idx);
     }
+    // On SMP, other cores may still be running clone child threads.
+    // Send IPI to force immediate reschedule on all other cores.
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::lapic::broadcast_reschedule();
 }
