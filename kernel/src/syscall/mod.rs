@@ -280,14 +280,25 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
 fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
     match nr {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
-        1 => sys_write(args[0] as i32, args[1], args[2]), // write
-        2 => linux_open(args[0], args[1], args[2]),      // open (deprecated, use openat)
-        3 => sys_close(args[0] as i32),                  // close
-        4 => linux_stat(args[0], args[1]),               // stat
-        5 => linux_fstat(args[0], args[1]),              // fstat
-        6 => linux_lstat(args[0], args[1]),              // lstat
-        7 => linux_poll(args[0], args[1], args[2]),      // poll
-        8 => linux_lseek(args[0], args[1], args[2]),     // lseek
+        1 => {
+            let result = sys_write(args[0] as i32, args[1], args[2]);
+            if args[0] >= 3 {
+                static WR_DBG: core::sync::atomic::AtomicUsize =
+                    core::sync::atomic::AtomicUsize::new(0);
+                let n = WR_DBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 20 {
+                    crate::console_println!("[wr] fd={} ret={}", args[0], result);
+                }
+            }
+            result
+        }
+        2 => linux_open(args[0], args[1], args[2]), // open (deprecated, use openat)
+        3 => sys_close(args[0] as i32),             // close
+        4 => linux_stat(args[0], args[1]),          // stat
+        5 => linux_fstat(args[0], args[1]),         // fstat
+        6 => linux_lstat(args[0], args[1]),         // lstat
+        7 => linux_poll(args[0], args[1], args[2]), // poll
+        8 => linux_lseek(args[0], args[1], args[2]), // lseek
         9 => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         10 => linux_mprotect(args[0], args[1], args[2]),
         11 => linux_munmap(args[0], args[1]), // munmap
@@ -969,7 +980,12 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             // Fall through to file write below
         }
         _ => {
-            return ERR_INVAL;
+            // Unknown fd — still try to write to console instead of failing
+            for i in 0..len {
+                let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+                crate::arch::platform::console_putchar(byte);
+            }
+            return len as isize;
         }
     }
 
