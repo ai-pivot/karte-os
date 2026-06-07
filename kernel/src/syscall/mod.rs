@@ -273,13 +273,7 @@ pub fn dispatch_syscall_linux(
 /// This is ONLY called from the SYSCALL instruction path (MSR LSTAR).
 #[cfg(target_arch = "x86_64")]
 fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
-    static TRACE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let count = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let result = dispatch_linux_syscall(nr, args);
-    if count < 2000 {
-        crate::console_print!("[T{}]nr={}={}\n", count, nr, result);
-    }
-    result
+    dispatch_linux_syscall(nr, args)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2414,9 +2408,7 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
         return ERR_INVAL;
     }
 
-    crate::console_println!("[exec] name='{}'", name);
-
-    // Read argv from user space
+    // Try streaming ELF loader from ext4 first
     let argv = if argv_ptr != 0 {
         read_user_argv(argv_ptr)
     } else {
@@ -2462,7 +2454,6 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
 
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
     let mut proc = if crate::driver::ext4::has_ext4() {
-        crate::console_println!("[exec] trying ext4 streaming for '{}'...", name);
         let read_opt = crate::driver::ext4::read_file_range(&name);
         crate::console_println!(
             "[exec] read_file_range returned {}",
@@ -2470,12 +2461,8 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
         );
         match read_opt {
             Some(read_fn) => {
-                crate::console_println!("[exec] got read_fn, loading ELF...");
                 match crate::process::Process::from_elf_streaming(read_fn, argv, envp, 0) {
-                    Ok(p) => {
-                        crate::console_println!("[exec] ELF loaded OK entry={:#x}", p.entry);
-                        p
-                    }
+                    Ok(p) => p,
                     Err(e) => {
                         crate::klog!(DEBUG, "[exec] Streaming ELF load failed: {}", e);
                         return ERR_NOMEM;

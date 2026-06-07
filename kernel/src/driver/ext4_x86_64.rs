@@ -396,6 +396,7 @@ pub fn create_directory(name: &str) -> Result<(), &'static str> {
         fs.lookup(ROOT_INODE as u64, parent_path)
             .map_err(|_| "ext4: parent directory not found")?
     };
+
     match fs.create_dir(parent_inode, dir_name) {
         Ok(_) => Ok(()),
         Err(_) => Err("ext4 create_dir failed"),
