@@ -766,6 +766,12 @@ pub fn sys_exit(code: i32) -> isize {
         crate::sched::wake_task(parent_idx);
     }
 
+    // Kill all clone child threads (same thread group).
+    // Go uses CLONE_THREAD; when the thread group leader exits,
+    // all threads must be terminated.
+    let my_pid = crate::process::current_pid();
+    crate::process::kill_clone_children(my_pid);
+
     // Mark this child task as exited in the scheduler
     crate::sched::mark_current_exited();
 
@@ -3282,7 +3288,7 @@ fn futex_wake(uaddr: usize, max_count: u32) -> isize {
 ///
 /// Real implementation with wait queues for FUTEX_WAIT/WAKE.
 /// Go runtime uses futex for goroutine synchronization.
-fn linux_futex(addr: usize, op: usize, val: usize) -> isize {
+pub fn linux_futex(addr: usize, op: usize, val: usize) -> isize {
     const FUTEX_WAIT: usize = 0;
     const FUTEX_WAKE: usize = 1;
     const FUTEX_WAIT_BITSET: usize = 9;

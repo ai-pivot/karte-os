@@ -643,6 +643,14 @@ pub fn set_exit_code(code: usize) {
     }
 }
 
+/// Set exit code for a process by its table index (used by kill_clone_children).
+pub fn set_exit_code_by_index(idx: usize, code: usize) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table[idx].as_mut() {
+        p.exit_code = code;
+    }
+}
+
 /// Set child_tid_ptr for the current process.
 pub fn set_child_tid_ptr(tidptr: usize) {
     let mut table = PROCESS_TABLE.lock();
@@ -871,4 +879,45 @@ pub fn set_state(idx: usize, state: ProcessState) {
 pub fn get_process_by_index(idx: usize) -> Option<Process> {
     let table = PROCESS_TABLE.lock();
     table[idx].clone()
+}
+
+/// Kill all clone child threads of the given PID.
+/// Used when a thread group leader exits (exit_group) to terminate
+/// all CLONE_THREAD children that share the same address space.
+pub fn kill_clone_children(parent_pid: usize) {
+    let mut indices_to_kill: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    {
+        let table = PROCESS_TABLE.lock();
+        for (i, proc_opt) in table.iter().enumerate() {
+            if let Some(p) = proc_opt {
+                // Find clone children: same ppid and still active
+                if p.ppid == parent_pid && p.state == ProcessState::Running {
+                    indices_to_kill.push(i);
+                }
+            }
+        }
+    }
+    for idx in indices_to_kill {
+        // CLONE_CHILD_CLEARTID: notify futex waiters
+        {
+            let table = PROCESS_TABLE.lock();
+            if let Some(p) = table[idx].as_ref() {
+                if p.child_tid_ptr != 0 {
+                    let tid_ptr = p.child_tid_ptr;
+                    drop(table);
+                    unsafe {
+                        core::ptr::write_volatile(tid_ptr as *mut i32, 0);
+                    }
+                    // Wake futex waiters
+                    crate::syscall::linux_futex(tid_ptr, 1, 1);
+                }
+            }
+        }
+        crate::process::set_state(idx, ProcessState::Exited);
+        crate::process::set_exit_code_by_index(idx, 0);
+        // Mark the scheduler task as Exited so it won't be scheduled again.
+        // This prevents the timer ISR from resuming a thread whose pages
+        // may have been freed when the thread group leader exited.
+        crate::sched::mark_task_exited_by_proc(idx);
+    }
 }

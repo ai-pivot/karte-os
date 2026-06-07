@@ -404,6 +404,19 @@ pub fn mark_current_exited() {
     }
 }
 
+/// Mark a scheduler task as Exited by its process table index.
+/// Used by kill_clone_children to terminate clone child threads.
+pub fn mark_task_exited_by_proc(proc_idx: usize) {
+    let slot = PROC_TO_SLOT[proc_idx].load(Ordering::Relaxed);
+    if slot >= MAX_TASKS {
+        return;
+    }
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut t) = sched.tasks[slot] {
+        t.state = TaskState::Exited;
+    }
+}
+
 pub fn schedule_block() {
     let (switch_to_init, current, next, next_proc_idx) = {
         let mut sched = SCHEDULER.lock();
