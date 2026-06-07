@@ -736,14 +736,14 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 /// Syscall 1: Exit the current process.
 pub fn sys_exit(code: i32) -> isize {
     // ═══════════════════════════════════════════════════════════════
-    // CRITICAL: Kill all clone children FIRST, before any I/O or
-    // operations that could be preempted by Timer ISR.
-    //
-    // On SMP, other cores may be running clone child threads right now.
-    // On single core, Timer ISR can preempt us between any two instructions.
-    // We must mark children Exited atomically so schedule() on ANY core
-    // will never resume them after this point.
+    // CRITICAL: cli FIRST. SYSCALL does NOT clear IF, so Timer ISR
+    // can preempt us at any point. We must prevent preemption while
+    // marking clone children Exited, otherwise Timer ISR's schedule()
+    // will resume them. For SMP, broadcast_reschedule() IPI forces
+    // other cores to re-evaluate.
     // ═══════════════════════════════════════════════════════════════
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("cli") };
 
     // 1. Atomically kill all clone child threads (marks both process
     //    table AND scheduler task as Exited). After this, no core's

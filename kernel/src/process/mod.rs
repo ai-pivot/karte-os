@@ -890,13 +890,17 @@ pub fn kill_clone_children(parent_pid: usize) {
         let table = PROCESS_TABLE.lock();
         for (i, proc_opt) in table.iter().enumerate() {
             if let Some(p) = proc_opt {
-                // Find clone children: same ppid and still active
-                if p.ppid == parent_pid && p.state == ProcessState::Running {
-                    indices_to_kill.push(i);
+                if p.ppid == parent_pid {
+                    crate::console_println!("[kill] idx={} pid={} ppid={} state={:?} — {}", i, p.pid, p.ppid, p.state,
+                        if p.state == ProcessState::Running { "KILL" } else { "skip" });
+                    if p.state == ProcessState::Running {
+                        indices_to_kill.push(i);
+                    }
                 }
             }
         }
     }
+    crate::console_println!("[kill] found {} children to kill", indices_to_kill.len());
     for idx in indices_to_kill {
         // CLONE_CHILD_CLEARTID: notify futex waiters
         {
