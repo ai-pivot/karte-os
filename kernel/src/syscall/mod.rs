@@ -1236,32 +1236,18 @@ fn linux_mmap(
     let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
     let mut vaddr = target_addr;
     while vaddr < end {
-        // Always unmap any existing identity mapping first, then
-        // create a fresh user mapping. This avoids the mprotect_user
-        // path which has issues with non-leaf USER bit propagation.
         if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
             crate::mm::vmm::unmap_user(user_pt, vaddr);
         }
-
         let frame = match crate::mm::pmm::alloc_frame() {
             Some(f) => f,
-            None => return -12, // ENOMEM
+            None => return -12,
         };
         if is_anonymous {
-            unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-            }
+            unsafe { core::ptr::write_bytes(frame as *mut u8, 0, page_size); }
         }
         crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
         vaddr += page_size;
-    }
-
-    // Flush TLB
-    flush_tlb_all();
-
-    // Advance brk tracking (for addr=0 kernel-chosen allocations)
-    if addr == 0 && end > crate::process::current_brk() {
-        crate::process::set_current_brk(end);
     }
 
     // Verify the mapping actually works
