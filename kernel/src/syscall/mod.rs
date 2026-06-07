@@ -2874,6 +2874,7 @@ fn sys_fork() -> isize {
         shared_page_table: false,
         clone_tls: 0,
         child_tid_ptr: 0,
+        fs_base: 0,
     };
 
     // Register child
@@ -3130,6 +3131,7 @@ fn linux_clone(
             } else {
                 0
             },
+            fs_base: 0,
         };
 
         let child_idx = match crate::process::add_process(child) {
@@ -3153,6 +3155,12 @@ fn linux_clone(
             Some(tid) => tid,
             None => return ERR_NOMEM,
         };
+
+        // Save FS_BASE for the child process (lock-free, for context switch restore)
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::sched::set_task_fs_base(child_idx, tls as u64);
+        }
 
         // CLONE_PARENT_SETTID: write child PID to parent's memory
         if (flags & 0x100000) != 0 && parent_tid_ptr != 0 {
@@ -3299,13 +3307,10 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
         ARCH_SET_FS => {
             // Go runtime uses %fs:-8 to store the g pointer (getg()).
             // Go writes the actual g pointer to [addr-8] BEFORE calling arch_prctl.
-            let tls_slot = unsafe { core::ptr::read_volatile((addr as *const u64).sub(1)) };
-            crate::console_println!(
-                "[arch_prctl] SET_FS addr={:#x} g@[-8]={:#x}",
-                addr,
-                tls_slot
-            );
             unsafe { crate::arch::idt::wrmsr(MSR_FS_BASE, addr as u64) };
+            // Save to per-task array for context switch restore (lock-free)
+            let proc_idx = crate::process::current_index();
+            crate::sched::set_task_fs_base(proc_idx, addr as u64);
             0
         }
         ARCH_GET_FS => {

@@ -225,7 +225,21 @@ pub fn init_for_cpu(cpu_id: usize) {
 /// Physical address of PER_CPU_TSS[0].privilege_stack_table[0].
 /// Used by trap_return_user asm to directly update TSS.RSP0 without calling Rust.
 #[cfg(target_arch = "x86_64")]
+/// Atomic version of TSS_RSP0_ADDR for lock-free RSP0 updates from schedule().
+pub static TSS_RSP0_ADDR_ATOMIC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub static mut TSS_RSP0_ADDR: u64 = 0;
+
+/// Set TSS.RSP0 for a specific CPU without calling current_hart().
+/// Used in schedule() where calling current_hart() in ISR context may be unsafe.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn set_kernel_rsp0_for_cpu(cpu_id: usize, kernel_stack_top: u64) {
+    unsafe {
+        let tss = &mut PER_CPU_TSS[cpu_id.min(MAX_CPUS - 1)];
+        tss.privilege_stack_table[0] = x86_64::VirtAddr::new_truncate(kernel_stack_top);
+    }
+}
 
 pub unsafe fn set_kernel_rsp0(kernel_stack_top: u64) {
     let cpu_id = crate::arch::smp::current_hart().min(MAX_CPUS - 1);
@@ -234,5 +248,6 @@ pub unsafe fn set_kernel_rsp0(kernel_stack_top: u64) {
         // Store address for trap_return_user asm (direct TSS write)
         let rsp0_ptr = core::ptr::addr_of_mut!(PER_CPU_TSS[0].privilege_stack_table[0]);
         TSS_RSP0_ADDR = rsp0_ptr as u64;
+        TSS_RSP0_ADDR_ATOMIC.store(rsp0_ptr as u64, core::sync::atomic::Ordering::Relaxed);
     }
 }

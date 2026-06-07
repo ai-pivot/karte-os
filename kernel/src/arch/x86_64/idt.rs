@@ -241,12 +241,20 @@ core::arch::global_asm!(
     "78:",
     // Restore return value
     "pop rax",
-    "add rsp, 8",   // skip user_cr3 slot
-    "pop rbx",      // user RSP
-    "pop rcx",      // user RIP
-    "pop r11",      // user RFLAGS
-    "add rsp, 7*8", // skip rax, rdi, rsi, rdx, r10, r8, r9 (7 pushes)
-    "pop rbp",      // callee-saved
+    "add rsp, 8", // skip user_cr3 slot
+    "pop rbx",    // user RSP
+    "pop rcx",    // user RIP
+    "pop r11",    // user RFLAGS
+    // Restore caller-saved arg registers (Go relies on r9=g surviving SYSCALL)
+    // Push order was: r9, r8, r10, rdx, rsi, rdi, rax → pop in reverse
+    "add rsp, 8", // skip rax (return value)
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop r10",
+    "pop r8",
+    "pop r9",
+    "pop rbp", // callee-saved
     "pop r12",
     "pop r13",
     "pop r14",
@@ -374,11 +382,6 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
         // Init runs with the kernel page table (identity-mapped).
         let kernel_pt = crate::mm::vmm::get_kernel_page_table();
         super::trap::activate_page_table(kernel_pt as *const _ as usize);
-    }
-
-    let ksp = crate::sched::current_kernel_sp();
-    if ksp != 0 {
-        set_syscall_ksp(ksp as u64);
     }
 }
 
@@ -902,9 +905,13 @@ fn set_naked_handler(
     ist_index: u16,
 ) {
     // Hardware IST: 0 = no IST, 1-7 = table[0-6].
-    // Software IST (0-based, same as x86_64 crate's set_stack_index): 0-6.
-    // Convert: hardware = software + 1.
-    let hw_ist = (ist_index + 1) & 0x7;
+    // Hardware IST: 0 = no IST (use RSP0), 1-7 = IST table[0-6].
+    // ist_index=0 means "no IST" — must map to hw_ist=0, NOT 1.
+    let hw_ist = if ist_index == 0 {
+        0u64
+    } else {
+        (ist_index as u64 + 1) & 0x7
+    };
     let attr_with_ist = (attr & !(0x7)) | hw_ist as u64;
 
     let selector: u64 = 0x0008;
@@ -931,8 +938,12 @@ unsafe fn set_naked_handler_raw(
     attr: u64,
     ist_index: u16,
 ) {
-    let hw_ist = (ist_index + 1) & 0x7;
-    let attr_with_ist = (attr & !(0x7)) | hw_ist as u64;
+    let hw_ist = if ist_index == 0 {
+        0u64
+    } else {
+        (ist_index as u64 + 1) & 0x7
+    };
+    let attr_with_ist = (attr & !(0x7)) | hw_ist;
 
     let selector: u64 = 0x0008;
     let lo = ((addr as u64 & 0xFFFF) << 0)
@@ -953,8 +964,13 @@ fn patch_ist_index(
     entry: &mut x86_64::structures::idt::Entry<x86_64::structures::idt::HandlerFunc>,
     ist_index: u16,
 ) {
-    // Convert software index (0-based) to hardware IST value (1-based).
-    let hw_ist = ((ist_index + 1) & 0x7) as u64;
+    // Hardware IST: 0 = no IST, 1-7 = IST table[0-6].
+    // ist_index=0 means "no IST" — must map to hw_ist=0, NOT 1.
+    let hw_ist = if ist_index == 0 {
+        0u64
+    } else {
+        ((ist_index as u64 + 1) & 0x7)
+    };
     unsafe {
         let ptr = entry as *mut _ as *mut u64;
         let mut lo = *ptr;

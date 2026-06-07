@@ -54,6 +54,8 @@ pub struct Process {
     pub page_table_root: usize,
     /// Kernel stack top (used for trap handling when in U-mode)
     pub kernel_stack_top: usize,
+    /// FS_BASE MSR value for TLS (set by clone ARCH_SETTLS)
+    pub fs_base: u64,
     /// User stack top
     pub user_stack_top: usize,
     /// Program break (top of heap)
@@ -260,6 +262,7 @@ impl Process {
             shared_page_table: false,
             clone_tls: 0,
             child_tid_ptr: 0,
+            fs_base: 0,
         })
     }
 
@@ -507,6 +510,7 @@ impl Process {
             shared_page_table: false,
             clone_tls: 0,
             child_tid_ptr: 0,
+            fs_base: 0,
         })
     }
 }
@@ -806,6 +810,22 @@ pub fn current_index() -> usize {
 pub fn get_kernel_sp(proc_idx: usize) -> Option<usize> {
     let table = PROCESS_TABLE.lock();
     table[proc_idx].as_ref().map(|p| p.kernel_stack_top)
+}
+
+/// Set FS_BASE MSR value for a process (used for TLS restore on context switch).
+#[cfg(target_arch = "x86_64")]
+pub fn set_fs_base(proc_idx: usize, val: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(ref mut p) = table[proc_idx] {
+        p.fs_base = val;
+    }
+}
+
+/// Get FS_BASE MSR value for a process.
+#[cfg(target_arch = "x86_64")]
+pub fn get_fs_base(proc_idx: usize) -> u64 {
+    let table = PROCESS_TABLE.lock();
+    table[proc_idx].as_ref().map(|p| p.fs_base).unwrap_or(0)
 }
 
 /// Set wait_child_idx for a process (marks it as waiting for a specific child).
