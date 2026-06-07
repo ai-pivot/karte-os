@@ -312,7 +312,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         // ─── File I/O (continued) ─────────────────────────────────
         16 => sys_ioctl(args[0] as i32, args[1], args[2]), // ioctl
         17 => linux_pread64(args[0] as i32, args[1], args[2], args[3]), // pread64
-        18 => 0,                                           // pwrite64 (stub)
+        18 => sys_write(args[0] as i32, args[1], args[2]), // pwrite64
         19 => linux_readv(args[0], args[1], args[2]),      // readv
         20 => 0,                                           // writev (stub)
         21 => 0,                                           // access (stub)
