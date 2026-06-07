@@ -1236,33 +1236,23 @@ fn linux_mmap(
     let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
     let mut vaddr = target_addr;
     while vaddr < end {
-        let needs_map = if flags & MAP_FIXED != 0 {
-            // MAP_FIXED: unmap existing pages first, then remap
-            if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
-                crate::mm::vmm::unmap_user(user_pt, vaddr);
-            }
-            true
-        } else {
-            crate::mm::vmm::translate_user(user_pt, vaddr).is_none()
-        };
-
-        if needs_map {
-            let frame = match crate::mm::pmm::alloc_frame() {
-                Some(f) => f,
-                None => return -12, // ENOMEM
-            };
-            if is_anonymous {
-                unsafe {
-                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                }
-            }
-            crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
-            crate::klog!(TRACE, "[mmap] mapped vaddr={:#x} paddr={:#x} pt_root={}", vaddr, frame, crate::process::current_page_table_root());
-            // This case is handled by needs_map above
-        } else {
-            // Page already exists, update its flags to match prot
-            crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
+        // Always unmap any existing identity mapping first, then
+        // create a fresh user mapping. This avoids the mprotect_user
+        // path which has issues with non-leaf USER bit propagation.
+        if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+            crate::mm::vmm::unmap_user(user_pt, vaddr);
         }
+
+        let frame = match crate::mm::pmm::alloc_frame() {
+            Some(f) => f,
+            None => return -12, // ENOMEM
+        };
+        if is_anonymous {
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            }
+        }
+        crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
         vaddr += page_size;
     }
 
