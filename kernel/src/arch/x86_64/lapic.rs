@@ -222,5 +222,7 @@ pub fn broadcast_reschedule() {
         lapic_write(0x300, 0x000C4020); // shorthand=all except self, vector=0x20
     }
     // Read ICR low to wait for delivery
-    unsafe { let _ = lapic_read(0x300); }
+    unsafe {
+        let _ = lapic_read(0x300);
+    }
 }

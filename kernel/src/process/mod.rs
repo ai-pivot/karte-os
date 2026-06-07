@@ -888,17 +888,24 @@ pub fn kill_clone_children(parent_pid: usize) {
     let mut indices_to_kill: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
     {
         let table = PROCESS_TABLE.lock();
-        for (i, proc_opt) in table.iter().enumerate() {
-            if let Some(p) = proc_opt {
-                if p.ppid == parent_pid {
-                    crate::console_println!("[kill] idx={} pid={} ppid={} state={:?}", i, p.pid, p.ppid, p.state);
-                    // Kill regardless of state (Running, Ready, Blocked)
-                    indices_to_kill.push(i);
+        // Collect ALL descendants of parent_pid (children, grandchildren, etc.)
+        // Go's CLONE_THREAD creates threads where child's ppid = caller's pid,
+        // so thread groups can be multi-level: PID=2 → PID=4 → PID=5,6,7
+        let mut frontier: alloc::vec::Vec<usize> = alloc::vec![parent_pid];
+        while let Some(ppid) = frontier.pop() {
+            for (i, proc_opt) in table.iter().enumerate() {
+                if indices_to_kill.contains(&i) {
+                    continue;
+                }
+                if let Some(p) = proc_opt {
+                    if p.ppid == ppid && p.pid != parent_pid {
+                        indices_to_kill.push(i);
+                        frontier.push(p.pid);
+                    }
                 }
             }
         }
     }
-    crate::console_println!("[kill] found {} children to kill", indices_to_kill.len());
     for idx in indices_to_kill {
         // CLONE_CHILD_CLEARTID: notify futex waiters
         {

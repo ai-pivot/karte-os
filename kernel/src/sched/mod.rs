@@ -336,7 +336,7 @@ pub fn schedule_exit() {
         let nxt_sp = TASK_SPS[next].load(Ordering::Relaxed);
         let initial_sp = INITIAL_TASK_SP[next].load(Ordering::Relaxed);
         if initial_sp != 0 && nxt_sp == initial_sp {
-            crate::console_println!("[EXIT] Task {} never saved, switching to init", next);
+            crate::klog!(DEBUG, "[EXIT] Task {} never saved, switching to init", next);
             // Mark the unsaved task as exited too
             {
                 let mut sched = SCHEDULER.lock();
@@ -469,7 +469,10 @@ pub fn schedule_block() {
         // Switch from blocked child to init
         let init_sp_ptr = INIT_TASK_SP.as_ptr() as *mut usize;
         unsafe {
-            __switch(&TASK_SPS[current] as *const AtomicUsize as *mut usize, init_sp_ptr);
+            __switch(
+                &TASK_SPS[current] as *const AtomicUsize as *mut usize,
+                init_sp_ptr,
+            );
         }
     } else {
         CURRENT_RUNNING.store(next, Ordering::Relaxed);

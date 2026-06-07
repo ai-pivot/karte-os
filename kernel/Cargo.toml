@@ -6,6 +6,8 @@ edition = "2024"
 [features]
 default = []
 test_mode = []
+klog_trace = []
+klog_debug = []
 
 [dependencies]
 buddy_system_allocator = "0.13"

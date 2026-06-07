@@ -172,7 +172,8 @@ pub fn dispatch_syscall_linux(
         && nr_usize != 28
         && nr_usize != 157
     {
-        crate::console_println!(
+        crate::klog!(
+            TRACE,
             "[P{}T#{}] sys{}({:#x},{:#x}) → {}",
             cur_pid,
             _tc,
@@ -635,7 +636,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
     let tc = TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(target_arch = "x86_64")]
     if tc < 50 {
-        crate::console_println!("[T#{tc}] sys{id} via80");
+        crate::klog!(TRACE, "[T#{tc}] sys{id} via80");
     }
 
     // Try Linux compat layer first.
@@ -650,7 +651,7 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
 
     #[cfg(target_arch = "x86_64")]
     if tc < 50 {
-        crate::console_println!("[T#{tc}] → {result}");
+        crate::klog!(TRACE, "[T#{tc}] → {result}");
     }
     result
 }
@@ -716,7 +717,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         }
 
         _ => {
-            crate::console_println!("[syscall] Unknown syscall: {}", id);
+            crate::klog!(WARN, "[syscall] Unknown syscall: {}", id);
             ERR_INVAL
         }
     }
@@ -743,7 +744,9 @@ pub fn sys_exit(code: i32) -> isize {
     // other cores to re-evaluate.
     // ═══════════════════════════════════════════════════════════════
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("cli") };
+    unsafe {
+        core::arch::asm!("cli")
+    };
 
     // 1. Atomically kill all clone child threads (marks both process
     //    table AND scheduler task as Exited). After this, no core's
@@ -756,11 +759,11 @@ pub fn sys_exit(code: i32) -> isize {
     crate::process::set_exit_code(code as usize);
 
     // 3. Now safe to do I/O — children are dead, won't interfere
-    crate::console_println!("[process] User process exited with code {}", code);
+    crate::klog!(INFO, "[process] User process exited with code {}", code);
 
     // If init (the shell) exits, no process remains → shut down the system.
     if crate::sched::is_init_running() {
-        crate::console_println!("[init] Shell exited, shutting down...");
+        crate::klog!(INFO, "[init] Shell exited, shutting down...");
         crate::arch::platform::shutdown();
     }
 
@@ -1197,7 +1200,7 @@ fn linux_mmap(
     }
 
     if crate::process::current_pid() >= 2 {
-        crate::console_println!(
+        crate::klog!(DEBUG,
             "[mmap] → {:#x} len={:#x} prot={}({}) flags={:#x}",
             target_addr,
             len,
@@ -1488,7 +1491,7 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     if crate::driver::fs::read_file_owned(&name).is_none() && (flags & O_CREAT == 0) {
         #[cfg(target_arch = "x86_64")]
         if oc < 10 {
-            crate::console_println!("[open] ENOENT: {name}");
+            crate::klog!(DEBUG, "[open] ENOENT: {name}");
         }
         return ERR_NOENT;
     }
@@ -1501,7 +1504,7 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         });
     #[cfg(target_arch = "x86_64")]
     if oc < 10 {
-        crate::console_println!("[open] {name} → fd={result}");
+        crate::klog!(DEBUG, "[open] {name} → fd={result}");
     }
     result
 }
@@ -1835,12 +1838,16 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
         Some(data) => match crate::process::Process::from_elf(&data) {
             Ok(p) => p,
             Err(e) => {
-                crate::console_println!("[spawn] Failed to create process: {}", e);
+                crate::klog!(DEBUG, "[spawn] Failed to create process: {}", e);
                 return ERR_NOMEM;
             }
         },
         None => {
-            crate::console_println!("[spawn] Program '{}' not found in filesystem", file_name);
+            crate::klog!(
+                DEBUG,
+                "[spawn] Program '{}' not found in filesystem",
+                file_name
+            );
             return ERR_NOENT;
         }
     };
@@ -1868,7 +1875,7 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
     let proc_idx = match crate::process::add_process(proc) {
         Some(idx) => idx,
         None => {
-            crate::console_println!("[spawn] Process table full");
+            crate::klog!(DEBUG, "[spawn] Process table full");
             return ERR_NOMEM;
         }
     };
@@ -1886,11 +1893,11 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
         proc_idx,
     ) {
         Some(_tid) => {
-            crate::console_println!("[spawn] Spawned process pid={}", child_pid);
+            crate::klog!(DEBUG, "[spawn] Spawned process pid={}", child_pid);
             child_pid as isize
         }
         None => {
-            crate::console_println!("[spawn] Scheduler full");
+            crate::klog!(DEBUG, "[spawn] Scheduler full");
             ERR_NOMEM
         }
     }
@@ -2161,7 +2168,7 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    crate::console_println!("[exec] Loading '{}'...", name);
+    crate::klog!(DEBUG, "[exec] Loading '{}'...", name);
 
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
     let proc = if crate::driver::ext4::has_ext4() {
@@ -2169,7 +2176,7 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
             Some(read_fn) => match crate::process::Process::from_elf_streaming(read_fn) {
                 Ok(p) => p,
                 Err(e) => {
-                    crate::console_println!("[exec] Streaming ELF load failed: {}", e);
+                    crate::klog!(DEBUG, "[exec] Streaming ELF load failed: {}", e);
                     return ERR_NOMEM;
                 }
             },
@@ -2179,12 +2186,12 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
                     Some(data) => match crate::process::Process::from_elf(&data) {
                         Ok(p) => p,
                         Err(e) => {
-                            crate::console_println!("[exec] Failed to create process: {}", e);
+                            crate::klog!(DEBUG, "[exec] Failed to create process: {}", e);
                             return ERR_NOMEM;
                         }
                     },
                     None => {
-                        crate::console_println!("[exec] Program '{}' not found", name);
+                        crate::klog!(DEBUG, "[exec] Program '{}' not found", name);
                         return ERR_NOENT;
                     }
                 }
@@ -2196,12 +2203,12 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
             Some(data) => match crate::process::Process::from_elf(&data) {
                 Ok(p) => p,
                 Err(e) => {
-                    crate::console_println!("[exec] Failed to create process: {}", e);
+                    crate::klog!(DEBUG, "[exec] Failed to create process: {}", e);
                     return ERR_NOMEM;
                 }
             },
             None => {
-                crate::console_println!("[exec] Program '{}' not found", name);
+                crate::klog!(DEBUG, "[exec] Program '{}' not found", name);
                 return ERR_NOENT;
             }
         }
@@ -2227,7 +2234,7 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
     let proc_idx = match crate::process::add_process(proc) {
         Some(idx) => idx,
         None => {
-            crate::console_println!("[exec] Process table full");
+            crate::klog!(DEBUG, "[exec] Process table full");
             return ERR_NOMEM;
         }
     };
@@ -2243,11 +2250,11 @@ fn sys_exec(path: usize, path_len: usize) -> isize {
         proc_idx,
     ) {
         Some(_tid) => {
-            crate::console_println!("[exec] Spawned '{}' pid={}", name, child_pid);
+            crate::klog!(DEBUG, "[exec] Spawned '{}' pid={}", name, child_pid);
             child_pid as isize
         }
         None => {
-            crate::console_println!("[exec] Scheduler full");
+            crate::klog!(DEBUG, "[exec] Scheduler full");
             ERR_NOMEM
         }
     }
@@ -2570,7 +2577,7 @@ fn pipe_write(pipe_id: usize, buf: usize, len: usize) -> isize {
             Some(n) => {
                 if n == crate::driver::pipe::EPIPE {
                     // Read end closed
-                    crate::console_println!("[pipe] write: Broken pipe");
+                    crate::klog!(DEBUG, "[pipe] write: Broken pipe");
                     return n;
                 }
                 if n == -1 {
@@ -2697,7 +2704,7 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
                     Some(data) => match crate::process::Process::from_elf(&data) {
                         Ok(p) => p,
                         Err(e) => {
-                            crate::console_println!("[exec] Failed to parse ELF '{}': {}", name, e);
+                            crate::klog!(DEBUG, "[exec] Failed to parse ELF '{}': {}", name, e);
                             return ERR_IO;
                         }
                     },
@@ -2711,7 +2718,7 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
             Some(data) => match crate::process::Process::from_elf(&data) {
                 Ok(p) => p,
                 Err(e) => {
-                    crate::console_println!("[exec] Failed to parse ELF '{}': {}", name, e);
+                    crate::klog!(DEBUG, "[exec] Failed to parse ELF '{}': {}", name, e);
                     return ERR_IO;
                 }
             },
@@ -2797,11 +2804,11 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
                 user_satp
             );
             #[cfg(target_arch = "riscv64")]
-            crate::console_println!("[exec] Launched '{}' (pid={})", name, proc.pid);
+            crate::klog!(DEBUG, "[exec] Launched '{}' (pid={})", name, proc.pid);
             proc.pid as isize
         }
         None => {
-            crate::console_println!("[exec] Failed to schedule process");
+            crate::klog!(DEBUG, "[exec] Failed to schedule process");
             ERR_NOMEM
         }
     }
@@ -2954,7 +2961,7 @@ fn sys_fork() -> isize {
             child_pid as isize
         }
         None => {
-            crate::console_println!("[fork] Failed to schedule child");
+            crate::klog!(DEBUG, "[fork] Failed to schedule child");
             ERR_NOMEM
         }
     }
@@ -3049,7 +3056,7 @@ fn linux_clone(
     tls: usize,           // r8 = 5th arg = tls
 ) -> isize {
     let is_vm_shared = (flags & 0x100) != 0; // CLONE_VM
-    crate::console_println!(
+    crate::klog!(DEBUG,
         "[linux_clone] flags={:#x} stack={:#x} ptid={:#x} ctid={:#x} tls={:#x}",
         flags,
         stack,
