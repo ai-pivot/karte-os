@@ -15,6 +15,16 @@ const SECTOR_SIZE: usize = 512;
 
 static READ_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MAX_DISK_OFFSET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn set_max_disk_offset(max_offset: u64) {
+    MAX_DISK_OFFSET.store(max_offset, Ordering::Relaxed);
+}
+
+fn is_offset_valid(offset: usize) -> bool {
+    let max = MAX_DISK_OFFSET.load(Ordering::Relaxed);
+    max == 0 || offset < max as usize
+}
 
 fn block_read(sector: usize, buf: &mut [u8]) -> Result<(), &'static str> {
     READ_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -45,6 +55,9 @@ impl KarteBlockDevice {
 impl Ext4BlockDevice for KarteBlockDevice {
     fn read_offset(&self, offset: usize) -> Vec<u8> {
         READ_COUNT.fetch_add(1, Ordering::Relaxed);
+        if !is_offset_valid(offset + BLOCK_SIZE - 1) {
+            return alloc::vec![0u8; BLOCK_SIZE];
+        }
         let mut buf = alloc::vec![0u8; BLOCK_SIZE];
         let base_sector = offset / SECTOR_SIZE;
         let skip = offset % SECTOR_SIZE;
@@ -72,6 +85,9 @@ impl Ext4BlockDevice for KarteBlockDevice {
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
         WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if !is_offset_valid(offset + data.len() - 1) {
+            return;
+        }
         let mut data_pos = 0;
         let mut current_offset = offset;
 
@@ -265,6 +281,14 @@ fn split_last_component(path: &str) -> (&str, &str) {
 pub fn init() -> Result<(), &'static str> {
     match Ext4Fs::new() {
         Ok(fs) => {
+            // Compute disk size from superblock for OOB protection
+            let ext4 = fs.ext4.lock();
+            let sb = &ext4.super_block;
+            let block_size = sb.block_size() as usize;
+            let max_offset = (sb.blocks_count() as u64) * (block_size as u64);
+            set_max_disk_offset(max_offset);
+            drop(ext4);
+
             *EXT4_FS.lock() = Some(fs);
             EXT4_AVAILABLE.store(true, Ordering::SeqCst);
             Ok(())

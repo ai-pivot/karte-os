@@ -236,9 +236,9 @@ pub fn schedule() {
                 core::arch::asm!(
                     "rdmsr",
                     "shl rdx, 32",
-                    "or rdx, rax",
-                    out("edx") fs_base,
-                    out("eax") _,
+                    "or rax, rdx",
+                    out("rax") fs_base,
+                    out("rdx") _,
                     in("ecx") 0xC0000100u32,
                 );
             }
@@ -393,12 +393,11 @@ pub fn schedule_exit() {
                 core::arch::asm!(
                     "rdmsr",
                     "shl rdx, 32",
-                    "or rdx, rax",
-                    out("edx") fs_base,
-                    out("eax") _,
+                    "or rax, rdx",
+                    out("rax") fs_base,
+                    out("rdx") _,
                     in("ecx") 0xC0000100u32,
-                );
-            }
+                );            }
             TASK_FS_BASE[save_idx].store(fs_base, Ordering::Relaxed);
         }
     }

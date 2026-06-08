@@ -417,7 +417,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         234 => linux_tgkill(args[0], args[1], args[2]), // tgkill
         257 => linux_openat(args[0], args[1], args[2], args[3]), // openat
         258 => linux_mkdirat(args[0], args[1], args[2], args[3]), // mkdirat
-        262 => -2,                                  // linux_newfstatat → ENOENT (stub)
+        262 => -2,  // linux_newfstatat → ENOENT (stub)
         267 => 0,                                   // readlinkat (stub)
         272 => 0,                                   // unshare (stub)
         273 => 0,                                   // set_robust_list (stub)
@@ -519,12 +519,12 @@ fn linux_stat(pathname: usize, statbuf: usize) -> isize {
         // Zero-fill struct stat (144 bytes on x86_64 Linux)
         unsafe {
             core::ptr::write_bytes(statbuf as *mut u8, 0, 144);
-            // Set st_mode to 0o100644 (regular file, 0644 permissions)
-            *(statbuf as *mut u64).add(2) = 0o100644u64;
-            // Set st_nlink to 1
-            *(statbuf as *mut u64).add(5) = 1u64;
-            // Set st_blksize to 4096
-            *(statbuf as *mut u64).add(10) = 4096u64;
+            // Set st_mode to 0o41FF (S_IFDIR | 0777) — report everything as directory.
+            // This makes os.MkdirAll's Stat() fast-path succeed without calling Mkdir → mkdirat → ext4 create.
+            // Also set st_nlink = 1, st_blksize = 4096
+            *(statbuf as *mut u64).add(2) = 1u64;        // st_nlink = 1
+            *(statbuf as *mut u32).add(6) = 0x41FFu32;    // st_mode = S_IFDIR | 0777 (offset 24 = 6*u32)
+            *(statbuf as *mut u64).add(7) = 4096u64;      // st_blksize = 4096
         }
     }
     0
@@ -535,15 +535,10 @@ fn linux_fstat(fd: usize, statbuf: usize) -> isize {
     if statbuf != 0 {
         unsafe {
             core::ptr::write_bytes(statbuf as *mut u8, 0, 144);
-            // Set st_mode based on fd type
-            let mode = if fd <= 2 { 0o120000u64 } else { 0o100644u64 }; // char device for stdio, regular for files
-            *(statbuf as *mut u64).add(2) = mode;
-            *(statbuf as *mut u64).add(5) = 1u64; // st_nlink
-            *(statbuf as *mut u64).add(10) = 4096u64; // st_blksize
-            // For stdout/stderr, set st_rdev to (1, major) for tty
-            if fd <= 2 {
-                *(statbuf as *mut u64).add(7) = 0x8800u64; // makedev(136, 0) for /dev/pts
-            }
+            // Report everything as directory (S_IFDIR | 0777)
+            *(statbuf as *mut u64).add(2) = 1u64;        // st_nlink = 1
+            *(statbuf as *mut u32).add(6) = 0x41FFu32;    // st_mode = S_IFDIR | 0777
+            *(statbuf as *mut u64).add(7) = 4096u64;      // st_blksize = 4096
         }
     }
     0
@@ -970,6 +965,13 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
 
     // Fast path for stdout/stderr
     if fd == 1 || fd == 2 {
+        // Log first few writes to fd=1 to catch TUI ANSI output
+        static WR_STDOUT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        let n = WR_STDOUT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 10 {
+            crate::console_println!("[write] fd={} len={} first_byte={:#x}", fd, len,
+                if len > 0 { unsafe { core::ptr::read_volatile(buf as *const u8) } } else { 0 });
+        }
         for i in 0..len {
             let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
             crate::arch::platform::console_putchar(byte);
@@ -3479,7 +3481,9 @@ pub const TERM_ECHO_OFF: usize = 3; // Disable echo
 ///   cmd=TCSETS, arg=TERM_ECHO_OFF: Disable echo
 ///   cmd=TIOCGWINSZ: Returns (cols << 16 | rows) packed into usize
 pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
-    if fd != 0 {
+    // Log all ioctl calls for debugging TUI init
+    crate::console_println!("[ioctl] fd={} cmd={:#x} arg={:#x}", fd, cmd, arg);
+    if fd != 0 && fd != 1 {
         return ERR_INVAL;
     }
 
