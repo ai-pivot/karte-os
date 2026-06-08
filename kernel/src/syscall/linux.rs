@@ -39,8 +39,9 @@ mod x86_64_syscalls {
     pub const L_OPEN: usize = 2;
     pub const L_CLOSE: usize = 3;
     pub const L_STAT: usize = 4;
-    pub const L_FSTAT: usize = 5;
+    pub const L_FSTAT: usize = 5; // Linux x86_64 fstat = 5
     pub const L_POLL: usize = 7;
+    pub const L_LSEEK: usize = 8; // Linux x86_64 lseek = 8
     pub const L_MMAP: usize = 9;
     pub const L_MPROTECT: usize = 10;
     pub const L_MUNMAP: usize = 11;
@@ -225,8 +226,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         40, 41, 42, // 50-52: setenv, getenv, chdir
         50, 51, 52, // 60-61: kill, sigret
         60, 61, // 70-77: socket..shutdown
-        70, 71, 72, 73, 74, 75, 76, 77, // 80: ioctl
-        80,
+        70, 71, 72, 73, 74, 75, 76, 77,
     ];
     if KARTEOS_NATIVE_NUMBERS.contains(&id) {
         return None;
@@ -331,8 +331,12 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             })
         }
         L_NEWFSTATAT => Some(Translation::Handled(0)), // stub
-        // Note: L_STAT(4) and L_FSTAT(5) removed — conflict with
-        // KarteOS SYS_BRK(4) and SYS_GETPID(5)
+        L_FSTAT => {
+            // fstat(fd, stat_ptr) — fill x86_64 struct stat (144 bytes)
+            let result = sys_fstat(args[0] as i32, args[1]);
+            Some(Translation::Handled(result))
+        }
+        // Note: L_STAT(4) removed — conflicts with KarteOS SYS_BRK(4)
         L_PREAD64 => Some(Translation::Dispatch {
             karte_nr: super::SYS_READ,
             args: [args[0], args[1], args[2], 0, 0, 0], // fd, buf, count
@@ -347,7 +351,8 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             let result = sys_getcwd(args[0], args[1]);
             Some(Translation::Handled(result))
         }
-        // Note: L_CHDIR(80) removed — conflicts with KarteOS SYS_IOCTL(80)
+        // Note: L_CHDIR(80) conflicts with KarteOS SYS_IOCTL(80) — use chdir via openat
+        L_KILL => Some(Translation::Handled(0)), // stub: Go doesn't use kill critically
         L_MKDIR => Some(Translation::Dispatch {
             karte_nr: super::SYS_MKDIR,
             args: [args[0], count_user_string(args[0]), 0, 0, 0, 0],
@@ -614,6 +619,49 @@ pub fn sys_uname(buf: usize) -> isize {
             }
         }
         offset += 65;
+    }
+    0
+}
+
+/// sys_fstat: Fill Linux x86_64 struct stat (144 bytes) in user memory.
+///
+/// struct stat layout (x86_64):
+///   offset 0:  st_dev (u64)     = 0
+///   offset 8:  st_ino (u64)     = fd + 1
+///   offset 16: st_nlink (u64)   = 1
+///   offset 24: st_mode (u32)    = 0x81A4 (S_IFREG | 0644)
+///   offset 28: st_uid (u32)     = 0
+///   offset 32: st_gid (u32)     = 0
+///   offset 36: __pad0 (u32)     = 0
+///   offset 40: st_rdev (u64)    = 0
+///   offset 48: st_size (u64)    = 0
+///   offset 56: st_blksize (u64) = 4096
+///   offset 64: st_blocks (u64)  = 0
+///   offset 72: st_atime (i64)   = 0
+///   offset 80: st_atime_nsec    = 0
+///   offset 88: st_mtime (i64)   = 0
+///   offset 96: st_mtime_nsec    = 0
+///   offset 104: st_ctime (i64)  = 0
+///   offset 112: st_ctime_nsec   = 0
+///   (remaining 24 bytes reserved/zero)
+fn sys_fstat(fd: i32, stat_ptr: usize) -> isize {
+    if stat_ptr == 0 {
+        return super::ERR_INVAL;
+    }
+    unsafe {
+        let p = stat_ptr as *mut u8;
+        // Zero out the entire struct (144 bytes)
+        for i in 0..144 {
+            (p.add(i) as *mut u8).write_volatile(0u8);
+        }
+        // st_ino = fd + 1 (fake inode number, non-zero to be valid)
+        (p.add(8) as *mut u64).write_volatile((fd as u64).wrapping_add(1));
+        // st_nlink = 1
+        (p.add(16) as *mut u64).write_volatile(1u64);
+        // st_mode = S_IFREG | 0644 = 0x81A4
+        (p.add(24) as *mut u32).write_volatile(0x81A4u32);
+        // st_blksize = 4096
+        (p.add(56) as *mut u64).write_volatile(4096u64);
     }
     0
 }

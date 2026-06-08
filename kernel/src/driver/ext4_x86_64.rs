@@ -216,10 +216,7 @@ impl FileSystem for Ext4Fs {
     fn read_file(&self, inode: u64, offset: usize, buf: &mut [u8]) -> Result<usize, VfsError> {
         let ext4 = self.ext4.lock();
         match ext4.read_at(inode as u32, offset, buf) {
-            Ok(n) => {
-
-                Ok(n)
-            }
+            Ok(n) => Ok(n),
             Err(e) => {
                 crate::console_println!("[ext4rd] ERR inode={} off={} err={:?}", inode, offset, e);
                 Err(VfsError::IoError)
@@ -710,9 +707,6 @@ fn create_directory_inner(path: &str) -> Result<(), &'static str> {
             "parent not found"
         })?
     };
-
-
-
 
     let mut ext4 = fs.ext4.lock();
     match ext4.create(parent_inode as u32, dir_name, 0o40777 as u16) {
