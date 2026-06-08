@@ -852,7 +852,7 @@ impl FdTable {
                     fd_num: 0,
                 });
                 if i <= 5 {
-                    crate::console_println!("[avf] fd={} vf={}", i, vfs_fd);
+                    // no debug log — holding fd_table lock
                 }
                 return Some(i);
             }
@@ -1082,7 +1082,7 @@ impl FdTable {
         if let Some(slot) = self.fds.get_mut(fd) {
             if slot.as_ref().map(|f| f.valid).unwrap_or(false) {
                 if fd <= 5 {
-                    crate::console_println!("[cl] fd={}", fd);
+                    // no debug log — holding fd_table lock
                 }
                 *slot = None;
                 return true;

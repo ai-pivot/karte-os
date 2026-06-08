@@ -1130,7 +1130,13 @@ pub fn sys_exit(code: i32) -> isize {
     crate::process::set_exit_code(code as usize);
 
     // 3. Now safe to do I/O — children are dead, won't interfere
-    crate::klog!(INFO, "[process] User process exited with code {}", code);
+    crate::klog!(
+        INFO,
+        "[process] User process pid={} slot={} exited with code {}",
+        my_pid,
+        crate::sched::current_running_slot(),
+        code
+    );
 
     // If init (the shell) exits, no process remains → shut down the system.
     if crate::sched::is_init_running() {
@@ -3756,17 +3762,13 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
             if let Some(pipe_id) = desc.pipe_id {
                 crate::driver::pipe::inc_ref(pipe_id);
             }
-            if let Some(ref mut child_table) = proc.fd_table {
-                child_table.set_fd(0, desc);
-            }
+            proc.fd_table.lock().set_fd(0, desc);
         }
         if let Some(desc) = stdout_desc {
             if let Some(pipe_id) = desc.pipe_id {
                 crate::driver::pipe::inc_ref(pipe_id);
             }
-            if let Some(ref mut child_table) = proc.fd_table {
-                child_table.set_fd(1, desc);
-            }
+            proc.fd_table.lock().set_fd(1, desc);
         }
     }
 
@@ -3914,7 +3916,11 @@ fn sys_fork() -> isize {
     let child_pid = crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     // Clone fd table
-    let fd_table = current.fd_table.clone();
+    // Fork: deep-copy fd table (each process has independent fds)
+    let fd_table = {
+        let parent_fd = current.fd_table.lock();
+        alloc::sync::Arc::new(spin::Mutex::new(parent_fd.clone()))
+    };
 
     // Create child process (env is inherited from parent)
     let child = crate::process::Process {
@@ -4205,12 +4211,14 @@ fn linux_clone(
         let child_pid =
             crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        // CLONE_FILES: clone fd table (true sharing would require Arc, clone is close enough)
+        // CLONE_FILES (0x400): threads share the same fd table via Arc.
+        // Without CLONE_FILES: independent fd table (deep copy like fork).
         let fd_table = if (flags & 0x400) != 0 {
-            // CLONE_FILES
+            // CLONE_FILES — Arc::clone, same inner FdTable
             parent_proc.fd_table.clone()
         } else {
-            Some(crate::driver::fs::FdTable::new())
+            // Independent fd table
+            alloc::sync::Arc::new(spin::Mutex::new(crate::driver::fs::FdTable::new()))
         };
 
         let child = crate::process::Process {

@@ -27,10 +27,14 @@ pub struct EpollEvent {
     pub data: u64,   // user data
 }
 
+const EPOLLET: u32 = 0x80000000;
+
 /// Per-fd epoll state
 #[derive(Clone, Copy)]
 struct EpollEntry {
     event: EpollEvent,
+    /// For EPOLLET: last reported revents. Only report again when revents changes.
+    last_revents: u32,
 }
 
 /// An epoll instance
@@ -109,7 +113,13 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
             } else {
                 return -14; // EFAULT
             };
-            instance.entries.insert(fd, EpollEntry { event });
+            instance.entries.insert(
+                fd,
+                EpollEntry {
+                    event,
+                    last_revents: 0,
+                },
+            );
         }
         EPOLL_CTL_MOD => {
             let event = if event_ptr != 0 {
@@ -118,7 +128,10 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
                 return -14;
             };
             match instance.entries.get_mut(&fd) {
-                Some(entry) => entry.event = event,
+                Some(entry) => {
+                    entry.event = event;
+                    entry.last_revents = 0; // reset ET state on MOD
+                }
                 None => return -2, // ENOENT
             }
         }
@@ -165,9 +178,9 @@ pub fn sys_epoll_wait(
     // Try to collect ready events
     let mut ready_count = 0usize;
 
-    let instances = EPOLL_INSTANCES.lock();
-    if let Some(instance) = instances.get(&epfd) {
-        for (&fd, entry) in &instance.entries {
+    let mut instances = EPOLL_INSTANCES.lock();
+    if let Some(instance) = instances.get_mut(&epfd) {
+        for (&fd, entry) in &mut instance.entries {
             if ready_count >= max_events {
                 break;
             }
@@ -175,8 +188,6 @@ pub fn sys_epoll_wait(
             let mut revents = 0u32;
 
             // Unified fd ready check — look up FdTable and dispatch by FdType.
-            // No special-casing by fd number. Each FdType variant implements
-            // its own is_readable / is_readable logic in FdTable.
             let fd_desc = crate::process::with_fd_table(|ft| ft.get(fd).cloned());
 
             if let Some(desc) = fd_desc {
@@ -188,13 +199,6 @@ pub fn sys_epoll_wait(
                 if entry.event.events & EPOLLOUT != 0 && desc.is_writable() {
                     revents |= EPOLLOUT;
                 }
-                // Error/hangup (always report if requested)
-                if entry.event.events & EPOLLERR != 0 {
-                    revents |= EPOLLERR;
-                }
-                if entry.event.events & EPOLLHUP != 0 {
-                    revents |= EPOLLHUP;
-                }
                 // Timerfd edge-triggered: clear trigger flag after reporting
                 if matches!(desc.fd_type, crate::driver::fs::FdType::Timerfd)
                     && revents & EPOLLIN != 0
@@ -202,12 +206,17 @@ pub fn sys_epoll_wait(
                     TIMERFD_STATES.lock().insert(fd, false);
                 }
             } else {
-                // fd not in FdTable — check legacy global maps (eventfd/timerfd
-                // created before FdTable integration). Report EPOLLHUP.
-                if entry.event.events & EPOLLHUP != 0 {
-                    revents |= EPOLLHUP;
-                }
+                // fd closed/invalid — report EPOLLHUP so caller can clean up
+                revents = EPOLLHUP;
             }
+
+            let is_et = entry.event.events & EPOLLET != 0;
+
+            // EPOLLET: only report when revents changes (edge-triggered semantics)
+            if is_et && revents == entry.last_revents && revents != EPOLLHUP {
+                continue; // no change since last report
+            }
+            entry.last_revents = revents;
 
             if revents != 0 {
                 // Log which fd is ready (limited)

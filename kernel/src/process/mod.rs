@@ -74,8 +74,9 @@ pub struct Process {
     /// Index in PROCESS_TABLE of the child this process is waiting for.
     /// None if not waiting. Used by sys_exit to wake the parent.
     pub wait_child_idx: Option<usize>,
-    /// Per-process file descriptor table
-    pub fd_table: Option<crate::driver::fs::FdTable>,
+    /// Per-process file descriptor table.
+    /// Arc-shared so CLONE_FILES threads see the same table.
+    pub fd_table: alloc::sync::Arc<spin::Mutex<crate::driver::fs::FdTable>>,
     /// Trap context pointer (saved on kernel stack)
     pub trap_ctx_ptr: usize,
     /// Whether this process's page table is shared via CLONE_VM.
@@ -463,7 +464,7 @@ impl Process {
             entry: elf.entry,
             state: ProcessState::Ready,
             exit_code: 0,
-            fd_table: Some(crate::driver::fs::FdTable::new()),
+            fd_table: alloc::sync::Arc::new(spin::Mutex::new(crate::driver::fs::FdTable::new())),
             wait_child_idx: None,
             trap_ctx_ptr: 0,
             shared_page_table: false,
@@ -797,7 +798,7 @@ impl Process {
             entry,
             state: ProcessState::Ready,
             exit_code: 0,
-            fd_table: Some(crate::driver::fs::FdTable::new()),
+            fd_table: alloc::sync::Arc::new(spin::Mutex::new(crate::driver::fs::FdTable::new())),
             wait_child_idx: None,
             trap_ctx_ptr: 0,
             shared_page_table: false,
@@ -1067,11 +1068,16 @@ pub fn with_fd_table<F, R>(f: F) -> R
 where
     F: FnOnce(&mut crate::driver::fs::FdTable) -> R,
 {
-    let mut table = PROCESS_TABLE.lock();
-    let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
-    let proc = table[idx].as_mut().expect("No current process");
-    let fd_table = proc.fd_table.as_mut().expect("No FD table");
-    f(fd_table)
+    // Get Arc reference under PROCESS_TABLE lock
+    let fd_arc = {
+        let table = PROCESS_TABLE.lock();
+        let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
+        let proc = table[idx].as_ref().expect("No current process");
+        proc.fd_table.clone() // Arc::clone — cheap refcount bump
+    }; // PROCESS_TABLE dropped here
+
+    let mut fd_table = fd_arc.lock();
+    f(&mut fd_table)
 }
 
 /// Test mode fallback — uses a global static FD table.
