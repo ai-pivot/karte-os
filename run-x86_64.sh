@@ -1,15 +1,15 @@
 #!/bin/bash
 # 启动 KarteOS x86_64 QEMU，直接进入 shell 交互模式
-# 在 shell 里输入 xbot-cli-static 即可启动 xbot TUI
+# 在 shell 里输入: xbot-cli-static
+#
+# 如果 xbot 报错退出，先用 tools/mkdisk.sh 创建配置文件：
+#   echo '{}' > /tmp/config.json && tools/mkdisk.sh put /tmp/config.json .xbot/config.json
+#
+# 退出 QEMU: Ctrl+A 然后按 X
 
 cd "$(dirname "$0")"
 
-echo "启动 KarteOS x86_64..."
-echo "进入 shell 后输入: xbot-cli-static"
-echo "退出 QEMU: Ctrl+A 然后按 X"
-echo "========================================"
-
-qemu-system-x86_64 \
+exec qemu-system-x86_64 \
   -machine pc -cpu qemu64 -m 512M \
   -cdrom target/karte-os-x86_64.iso \
   -serial stdio \

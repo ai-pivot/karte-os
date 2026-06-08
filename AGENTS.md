@@ -266,6 +266,9 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **EPOLLET edge-triggered**: `EpollEntry` tracks `last_revents` per fd. For `EPOLLET` entries, `epoll_wait` only reports when `revents` changes from `last_revents`. Without this, every `epoll_wait` returns EPOLLOUT for writable fds → Go netpoller spins forever. `epoll_ctl MOD` resets `last_revents` to 0.
 - **EPOLLERR/EPOLLHUP**: Do NOT unconditionally return EPOLLERR/EPOLLHUP when the caller requests them. Only report on real errors or when fd is closed/invalid. Unconditional reporting causes Go's netpoller to loop infinitely.
 - **x86_64 xbot testing**: xbot-cli-static reads `.xbot/config.json` on startup with O_RDONLY (no O_CREAT). On a clean disk without this file, xbot writes `{"error"...}` to xbot.db and exits(1). Use `tools/mkdisk.sh put` to pre-create `.xbot/config.json` (`{}` is sufficient) before testing.
+- **x86_64 copy_kernel_mappings huge pages**: Only copy PDP entries with PS=0 (PD table pointers). Skip 1GB huge pages (PS=1) which map MMIO (LAPIC 0xFEE00000, IOAPIC 0xFEC00000). These must NOT be user-accessible — kernel accesses MMIO via `with_kernel_cr3()`.
+- **x86_64 user page table MMIO**: LAPIC, IOAPIC, and PCI MMIO are NOT mapped into user page tables. Any user-space access to these addresses triggers PF (by design). Go runtime should never access MMIO directly.
+- **Linux syscall compatibility layer**: `linux.rs` translates Linux syscall numbers to KarteOS native syscalls. Key implemented: `uname(122)` (fake "Linux 6.1.0"), `getcwd(79)`, `sysinfo(99)`, `gettimeofday(96)`, `sched_getaffinity(204)`, `clock_gettime(228)`, `mprotect(10)`. Go runtime depends on these for initialization.
 
 ## Knowledge Files
 

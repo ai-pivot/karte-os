@@ -217,29 +217,7 @@ impl FileSystem for Ext4Fs {
         let ext4 = self.ext4.lock();
         match ext4.read_at(inode as u32, offset, buf) {
             Ok(n) => {
-                if offset == 0 && n > 0 && buf.len() >= 16 {
-                    crate::console_println!(
-                        "[ext4rd] inode={} off=0 read={} hdr={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                        inode,
-                        n,
-                        buf[0],
-                        buf[1],
-                        buf[2],
-                        buf[3],
-                        buf[4],
-                        buf[5],
-                        buf[6],
-                        buf[7],
-                        buf[8],
-                        buf[9],
-                        buf[10],
-                        buf[11],
-                        buf[12],
-                        buf[13],
-                        buf[14],
-                        buf[15]
-                    );
-                }
+
                 Ok(n)
             }
             Err(e) => {
@@ -611,12 +589,7 @@ fn write_file_inner(name: &str, data: &[u8]) -> Result<(), &'static str> {
         })?;
     } else {
         let (parent_path, file_name) = split_last_component(name);
-        crate::console_println!(
-            "[ext4] create new '{}' parent='{}' name='{}'",
-            name,
-            parent_path,
-            file_name
-        );
+
         let parent_inode = if parent_path.is_empty() {
             ROOT_INODE as u64
         } else {
@@ -625,7 +598,7 @@ fn write_file_inner(name: &str, data: &[u8]) -> Result<(), &'static str> {
                 "ext4: parent directory not found"
             })?
         };
-        crate::console_println!("[ext4] parent_inode={}", parent_inode);
+
         let inode = fs.create_file(parent_inode, file_name).map_err(|e| {
             crate::console_println!(
                 "[ext4] create_file '{}' in inode {}: err {:?}",
@@ -635,7 +608,7 @@ fn write_file_inner(name: &str, data: &[u8]) -> Result<(), &'static str> {
             );
             "ext4 create failed"
         })?;
-        crate::console_println!("[ext4] created inode={}", inode);
+
         fs.write_file(inode, 0, data).map_err(|e| {
             crate::console_println!("[ext4] write new '{}' inode={}: err {:?}", name, inode, e);
             "ext4 write failed"
@@ -737,36 +710,9 @@ fn create_directory_inner(path: &str) -> Result<(), &'static str> {
             "parent not found"
         })?
     };
-    crate::console_println!(
-        "[ext4] create_dir '{}' parent_inode={}",
-        dir_name,
-        parent_inode
-    );
 
-    // Debug: dump raw BGDT data to verify read correctness
-    {
-        let bd = KarteBlockDevice::new();
-        let raw = bd.read_offset(4096);
-        crate::console_println!(
-            "[ext4] BGDT raw: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
-            raw[0],
-            raw[1],
-            raw[2],
-            raw[3],
-            raw[4],
-            raw[5],
-            raw[6],
-            raw[7],
-            raw[8],
-            raw[9],
-            raw[10],
-            raw[11],
-            raw[12],
-            raw[13],
-            raw[14],
-            raw[15]
-        );
-    }
+
+
 
     let mut ext4 = fs.ext4.lock();
     match ext4.create(parent_inode as u32, dir_name, 0o40777 as u16) {
