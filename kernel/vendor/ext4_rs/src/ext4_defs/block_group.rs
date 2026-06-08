@@ -52,6 +52,7 @@ impl Ext4BlockGroup {
         let offset = (block_group_idx % dsc_cnt) * desc_size;
 
         let ext4block = Block::load(block_device, block_id * BLOCK_SIZE);
+
         let bg: Ext4BlockGroup = ext4block.read_offset_as(offset);
 
         bg
@@ -123,12 +124,14 @@ impl Ext4BlockGroup {
 
     /// Get the count of free inodes in this block group.
     pub fn get_free_inodes_count(&self) -> u32 {
-        ((self.free_inodes_count_hi as u64) << 32) as u32 | self.free_inodes_count_lo as u32
+        // Only use lo part — hi part contains garbage if desc_size=32
+        self.free_inodes_count_lo as u32
     }
 
     /// Get the block number of the inode table for this block group.
     pub fn get_inode_table_blk_num(&self) -> u32 {
-        ((self.inode_table_first_block_hi as u64) << 32) as u32 | self.inode_table_first_block_lo
+        // Only use lo part — hi part contains garbage if desc_size=32
+        self.inode_table_first_block_lo
     }
 }
 
@@ -230,17 +233,15 @@ impl Ext4BlockGroup {
 
     /// Get the count of free blocks in this block group.
     pub fn get_free_blocks_count(&self) -> u64 {
-        let mut v = self.free_blocks_count_lo as u64;
-        if self.free_blocks_count_hi != 0 {
-            v |= (self.free_blocks_count_hi as u64) << 32;
-        }
-        v
+        // Only use lo part — hi part may contain garbage if desc_size=32
+        // (64-byte struct reads into next BGDT entry's data)
+        self.free_blocks_count_lo as u64
     }
 
     /// Set the count of free blocks in this block group.
     pub fn set_free_blocks_count(&mut self, cnt: u32) {
         self.free_blocks_count_lo = (cnt & 0xffff) as u16;
-        self.free_blocks_count_hi = (cnt >> 16) as u16;
+        self.free_blocks_count_hi = 0; // Don't write hi — would corrupt next BGDT entry
     }
 
     /// Set the inode allocation bitmap checksum for this block group.

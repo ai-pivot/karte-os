@@ -27,6 +27,16 @@ impl Ext4 {
 
         let mut depth = node.header.depth;
 
+        // Sanity check: ext4 extent tree depth should never exceed 5
+        if depth > 5 {
+            log::error!(
+                "[find_extent] CORRUPT extent tree depth={} for inode {}",
+                depth,
+                inode_ref.inode_num
+            );
+            return_errno_with_message!(Errno::ENOENT, "Extent tree depth too large");
+        }
+
         // Traverse down the tree if depth > 0
         let mut pblock_of_node = 0;
         while depth > 0 {

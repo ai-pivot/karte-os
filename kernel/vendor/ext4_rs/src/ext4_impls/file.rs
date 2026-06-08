@@ -291,11 +291,29 @@ impl Ext4 {
             return Ok(0);
         }
 
+        log::warn!(
+            "[write_at] inode={} offset={} len={}",
+            inode,
+            offset,
+            write_buf_len
+        );
+
         // get the inode reference
         let mut inode_ref = self.get_inode_ref(inode);
 
         // Get the file size
         let file_size = inode_ref.inode.size();
+        if file_size > 0x100000_0000 || write_buf_len > 0x100000_0000 || offset > 0x100000_0000 {
+            log::error!(
+                "[Write] SUSPICIOUS inode={} offset={} wlen={} fsize={}",
+                inode,
+                offset,
+                write_buf_len,
+                file_size
+            );
+        }
+
+        log::warn!("[write_at] file_size={}", file_size);
         log::trace!(
             "[Write] Starting write - inode: {}, offset: {}, size: {}, current file size: {}",
             inode,
@@ -327,14 +345,22 @@ impl Ext4 {
         // Start bgid for block allocation
         let mut start_bgid = 0;
 
-        // Pre-allocate blocks if needed
+        // Pre-allocate blocks if needed (with overflow protection for unsigned subtraction)
+        let existing_blocks_after_start = (ifile_blocks as usize).saturating_sub(iblk_idx);
         let blocks_to_allocate = if iblk_idx >= ifile_blocks as usize {
             total_blocks_needed
+        } else if total_blocks_needed > existing_blocks_after_start {
+            total_blocks_needed - existing_blocks_after_start
         } else {
-            max(0, total_blocks_needed - (ifile_blocks as usize - iblk_idx))
+            0
         };
 
         if blocks_to_allocate > 0 {
+            log::warn!(
+                "[write_at] blocks_to_allocate={} inode={}",
+                blocks_to_allocate,
+                inode_ref.inode_num
+            );
             log::trace!("[Pre-allocation] Allocating {} blocks", blocks_to_allocate);
 
             // 使用append_inode_pblk_batch进行批量块分配
@@ -389,7 +415,7 @@ impl Ext4 {
         let available_blocks = if iblk_idx >= ifile_blocks as usize {
             new_blocks
         } else {
-            (ifile_blocks as usize - iblk_idx) + new_blocks
+            (ifile_blocks as usize - iblk_idx).saturating_add(new_blocks)
         };
 
         if available_blocks < required_blocks {

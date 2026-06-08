@@ -159,9 +159,16 @@ impl FileSystem for Ext4Fs {
             let entries = ext4.dir_get_entries(current_dir);
             let mut found = None;
             for entry in &entries {
-                if entry.get_name() == component {
+                let entry_name = entry.get_name();
+                crate::console_println!(
+                    "[lookup] dir={} entry='{}' target='{}' inode={}",
+                    current_dir,
+                    entry_name,
+                    component,
+                    entry.inode
+                );
+                if entry_name == component {
                     found = Some(entry.inode);
-                    break;
                 }
             }
             match found {
@@ -216,23 +223,67 @@ impl FileSystem for Ext4Fs {
     fn read_file(&self, inode: u64, offset: usize, buf: &mut [u8]) -> Result<usize, VfsError> {
         let ext4 = self.ext4.lock();
         match ext4.read_at(inode as u32, offset, buf) {
-            Ok(n) => Ok(n),
-            Err(_) => Err(VfsError::IoError),
+            Ok(n) => {
+                if offset == 0 && n > 0 && buf.len() >= 16 {
+                    crate::console_println!(
+                        "[ext4rd] inode={} off=0 read={} hdr={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        inode,
+                        n,
+                        buf[0],
+                        buf[1],
+                        buf[2],
+                        buf[3],
+                        buf[4],
+                        buf[5],
+                        buf[6],
+                        buf[7],
+                        buf[8],
+                        buf[9],
+                        buf[10],
+                        buf[11],
+                        buf[12],
+                        buf[13],
+                        buf[14],
+                        buf[15]
+                    );
+                }
+                Ok(n)
+            }
+            Err(e) => {
+                crate::console_println!("[ext4rd] ERR inode={} off={} err={:?}", inode, offset, e);
+                Err(VfsError::IoError)
+            }
         }
     }
 
     fn write_file(&mut self, inode: u64, offset: usize, data: &[u8]) -> Result<usize, VfsError> {
         let ext4 = self.ext4.lock();
+        crate::console_println!("[ext4wr] inode={} off={} len={}", inode, offset, data.len());
         match ext4.write_at(inode as u32, offset, data) {
-            Ok(n) => Ok(n),
-            Err(_) => Err(VfsError::IoError),
+            Ok(n) => {
+                crate::console_println!("[ext4wr] ok inode={} wrote={}", inode, n);
+                Ok(n)
+            }
+            Err(e) => {
+                crate::console_println!("[ext4wr] ERR inode={} err={:?}", inode, e);
+                Err(VfsError::IoError)
+            }
         }
     }
 
     fn create_file(&mut self, dir: u64, name: &str) -> Result<u64, VfsError> {
         let ext4 = self.ext4.lock();
         match ext4.create(dir as u32, name, EXT4_INODE_MODE_FILE as u16) {
-            Ok(inode_ref) => Ok(inode_ref.inode_num as u64),
+            Ok(inode_ref) => {
+                let ino = inode_ref.inode_num;
+                crate::console_println!(
+                    "[create_file] dir={} name='{}' -> inode={}",
+                    dir,
+                    name,
+                    ino
+                );
+                Ok(ino as u64)
+            }
             Err(_) => Err(VfsError::IoError),
         }
     }
@@ -319,23 +370,38 @@ impl crate::driver::vfs::FileSystem for Ext4FileSystem {
     fn lookup(&self, dir: u64, name: &str) -> Result<u64, crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let guard = EXT4_FS.lock();
-            let fs = guard.as_ref().ok_or(crate::driver::vfs::VfsError::NotFound)?;
-            fs.lookup(dir, name).map_err(|_| crate::driver::vfs::VfsError::NotFound)
+            let fs = guard
+                .as_ref()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.lookup(dir, name)
+                .map_err(|_| crate::driver::vfs::VfsError::NotFound)
         })
     }
 
-    fn metadata(&self, inode: u64) -> Result<crate::driver::vfs::VfsMetadata, crate::driver::vfs::VfsError> {
+    fn metadata(
+        &self,
+        inode: u64,
+    ) -> Result<crate::driver::vfs::VfsMetadata, crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let guard = EXT4_FS.lock();
-            let fs = guard.as_ref().ok_or(crate::driver::vfs::VfsError::NotFound)?;
-            fs.metadata(inode).map_err(|_| crate::driver::vfs::VfsError::NotFound)
+            let fs = guard
+                .as_ref()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.metadata(inode)
+                .map_err(|_| crate::driver::vfs::VfsError::NotFound)
         })
     }
 
-    fn readdir(&self, dir: u64, idx: usize) -> Result<Option<crate::driver::vfs::VfsDirEntry>, crate::driver::vfs::VfsError> {
+    fn readdir(
+        &self,
+        dir: u64,
+        idx: usize,
+    ) -> Result<Option<crate::driver::vfs::VfsDirEntry>, crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let guard = EXT4_FS.lock();
-            let fs = guard.as_ref().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            let fs = guard
+                .as_ref()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
             let ext4 = fs.ext4.lock();
             let entries = ext4.dir_get_entries(dir as u32);
             if idx >= entries.len() {
@@ -358,32 +424,57 @@ impl crate::driver::vfs::FileSystem for Ext4FileSystem {
         })
     }
 
-    fn read_file(&self, inode: u64, offset: usize, buf: &mut [u8]) -> Result<usize, crate::driver::vfs::VfsError> {
+    fn read_file(
+        &self,
+        inode: u64,
+        offset: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let guard = EXT4_FS.lock();
-            let fs = guard.as_ref().ok_or(crate::driver::vfs::VfsError::NotFound)?;
-            fs.read_file(inode, offset, buf).map_err(|_| crate::driver::vfs::VfsError::IoError)
+            let fs = guard
+                .as_ref()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.read_file(inode, offset, buf)
+                .map_err(|_| crate::driver::vfs::VfsError::IoError)
         })
     }
 
-    fn write_file(&mut self, inode: u64, offset: usize, data: &[u8]) -> Result<usize, crate::driver::vfs::VfsError> {
+    fn write_file(
+        &mut self,
+        inode: u64,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize, crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let mut guard = EXT4_FS.lock();
-            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
-            fs.write_file(inode, offset, data).map_err(|_| crate::driver::vfs::VfsError::IoError)
+            let fs = guard
+                .as_mut()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.write_file(inode, offset, data)
+                .map_err(|_| crate::driver::vfs::VfsError::IoError)
         })
     }
 
     fn create_file(&mut self, dir: u64, name: &str) -> Result<u64, crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let mut guard = EXT4_FS.lock();
-            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            let fs = guard
+                .as_mut()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
             let mut ext4 = fs.ext4.lock();
-            let inode_ref = ext4.create(dir as u32, name, 0o100644 as u16)
+            let inode_ref = ext4
+                .create(dir as u32, name, 0o100644 as u16)
                 .map_err(|e| {
                     crate::console_println!("[ext4 vfs] create_file '{}' err={:?}", name, e);
                     crate::driver::vfs::VfsError::IoError
                 })?;
+            crate::console_println!(
+                "[create_file] dir={} name='{}' -> inode={}",
+                dir,
+                name,
+                inode_ref.inode_num
+            );
             Ok(inode_ref.inode_num as u64)
         })
     }
@@ -391,9 +482,12 @@ impl crate::driver::vfs::FileSystem for Ext4FileSystem {
     fn create_dir(&mut self, dir: u64, name: &str) -> Result<u64, crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let mut guard = EXT4_FS.lock();
-            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            let fs = guard
+                .as_mut()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
             let mut ext4 = fs.ext4.lock();
-            let inode_ref = ext4.create(dir as u32, name, 0o40755 as u16)
+            let inode_ref = ext4
+                .create(dir as u32, name, 0o40755 as u16)
                 .map_err(|_| crate::driver::vfs::VfsError::IoError)?;
             Ok(inode_ref.inode_num as u64)
         })
@@ -402,16 +496,26 @@ impl crate::driver::vfs::FileSystem for Ext4FileSystem {
     fn unlink(&mut self, dir: u64, name: &str) -> Result<(), crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let mut guard = EXT4_FS.lock();
-            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
-            fs.unlink(dir, name).map_err(|_| crate::driver::vfs::VfsError::IoError)
+            let fs = guard
+                .as_mut()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.unlink(dir, name)
+                .map_err(|_| crate::driver::vfs::VfsError::IoError)
         })
     }
 
-    fn set_file_size(&mut self, inode: u64, size: usize) -> Result<(), crate::driver::vfs::VfsError> {
+    fn set_file_size(
+        &mut self,
+        inode: u64,
+        size: usize,
+    ) -> Result<(), crate::driver::vfs::VfsError> {
         with_kernel_cr3_ext4(|| {
             let mut guard = EXT4_FS.lock();
-            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
-            fs.set_file_size(inode, size).map_err(|_| crate::driver::vfs::VfsError::IoError)
+            let fs = guard
+                .as_mut()
+                .ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.set_file_size(inode, size)
+                .map_err(|_| crate::driver::vfs::VfsError::IoError)
         })
     }
 }
@@ -453,7 +557,9 @@ pub fn read_file(name: &str) -> Option<Vec<u8>> {
         let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
         let metadata = fs.metadata(inode).ok()?;
         let size = metadata.size;
-        if size == 0 {
+        if size == 0 || size > 16 * 1024 * 1024 {
+            // Safety: reject unreasonably large sizes to prevent capacity overflow
+            crate::console_println!("[read_file_to_buf] size too large or zero: {}", size);
             return Some(Vec::new());
         }
         let mut buf = alloc::vec![0u8; size];
@@ -487,7 +593,9 @@ pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result
 }
 
 pub fn lookup_path(name: &str) -> Option<u64> {
-    if !has_ext4() { return None; }
+    if !has_ext4() {
+        return None;
+    }
     with_kernel_cr3_ext4(|| {
         let guard = EXT4_FS.lock();
         let fs = guard.as_ref()?;
@@ -496,7 +604,9 @@ pub fn lookup_path(name: &str) -> Option<u64> {
 }
 
 pub fn metadata_of(inode: u64) -> Option<VfsMetadata> {
-    if !has_ext4() { return None; }
+    if !has_ext4() {
+        return None;
+    }
     with_kernel_cr3_ext4(|| {
         let guard = EXT4_FS.lock();
         let fs = guard.as_ref()?;
@@ -645,26 +755,55 @@ fn create_directory_inner(path: &str) -> Result<(), &'static str> {
         ROOT_INODE as u64
     } else {
         fs.lookup(ROOT_INODE as u64, parent_path).map_err(|e| {
-            crate::console_println!("[ext4] create_dir: parent '{}' not found: {:?}", parent_path, e);
+            crate::console_println!(
+                "[ext4] create_dir: parent '{}' not found: {:?}",
+                parent_path,
+                e
+            );
             "parent not found"
         })?
     };
-    crate::console_println!("[ext4] create_dir '{}' parent_inode={}", dir_name, parent_inode);
+    crate::console_println!(
+        "[ext4] create_dir '{}' parent_inode={}",
+        dir_name,
+        parent_inode
+    );
 
     // Debug: dump raw BGDT data to verify read correctness
     {
         let bd = KarteBlockDevice::new();
         let raw = bd.read_offset(4096);
-        crate::console_println!("[ext4] BGDT raw: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
-            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]);
+        crate::console_println!(
+            "[ext4] BGDT raw: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
+            raw[0],
+            raw[1],
+            raw[2],
+            raw[3],
+            raw[4],
+            raw[5],
+            raw[6],
+            raw[7],
+            raw[8],
+            raw[9],
+            raw[10],
+            raw[11],
+            raw[12],
+            raw[13],
+            raw[14],
+            raw[15]
+        );
     }
 
     let mut ext4 = fs.ext4.lock();
     match ext4.create(parent_inode as u32, dir_name, 0o40777 as u16) {
         Ok(_) => Ok(()),
         Err(e) => {
-            crate::console_println!("[ext4] create_dir FAILED '{}/{}' err={:?}", parent_path, dir_name, e);
+            crate::console_println!(
+                "[ext4] create_dir FAILED '{}/{}' err={:?}",
+                parent_path,
+                dir_name,
+                e
+            );
             Err("ext4 create_dir failed")
         }
     }

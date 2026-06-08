@@ -11,7 +11,11 @@ impl Ext4 {
         let mut iterations = 0u32;
         let max_iterations = bg_count * 2 + 1;
 
-        log::warn!("[ialloc] bg_count={} desc_size={}", bg_count, super_block.desc_size);
+        log::warn!(
+            "[ialloc] bg_count={} desc_size={}",
+            bg_count,
+            super_block.desc_size
+        );
 
         while bgid < bg_count {
             iterations += 1;

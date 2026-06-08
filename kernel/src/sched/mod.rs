@@ -397,7 +397,8 @@ pub fn schedule_exit() {
                     out("rax") fs_base,
                     out("rdx") _,
                     in("ecx") 0xC0000100u32,
-                );            }
+                );
+            }
             TASK_FS_BASE[save_idx].store(fs_base, Ordering::Relaxed);
         }
     }

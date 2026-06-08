@@ -502,13 +502,28 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_IOCTL => Some(Translation::Handled(0)),
         L_OPENAT => {
             let path_ptr = args[1];
+            let flags = args[2]; // Preserve flags! O_CREAT, O_RDWR, etc.
             let path_len = count_user_string(path_ptr);
             if path_len == 0 {
                 return Some(Translation::Handled(super::ERR_NOENT));
             }
+            #[cfg(target_arch = "x86_64")]
+            if path_len < 100 {
+                let name = super::read_user_path(path_ptr, path_len);
+                if let Some(ref n) = name {
+                    if n.contains("xbot")
+                        || n.contains("session")
+                        || n.contains(".db")
+                        || n.contains("shm")
+                        || n.contains("wal")
+                    {
+                        crate::console_println!("[openat:compat] '{}' flags={:#x}", n, flags);
+                    }
+                }
+            }
             Some(Translation::Dispatch {
                 karte_nr: super::SYS_OPEN,
-                args: [path_ptr, path_len, 0, 0, 0, 0],
+                args: [path_ptr, path_len, flags, 0, 0, 0],
             })
         }
         L_CLOSE => Some(Translation::Dispatch {

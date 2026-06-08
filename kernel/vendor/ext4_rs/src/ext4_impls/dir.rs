@@ -121,6 +121,14 @@ impl Ext4 {
 
         // calculate total blocks
         let inode_size = inode_ref.inode.size();
+        if inode_size > 0x10000000 {
+            log::error!(
+                "[dir_get_entries] inode={} SUSPICIOUS size={}",
+                inode,
+                inode_size
+            );
+            return entries;
+        }
         let total_blocks = inode_size / BLOCK_SIZE as u64;
 
         // start from the first logical block

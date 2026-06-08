@@ -67,6 +67,8 @@ const ATA_CMD_WRITE_DMA: u8 = 0xCA;
 const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
 const ATA_CMD_WRITE_DMA_EXT: u8 = 0x34;
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
+const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
 
 // ─── Data Structures ───────────────────────────────────────────────
 
@@ -537,6 +539,59 @@ pub fn write_block(block_id: usize, buf: &[u8]) -> Result<(), &'static str> {
     }
 
     Ok(())
+}
+
+/// Flush the SATA drive's write cache to physical media.
+/// Issues ATA FLUSH CACHE EXT (0xEA) or FLUSH CACHE (0xE7) command.
+pub fn flush_cache() -> Result<(), &'static str> {
+    let base = AHCI_BASE.load(Ordering::Relaxed);
+    let port = AHCI_PORT.load(Ordering::Relaxed);
+    let mem = unsafe { get_port_mem() }.ok_or("AHCI not initialized")?;
+    let lba48 = unsafe { supports_lba48(base) };
+
+    let cmd = if lba48 {
+        ATA_CMD_FLUSH_CACHE_EXT
+    } else {
+        ATA_CMD_FLUSH_CACHE
+    };
+
+    unsafe {
+        // Build Command FIS — flush cache has no data transfer
+        build_cmd_fis(mem.ct_base, cmd, 0, 0, false);
+
+        // Setup Command Header — no PRD entries (PRDTL=0), no data transfer
+        let ch = mem.clb_base as *mut CommandHeader;
+        let cfl: u32 = 5; // FIS length in DWORDs
+        (*ch).dw0 = cfl & 0x1F; // No write bit, no PRDTL
+        (*ch).dw1 = 0;
+        (*ch).ctba = mem.ct_base as u32;
+        (*ch).ctbau = (mem.ct_base >> 32) as u32;
+        (*ch)._rsvd = [0; 4];
+
+        // Clear pending interrupts
+        port_reg_write(base, port, PORT_IS, 0xFFFFFFFF);
+
+        // Issue command
+        port_reg_write(base, port, PORT_CI, 1);
+
+        // Poll for completion
+        for _ in 0..10_000_000 {
+            let ci = port_reg_read(base, port, PORT_CI);
+            let tfd = port_reg_read(base, port, PORT_TFD);
+            if (tfd & 0x01) != 0 {
+                let serr = port_reg_read(base, port, PORT_SERR);
+                crate::console_println!("[ahci] Flush error: TFD={:#x} SERR={:#x}", tfd, serr);
+                port_reg_write(base, port, PORT_SERR, 0xFFFFFFFF);
+                port_reg_write(base, port, PORT_IS, 0xFFFFFFFF);
+                return Err("AHCI flush cache error");
+            }
+            if (ci & 1) == 0 {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err("AHCI flush cache timeout")
+    }
 }
 
 /// Return the capacity of the AHCI drive in sectors.

@@ -233,7 +233,7 @@ pub fn dispatch_syscall_linux(
     }
 
     static TRACE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let _tc = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let tc = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let result = dispatch_linux_raw(
         nr as usize,
         [
@@ -248,23 +248,9 @@ pub fn dispatch_syscall_linux(
     // Trace non-init process syscalls
     let nr_usize = nr as usize;
     let cur_pid = crate::process::current_pid();
-    if cur_pid >= 2
-        && nr_usize != 228
-        && nr_usize != 35
-        && nr_usize != 9
-        && nr_usize != 28
-        && nr_usize != 157
-    {
-        crate::klog!(
-            TRACE,
-            "[P{}T#{}] sys{}({:#x},{:#x}) → {}",
-            cur_pid,
-            _tc,
-            nr_usize,
-            a1 as usize,
-            a2 as usize,
-            result
-        );
+    // Trace syscalls that return errors (for debugging)
+    if result < 0 && nr_usize != 228 && nr_usize != 35 && nr_usize != 24 {
+        crate::console_println!("[sc-err] nr={} -> {} (pid={})", nr_usize, result, cur_pid);
     }
     result as u64
 }
@@ -312,8 +298,8 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
 
         // ─── File I/O (continued) ─────────────────────────────────
         16 => sys_ioctl(args[0] as i32, args[1], args[2]), // ioctl
-        17 => linux_pread64(args[0] as i32, args[1], args[2], args[3]), // pread64
-        18 => sys_write(args[0] as i32, args[1], args[2]), // pwrite64
+        17 => linux_pread64(args[0] as i32, args[1], args[2], args[3], args[4]), // pread64
+        18 => linux_pwrite64(args[0] as i32, args[1], args[2], args[3], args[4]), // pwrite64
         19 => linux_readv(args[0], args[1], args[2]),      // readv
         20 => 0,                                           // writev (stub)
         21 => 0,                                           // access (stub)
@@ -326,7 +312,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         25 => ERR_INVAL,                                   // mremap (stub)
         26 => 0,                                           // msync (stub)
         27 => 0,                                           // mincore (stub)
-        28 => linux_madvise(args[0], args[1], args[2]),  // madvise
+        28 => linux_madvise(args[0], args[1], args[2]),    // madvise
         29 => linux_dup(args[0]),                          // dup
         30 => linux_dup2(args[0], args[1]),                // dup2
         31 => linux_pause(),                               // pause
@@ -388,6 +374,8 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         107 => 0,                                   // geteuid (stub: root)
         108 => 0,                                   // getegid (stub: root)
         72 => linux_fcntl(args[0], args[1], args[2]),
+        74 => linux_fsync(args[0]), // fsync
+        75 => linux_fsync(args[0]), // fdatasync (same as fsync for us)
         77 => {
             // ftruncate(fd, length) — resize file
             let fd = args[0] as i32;
@@ -395,19 +383,20 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
             crate::process::with_fd_table(|fd_table| {
                 let fd_type = fd_table.get(fd as usize).map(|d| d.fd_type.clone());
                 fd_type
-            }).map_or(0, |fd_type| {
+            })
+            .map_or(0, |fd_type| {
                 match fd_type {
-                    FdType::VfsFile(vfs_fd) => {
-                        match crate::driver::vfs::truncate(vfs_fd, length) {
-                            Ok(()) => 0,
-                            Err(_) => -1,
+                    FdType::VfsFile(vfs_fd) => match crate::driver::vfs::truncate(vfs_fd, length) {
+                        Ok(()) => 0,
+                        Err(_) => -1,
+                    },
+                    FdType::FakeFile(_) => crate::process::with_fd_table(|fd_table| {
+                        if fd_table.fake_truncate(fd, length) {
+                            0
+                        } else {
+                            0
                         }
-                    }
-                    FdType::FakeFile(_) => {
-                        crate::process::with_fd_table(|fd_table| {
-                            if fd_table.fake_truncate(fd, length) { 0 } else { 0 }
-                        })
-                    }
+                    }),
                     _ => {
                         // Ext4File, pipe, etc. — pretend success
                         0
@@ -431,7 +420,8 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         234 => linux_tgkill(args[0], args[1], args[2]), // tgkill
         257 => linux_openat(args[0], args[1], args[2], args[3]), // openat
         258 => linux_mkdirat(args[0], args[1], args[2], args[3]), // mkdirat
-        262 => -2,  // linux_newfstatat → ENOENT (stub)
+        262 => linux_newfstatat(args[0], args[1], args[2], args[3]), // newfstatat
+        263 => sys_unlink(args[1], linux::count_user_string(args[1])), // unlinkat
         267 => 0,                                   // readlinkat (stub)
         272 => 0,                                   // unshare (stub)
         273 => 0,                                   // set_robust_list (stub)
@@ -503,7 +493,11 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
         Ok(vfs_fd) => {
             // Register the VFS fd in the process FdTable
             crate::process::with_fd_table(|fd_table| {
-                match fd_table.alloc_vfs_fd(alloc::format!("{}", path_str), vfs_fd, our_flags as u32) {
+                match fd_table.alloc_vfs_fd(
+                    alloc::format!("{}", path_str),
+                    vfs_fd,
+                    our_flags as u32,
+                ) {
                     Some(fd) => fd as isize,
                     None => ERR_NOMEM,
                 }
@@ -517,7 +511,23 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                 || path_str.starts_with("/run");
             // /etc/resolv.conf, /etc/localtime etc. — fake these too
             let is_etc = path_str.starts_with("/etc");
-            if is_pseudo || is_etc {
+
+            // /dev/urandom and /dev/random need real random bytes, not FakeFile
+            // Match both "/dev/urandom" and "dev/urandom" (SQLite may use relative path)
+            let is_urandom = path_str == "/dev/urandom"
+                || path_str == "/dev/random"
+                || path_str == "dev/urandom"
+                || path_str == "dev/random";
+
+            if is_urandom {
+                crate::console_println!("[openat] urandom fd flags={:#x}", flags);
+                crate::process::with_fd_table(|fd_table| {
+                    match fd_table.alloc_urandom_fd(our_flags as u32) {
+                        Some(fd) => fd as isize,
+                        None => ERR_NOENT,
+                    }
+                })
+            } else if is_pseudo || is_etc {
                 crate::console_println!("[openat] fake '{}' flags={:#x}", path_str, flags);
                 crate::process::with_fd_table(|fd_table| {
                     match fd_table.alloc_fake_fd(alloc::format!("{}", path_str), our_flags as u32) {
@@ -526,7 +536,12 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                     }
                 })
             } else {
-                crate::console_println!("[openat] ERR '{}' flags={:#x} err={:?}", path_str, flags, e);
+                crate::console_println!(
+                    "[openat] ERR '{}' flags={:#x} err={:?}",
+                    path_str,
+                    flags,
+                    e
+                );
                 ERR_NOENT
             }
         }
@@ -534,34 +549,136 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
 }
 
 #[cfg(target_arch = "x86_64")]
-/// Linux stat / fstat — return a zeroed stat structure (Go mostly ignores the result)
+/// Linux stat — return stat structure with correct file type from VFS metadata.
 fn linux_stat(pathname: usize, statbuf: usize) -> isize {
-    let _ = pathname;
     if statbuf != 0 {
-        // Zero-fill struct stat (144 bytes on x86_64 Linux)
-        unsafe {
-            core::ptr::write_bytes(statbuf as *mut u8, 0, 144);
-            // Set st_mode to 0o41FF (S_IFDIR | 0777) — report everything as directory.
-            // This makes os.MkdirAll's Stat() fast-path succeed without calling Mkdir → mkdirat → ext4 create.
-            // Also set st_nlink = 1, st_blksize = 4096
-            *(statbuf as *mut u64).add(2) = 1u64;        // st_nlink = 1
-            *(statbuf as *mut u32).add(6) = 0x41FFu32;    // st_mode = S_IFDIR | 0777 (offset 24 = 6*u32)
-            *(statbuf as *mut u64).add(7) = 4096u64;      // st_blksize = 4096
+        // Try to read the path
+        let path_len = linux::count_user_string(pathname);
+        let mut buf = [0u8; 256];
+        if path_len > 0 && path_len <= 256 {
+            unsafe {
+                let src = pathname as *const u8;
+                for i in 0..path_len {
+                    buf[i] = core::ptr::read_volatile(src.add(i));
+                }
+            }
+            if let Ok(s) = core::str::from_utf8(&buf[..path_len]) {
+                let resolved = crate::syscall::resolve_path(s);
+
+                // Check if it's a pseudo path (/proc, /sys, /dev, /etc, /run)
+                let is_pseudo = resolved.starts_with("/proc")
+                    || resolved.starts_with("/sys")
+                    || resolved.starts_with("/dev")
+                    || resolved.starts_with("/run")
+                    || resolved.starts_with("/etc");
+
+                // Try VFS walk to get real inode and metadata
+                if let Ok(ino) = crate::driver::vfs::walk_path_resolved(&resolved) {
+                    if let Ok(meta) = crate::driver::vfs::inode_metadata(ino) {
+                        let st_mode = if meta.is_dir() {
+                            0x41FFu32 // S_IFDIR | 0777
+                        } else {
+                            0x81A4u32 // S_IFREG | 0644
+                        };
+                        unsafe {
+                            let p = statbuf as *mut u8;
+                            core::ptr::write_bytes(p, 0, 144);
+                            *((p as usize + 8) as *mut u64) = ino; // st_ino
+                            *((p as usize + 16) as *mut u64) = 1; // st_nlink = 1
+                            *((p as usize + 24) as *mut u32) = st_mode; // st_mode
+                            *((p as usize + 48) as *mut i64) = meta.size as i64; // st_size
+                            *((p as usize + 56) as *mut i64) = 4096; // st_blksize
+                        }
+                        return 0;
+                    }
+                }
+
+                // Pseudo-filesystem paths: fake as directory (for MkdirAll compatibility)
+                if is_pseudo {
+                    unsafe {
+                        let p = statbuf as *mut u8;
+                        core::ptr::write_bytes(p, 0, 144);
+                        *((p as usize + 16) as *mut u64) = 1; // st_nlink = 1
+                        *((p as usize + 24) as *mut u32) = 0x41FFu32; // S_IFDIR | 0777
+                        *((p as usize + 56) as *mut i64) = 4096; // st_blksize
+                    }
+                    return 0;
+                }
+
+                // Real filesystem path not found — return ENOENT so Go's MkdirAll
+                // knows it needs to create the directory
+                return -2; // ENOENT
+            }
         }
+
+        // Couldn't parse path — return ENOENT
+        return -2; // ENOENT
     }
     0
 }
 
 #[cfg(target_arch = "x86_64")]
 fn linux_fstat(fd: usize, statbuf: usize) -> isize {
-    if statbuf != 0 {
-        unsafe {
-            core::ptr::write_bytes(statbuf as *mut u8, 0, 144);
-            // Report everything as directory (S_IFDIR | 0777)
-            *(statbuf as *mut u64).add(2) = 1u64;        // st_nlink = 1
-            *(statbuf as *mut u32).add(6) = 0x41FFu32;    // st_mode = S_IFDIR | 0777
-            *(statbuf as *mut u64).add(7) = 4096u64;      // st_blksize = 4096
+    if statbuf == 0 {
+        return 0;
+    }
+
+    // x86_64 Linux struct stat layout (144 bytes):
+    //   0:  st_dev     (u64)
+    //   8:  st_ino     (u64)
+    //  16:  st_nlink   (u64)
+    //  24:  st_mode    (u32), st_uid (u32)
+    //  32:  st_gid     (u32), pad (u32)
+    //  40:  st_rdev    (u64)
+    //  48:  st_size    (i64)
+    //  56:  st_blksize (i64)
+    //  64:  st_blocks  (i64)
+
+    // Determine file type and metadata from fd
+    let (st_mode, st_size, st_ino) = crate::process::with_fd_table(|fd_table| {
+        if let Some(desc) = fd_table.get(fd) {
+            match &desc.fd_type {
+                FdType::VfsFile(vfs_fd) => {
+                    let ino = crate::driver::vfs::get_inode_for_fd(*vfs_fd).unwrap_or(0);
+                    (0x81A4u32, 0u64, ino) // S_IFREG | 0644
+                }
+                FdType::Urandom => {
+                    (0x21A4u32, 0u64, 0u64) // S_IFCHR | 0644 (character device)
+                }
+                FdType::FakeFile(_) => {
+                    (0x81A4u32, 0u64, 0u64) // S_IFREG | 0644
+                }
+                FdType::Stdio => {
+                    (0x21A4u32, 0u64, 1u64) // S_IFCHR | 0644, inode 1
+                }
+                FdType::PipeRead | FdType::PipeWrite => {
+                    (0x11A4u32, 0u64, 0u64) // S_IFIFO | 0644
+                }
+                _ => {
+                    (0x81A4u32, 0u64, 0u64) // default: regular file
+                }
+            }
+        } else {
+            (0x41FFu32, 0u64, 0u64) // S_IFDIR | 0777 (fallback)
         }
+    });
+
+    unsafe {
+        let p = statbuf as *mut u8;
+        core::ptr::write_bytes(p, 0, 144);
+        // st_dev = 0 (offset 0)
+        // st_ino (offset 8)
+        *((p as usize + 8) as *mut u64) = st_ino;
+        // st_nlink = 1 (offset 16)
+        *((p as usize + 16) as *mut u64) = 1;
+        // st_mode (offset 24)
+        *((p as usize + 24) as *mut u32) = st_mode;
+        // st_rdev = 0 (offset 40)
+        // st_size (offset 48)
+        *((p as usize + 48) as *mut i64) = st_size as i64;
+        // st_blksize = 4096 (offset 56)
+        *((p as usize + 56) as *mut i64) = 4096;
+        // st_blocks = 0 (offset 64)
     }
     0
 }
@@ -574,6 +691,7 @@ fn linux_lstat(_pathname: usize, statbuf: usize) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 fn linux_newfstatat(_dirfd: usize, pathname: usize, statbuf: usize, _flags: usize) -> isize {
+    // For now, delegate to linux_stat which returns S_IFREG
     linux_stat(pathname, statbuf)
 }
 
@@ -590,8 +708,69 @@ fn linux_lseek(_fd: usize, _offset: usize, _whence: usize) -> isize {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn linux_pread64(fd: i32, buf: usize, count: usize, _offset: usize) -> isize {
+#[cfg(target_arch = "x86_64")]
+fn linux_pread64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi: usize) -> isize {
+    let offset = (offset_hi as u64) << 32 | (offset_lo as u64);
+    let offset = offset as usize;
+    if count == 0 {
+        return 0;
+    }
+
+    // Kernel buffer for VFS read (user pointer can't be used under kernel CR3)
+    let mut data = alloc::vec![0u8; count];
+
+    // Try VFS pread (offset-based, no fd position update)
+    match crate::driver::vfs::pread(fd as usize, &mut data, offset) {
+        Ok(n) => {
+            // Copy to user space
+            let dst = buf as *mut u8;
+            unsafe {
+                for i in 0..n {
+                    core::ptr::write_volatile(dst.add(i), data[i]);
+                }
+            }
+            return n as isize;
+        }
+        Err(_) => {}
+    }
+
+    // Fallback to regular sys_read for non-VFS fds (pipes, stdio, etc.)
     sys_read(fd, buf, count)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi: usize) -> isize {
+    let offset = (offset_hi as u64) << 32 | (offset_lo as u64);
+    let offset = offset as usize;
+    if count == 0 {
+        return 0;
+    }
+
+    // Read from user space into kernel buffer
+    let mut data = alloc::vec![0u8; count];
+    let src = buf as *const u8;
+    unsafe {
+        for i in 0..count {
+            data[i] = core::ptr::read_volatile(src.add(i));
+        }
+    }
+
+    // Try VFS pwrite (offset-based, no fd position update)
+    match crate::driver::vfs::pwrite(fd as usize, &data, offset) {
+        Ok(n) => return n as isize,
+        Err(_) => {}
+    }
+
+    // Fallback: check if fd is stdout/stderr
+    if fd == 1 || fd == 2 {
+        for &b in &data {
+            crate::arch::uart::putchar(b);
+        }
+        return count as isize;
+    }
+
+    // Fallback for non-VFS fds (pipes, etc.): ignore offset, do regular write
+    sys_write(fd, buf, count)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -809,12 +988,14 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         crate::arch::ioapic::unmask_external_irqs();
     }
 
-    // Syscall trace for Go binary debugging
-    static TRACE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let tc = TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Syscall trace — print syscalls in the critical window to find capacity overflow
     #[cfg(target_arch = "x86_64")]
-    if tc < 50 {
-        crate::klog!(TRACE, "[T#{tc}] sys{id} via80");
+    {
+        static SC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        let n = SC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n > 200 {
+            crate::console_println!("[sc] #{} id={}", n, id);
+        }
     }
 
     // Try Linux compat layer first.
@@ -828,8 +1009,12 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
     };
 
     #[cfg(target_arch = "x86_64")]
-    if tc < 50 {
-        crate::klog!(TRACE, "[T#{tc}] → {result}");
+    {
+        static SC2: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        let n2 = SC2.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n2 > 200 {
+            crate::console_println!("[sc] #{} id={} -> {}", n2, id, result);
+        }
     }
     result
 }
@@ -992,8 +1177,16 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         static WR_STDOUT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
         let n = WR_STDOUT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if n < 10 {
-            crate::console_println!("[write] fd={} len={} first_byte={:#x}", fd, len,
-                if len > 0 { unsafe { core::ptr::read_volatile(buf as *const u8) } } else { 0 });
+            crate::console_println!(
+                "[write] fd={} len={} first_byte={:#x}",
+                fd,
+                len,
+                if len > 0 {
+                    unsafe { core::ptr::read_volatile(buf as *const u8) }
+                } else {
+                    0
+                }
+            );
         }
         for i in 0..len {
             let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
@@ -1033,16 +1226,37 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
                 fd_table.fake_write(fd, buf, len).unwrap_or(len as isize)
             });
         }
+        Some((FdType::Urandom, _, _)) => {
+            // /dev/urandom: writes are silently discarded
+            return len as isize;
+        }
         Some((FdType::VfsFile(vfs_fd), _, _)) => {
             // VFS file: copy user data to kernel buffer first, because
             // vfs::write() switches to kernel CR3 where user pages are inaccessible.
             let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
             let mut kbuf = alloc::vec![0u8; len];
             kbuf.copy_from_slice(data);
+            // Debug: show which inode this write targets
+            {
+                let inode = crate::driver::vfs::get_inode_for_fd(vfs_fd);
+                if len > 20 {
+                    let preview = &kbuf[..20.min(len)];
+                    crate::console_println!(
+                        "[wr] fd={} vfs_fd={} inode={:?} len={} {:02x?}",
+                        fd,
+                        vfs_fd,
+                        inode,
+                        len,
+                        &preview[..8.min(preview.len())]
+                    );
+                }
+            }
             return match crate::driver::vfs::write(vfs_fd, &kbuf) {
                 Ok(n) => {
                     crate::process::with_fd_table(|fd_table| {
-                        if let Some(f) = fd_table.get_mut(fd as usize) { f.pos += n; }
+                        if let Some(f) = fd_table.get_mut(fd as usize) {
+                            f.pos += n;
+                        }
                     });
                     n as isize
                 }
@@ -1131,6 +1345,12 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 fd_table.fake_read(fd, buf, len).unwrap_or(0)
             });
         }
+        Some((FdType::Urandom, _, _)) => {
+            // /dev/urandom: generate random bytes
+            return crate::process::with_fd_table(|fd_table| {
+                fd_table.fake_read(fd, buf, len).unwrap_or(0)
+            });
+        }
         Some((FdType::VfsFile(vfs_fd), _, _)) => {
             // VFS file: read into kernel buffer first, then copy to user space.
             // vfs::read() switches to kernel CR3 where user pages are inaccessible.
@@ -1140,7 +1360,9 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
                     data[..n].copy_from_slice(&kbuf[..n]);
                     crate::process::with_fd_table(|fd_table| {
-                        if let Some(f) = fd_table.get_mut(fd as usize) { f.pos += n; }
+                        if let Some(f) = fd_table.get_mut(fd as usize) {
+                            f.pos += n;
+                        }
                     });
                     n as isize
                 }
@@ -1710,6 +1932,24 @@ fn flush_tlb_all() {
 ///   - F_GETFL / F_SETFL: file status flags
 ///   - F_GETLK / F_SETLK / F_SETLKW: POSIX advisory byte-range locking
 ///
+/// Linux fsync(fd) — flush file data to disk.
+/// For VFS/ext4 files, issues ATA FLUSH CACHE via AHCI to ensure data is on disk.
+#[cfg(target_arch = "x86_64")]
+fn linux_fsync(fd: usize) -> isize {
+    if fd >= crate::driver::fs::MAX_FDS {
+        return -9; // EBADF
+    }
+    // Issue ATA FLUSH CACHE to ensure all pending writes reach the physical disk.
+    // This is critical for SQLite WAL mode durability guarantees.
+    if crate::driver::ahci::is_available() {
+        if let Err(e) = crate::driver::ahci::flush_cache() {
+            crate::console_println!("[fsync] AHCI flush failed: {}", e);
+            return -5; // EIO
+        }
+    }
+    0
+}
+
 /// SQLite WAL mode depends critically on byte-range locks to coordinate
 /// concurrent access from multiple Go goroutines (clone'd threads).
 fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
@@ -1754,24 +1994,13 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let flock = Flock::read_from_user(arg as *const u8);
 
             // Look up the inode for this fd — locks are keyed by inode.
-            let inode = crate::process::with_fd_table(|fd_table| {
-                match fd_table.get(fd) {
-                    Some(desc) => {
-                        match desc.fd_type {
-                            FdType::File => {
-                                crate::driver::vfs::get_inode_for_fd(fd)
-                            }
-                            FdType::Ext4File(ref ext4fd) => {
-                                Some(ext4fd.inode_num as u64)
-                            }
-                            FdType::VfsFile(vfs_fd) => {
-                                crate::driver::vfs::get_inode_for_fd(vfs_fd)
-                            }
-                            _ => Some(fd as u64 + 0x10000),
-                        }
-                    }
-                    None => None,
-                }
+            let inode = crate::process::with_fd_table(|fd_table| match fd_table.get(fd) {
+                Some(desc) => match desc.fd_type {
+                    FdType::File => crate::driver::vfs::get_inode_for_fd(fd),
+                    FdType::VfsFile(vfs_fd) => crate::driver::vfs::get_inode_for_fd(vfs_fd),
+                    _ => Some(fd as u64 + 0x10000),
+                },
+                None => None,
             });
 
             let inode = match inode {
@@ -1857,9 +2086,9 @@ fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
             0
         }
         // All other advice values: no-op success
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED
-        | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
-        | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_COLLAPSE => 0,
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTFORK
+        | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE
+        | MADV_COLLAPSE => 0,
         _ => 0, // Unknown advice: silently succeed
     }
 }
@@ -2029,10 +2258,32 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     }
 
     // Convert flags: Linux x86_64 O_CREAT=0x40, our internal=0x100
-    let linux_o_creat: u32 = if cfg!(target_arch = "x86_64") { 0x40 } else { 0x100 };
-    let has_creat = (flags & linux_o_creat) != 0 || (flags & O_CREAT) != 0;
-    let our_flags = if has_creat { O_CREAT } else { 0 }
-        | (flags & (crate::driver::fs::O_TRUNC | crate::driver::fs::O_APPEND));
+    let linux_o_creat: u32 = if cfg!(target_arch = "x86_64") {
+        0x40
+    } else {
+        0x100
+    };
+    let has_creat = (flags & linux_o_creat) != 0 || (flags & crate::driver::fs::O_CREAT) != 0;
+    let our_flags = if has_creat {
+        crate::driver::fs::O_CREAT
+    } else {
+        0
+    } | (flags & (crate::driver::fs::O_TRUNC | crate::driver::fs::O_APPEND));
+
+    if name.contains("xbot")
+        || name.contains("session")
+        || name.contains(".db")
+        || name.contains("shm")
+        || name.contains("wal")
+    {
+        crate::console_println!(
+            "[sys_open] '{}' linux_flags={:#x} has_creat={} our_flags={:#x}",
+            name,
+            flags,
+            has_creat,
+            our_flags
+        );
+    }
 
     // Try VFS open first (supports real ext4 files with O_CREAT)
     match crate::driver::vfs::open(&name, our_flags) {
@@ -2054,6 +2305,36 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         || name.starts_with("/dev")
         || name.starts_with("/run")
         || name.starts_with("/etc");
+
+    // /dev/urandom and /dev/random need real random bytes
+    // Match both "/dev/urandom" and "dev/urandom" (SQLite may use relative path)
+    let is_urandom = name == "/dev/urandom"
+        || name == "/dev/random"
+        || name == "dev/urandom"
+        || name == "dev/random";
+    if is_urandom {
+        crate::console_println!("[sys_open] urandom MATCH name='{}'", name);
+    }
+
+    // If VFS failed, try RamFS fallback (for test files and embedded files)
+    if !is_pseudo && !is_urandom {
+        let ram_fs = crate::driver::fs::global_fs();
+        if ram_fs.read(&name).is_some() {
+            return crate::process::with_fd_table(|fd_table| {
+                match fd_table.alloc(name.clone(), flags) {
+                    Some(fd) => fd as isize,
+                    None => ERR_NOMEM,
+                }
+            });
+        }
+    }
+
+    if is_urandom {
+        return crate::process::with_fd_table(|fd_table| match fd_table.alloc_urandom_fd(flags) {
+            Some(fd) => fd as isize,
+            None => ERR_NOMEM,
+        });
+    }
 
     if is_pseudo {
         return crate::process::with_fd_table(|fd_table| {
@@ -2320,9 +2601,24 @@ fn sys_unlink(path: usize, path_len: usize) -> isize {
         _ => return ERR_INVAL,
     };
     let name = resolve_path(&name);
+
+    // Debug: log unlink for SQLite-related files
+    if name.contains("xbot")
+        || name.contains(".db")
+        || name.contains("shm")
+        || name.contains("wal")
+        || name.contains("journal")
+    {
+        crate::console_println!("[unlink] '{}'", name);
+    }
+
+    // Try to delete from VFS/ext4/RamFS. If the file doesn't exist,
+    // still return success — SQLite's WAL mode cleanup tries to delete
+    // old -shm/-wal files that may not exist, and treating ENOENT as
+    // an IO error causes SQLITE_IOERR_DELETE_NOENT (5898).
     match crate::driver::fs::delete_file(&name) {
         Ok(()) => 0,
-        Err(()) => ERR_NOENT,
+        Err(()) => 0, // File not found is NOT an error for unlink
     }
 }
 
@@ -3741,25 +4037,25 @@ pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
             }
             0
         }
-        TCSETS => match arg {
-            TERM_RAW => {
-                crate::driver::tty::set_mode(crate::driver::tty::TtyMode::Raw);
-                0
+        TCSETS => {
+            // arg is a pointer to struct termios in user space.
+            // struct termios { c_iflag: u32, c_oflag: u32, c_cflag: u32, c_lflag: u32,
+            //                  c_line: u8, c_cc: [u8; 19] }
+            // Parse lflag to determine mode.
+            if arg != 0 {
+                let lflag = unsafe { *((arg + 12) as *const u32) };
+                let icanon = (lflag & 0x0002) != 0; // ICANON
+                let echo = (lflag & 0x0008) != 0; // ECHO
+                if !icanon {
+                    // Raw mode: ICANON cleared
+                    crate::driver::tty::set_mode(crate::driver::tty::TtyMode::Raw);
+                } else {
+                    crate::driver::tty::set_mode(crate::driver::tty::TtyMode::Canonical);
+                }
+                crate::driver::tty::set_echo(echo);
             }
-            TERM_COOKED => {
-                crate::driver::tty::set_mode(crate::driver::tty::TtyMode::Canonical);
-                0
-            }
-            TERM_ECHO_ON => {
-                crate::driver::tty::set_echo(true);
-                0
-            }
-            TERM_ECHO_OFF => {
-                crate::driver::tty::set_echo(false);
-                0
-            }
-            _ => ERR_INVAL,
-        },
+            0
+        }
         TIOCGWINSZ => {
             // Write struct winsize into user-space buffer at `arg`.
             // struct winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }

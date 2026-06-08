@@ -240,18 +240,27 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
 
     match inode_result {
         Ok(inode) => {
+            crate::console_println!("[vfs] open '{}' found inode={}", relative_path, inode);
             // File exists — optionally truncate
             if flags & O_TRUNC != 0 {
                 let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
                 mount.fs.set_file_size(inode, 0)?;
             }
-            vfs.open_files.alloc(mount_id, inode, flags)
+            crate::console_println!("[vfs] open found inode={}", inode);
+            let vfs_fd = vfs.open_files.alloc(mount_id, inode, flags)?;
+            crate::console_println!("[vfs] open found -> vfs_fd={}", vfs_fd);
+            Ok(vfs_fd)
         }
         Err(walk_err) => {
             if flags & O_CREAT != 0 {
                 // File doesn't exist but O_CREAT is set — create it
                 let (parent_path, file_name) = split_filename(&relative_path)?;
-                crate::console_println!("[vfs] O_CREAT '{}' parent='{}' name='{}'", relative_path, parent_path, file_name);
+                crate::console_println!(
+                    "[vfs] O_CREAT '{}' parent='{}' name='{}'",
+                    relative_path,
+                    parent_path,
+                    file_name
+                );
                 let parent_inode = {
                     let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
                     if parent_path.is_empty() {
@@ -260,7 +269,11 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
                         match walk_path(&*mount.fs, parent_path) {
                             Ok(inode) => inode,
                             Err(e) => {
-                                crate::console_println!("[vfs] O_CREAT parent '{}' walk err={:?}", parent_path, e);
+                                crate::console_println!(
+                                    "[vfs] O_CREAT parent '{}' walk err={:?}",
+                                    parent_path,
+                                    e
+                                );
                                 return Err(e);
                             }
                         }
@@ -268,18 +281,69 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
                 };
                 let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
                 match mount.fs.create_file(parent_inode, file_name) {
-                    Ok(inode) => vfs.open_files.alloc(mount_id, inode, flags),
+                    Ok(ino) => {
+                        let vfs_fd = vfs.open_files.alloc(mount_id, ino, flags)?;
+                        crate::console_println!(
+                            "[vfs] O_CREAT '{}' -> vfs_fd={} inode={}",
+                            file_name,
+                            vfs_fd,
+                            ino
+                        );
+                        Ok(vfs_fd)
+                    }
                     Err(e) => {
-                        crate::console_println!("[vfs] O_CREAT create_file '{}' err={:?}", file_name, e);
+                        crate::console_println!(
+                            "[vfs] O_CREAT create_file '{}' err={:?}",
+                            file_name,
+                            e
+                        );
                         Err(VfsError::IoError)
                     }
                 }
             } else {
-                crate::console_println!("[vfs] open '{}' walk_err={:?} flags={:#x} no O_CREAT", relative_path, walk_err, flags);
+                crate::console_println!(
+                    "[vfs] open '{}' walk_err={:?} flags={:#x} no O_CREAT",
+                    relative_path,
+                    walk_err,
+                    flags
+                );
                 Err(walk_err)
             }
         }
     }
+}
+
+/// Check if a file exists in the VFS (by walking the path).
+pub fn exists(path: &str) -> bool {
+    let vfs = VFS.lock();
+    if vfs.mounts.is_empty() {
+        return false;
+    }
+    let mount = &vfs.mounts[0];
+    match walk_path(&*mount.fs, path) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// Walk a resolved path and return the inode number.
+pub fn walk_path_resolved(path: &str) -> Result<u64, VfsError> {
+    let vfs = VFS.lock();
+    if vfs.mounts.is_empty() {
+        return Err(VfsError::NotFound);
+    }
+    let mount = &vfs.mounts[0];
+    walk_path(&*mount.fs, path)
+}
+
+/// Get metadata for a given inode number.
+pub fn inode_metadata(inode: u64) -> Result<VfsMetadata, VfsError> {
+    let vfs = VFS.lock();
+    if vfs.mounts.is_empty() {
+        return Err(VfsError::NotFound);
+    }
+    let mount = &vfs.mounts[0];
+    mount.fs.metadata(inode)
 }
 
 /// Get the inode number for a given fd in the VFS open file table.
@@ -332,11 +396,47 @@ pub fn write(fd: usize, data: &[u8]) -> Result<usize, VfsError> {
     let mount_id = of.mount_id;
     let inode = of.inode;
     let offset = of.pos;
+    if data.len() >= 8 {
+        crate::console_println!(
+            "[vfs_wr] fd={} inode={} off={} len={} {:02x?}",
+            fd,
+            inode,
+            offset,
+            data.len(),
+            &data[..8.min(data.len())]
+        );
+    }
     let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
     let bytes_written = mount.fs.write_file(inode, offset, data)?;
     let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;
     of.pos += bytes_written;
     Ok(bytes_written)
+}
+
+/// Write at a specific offset without updating fd position (for pwrite64)
+pub fn pwrite(fd: usize, data: &[u8], offset: usize) -> Result<usize, VfsError> {
+    let mut vfs = VFS.lock();
+    let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;
+    if of.flags == O_RDONLY {
+        return Err(VfsError::PermissionDenied);
+    }
+    let mount_id = of.mount_id;
+    let inode = of.inode;
+    let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
+    mount.fs.write_file(inode, offset, data)
+}
+
+/// Read at a specific offset without updating fd position (for pread64)
+pub fn pread(fd: usize, buf: &mut [u8], offset: usize) -> Result<usize, VfsError> {
+    let mut vfs = VFS.lock();
+    let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;
+    if of.flags == O_WRONLY {
+        return Err(VfsError::PermissionDenied);
+    }
+    let mount_id = of.mount_id;
+    let inode = of.inode;
+    let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
+    mount.fs.read_file(inode, offset, buf)
 }
 
 /// Close an open file

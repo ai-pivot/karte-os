@@ -202,6 +202,7 @@ pub fn init() {
             // Register ext4 as the root filesystem in VFS so that
             // syscalls like openat(O_CREAT) can create files on ext4
             // through the VFS layer.
+            #[cfg(target_arch = "x86_64")]
             match crate::driver::ext4::mount_to_vfs() {
                 Ok(()) => crate::console_println!("[fs] ext4 registered in VFS"),
                 Err(e) => crate::console_println!("[fs] ext4 VFS mount failed: {}", e),
@@ -467,9 +468,9 @@ impl Flock {
     /// For SQLite, l_whence is always SEEK_SET (0).
     pub fn abs_start(&self) -> i64 {
         match self.l_whence {
-            0 => self.l_start,       // SEEK_SET
-            1 => self.l_start,       // SEEK_CUR (approximate — no file pos available)
-            2 => self.l_start,       // SEEK_END (approximate)
+            0 => self.l_start, // SEEK_SET
+            1 => self.l_start, // SEEK_CUR (approximate — no file pos available)
+            2 => self.l_start, // SEEK_END (approximate)
             _ => self.l_start,
         }
     }
@@ -576,12 +577,7 @@ pub fn release_fd_locks(fd: usize) {
 /// Returns (retval, should_write_flock).
 /// - retval: syscall return value (0 = success, -1 = error)
 /// - If should_write_flock, the caller should write `out_flock` to user buf.
-pub fn fcntl_lock_op(
-    cmd: usize,
-    fd: usize,
-    inode: u64,
-    flock: &Flock,
-) -> (isize, Option<Flock>) {
+pub fn fcntl_lock_op(cmd: usize, fd: usize, inode: u64, flock: &Flock) -> (isize, Option<Flock>) {
     let lock_type = flock.l_type as u16;
     let start = flock.abs_start();
     let end = flock.abs_end();
@@ -668,6 +664,9 @@ pub enum FdType {
     FakeFile(alloc::vec::Vec<u8>),
     /// Virtual file (e.g., /proc/version) — always readable, empty content.
     VirtualFile,
+    /// /dev/urandom — reads return cryptographic-quality random bytes,
+    /// writes are discarded. Required by SQLite WAL mode for nonce generation.
+    Urandom,
     /// eventfd — for Go runtime polling.
     #[cfg(target_arch = "x86_64")]
     Eventfd,
@@ -726,14 +725,15 @@ impl FileDescriptor {
                 }
             }
             #[cfg(target_arch = "x86_64")]
-            FdType::Eventfd => {
-                crate::syscall::epoll::eventfd::eventfd_peek_by_fd(self.fd_num) > 0
-            }
+            FdType::Eventfd => crate::syscall::epoll::eventfd::eventfd_peek_by_fd(self.fd_num) > 0,
             #[cfg(target_arch = "x86_64")]
-            FdType::Timerfd => {
-                crate::syscall::epoll::timerfd_peek(self.fd_num)
-            }
-            FdType::PipeWrite | FdType::File | FdType::FakeFile(_) | FdType::VirtualFile | FdType::VfsFile(_) => false,
+            FdType::Timerfd => crate::syscall::epoll::timerfd_peek(self.fd_num),
+            FdType::PipeWrite
+            | FdType::File
+            | FdType::FakeFile(_)
+            | FdType::VirtualFile
+            | FdType::VfsFile(_)
+            | FdType::Urandom => false,
             #[cfg(target_arch = "x86_64")]
             FdType::Ext4File(_) => false,
         }
@@ -751,7 +751,11 @@ impl FileDescriptor {
             FdType::Stdio => self.name != "stdin",
             FdType::PipeWrite => true,
             FdType::PipeRead | FdType::Eventfd | FdType::Timerfd => false,
-            FdType::File | FdType::FakeFile(_) | FdType::VirtualFile | FdType::VfsFile(_) => true,
+            FdType::File
+            | FdType::FakeFile(_)
+            | FdType::VirtualFile
+            | FdType::VfsFile(_)
+            | FdType::Urandom => true,
             FdType::Ext4File(desc) => desc.writable,
         }
     }
@@ -762,7 +766,11 @@ impl FileDescriptor {
             FdType::Stdio => self.name != "stdin",
             FdType::PipeWrite => true,
             FdType::PipeRead => false,
-            FdType::File | FdType::FakeFile(_) | FdType::VirtualFile => true,
+            FdType::File
+            | FdType::FakeFile(_)
+            | FdType::VirtualFile
+            | FdType::Urandom
+            | FdType::VfsFile(_) => true,
         }
     }
 
@@ -819,7 +827,7 @@ impl FdTable {
                     valid: true,
                     fd_type: FdType::File,
                     pipe_id: None,
-                fd_num: 0,
+                    fd_num: 0,
                 });
                 return Some(i);
             }
@@ -832,9 +840,10 @@ impl FdTable {
     /// The FdTable entry just records the vfs_fd for routing read/write/close.
     pub fn alloc_vfs_fd(&mut self, name: String, vfs_fd: usize, flags: u32) -> Option<usize> {
         for (i, slot) in self.fds.iter_mut().enumerate() {
-            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+            let is_free = slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false);
+            if is_free {
                 *slot = Some(FileDescriptor {
-                    name,
+                    name: name.clone(),
                     pos: 0,
                     flags,
                     valid: true,
@@ -842,6 +851,9 @@ impl FdTable {
                     pipe_id: None,
                     fd_num: 0,
                 });
+                if i <= 5 {
+                    crate::console_println!("[avf] fd={} vf={}", i, vfs_fd);
+                }
                 return Some(i);
             }
         }
@@ -859,7 +871,7 @@ impl FdTable {
                     valid: true,
                     fd_type: FdType::Stdio,
                     pipe_id: None,
-                fd_num: 0,
+                    fd_num: 0,
                 });
                 return Some(i);
             }
@@ -878,7 +890,26 @@ impl FdTable {
                     valid: true,
                     fd_type: FdType::FakeFile(alloc::vec![]),
                     pipe_id: None,
-                fd_num: 0,
+                    fd_num: 0,
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Allocate a fd for /dev/urandom — reads produce random bytes.
+    pub fn alloc_urandom_fd(&mut self, flags: u32) -> Option<usize> {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = Some(FileDescriptor {
+                    name: alloc::string::String::from("/dev/urandom"),
+                    pos: 0,
+                    flags,
+                    valid: true,
+                    fd_type: FdType::Urandom,
+                    pipe_id: None,
+                    fd_num: 0,
                 });
                 return Some(i);
             }
@@ -922,6 +953,10 @@ impl FdTable {
                     };
                     (pos, core::cmp::min(len, avail))
                 }
+                FdType::Urandom => {
+                    // /dev/urandom: always produces bytes, never EOF
+                    (0, len)
+                }
                 _ => return None,
             }
         };
@@ -929,10 +964,27 @@ impl FdTable {
         {
             let slot = self.fds.get(fd as usize)?;
             let desc = slot.as_ref()?;
-            if let FdType::FakeFile(data) = &desc.fd_type {
-                for i in 0..to_read {
-                    unsafe { core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i]) };
+            match &desc.fd_type {
+                FdType::FakeFile(data) => {
+                    for i in 0..to_read {
+                        unsafe { core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i]) };
+                    }
                 }
+                FdType::Urandom => {
+                    // Generate pseudo-random bytes using LCG PRNG
+                    static PRNG: core::sync::atomic::AtomicU64 =
+                        core::sync::atomic::AtomicU64::new(0xDEADBEEFCAFE1234);
+                    for i in 0..to_read {
+                        let prev = PRNG.load(core::sync::atomic::Ordering::Relaxed);
+                        let next = prev
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        PRNG.store(next, core::sync::atomic::Ordering::Relaxed);
+                        let byte = ((next >> ((i % 8) * 8)) & 0xFF) as u8;
+                        unsafe { core::ptr::write_volatile((buf + i) as *mut u8, byte) };
+                    }
+                }
+                _ => {}
             }
         }
         // Update pos
@@ -1029,6 +1081,9 @@ impl FdTable {
     pub fn close(&mut self, fd: usize) -> bool {
         if let Some(slot) = self.fds.get_mut(fd) {
             if slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                if fd <= 5 {
+                    crate::console_println!("[cl] fd={}", fd);
+                }
                 *slot = None;
                 return true;
             }

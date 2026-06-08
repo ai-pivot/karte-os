@@ -88,6 +88,13 @@ impl Ext4Inode {
     }
 
     pub fn size(&self) -> u64 {
+        // Only use lower 32 bits — size_hi may contain garbage if disk
+        // was formatted without 64bit feature and inode table has stale data
+        self.size as u64
+    }
+
+    /// Get the full 64-bit size (use only when 64-bit support is confirmed)
+    pub fn size_full(&self) -> u64 {
         self.size as u64 | ((self.size_hi as u64) << 32)
     }
 

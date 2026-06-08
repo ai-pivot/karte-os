@@ -35,16 +35,43 @@ menuentry "KarteOS" {
 }
 EOF
 grub-mkrescue -o target/karte-os-x86_64.iso target/x86_64-iso
-qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot
-# With VirtIO block device:
-qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot \
-    -drive file=disk.img,format=raw,if=none,id=hd0 -device virtio-blk-pci,drive=hd0
-# With AHCI/SATA (real hardware compatible):
-qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -no-reboot \
+
+# Run with AHCI/SATA (recommended for xbot testing, requires 512M RAM):
+qemu-system-x86_64 -machine pc -cpu qemu64 -m 512M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot \
     -drive file=disk.img,format=raw,if=none,id=hd0 -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0
-# With VGA display (shows text on screen instead of -display none):
-qemu-system-x86_64 -machine pc -cpu qemu64 -m 128M -cdrom target/karte-os-x86_64.iso -serial stdio -no-reboot \
-    -drive file=disk.img,format=raw,if=none,id=hd0 -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0
+
+# x86_64 xbot test — build kernel + ISO + run xbot-cli-static with output captured to file:
+rm -f /tmp/qemu-serial.sock
+cd /home/user/src/karte-os
+qemu-system-x86_64 -machine pc -cpu qemu64 -m 512M \
+    -cdrom target/karte-os-x86_64.iso \
+    -chardev socket,id=s0,path=/tmp/qemu-serial.sock,server=on,wait=off \
+    -serial chardev:s0 \
+    -display none -no-reboot \
+    -drive file=disk.img,format=raw,if=none,id=hd0 \
+    -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 &
+QEMU_PID=$!
+sleep 6  # wait for boot
+python3 -c "
+import socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect('/tmp/qemu-serial.sock')
+time.sleep(1)
+s.send(b'xbot-cli-static\n')
+time.sleep(10)
+output = b''
+s.settimeout(1)
+while True:
+    try:
+        data = s.recv(4096)
+        if not data: break
+        output += data
+    except: break
+open('/tmp/qemu-xbot.log', 'wb').write(output)
+s.close()
+"
+kill $QEMU_PID 2>/dev/null; wait $QEMU_PID 2>/dev/null
+cat /tmp/qemu-xbot.log  # view output
 ```
 
 QEMU exit: `Ctrl+A` then `X`.
