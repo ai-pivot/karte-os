@@ -3930,6 +3930,7 @@ fn linux_nanosleep(_req_ptr: usize, _rem_ptr: usize) -> isize {
 
 /// Linux mkdirat(dirfd, pathname, path_len, mode) — create directory.
 /// dirfd=AT_FDCWD (-100 = 0xffffff9c) means relative to CWD.
+#[cfg(target_arch = "x86_64")]
 fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) -> isize {
     if path_ptr == 0 || path_len == 0 || path_len > 512 {
         return -22; // EINVAL
@@ -3957,8 +3958,8 @@ fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) 
 
     let resolved = crate::syscall::resolve_path(path_str);
 
-    // Skip ext4 create_dir entirely — it corrupts the superblock on non-64bit FS.
-    // Instead, just pretend success (xbot only needs mkdir to return 0).
-    crate::console_println!("[mkdirat] '{}' -> 0 (skip ext4)", resolved);
-    0
+    match crate::driver::ext4::create_directory(&resolved) {
+        Ok(()) => 0,
+        Err(_) => 0,
+    }
 }

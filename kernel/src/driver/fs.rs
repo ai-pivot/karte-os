@@ -412,7 +412,7 @@ pub enum FdType {
     Timerfd,
     /// ext4 file descriptor.
     #[cfg(target_arch = "x86_64")]
-    Ext4File(crate::driver::ext4_x86_64::Ext4FileDesc),
+    Ext4File(crate::driver::ext4::Ext4FileDesc),
 }
 
 /// A file descriptor entry — wraps an in-memory file with seek position

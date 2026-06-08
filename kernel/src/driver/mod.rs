@@ -19,8 +19,6 @@ pub mod virtio;
 
 pub mod block;
 pub mod ext4;
-#[cfg(target_arch = "x86_64")]
-pub mod ext4_x86_64;
 pub mod fat32;
 pub mod fs;
 pub mod pipe;

@@ -44,6 +44,7 @@ impl KarteBlockDevice {
 
 impl Ext4BlockDevice for KarteBlockDevice {
     fn read_offset(&self, offset: usize) -> Vec<u8> {
+        READ_COUNT.fetch_add(1, Ordering::Relaxed);
         let mut buf = alloc::vec![0u8; BLOCK_SIZE];
         let base_sector = offset / SECTOR_SIZE;
         let skip = offset % SECTOR_SIZE;
@@ -70,6 +71,7 @@ impl Ext4BlockDevice for KarteBlockDevice {
     }
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
+        WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
         let mut data_pos = 0;
         let mut current_offset = offset;
 
@@ -450,23 +452,13 @@ pub fn create_directory(path: &str) -> Result<(), &'static str> {
     let parent_inode = if parent_path.is_empty() {
         ROOT_INODE as u64
     } else {
-        fs.lookup(ROOT_INODE as u64, parent_path).map_err(|e| {
-            crate::console_println!("[ext4] mkdir parent '{}' not found: {:?}", parent_path, e);
-            "parent not found"
-        })?
+        fs.lookup(ROOT_INODE as u64, parent_path).map_err(|_| "parent not found")?
     };
 
     let mut ext4 = fs.ext4.lock();
-    match ext4.create(parent_inode as u32, dir_name, 0o40777 as u16) {
-        Ok(_ref) => {
-            crate::console_println!("[ext4] dir '{}' created inode={}", path, _ref.inode_num);
-            Ok(())
-        }
-        Err(e) => {
-            crate::console_println!("[ext4] mkdir '{}' failed: {:?}", path, e);
-            Err("ext4 create_dir failed")
-        }
-    }
+    ext4.create(parent_inode as u32, dir_name, 0o40777 as u16)
+        .map_err(|_| "ext4 create_dir failed")?;
+    Ok(())
 }
 
 pub fn delete_file(name: &str) -> Result<(), &'static str> {
