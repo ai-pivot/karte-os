@@ -149,35 +149,41 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
             };
             let user_pdp = unsafe { &mut *((user_pdp_ppn << 12) as *mut vmm::PageTable) };
             let user_flag = vmm::PTEFlags::USER.bits();
+            // CRITICAL: Only copy PDP entries that point to PD tables (PS=0).
+            // Skip 1GB huge page entries (PS=1) — these are MMIO ranges
+            // (LAPIC at 0xFEE00000, etc.) which must NOT be user-accessible.
+            const PS_BIT: u64 = 0x80;
             for i in 0..512 {
                 let kpe = kernel_pdp.entries[i];
-                if kpe.is_valid() && !user_pdp.entries[i].is_valid() {
-                    let kernel_pd = unsafe { &mut *((kpe.ppn() << 12) as *mut vmm::PageTable) };
-                    let new_pd = vmm::PageTable::zeroed();
-                    let new_pd_ppn = (new_pd as *const vmm::PageTable as usize) >> 12;
-                    for j in 0..512 {
-                        let pd_entry = kernel_pd.entries[j];
-                        if pd_entry.is_valid() {
-                            new_pd.entries[j] = vmm::PTE(pd_entry.0 | user_flag);
-                        }
-                    }
-                    let pd_flags = vmm::PTEFlags::PRESENT.bits()
-                        | vmm::PTEFlags::WRITABLE.bits()
-                        | vmm::PTEFlags::USER.bits();
-                    user_pdp.entries[i] = vmm::PTE(((new_pd_ppn as u64) << 12) | pd_flags);
+                // Skip non-present and 1GB huge pages (PS=1)
+                if !kpe.is_valid() || (kpe.0 & PS_BIT) != 0 {
+                    continue;
                 }
+                if user_pdp.entries[i].is_valid() {
+                    continue;
+                }
+                let kernel_pd = unsafe { &mut *((kpe.ppn() << 12) as *mut vmm::PageTable) };
+                let new_pd = vmm::PageTable::zeroed();
+                let new_pd_ppn = (new_pd as *const vmm::PageTable as usize) >> 12;
+                for j in 0..512 {
+                    let pd_entry = kernel_pd.entries[j];
+                    if pd_entry.is_valid() {
+                        new_pd.entries[j] = vmm::PTE(pd_entry.0 | user_flag);
+                    }
+                }
+                let pd_flags = vmm::PTEFlags::PRESENT.bits()
+                    | vmm::PTEFlags::WRITABLE.bits()
+                    | vmm::PTEFlags::USER.bits();
+                user_pdp.entries[i] = vmm::PTE(((new_pd_ppn as u64) << 12) | pd_flags);
             }
         }
 
-        crate::console_println!("[copy_km] done PDP copy, mapping VGA/MMIO...");
-        // Map VGA text buffer at 0xB8000 (2 pages)
+        crate::console_println!("[copy_km] done PDP copy, mapping VGA...");
+        // Map VGA text buffer at 0xB8000 (needed for console_putchar in trap path)
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xB9000, 0xB9000, vmm::PTEFlags::KRW);
-        // Map LAPIC/IOAPIC MMIO
-        vmm::map(user_pt, 0xFEE0_0000, 0xFEE0_0000, vmm::PTEFlags::KRW);
-        vmm::map(user_pt, 0xFEC0_0000, 0xFEC0_0000, vmm::PTEFlags::KRW);
-        // Map PCI MMIO region
-        vmm::identity_map_2mb(user_pt, 0xF000_0000, 0x1_0000_0000, vmm::PTEFlags::KRW);
+        // NOTE: LAPIC (0xFEE00000), IOAPIC (0xFEC00000), PCI MMIO are NOT
+        // mapped into user page tables. Kernel accesses them via with_kernel_cr3().
 
         // Map kernel stack pages into user page table.
         let kstack_base = kernel_stack_top - KERNEL_STACK_PAGES * 4096;

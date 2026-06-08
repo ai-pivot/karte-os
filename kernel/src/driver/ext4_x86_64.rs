@@ -160,13 +160,6 @@ impl FileSystem for Ext4Fs {
             let mut found = None;
             for entry in &entries {
                 let entry_name = entry.get_name();
-                crate::console_println!(
-                    "[lookup] dir={} entry='{}' target='{}' inode={}",
-                    current_dir,
-                    entry_name,
-                    component,
-                    entry.inode
-                );
                 if entry_name == component {
                     found = Some(entry.inode);
                 }
@@ -258,16 +251,9 @@ impl FileSystem for Ext4Fs {
 
     fn write_file(&mut self, inode: u64, offset: usize, data: &[u8]) -> Result<usize, VfsError> {
         let ext4 = self.ext4.lock();
-        crate::console_println!("[ext4wr] inode={} off={} len={}", inode, offset, data.len());
         match ext4.write_at(inode as u32, offset, data) {
-            Ok(n) => {
-                crate::console_println!("[ext4wr] ok inode={} wrote={}", inode, n);
-                Ok(n)
-            }
-            Err(e) => {
-                crate::console_println!("[ext4wr] ERR inode={} err={:?}", inode, e);
-                Err(VfsError::IoError)
-            }
+            Ok(n) => Ok(n),
+            Err(_) => Err(VfsError::IoError),
         }
     }
 
@@ -276,12 +262,6 @@ impl FileSystem for Ext4Fs {
         match ext4.create(dir as u32, name, EXT4_INODE_MODE_FILE as u16) {
             Ok(inode_ref) => {
                 let ino = inode_ref.inode_num;
-                crate::console_println!(
-                    "[create_file] dir={} name='{}' -> inode={}",
-                    dir,
-                    name,
-                    ino
-                );
                 Ok(ino as u64)
             }
             Err(_) => Err(VfsError::IoError),
@@ -469,12 +449,6 @@ impl crate::driver::vfs::FileSystem for Ext4FileSystem {
                     crate::console_println!("[ext4 vfs] create_file '{}' err={:?}", name, e);
                     crate::driver::vfs::VfsError::IoError
                 })?;
-            crate::console_println!(
-                "[create_file] dir={} name='{}' -> inode={}",
-                dir,
-                name,
-                inode_ref.inode_num
-            );
             Ok(inode_ref.inode_num as u64)
         })
     }

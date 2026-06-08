@@ -320,8 +320,6 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             let path_ptr = args[1];
             let flags = args[2];
             let path_len = count_user_string(path_ptr);
-            #[cfg(target_arch = "x86_64")]
-            crate::console_println!("[openat] ptr={path_ptr:#x} len={path_len} flags={flags:#x}");
             if path_len == 0 {
                 return Some(Translation::Handled(super::ERR_NOENT));
             }

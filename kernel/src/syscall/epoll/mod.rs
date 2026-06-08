@@ -83,28 +83,6 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
         Some(i) => i,
         None => return -9, // EBADF
     };
-    static CTL_DBG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let n = CTL_DBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n < 30 {
-        let op_name = match op {
-            1 => "ADD",
-            2 => "MOD",
-            3 => "DEL",
-            _ => "?",
-        };
-        let events = if event_ptr != 0 {
-            unsafe { (*(event_ptr as *const EpollEvent)).events }
-        } else {
-            0
-        };
-        crate::console_println!(
-            "[epoll] ctl epfd={} {} fd={} events={:#x}",
-            epfd,
-            op_name,
-            fd,
-            events
-        );
-    }
 
     match op {
         EPOLL_CTL_ADD => {
@@ -219,20 +197,6 @@ pub fn sys_epoll_wait(
             entry.last_revents = revents;
 
             if revents != 0 {
-                // Log which fd is ready (limited)
-                {
-                    static FD_READY_LOG: core::sync::atomic::AtomicUsize =
-                        core::sync::atomic::AtomicUsize::new(0);
-                    let n = FD_READY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    if n < 50 {
-                        crate::console_println!(
-                            "[epoll_fd_ready] fd={} events={:#x} revents={:#x}",
-                            fd,
-                            entry.event.events,
-                            revents
-                        );
-                    }
-                }
                 output[ready_count].events = revents;
                 output[ready_count].data = entry.event.data;
                 ready_count += 1;
@@ -241,20 +205,6 @@ pub fn sys_epoll_wait(
     }
 
     if ready_count > 0 {
-        let slot = crate::sched::CURRENT_RUNNING.load(core::sync::atomic::Ordering::Relaxed);
-        if slot < 4 {
-            static EPOLL_READY_LOG: core::sync::atomic::AtomicUsize =
-                core::sync::atomic::AtomicUsize::new(0);
-            let n = EPOLL_READY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 30 {
-                crate::console_println!(
-                    "[epoll_ready] slot={} epfd={} count={}",
-                    slot,
-                    epfd,
-                    ready_count
-                );
-            }
-        }
         return ready_count as isize;
     }
 
@@ -265,8 +215,6 @@ pub fn sys_epoll_wait(
 
     // Positive timeout or infinite wait: block the task until timeout
     drop(instances);
-    let slot = crate::sched::CURRENT_RUNNING.load(core::sync::atomic::Ordering::Relaxed);
-    crate::console_println!("[epoll_wait] slot={} timeout={}", slot, timeout_ms);
     if timeout_ms > 0 {
         let target = crate::arch::platform::uptime_ms() + timeout_ms as u64;
         crate::sched::sleep_until(target);

@@ -130,7 +130,7 @@ static INIT_TASK_SP: AtomicUsize = AtomicUsize::new(0);
 
 /// Log counter — only print first N scheduler events to avoid flooding.
 static SCHED_LOG_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-const SCHED_LOG_LIMIT: usize = 2000;
+const SCHED_LOG_LIMIT: usize = 0;
 
 struct Scheduler {
     tasks: [Option<TaskControlBlock>; MAX_TASKS],
@@ -658,13 +658,6 @@ pub fn sleep_until(wake_tick: u64) {
         return;
     }
     let now = crate::arch::platform::uptime_ms();
-    // ALWAYS print — critical for diagnosing epoll_wait blocking
-    crate::console_println!(
-        "[sleep] slot={} now={} target={}",
-        task_slot,
-        now,
-        wake_tick
-    );
     if wake_tick <= now {
         return; // Already expired, no need to block
     }

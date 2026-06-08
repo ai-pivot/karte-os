@@ -240,27 +240,18 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
 
     match inode_result {
         Ok(inode) => {
-            crate::console_println!("[vfs] open '{}' found inode={}", relative_path, inode);
             // File exists — optionally truncate
             if flags & O_TRUNC != 0 {
                 let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
                 mount.fs.set_file_size(inode, 0)?;
             }
-            crate::console_println!("[vfs] open found inode={}", inode);
             let vfs_fd = vfs.open_files.alloc(mount_id, inode, flags)?;
-            crate::console_println!("[vfs] open found -> vfs_fd={}", vfs_fd);
             Ok(vfs_fd)
         }
         Err(walk_err) => {
             if flags & O_CREAT != 0 {
                 // File doesn't exist but O_CREAT is set — create it
                 let (parent_path, file_name) = split_filename(&relative_path)?;
-                crate::console_println!(
-                    "[vfs] O_CREAT '{}' parent='{}' name='{}'",
-                    relative_path,
-                    parent_path,
-                    file_name
-                );
                 let parent_inode = {
                     let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
                     if parent_path.is_empty() {
@@ -283,12 +274,6 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
                 match mount.fs.create_file(parent_inode, file_name) {
                     Ok(ino) => {
                         let vfs_fd = vfs.open_files.alloc(mount_id, ino, flags)?;
-                        crate::console_println!(
-                            "[vfs] O_CREAT '{}' -> vfs_fd={} inode={}",
-                            file_name,
-                            vfs_fd,
-                            ino
-                        );
                         Ok(vfs_fd)
                     }
                     Err(e) => {
@@ -396,16 +381,6 @@ pub fn write(fd: usize, data: &[u8]) -> Result<usize, VfsError> {
     let mount_id = of.mount_id;
     let inode = of.inode;
     let offset = of.pos;
-    if data.len() >= 8 {
-        crate::console_println!(
-            "[vfs_wr] fd={} inode={} off={} len={} {:02x?}",
-            fd,
-            inode,
-            offset,
-            data.len(),
-            &data[..8.min(data.len())]
-        );
-    }
     let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
     let bytes_written = mount.fs.write_file(inode, offset, data)?;
     let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;

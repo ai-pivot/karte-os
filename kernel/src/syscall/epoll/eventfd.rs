@@ -28,10 +28,7 @@ pub fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
         )
     });
     let fd = match fd {
-        Some(f) => {
-            crate::console_println!("[eventfd] alloc fd={}", f);
-            f as i32
-        }
+        Some(f) => f as i32,
         None => {
             crate::console_println!("[eventfd] FAILED to alloc fd!");
             return -24; // EMFILE
@@ -75,7 +72,6 @@ pub fn eventfd_read(fd: i32, buf: usize, len: usize) -> isize {
         unsafe {
             core::ptr::write_volatile(buf as *mut u64, val);
         }
-        crate::console_println!("[eventfd] read fd={} consumed={}", fd, val);
         8
     } else {
         -9 // EBADF
@@ -96,13 +92,6 @@ pub fn eventfd_write(fd: i32, buf: usize, len: usize) -> isize {
     if let Some(counter) = states.get_mut(&fd) {
         let old = *counter;
         *counter = counter.saturating_add(val);
-        crate::console_println!(
-            "[eventfd] write fd={} val={} old_counter={} new_counter={}",
-            fd,
-            val,
-            old,
-            *counter
-        );
         8
     } else {
         crate::console_println!("[eventfd] write fd={} EBADF!", fd);

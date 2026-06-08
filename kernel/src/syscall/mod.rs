@@ -245,13 +245,6 @@ pub fn dispatch_syscall_linux(
             a6 as usize,
         ],
     );
-    // Trace non-init process syscalls
-    let nr_usize = nr as usize;
-    let cur_pid = crate::process::current_pid();
-    // Trace syscalls that return errors (for debugging)
-    if result < 0 && nr_usize != 228 && nr_usize != 35 && nr_usize != 24 {
-        crate::console_println!("[sc-err] nr={} -> {} (pid={})", nr_usize, result, cur_pid);
-    }
     result as u64
 }
 
@@ -269,14 +262,6 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
         1 => {
             let result = sys_write(args[0] as i32, args[1], args[2]);
-            if args[0] >= 3 {
-                static WR_DBG: core::sync::atomic::AtomicUsize =
-                    core::sync::atomic::AtomicUsize::new(0);
-                let n = WR_DBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if n < 20 {
-                    crate::console_println!("[wr] fd={} ret={}", args[0], result);
-                }
-            }
             result
         }
         2 => linux_open(args[0], args[1], args[2]), // open (deprecated, use openat)
@@ -484,9 +469,6 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
     let linux_creat = 0x40;
     let has_creat = (flags & linux_creat) != 0;
 
-    // Debug: log all openat calls
-    crate::console_println!("[openat] '{}' flags={:#x}", path_str, flags);
-
     // Try VFS open with converted flags
     let our_flags = if has_creat { 0x100 } else { 0 } | (flags & 0x600); // keep O_TRUNC/O_APPEND
     match crate::driver::vfs::open(path_str, our_flags as u32) {
@@ -520,7 +502,6 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                 || path_str == "dev/random";
 
             if is_urandom {
-                crate::console_println!("[openat] urandom fd flags={:#x}", flags);
                 crate::process::with_fd_table(|fd_table| {
                     match fd_table.alloc_urandom_fd(our_flags as u32) {
                         Some(fd) => fd as isize,
@@ -528,7 +509,6 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                     }
                 })
             } else if is_pseudo || is_etc {
-                crate::console_println!("[openat] fake '{}' flags={:#x}", path_str, flags);
                 crate::process::with_fd_table(|fd_table| {
                     match fd_table.alloc_fake_fd(alloc::format!("{}", path_str), our_flags as u32) {
                         Some(fd) => fd as isize,
@@ -1023,14 +1003,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
     match id {
         SYS_DEBUG_PRINT => sys_debug_print(args[0], args[1]),
         SYS_EXIT => sys_exit(args[0] as i32),
-        SYS_WRITE => {
-            let result = sys_write(args[0] as i32, args[1], args[2]);
-            // Debug: log writes to non-stdio fds
-            if args[0] >= 3 && result < 0 {
-                crate::console_println!("[write] fd={} len={} ret={}", args[0], args[2], result);
-            }
-            result
-        }
+        SYS_WRITE => sys_write(args[0] as i32, args[1], args[2]),
         SYS_READ => sys_read(args[0] as i32, args[1], args[2]),
         SYS_BRK => sys_brk(args[0]),
         SYS_GETPID => sys_getpid(),
@@ -1179,21 +1152,6 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
 
     // Fast path for stdout/stderr
     if fd == 1 || fd == 2 {
-        // Log first few writes to fd=1 to catch TUI ANSI output
-        static WR_STDOUT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-        let n = WR_STDOUT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 10 {
-            crate::console_println!(
-                "[write] fd={} len={} first_byte={:#x}",
-                fd,
-                len,
-                if len > 0 {
-                    unsafe { core::ptr::read_volatile(buf as *const u8) }
-                } else {
-                    0
-                }
-            );
-        }
         for i in 0..len {
             let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
             crate::arch::platform::console_putchar(byte);
@@ -1201,15 +1159,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         return len as isize;
     }
 
-    // Debug: log writes to non-stdio fds
     let fd_info = get_fd_info(fd);
-    if fd >= 3 {
-        static WR_DBG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-        let n = WR_DBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 5 {
-            crate::console_println!("[write] fd={} len={}", fd, len);
-        }
-    }
 
     match fd_info {
         Some((FdType::PipeWrite, Some(pipe_id), _)) => {
@@ -1242,21 +1192,6 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
             let mut kbuf = alloc::vec![0u8; len];
             kbuf.copy_from_slice(data);
-            // Debug: show which inode this write targets
-            {
-                let inode = crate::driver::vfs::get_inode_for_fd(vfs_fd);
-                if len > 20 {
-                    let preview = &kbuf[..20.min(len)];
-                    crate::console_println!(
-                        "[wr] fd={} vfs_fd={} inode={:?} len={} {:02x?}",
-                        fd,
-                        vfs_fd,
-                        inode,
-                        len,
-                        &preview[..8.min(preview.len())]
-                    );
-                }
-            }
             return match crate::driver::vfs::write(vfs_fd, &kbuf) {
                 Ok(n) => {
                     crate::process::with_fd_table(|fd_table| {
@@ -2318,9 +2253,6 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         || name == "/dev/random"
         || name == "dev/urandom"
         || name == "dev/random";
-    if is_urandom {
-        crate::console_println!("[sys_open] urandom MATCH name='{}'", name);
-    }
 
     // If VFS failed, try RamFS fallback (for test files and embedded files)
     if !is_pseudo && !is_urandom {
