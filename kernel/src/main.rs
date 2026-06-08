@@ -229,6 +229,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
 
+        crate::console_println!("[init] Initializing virtual filesystem...");
+        crate::driver::ramfs::virtual_init();
+
         crate::console_println!("[init] Initializing environment...");
         env::init();
 

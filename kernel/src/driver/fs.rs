@@ -402,6 +402,17 @@ pub enum FdType {
     PipeWrite,
     /// Fake file with in-memory buffer — for virtual files (.xbot/*).
     FakeFile(alloc::vec::Vec<u8>),
+    /// Virtual file (e.g., /proc/version) — always readable, empty content.
+    VirtualFile,
+    /// eventfd — for Go runtime polling.
+    #[cfg(target_arch = "x86_64")]
+    Eventfd,
+    /// timerfd — for Go runtime timers.
+    #[cfg(target_arch = "x86_64")]
+    Timerfd,
+    /// ext4 file descriptor.
+    #[cfg(target_arch = "x86_64")]
+    Ext4File(crate::driver::ext4_x86_64::Ext4FileDesc),
 }
 
 /// A file descriptor entry — wraps an in-memory file with seek position
@@ -419,12 +430,80 @@ pub struct FileDescriptor {
     pub fd_type: FdType,
     /// Pipe ID (only valid when fd_type is PipeRead or PipeWrite).
     pub pipe_id: Option<usize>,
+    /// The fd number itself (for routing eventfd/timerfd lookups).
+    pub fd_num: usize,
 }
 
 /// Per-process file descriptor table
 #[derive(Clone)]
 pub struct FdTable {
     fds: [Option<FileDescriptor>; MAX_FDS],
+}
+
+impl FileDescriptor {
+    /// Check if this fd has data available for reading.
+    #[cfg(target_arch = "x86_64")]
+    pub fn is_readable(&self) -> bool {
+        match &self.fd_type {
+            FdType::Stdio => {
+                if self.name == "stdin" {
+                    crate::driver::tty::has_input()
+                } else {
+                    false
+                }
+            }
+            FdType::PipeRead => {
+                if let Some(pipe_id) = self.pipe_id {
+                    crate::driver::pipe::pipe_available(pipe_id) > 0
+                } else {
+                    false
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            FdType::Eventfd => {
+                crate::syscall::epoll::eventfd::eventfd_peek_by_fd(self.fd_num) > 0
+            }
+            #[cfg(target_arch = "x86_64")]
+            FdType::Timerfd => {
+                crate::syscall::epoll::timerfd_peek(self.fd_num)
+            }
+            FdType::PipeWrite | FdType::File | FdType::FakeFile(_) | FdType::VirtualFile => false,
+            #[cfg(target_arch = "x86_64")]
+            FdType::Ext4File(_) => false,
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn is_readable(&self) -> bool {
+        false
+    }
+
+    /// Check if this fd is ready for writing.
+    #[cfg(target_arch = "x86_64")]
+    pub fn is_writable(&self) -> bool {
+        match &self.fd_type {
+            FdType::Stdio => self.name != "stdin",
+            FdType::PipeWrite => true,
+            FdType::PipeRead | FdType::Eventfd | FdType::Timerfd => false,
+            FdType::File | FdType::FakeFile(_) | FdType::VirtualFile => true,
+            FdType::Ext4File(desc) => desc.writable,
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn is_writable(&self) -> bool {
+        match &self.fd_type {
+            FdType::Stdio => self.name != "stdin",
+            FdType::PipeWrite => true,
+            FdType::PipeRead => false,
+            FdType::File | FdType::FakeFile(_) | FdType::VirtualFile => true,
+        }
+    }
+
+    /// Get the fd number.
+    pub fn fd_number(&self) -> usize {
+        self.fd_num
+    }
 }
 
 impl FdTable {
@@ -440,6 +519,7 @@ impl FdTable {
             valid: true,
             fd_type: FdType::Stdio,
             pipe_id: None,
+            fd_num: 0,
         });
         table.fds[1] = Some(FileDescriptor {
             name: String::from("stdout"),
@@ -448,6 +528,7 @@ impl FdTable {
             valid: true,
             fd_type: FdType::Stdio,
             pipe_id: None,
+            fd_num: 0,
         });
         table.fds[2] = Some(FileDescriptor {
             name: String::from("stderr"),
@@ -456,6 +537,7 @@ impl FdTable {
             valid: true,
             fd_type: FdType::Stdio,
             pipe_id: None,
+            fd_num: 0,
         });
         table
     }
@@ -471,6 +553,7 @@ impl FdTable {
                     valid: true,
                     fd_type: FdType::File,
                     pipe_id: None,
+                fd_num: 0,
                 });
                 return Some(i);
             }
@@ -489,6 +572,7 @@ impl FdTable {
                     valid: true,
                     fd_type: FdType::Stdio,
                     pipe_id: None,
+                fd_num: 0,
                 });
                 return Some(i);
             }
@@ -507,6 +591,7 @@ impl FdTable {
                     valid: true,
                     fd_type: FdType::FakeFile(alloc::vec![]),
                     pipe_id: None,
+                fd_num: 0,
                 });
                 return Some(i);
             }
@@ -603,6 +688,7 @@ impl FdTable {
                         FdType::PipeWrite
                     },
                     pipe_id: Some(pipe_id),
+                    fd_num: i,
                 });
                 return Some(i);
             }

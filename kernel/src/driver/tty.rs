@@ -148,6 +148,11 @@ pub enum TtyMode {
 /// TTY input ring buffer (completed lines / raw bytes ready for sys_read)
 static TTY_INPUT: RingBuffer = RingBuffer::new();
 
+/// Check if TTY has input data available (for epoll EPOLLIN on stdin)
+pub fn has_input() -> bool {
+    TTY_INPUT.len() > 0
+}
+
 /// Line editor (only used in canonical mode)
 static TTY_LINE: LineEditorData = LineEditorData {
     inner: UnsafeCell::new(LineEditor::new()),

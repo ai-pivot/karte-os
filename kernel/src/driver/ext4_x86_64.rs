@@ -100,6 +100,13 @@ impl Ext4BlockDevice for KarteBlockDevice {
 unsafe impl Send for KarteBlockDevice {}
 unsafe impl Sync for KarteBlockDevice {}
 
+/// Descriptor for an open ext4 file, stored in FdTable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ext4FileDesc {
+    pub inode_num: u32,
+    pub writable: bool,
+}
+
 pub struct Ext4Fs {
     ext4: spin::Mutex<Ext4>,
 }
@@ -242,7 +249,7 @@ impl FileSystem for Ext4Fs {
 
 // SpinLock (not YieldMutex) for EXT4_FS: AHCI I/O happens while holding this lock.
 // Timer interrupt during I/O + YieldMutex = infinite yield deadlock.
-static EXT4_FS: spin::Mutex<Option<Ext4Fs>> = spin::Mutex::new(None);
+pub(crate) static EXT4_FS: spin::Mutex<Option<Ext4Fs>> = spin::Mutex::new(None);
 static EXT4_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 fn split_last_component(path: &str) -> (&str, &str) {
@@ -331,21 +338,46 @@ pub fn write_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
     let fs = guard.as_mut().ok_or("ext4 not initialized")?;
     let inode = fs.lookup(ROOT_INODE as u64, name).unwrap_or_else(|_| 0);
     if inode != 0 {
-        fs.write_file(inode, 0, data)
-            .map_err(|_| "ext4 write failed")?;
+        fs.write_file(inode, 0, data).map_err(|e| {
+            crate::console_println!(
+                "[ext4] write existing '{}' inode={}: err {:?}",
+                name,
+                inode,
+                e
+            );
+            "ext4 write failed"
+        })?;
     } else {
         let (parent_path, file_name) = split_last_component(name);
+        crate::console_println!(
+            "[ext4] create new '{}' parent='{}' name='{}'",
+            name,
+            parent_path,
+            file_name
+        );
         let parent_inode = if parent_path.is_empty() {
             ROOT_INODE as u64
         } else {
-            fs.lookup(ROOT_INODE as u64, parent_path)
-                .map_err(|_| "ext4: parent directory not found")?
+            fs.lookup(ROOT_INODE as u64, parent_path).map_err(|e| {
+                crate::console_println!("[ext4] parent '{}' not found: {:?}", parent_path, e);
+                "ext4: parent directory not found"
+            })?
         };
-        let inode = fs
-            .create_file(parent_inode, file_name)
-            .map_err(|_| "ext4 create failed")?;
-        fs.write_file(inode, 0, data)
-            .map_err(|_| "ext4 write failed")?;
+        crate::console_println!("[ext4] parent_inode={}", parent_inode);
+        let inode = fs.create_file(parent_inode, file_name).map_err(|e| {
+            crate::console_println!(
+                "[ext4] create_file '{}' in inode {}: err {:?}",
+                file_name,
+                parent_inode,
+                e
+            );
+            "ext4 create failed"
+        })?;
+        crate::console_println!("[ext4] created inode={}", inode);
+        fs.write_file(inode, 0, data).map_err(|e| {
+            crate::console_println!("[ext4] write new '{}' inode={}: err {:?}", name, inode, e);
+            "ext4 write failed"
+        })?;
     }
     Ok(())
 }
@@ -383,33 +415,55 @@ pub fn list_directory(path: &str) -> Vec<(String, usize)> {
     result
 }
 
-pub fn create_directory(name: &str) -> Result<(), &'static str> {
+pub fn create_directory(path: &str) -> Result<(), &'static str> {
     if !has_ext4() {
         return Err("ext4 not initialized");
     }
+
+    // Check if already exists
+    {
+        let guard = EXT4_FS.lock();
+        if let Some(fs) = guard.as_ref() {
+            if fs.lookup(ROOT_INODE as u64, path).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    let (parent_path, dir_name) = split_last_component(path);
+
+    // Ensure parent exists recursively
+    if !parent_path.is_empty() {
+        let parent_exists = {
+            let guard = EXT4_FS.lock();
+            guard.as_ref().map_or(false, |fs| {
+                fs.lookup(ROOT_INODE as u64, parent_path).is_ok()
+            })
+        };
+        if !parent_exists {
+            create_directory(parent_path)?;
+        }
+    }
+
     let mut guard = EXT4_FS.lock();
     let fs = guard.as_mut().ok_or("ext4 not initialized")?;
-    let (parent_path, dir_name) = split_last_component(name);
     let parent_inode = if parent_path.is_empty() {
         ROOT_INODE as u64
     } else {
-        fs.lookup(ROOT_INODE as u64, parent_path)
-            .map_err(|_| "ext4: parent directory not found")?
+        fs.lookup(ROOT_INODE as u64, parent_path).map_err(|e| {
+            crate::console_println!("[ext4] mkdir parent '{}' not found: {:?}", parent_path, e);
+            "parent not found"
+        })?
     };
 
     let mut ext4 = fs.ext4.lock();
-
     match ext4.create(parent_inode as u32, dir_name, 0o40777 as u16) {
         Ok(_ref) => {
-            crate::console_println!(
-                "[ext4] dir '{}' created (inode={})",
-                dir_name,
-                _ref.inode_num
-            );
+            crate::console_println!("[ext4] dir '{}' created inode={}", path, _ref.inode_num);
             Ok(())
         }
-        Err(_) => {
-            crate::console_println!("[ext4] create '{}' failed", dir_name);
+        Err(e) => {
+            crate::console_println!("[ext4] mkdir '{}' failed: {:?}", path, e);
             Err("ext4 create_dir failed")
         }
     }

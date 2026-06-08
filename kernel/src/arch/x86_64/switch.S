@@ -69,6 +69,27 @@ __switch:
     # Recover original RSP (the value before alignment was applied)
     mov rsp, [rsp + 512]
 
+    # Debug: validate return address before restoring
+    # Kernel code is in 0x100000 - 0x200000 range
+    mov rax, [rsp + 48]    # return address is at orig_rsp + 48
+    cmp rax, 0x100000
+    jb .Lswitch_bad_ret
+    cmp rax, 0x200000
+    jae .Lswitch_bad_ret
+    jmp .Lswitch_restore_ok
+.Lswitch_bad_ret:
+    # Invalid return address! Print BADSW to VGA and halt
+    mov rsi, [rsp + 48]    # bad return address
+    mov rdi, rsp            # orig_rsp
+    mov byte ptr [0xB8000], 'B'
+    mov byte ptr [0xB8002], 'A'
+    mov byte ptr [0xB8004], 'D'
+    mov byte ptr [0xB8006], 'S'
+    mov byte ptr [0xB8008], 'W'
+    cli
+    hlt
+.Lswitch_restore_ok:
+
     # Restore callee-saved registers
     pop r15
     pop r14

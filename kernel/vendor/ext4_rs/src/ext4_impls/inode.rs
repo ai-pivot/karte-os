@@ -84,7 +84,9 @@ impl Ext4 {
             return Ok(fblock);
         }
 
-        return_errno_with_message!(Errno::EIO, "search extent fail");
+        // No extent found for this lblock. For new/empty files this is normal.
+        // Return 0 to indicate "no physical block mapped".
+        Ok(0)
     }
 
     /// Allocate a new block

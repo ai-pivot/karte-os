@@ -203,6 +203,16 @@ where
     table[pipe_id].as_mut().map(f)
 }
 
+/// Check how many bytes are available in a pipe without consuming them.
+/// Returns 0 if pipe doesn't exist or is empty.
+pub fn pipe_available(pipe_id: usize) -> usize {
+    let table = PIPE_TABLE.lock();
+    match &table[pipe_id] {
+        Some(pipe) => pipe.data_len,
+        None => 0,
+    }
+}
+
 /// Increment reference count for a pipe.
 pub fn inc_ref(pipe_id: usize) {
     let mut refs = PIPE_REFCOUNTS.lock();

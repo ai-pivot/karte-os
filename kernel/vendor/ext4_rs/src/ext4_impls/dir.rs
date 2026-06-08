@@ -209,7 +209,17 @@ impl Ext4 {
         let mut iblock = 0;
         while iblock < total_blocks {
             // get physical block id of a logical block id
-            let pblock = self.get_pblock_idx(parent, iblock as u32)?;
+            let pblock = match self.get_pblock_idx(parent, iblock as u32) {
+                Ok(pb) => pb,
+                Err(_) => {
+                    iblock += 1;
+                    continue; // skip unmapped blocks
+                }
+            };
+            if pblock == 0 {
+                iblock += 1;
+                continue; // skip unmapped blocks (sparse file)
+            }
 
             // load physical block
             let mut ext4block = Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);

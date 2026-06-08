@@ -7,6 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::driver::vfs::{FileSystem, VfsDirEntry, VfsError, VfsFileType, VfsMetadata};
+use crate::sync::spinlock::SpinLock;
 
 // ─── RamFS File Node ──────────────────────────────────────────────────────
 
@@ -316,4 +317,202 @@ impl FileSystem for RamFileSystem {
         node.data = RamFileData::Owned(owned);
         Ok(())
     }
+}
+
+// ─── Path-based helpers (for virtual filesystem API) ─────────────────
+
+impl RamFileSystem {
+    /// Walk a multi-level path like "/proc/version", creating intermediate
+    /// directories as needed. Returns the target parent inode and the final
+    /// component name, or an error.
+    fn walk_create_dirs(&mut self, path: &str) -> Result<(u64, String), VfsError> {
+        let trimmed = path.strip_prefix('/').unwrap_or(path);
+        let parts: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Err(VfsError::InvalidParam);
+        }
+        let mut dir_inode = ROOT_INODE;
+        // All but the last component are directories to create/find
+        for i in 0..parts.len() - 1 {
+            let part = parts[i];
+            match self.find_child_by_name(dir_inode, part) {
+                Some(child) => {
+                    let child_node = self.nodes.get(&child).ok_or(VfsError::NotFound)?;
+                    if !child_node.is_dir {
+                        return Err(VfsError::NotADirectory);
+                    }
+                    dir_inode = child;
+                }
+                None => {
+                    // Create intermediate directory
+                    dir_inode = self.create_dir(dir_inode, part)?;
+                }
+            }
+        }
+        let file_name = String::from(*parts.last().unwrap());
+        Ok((dir_inode, file_name))
+    }
+
+    /// Walk a path to find the inode of a file or directory. Does NOT create.
+    fn walk_path(&self, path: &str) -> Result<u64, VfsError> {
+        let trimmed = path.strip_prefix('/').unwrap_or(path);
+        if trimmed.is_empty() {
+            return Ok(ROOT_INODE);
+        }
+        let parts: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        let mut inode = ROOT_INODE;
+        for part in parts {
+            inode = self
+                .find_child_by_name(inode, part)
+                .ok_or(VfsError::NotFound)?;
+        }
+        Ok(inode)
+    }
+
+    /// Create (or overwrite) a file at the given path with the given data.
+    /// Intermediate directories are created as needed.
+    pub fn create_path(&mut self, path: &str, data: &[u8]) -> Result<(), VfsError> {
+        let (dir_inode, file_name) = self.walk_create_dirs(path)?;
+        // Check if file exists
+        if let Some(existing) = self.find_child_by_name(dir_inode, &file_name) {
+            // Overwrite
+            if let Some(node) = self.nodes.get_mut(&existing) {
+                node.data = RamFileData::Owned(data.to_vec());
+                return Ok(());
+            }
+        }
+        // Create new file
+        let inode = self.alloc_inode();
+        let node = RamFsNode {
+            name: file_name,
+            data: RamFileData::Owned(data.to_vec()),
+            is_dir: false,
+            children: Vec::new(),
+        };
+        self.nodes.insert(inode, node);
+        self.add_child(dir_inode, inode);
+        Ok(())
+    }
+
+    /// Read file data at path into an owned Vec.
+    pub fn read_path(&self, path: &str) -> Option<Vec<u8>> {
+        let inode = self.walk_path(path).ok()?;
+        let node = self.nodes.get(&inode)?;
+        if node.is_dir {
+            return None;
+        }
+        Some(node.data.as_slice().to_vec())
+    }
+
+    /// Check if a path exists (file or directory).
+    pub fn path_exists(&self, path: &str) -> bool {
+        self.walk_path(path).is_ok()
+    }
+
+    /// List children of a directory path. Returns Vec of (name, is_dir, size).
+    pub fn readdir_path(&self, path: &str) -> Option<Vec<(String, bool, usize)>> {
+        let inode = self.walk_path(path).ok()?;
+        let dir_node = self.nodes.get(&inode)?;
+        if !dir_node.is_dir {
+            return None;
+        }
+        let mut entries = Vec::new();
+        for &child_inode in &dir_node.children {
+            if let Some(child) = self.nodes.get(&child_inode) {
+                entries.push((child.name.clone(), child.is_dir, child.data.len()));
+            }
+        }
+        Some(entries)
+    }
+
+    /// Get file size at path. Returns None if not found or is a directory.
+    pub fn file_size(&self, path: &str) -> Option<usize> {
+        let inode = self.walk_path(path).ok()?;
+        let node = self.nodes.get(&inode)?;
+        if node.is_dir {
+            return None;
+        }
+        Some(node.data.len())
+    }
+
+    /// Write data to an existing file at path. Returns bytes written.
+    pub fn write_path(
+        &mut self,
+        path: &str,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize, VfsError> {
+        let inode = self.walk_path(path)?;
+        self.write_file(inode, offset, data)
+    }
+}
+
+// ─── Global Virtual RamFS ─────────────────────────────────────────────────
+
+/// Global RamFS instance for virtual files (/proc, /sys, /etc, etc.)
+/// Uses Option to allow non-const initialization at runtime.
+static VIRTUAL_RAMFS: SpinLock<Option<RamFileSystem>> = SpinLock::new(None);
+
+/// Ensure the virtual RamFS is initialized (called lazily on first access).
+fn ensure_virtual_ramfs() {
+    let mut guard = VIRTUAL_RAMFS.lock();
+    if guard.is_none() {
+        *guard = Some(RamFileSystem::new());
+    }
+}
+
+/// Initialize the virtual RamFS and pre-populate with standard files.
+pub fn virtual_init() {
+    ensure_virtual_ramfs();
+    let mut vfs = VIRTUAL_RAMFS.lock();
+    let ramfs = vfs.as_mut().unwrap();
+    // /proc
+    let _ = ramfs.create_path("/proc/version", b"Linux 6.1.0 KarteOS x86_64");
+    // /etc
+    let _ = ramfs.create_path("/etc/resolv.conf", b"nameserver 10.0.2.3");
+    let _ = ramfs.create_path("/etc/hostname", b"karteos");
+    let _ = ramfs.create_path("/etc/passwd", b"root:x:0:0:root:/root:/bin/sh");
+    let _ = ramfs.create_path("/etc/group", b"root:x:0:");
+}
+
+/// Create (or overwrite) a virtual file at path.
+pub fn virtual_create(path: &str, data: &[u8]) {
+    ensure_virtual_ramfs();
+    let mut vfs = VIRTUAL_RAMFS.lock();
+    let _ = vfs.as_mut().unwrap().create_path(path, data);
+}
+
+/// Read virtual file at path.
+pub fn virtual_read(path: &str) -> Option<Vec<u8>> {
+    ensure_virtual_ramfs();
+    let vfs = VIRTUAL_RAMFS.lock();
+    vfs.as_ref().unwrap().read_path(path)
+}
+
+/// Check if a virtual path exists.
+pub fn virtual_exists(path: &str) -> bool {
+    ensure_virtual_ramfs();
+    let vfs = VIRTUAL_RAMFS.lock();
+    vfs.as_ref().unwrap().path_exists(path)
+}
+
+/// List a virtual directory. Returns Vec of (name, is_dir, size).
+pub fn virtual_readdir(path: &str) -> Option<Vec<(String, bool, usize)>> {
+    ensure_virtual_ramfs();
+    let vfs = VIRTUAL_RAMFS.lock();
+    vfs.as_ref().unwrap().readdir_path(path)
+}
+
+/// Get virtual file size.
+pub fn virtual_size(path: &str) -> Option<usize> {
+    ensure_virtual_ramfs();
+    let vfs = VIRTUAL_RAMFS.lock();
+    vfs.as_ref().unwrap().file_size(path)
+}
+
+/// Write to an existing virtual file.
+pub fn virtual_write(path: &str, offset: usize, data: &[u8]) -> Result<usize, VfsError> {
+    ensure_virtual_ramfs();
+    let mut vfs = VIRTUAL_RAMFS.lock();
+    vfs.as_mut().unwrap().write_path(path, offset, data)
 }

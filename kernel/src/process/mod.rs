@@ -36,7 +36,7 @@ pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack
 pub(crate) static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
 /// Maximum number of processes in the system
-const MAX_PROCESSES: usize = 16;
+const MAX_PROCESSES: usize = 64;
 
 /// Process state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -937,6 +937,14 @@ pub fn set_exit_code(code: usize) {
     }
 }
 
+/// Free a process table slot so it can be reused by new clone/fork calls.
+/// Called from sys_exit() after marking the process as Exited but before
+/// schedule_exit(). The scheduler slot (TaskControlBlock) is NOT freed here.
+pub fn free_process_slot(idx: usize) {
+    let mut table = PROCESS_TABLE.lock();
+    table[idx] = None;
+}
+
 /// Set exit code for a process by its table index (used by kill_clone_children).
 pub fn set_exit_code_by_index(idx: usize, code: usize) {
     let mut table = PROCESS_TABLE.lock();
@@ -1222,6 +1230,8 @@ pub fn kill_clone_children(parent_pid: usize) {
         // This prevents the timer ISR from resuming a thread whose pages
         // may have been freed when the thread group leader exited.
         crate::sched::mark_task_exited_by_proc(idx);
+        // Free the process table slot so it can be reused
+        crate::process::free_process_slot(idx);
     }
     // On SMP, other cores may still be running clone child threads.
     // Send IPI to force immediate reschedule on all other cores.

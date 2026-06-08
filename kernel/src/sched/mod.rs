@@ -78,7 +78,16 @@ static TASK_SPS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_
 /// Which task slot is currently running (updated by schedule() before __switch).
 /// After __switch returns, this reflects the task we just switched TO
 /// (may have been updated by another schedule() invocation in between).
-pub(crate) static CURRENT_RUNNING: AtomicUsize = AtomicUsize::new(MAX_TASKS);
+pub static CURRENT_RUNNING: AtomicUsize = AtomicUsize::new(MAX_TASKS);
+
+/// Get the currently running scheduler slot (for diagnostics).
+pub fn current_running_slot() -> usize {
+    CURRENT_RUNNING.load(Ordering::Relaxed)
+}
+/// Last scheduled task slot — used for fair round-robin when switching from init.
+/// Without this, schedule() always picks slot 0 when init is running,
+/// starving higher-numbered slots.
+static LAST_SCHEDULED: AtomicUsize = AtomicUsize::new(0);
 /// Mapping from process table index to scheduler slot.
 /// Needed because process_idx != scheduler_slot in general.
 static PROC_TO_SLOT: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(MAX_TASKS) }; MAX_TASKS];
@@ -119,6 +128,10 @@ static TASK_FS_BASE: [core::sync::atomic::AtomicU64; MAX_TASKS] =
 /// __switch saves init's sp here. schedule_exit() uses it to switch back.
 static INIT_TASK_SP: AtomicUsize = AtomicUsize::new(0);
 
+/// Log counter — only print first N scheduler events to avoid flooding.
+static SCHED_LOG_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+const SCHED_LOG_LIMIT: usize = 2000;
+
 struct Scheduler {
     tasks: [Option<TaskControlBlock>; MAX_TASKS],
     task_to_process: [usize; MAX_TASKS],
@@ -152,7 +165,12 @@ pub fn schedule() {
 
         // Find the next Ready child. When init is running, scan from slot 0;
         // when a child is running, scan starting after it (round-robin).
-        let start = if init_running { 0 } else { current + 1 };
+        // Use LAST_SCHEDULED for fairness when switching from init.
+        let start = if init_running {
+            LAST_SCHEDULED.load(Ordering::Relaxed) + 1
+        } else {
+            current + 1
+        };
         let mut next = INIT_SENTINEL;
         for i in 0..count {
             let candidate = (start + i) % count;
@@ -166,6 +184,26 @@ pub fn schedule() {
         if next == INIT_SENTINEL {
             return; // no Ready child to switch to — keep running current
         }
+
+        // Scheduler log (limited)
+        {
+            let n = SCHED_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < SCHED_LOG_LIMIT {
+                if init_running {
+                    crate::console_println!("[sched] #{} timer: init -> slot{}", n, next);
+                } else {
+                    crate::console_println!(
+                        "[sched] #{} timer: slot{} -> slot{}",
+                        n,
+                        current,
+                        next
+                    );
+                }
+            }
+        }
+
+        // Remember which slot we picked for fair round-robin next time
+        LAST_SCHEDULED.store(next, Ordering::Relaxed);
 
         // Demote the currently-running child back to Ready (init has no TCB).
         if !init_running {
@@ -213,6 +251,14 @@ pub fn schedule() {
         let init_sp_ptr = INIT_TASK_SP.as_ptr() as *mut usize;
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
         let _next_sp_val = unsafe { *nxt_ptr };
+
+        // Set PENDING_FS_BASE for trap_return_user (same as non-init path)
+        #[cfg(target_arch = "x86_64")]
+        {
+            let next_fs_base = TASK_FS_BASE[next].load(Ordering::Relaxed);
+            crate::arch::trap::PENDING_FS_BASE.store(next_fs_base, Ordering::Relaxed);
+        }
+
         // NOTE: Do NOT change SYSCALL_KSP here! SYSCALL_KSP is used by the
         // currently executing code (init's syscall handler). Changing it would
         // cause subsequent stack pushes to land on the child's kernel stack,
@@ -237,6 +283,16 @@ pub fn schedule() {
         // we read CURRENT_RUNNING to know which task we actually are.
         CURRENT_RUNNING.store(next, Ordering::Relaxed);
 
+        // Set PENDING_FS_BASE for trap_return_user.
+        // When __switch resumes a task for the first time (via trap_return_user),
+        // it bypasses the FS_BASE restore code below. trap_return_user reads
+        // this value to set the thread's TLS correctly before returning to Ring 3.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let next_fs_base = TASK_FS_BASE[next].load(Ordering::Relaxed);
+            crate::arch::trap::PENDING_FS_BASE.store(next_fs_base, Ordering::Relaxed);
+        }
+
         let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
         let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
         unsafe {
@@ -251,6 +307,10 @@ pub fn schedule() {
     #[cfg(target_arch = "x86_64")]
     {
         let current = CURRENT_RUNNING.load(Ordering::Relaxed);
+        let n = SCHED_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < SCHED_LOG_LIMIT {
+            crate::console_println!("[sched] #{} sched_resume: CURRENT_RUNNING={}", n, current);
+        }
         if current < MAX_TASKS {
             let kernel_sp = TASK_KSTACK[current].load(Ordering::Relaxed);
             if kernel_sp != 0 {
@@ -285,9 +345,8 @@ pub fn schedule_exit() {
         let current = sched.current;
         let count = sched.count;
         if current < count {
-            if let Some(ref mut t) = sched.tasks[current] {
-                t.state = TaskState::Exited;
-            }
+            // Free the scheduler slot — task is exiting, no need to keep it
+            sched.tasks[current] = None;
         }
 
         // Look for another Ready child, starting after the current one.
@@ -439,9 +498,8 @@ pub fn mark_task_exited_by_proc(proc_idx: usize) {
         return;
     }
     let mut sched = SCHEDULER.lock();
-    if let Some(ref mut t) = sched.tasks[slot] {
-        t.state = TaskState::Exited;
-    }
+    // Free the scheduler slot so it can be reused by new clone threads
+    sched.tasks[slot] = None;
 }
 
 pub fn schedule_block() {
@@ -456,8 +514,12 @@ pub fn schedule_block() {
         }
 
         let mut next: usize = current;
-        for i in 1..sched.count {
-            let candidate = (current + i) % sched.count;
+        let start = LAST_SCHEDULED.load(Ordering::Relaxed) + 1;
+        for i in 0..sched.count {
+            let candidate = (start + i) % sched.count;
+            if candidate == current {
+                continue;
+            }
             if let Some(ref t) = sched.tasks[candidate] {
                 if t.state == TaskState::Ready {
                     next = candidate;
@@ -470,8 +532,13 @@ pub fn schedule_block() {
             // No other Ready child — switch back to init to avoid busy-loop.
             // The blocked task will be re-scheduled when wake_task() is called.
             sched.current = INIT_SENTINEL;
+            let n = SCHED_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < SCHED_LOG_LIMIT {
+                crate::console_println!("[sched] #{} block: slot{} -> init (no Ready)", n, current);
+            }
             (true, current, 0usize, 0usize)
         } else {
+            LAST_SCHEDULED.store(next, Ordering::Relaxed);
             if let Some(ref mut t) = sched.tasks[next] {
                 t.state = TaskState::Running;
             }
@@ -481,6 +548,10 @@ pub fn schedule_block() {
             crate::process::set_current_page_table_root(crate::process::get_page_table_root(
                 next_proc_idx,
             ));
+            let n = SCHED_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < SCHED_LOG_LIMIT {
+                crate::console_println!("[sched] #{} block: slot{} -> slot{}", n, current, next);
+            }
             (false, current, next, next_proc_idx)
         }
     };
@@ -514,6 +585,15 @@ pub fn schedule_block() {
     #[cfg(target_arch = "x86_64")]
     {
         let cur = CURRENT_RUNNING.load(Ordering::Relaxed);
+        let n = SCHED_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < SCHED_LOG_LIMIT {
+            crate::console_println!(
+                "[sched] #{} block_resume: CURRENT_RUNNING={} (expected {})",
+                n,
+                cur,
+                current
+            );
+        }
         if cur < MAX_TASKS {
             let kernel_sp = TASK_KSTACK[cur].load(Ordering::Relaxed);
             if kernel_sp != 0 {
@@ -535,9 +615,135 @@ pub fn wake_task(proc_idx: usize) {
             if let Some(ref mut t) = sched.tasks[i] {
                 if t.state == TaskState::Blocked {
                     t.state = TaskState::Ready;
+                    let n = SCHED_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n < SCHED_LOG_LIMIT {
+                        crate::console_println!(
+                            "[sched] #{} wake: slot{} (proc{}) Blocked->Ready",
+                            n,
+                            i,
+                            proc_idx
+                        );
+                    }
                 }
             }
             return;
+        }
+    }
+}
+
+// ── Timer-based sleep queue ──────────────────────────────────────────
+// Each entry: (task_slot_index, wake_tick)
+// wake_tick = uptime_ms() value at which to wake the task.
+// Called from timer ISR to check for expired sleeps.
+
+use alloc::vec::Vec;
+
+/// Global sleep queue protected by a spin lock.
+static SLEEP_QUEUE: SpinLock<Vec<(usize, u64)>> = SpinLock::new(Vec::new());
+
+/// Block the current task and schedule it to wake at `wake_tick` (uptime_ms).
+/// Called from nanosleep / epoll_wait timeout.
+pub fn sleep_until(wake_tick: u64) {
+    let task_slot = CURRENT_RUNNING.load(Ordering::Relaxed);
+    // task_slot == MAX_TASKS means init — init must never block
+    let max_tasks = {
+        let sched = SCHEDULER.lock();
+        sched.count
+    };
+    if task_slot >= max_tasks {
+        // Init: busy-wait instead (init must never block)
+        while crate::arch::platform::uptime_ms() < wake_tick {
+            core::hint::spin_loop();
+        }
+        return;
+    }
+    let now = crate::arch::platform::uptime_ms();
+    // ALWAYS print — critical for diagnosing epoll_wait blocking
+    crate::console_println!(
+        "[sleep] slot={} now={} target={}",
+        task_slot,
+        now,
+        wake_tick
+    );
+    if wake_tick <= now {
+        return; // Already expired, no need to block
+    }
+    {
+        let n = SCHED_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < SCHED_LOG_LIMIT {
+            crate::console_println!(
+                "[sched] #{} sleep: slot{} now={} target={}",
+                n,
+                task_slot,
+                now,
+                wake_tick
+            );
+        }
+        let mut q = SLEEP_QUEUE.lock();
+        q.push((task_slot, wake_tick));
+    }
+    // Block the task (schedule_block switches to another Ready task)
+    schedule_block();
+}
+
+/// Called from timer ISR every tick (~10ms).
+/// Checks all sleeping tasks and wakes those whose deadline has passed.
+/// Uses try_lock to avoid deadlock in ISR context.
+pub fn tick_sleep_queue() {
+    let now = crate::arch::platform::uptime_ms();
+    let mut to_wake = Vec::new();
+    {
+        let mut q = match SLEEP_QUEUE.try_lock() {
+            Some(guard) => guard,
+            None => {
+                static SLEEP_MISS: core::sync::atomic::AtomicUsize =
+                    core::sync::atomic::AtomicUsize::new(0);
+                let n = SLEEP_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 5 {
+                    crate::console_println!("[sleep] SLEEP_QUEUE try_lock failed (miss #{})", n);
+                }
+                return;
+            }
+        };
+        let mut i = 0;
+        while i < q.len() {
+            if q[i].1 <= now {
+                to_wake.push(q[i].0);
+                q.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if to_wake.is_empty() {
+        return;
+    }
+    let n = SCHED_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < SCHED_LOG_LIMIT {
+        crate::console_println!(
+            "[sched] #{} tick_wake: now={} waking {} tasks",
+            n,
+            now,
+            to_wake.len()
+        );
+    }
+    let mut sched = match SCHEDULER.try_lock() {
+        Some(guard) => guard,
+        None => {
+            static SCHED_MISS: core::sync::atomic::AtomicUsize =
+                core::sync::atomic::AtomicUsize::new(0);
+            let n = SCHED_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 5 {
+                crate::console_println!("[sleep] SCHEDULER try_lock failed (miss #{})", n);
+            }
+            return;
+        }
+    };
+    for task_slot in to_wake {
+        if let Some(ref mut t) = sched.tasks[task_slot] {
+            if t.state == TaskState::Blocked {
+                t.state = TaskState::Ready;
+            }
         }
     }
 }
@@ -701,6 +907,10 @@ unsafe extern "C" fn clone_first_shim() -> ! {
             //   +0x28: kernel_sp  +0x30: user_cr3  +0x38: trap_from_user
             "cli",
 
+            // 0. Disable interrupts — we're in kernel mode manipulating TrapContext.
+            // Timer ISR would corrupt our stack if it fires during this sequence.
+            "cli",
+
             // 1. Set TSS.RSP0 and SYSCALL_KSP from r14 (kernel_stack_top)
             // r14 was loaded by __switch RESTORE from per-task switch frame slot 528
             // (no longer uses global PENDING_RSP0 — avoids race with multiple clones)
@@ -762,6 +972,21 @@ unsafe extern "C" fn clone_first_shim() -> ! {
 
             // 6. Restore rax = 0 (child return value from clone)
             "xor rax, rax",
+
+            // 7. Validate RIP before iretq — if < 0x400000, TrapContext is corrupted
+            "cmp r14, 0x400000",
+            "jae 4f",
+            // Invalid RIP! Print diagnostic and halt
+            "mov rsi, r14",       // bad RIP value
+            "mov rdi, rsp",       // current RSP for context
+            "mov rax, 0xB8000",   // VGA buffer
+            "mov byte ptr [rax], 'C'",
+            "mov byte ptr [rax+2], 'R'",
+            "mov byte ptr [rax+4], 'P'",
+            "mov byte ptr [rax+6], 'F'",  // CLONE RIP FAIL
+            "cli",
+            "hlt",
+            "4:",
 
             // 7. Restore user RSP and iretq
             "mov rsp, rdx",
@@ -855,6 +1080,21 @@ pub fn add_clone_process(
         // Build TrapContext as a copy of parent's, with modifications for child
         let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
         *ctx = parent_ctx.clone();
+
+        // Debug: validate parent's TrapContext.rip
+        let parent_rip = parent_ctx.rip;
+        if parent_rip < 0x400000 {
+            crate::console_println!(
+                "[clone] WARNING: parent_rip={:#x} is below 0x400000! TrapContext may be corrupted!",
+                parent_rip
+            );
+            // Dump first 8 words of parent's TrapContext
+            let p = parent_ctx as *const crate::arch::trap::TrapContext as *const u64;
+            for i in 0..8 {
+                crate::console_println!("  parent_ctx[{}] = {:#x}", i, unsafe { *p.add(i) });
+            }
+        }
+
         // Modifications for clone child:
         (*ctx).rax = 0; // Child returns 0 from clone
         (*ctx).rsp = new_user_sp as u64; // Use new user stack
@@ -865,7 +1105,15 @@ pub fn add_clone_process(
         // load this into r15 register (overwriting __switch's r15). Both paths
         // need to agree on the TLS value.
         (*ctx).r15 = tls as u64;
-        // Debug: print R8=mp, R9=gp, R12=fn from parent's TrapContext
+        // Debug: print child's TrapContext.rip to verify
+        crate::console_println!(
+            "[clone] child TrapContext: rip={:#x} rsp={:#x} r8={:#x} r9={:#x} r12={:#x}",
+            (*ctx).rip,
+            (*ctx).rsp,
+            (*ctx).r8,
+            (*ctx).r9,
+            (*ctx).r12
+        );
     }
 
     TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);

@@ -407,13 +407,23 @@ impl ExtentNode {
                 // Internal node handling
                 let start = size_of::<Ext4ExtentHeader>();
                 let indexes = &internal_data[start..];
+                let index_size = size_of::<Ext4ExtentIndex>();
+                let max_entries = indexes.len() / index_size;
+                let entries = (self.header.entries_count as usize).min(max_entries);
+
+                if entries == 0 {
+                    return None;
+                }
 
                 let mut l = 0;
-                let mut r = (self.header.entries_count - 1) as usize;
+                let mut r = entries - 1;
 
                 while l <= r {
                     let m = l + (r - l) / 2;
-                    let offset = m * size_of::<Ext4ExtentIndex>();
+                    let offset = m * index_size;
+                    if offset + index_size > indexes.len() {
+                        break;
+                    }
                     let extent_index = Ext4ExtentIndex::load_from_u8(&indexes[offset..]);
 
                     if lblock < extent_index.first_block {

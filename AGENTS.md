@@ -63,6 +63,8 @@ make test                             # 4. Run tests (must be ALL PASSED)
 
 ## Coding Conventions
 
+- **禁止 hack 和 shortcut**：任何时候都不要用临时方案绕过问题。如果脑子里出现"这是一个很大的改动"的想法，立刻实现完整方案。只要有更彻底的方案，就禁止用更小的方案。FakeFile、stub syscall、busy-wait 替代真正 sleep——这些都是禁止的。
+- **禁止特殊处理**：永远不要用 `if fd == 0`、`if fd >= 100`、`if slot == X` 这种硬编码的特殊判断来区分不同类型的 fd/task/slot。必须为每种类型建立统一的数据结构和接口（如 `FdInfo` trait 或 enum），所有类型通过同一个接口查询状态。硬编码的 magic number 判断是严格禁止的——发现一个立刻重构为正确方案。
 - **DRY (Don't Repeat Yourself)**: Abstract common patterns into helper functions. Example: CR3 switch for page table operations → use a single `with_kernel_cr3(closure)` helper instead of copy-pasting save/switch/restore at every call site. If you find yourself writing the same 5+ lines in multiple places, extract it.
 - **Always check full output**: When QEMU test output goes to a file, **read the entire file** (or at least the tail) before forming hypotheses. Never assume what happened based on partial grep results. A single `tail -40` can save 30 minutes of misdiagnosis.
 - **Empirical evidence first**: Do not analyze based on assumptions. If a PF loop occurs, add targeted diagnostics (print PTE values, CR3, frame addresses) to verify the hypothesis before attempting fixes. Every fix should be preceded by evidence of the root cause.

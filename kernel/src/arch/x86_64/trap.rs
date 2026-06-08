@@ -49,6 +49,12 @@ use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::PhysFrame;
 use x86_64::{PhysAddr, VirtAddr};
 
+/// Global FS_BASE value to restore in `trap_return_user` before returning to Ring 3.
+/// Set by `schedule()` before `__switch`, consumed by `trap_return_user` asm.
+/// This ensures clone'd threads get their TLS (FS_BASE) set correctly on first run.
+#[cfg(target_arch = "x86_64")]
+pub static PENDING_FS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Complete register state saved on trap entry.
 ///
 /// Field ordering is critical: GP regs first, then iretq frame, then
@@ -200,6 +206,23 @@ pub unsafe extern "C" fn trap_return_user() {
             // NOTE: user_cr3 is stored as the full physical address of the
             // PML4 table (already shifted by callers), so we use it directly.
             "cli",
+
+            // ── Restore FS_BASE for TLS (Go goroutine getg()) ──
+            // schedule() sets PENDING_FS_BASE before __switch to the target task's FS_BASE.
+            // This is critical for clone'd threads which enter via trap_return_user
+            // (bypassing schedule()'s post-__switch FS_BASE restore).
+            "mov rax, [rip + {pending_fs_base}]",
+            "test rax, rax",
+            "jz 4f",
+            "mov rcx, 0xC0000100",  // IA32_FS_BASE MSR
+            "mov rdx, rax",
+            "shr rdx, 32",           // rdx = high 32 bits
+            "mov eax, eax",          // eax = low 32 bits (zero-extends, clears upper)
+            "wrmsr",
+            "xor rax, rax",
+            "mov [rip + {pending_fs_base}], rax", // clear after use
+            "4:",
+
             "cmp qword ptr [rsp + 0x30], 0",
             "je 2f", // skip if user_cr3 == 0
             "mov rax, [rsp + 0x30]",
@@ -209,6 +232,7 @@ pub unsafe extern "C" fn trap_return_user() {
             "iretq",
             tss_rsp0_addr = sym super::super::gdt::TSS_RSP0_ADDR,
             syscall_ksp = sym super::super::idt::SYSCALL_KSP,
+            pending_fs_base = sym PENDING_FS_BASE,
         );
     }
 }

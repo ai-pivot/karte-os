@@ -396,42 +396,24 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     let _ = ctx;
-
-    // Send EOI early — before any scheduling
     super::lapic::local_eoi();
-
     crate::driver::tty::poll_uart();
     crate::arch::platform::tick_uptime();
-    // Note: set_next_timer is not needed for periodic mode
-
-    // Increment global tick counter
+    crate::sched::tick_sleep_queue();
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-    // schedule() is now safe because timer IDT uses TSS RSP0 (per-task kernel stack)
-    // instead of IST. __switch() saves/restores the correct stack pointer.
     crate::sched::schedule();
-
-    // After schedule(), update SYSCALL_KSP to the current task's kernel stack.
-    // This ensures the next syscall uses the correct per-task stack.
-    // When init (shell) is running, restore to init's original SYSCALL_KSP.
     if let Some(ksp) = crate::sched::current_kernel_stack() {
         unsafe { crate::arch::idt::SYSCALL_KSP = ksp };
     } else {
-        // Init is running — restore SYSCALL_KSP to init's kernel stack
         unsafe {
             crate::arch::idt::SYSCALL_KSP =
                 crate::arch::idt::INIT_SYSCALL_KSP.load(core::sync::atomic::Ordering::Relaxed)
         };
     }
-
-    // After schedule(), switch to the target process's page table.
-    // If target_root is 0 (init), reload the kernel CR3 so we don't run
-    // with a dead process's user page table.
     let target_root = crate::process::current_page_table_root();
     if target_root != 0 {
         super::trap::activate_page_table((target_root << 12) as usize);
     } else {
-        // Init runs with the kernel page table (identity-mapped).
         let kernel_pt = crate::mm::vmm::get_kernel_page_table();
         super::trap::activate_page_table(kernel_pt as *const _ as usize);
     }
@@ -534,6 +516,50 @@ unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
 
         // Debug: trace r14 for clone syscall to diagnose "morestack on g0"
         if syscall_nr == 56 && crate::process::current_pid() >= 2 {}
+
+        // Debug: trace clone syscall — print user_rip (RCX) to verify TrapContext
+        if syscall_nr == 56 {
+            crate::console_println!(
+                "[sys:clone] user_rip={:#x} user_rsp_from_stack={:#x} saved_rbx_orig={:#x}",
+                user_rip,
+                user_rsp,
+                saved_rbx
+            );
+        }
+        // Debug: trace eventfd writes (nr=1) and eventfd2 (nr=290)
+        if syscall_nr == 1 && a0 >= 200 {
+            static SWDBG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            let n = SWDBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 10 {
+                crate::console_println!("[sys:wr] fd={} buf={:#x} len={}", a0, a1, a2);
+            }
+        }
+        if syscall_nr == 290 {
+            crate::console_println!("[sys:eventfd2] initval={} flags={}", a0, a1);
+        }
+        // Trace futex operations
+        if syscall_nr == 202 {
+            static FUTDBG: core::sync::atomic::AtomicUsize =
+                core::sync::atomic::AtomicUsize::new(0);
+            let n = FUTDBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 30 {
+                crate::console_println!(
+                    "[sys:futex] uaddr={:#x} op={} val={} a3={:#x}",
+                    a0,
+                    a1,
+                    a2,
+                    a3
+                );
+            }
+        }
+        // Trace epoll_pwait returns
+        if syscall_nr == 281 {
+            static EPDBG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+            let n = EPDBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 20 {
+                crate::console_println!("[sys:epoll_pwait] epfd={}", a0);
+            }
+        }
 
         let result = crate::syscall::dispatch_syscall_linux(syscall_nr, a0, a1, a2, a3, a4, a5);
 
@@ -687,6 +713,10 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     let page_addr = fault_addr_val & !(page_size - 1);
 
     // Print concise PF info
+    let mut fs_base: u64 = 0;
+    unsafe {
+        core::arch::asm!("rdmsr", "shl rdx, 32", "or rdx, rax", out("edx") fs_base, out("eax") _, in("ecx") 0xC0000100u32)
+    };
     if !from_user {
         crate::console_println!(
             "[PF] KERN addr={:#x} rip={:#x} cr3={:#x}",
@@ -695,12 +725,63 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             raw_cr3
         );
     } else {
-        crate::console_println!(
-            "[PF] USER addr={:#x} rip={:#x} pid={}",
-            fault_addr_val,
-            rip,
-            crate::process::current_pid()
-        );
+        // Extra debug for very-low-RIP faults (clone issue)
+        let extra = if rip < 0x400000 {
+            // Dump stack for diagnosis
+            let rsp_pages = rsp_val & !0xFFF;
+            let stack_ok = rsp_pages > 0x1000 && rsp_pages < 0x800000000000;
+            crate::console_println!(
+                "[PF] USER LOW-RIP! addr={:#x} rip={:#x} pid={} slot={} fs_base={:#x} rsp={:#x} err={} stack_ok={}",
+                fault_addr_val,
+                rip,
+                crate::process::current_pid(),
+                crate::sched::current_running_slot(),
+                fs_base,
+                rsp_val,
+                error_code,
+                stack_ok
+            );
+            if stack_ok {
+                // Dump 8 words at RSP
+                for i in 0..8 {
+                    let val = unsafe { *((rsp_val + i * 8) as *const u64) };
+                    crate::console_println!("  [rsp+{:#x}] = {:#x}", i * 8, val);
+                }
+            }
+            // Also dump the kernel stack TrapContext to see what rip was set to
+            let ksp = crate::arch::idt::get_syscall_ksp();
+            if ksp > 0 {
+                let ctx = ksp as *const u64;
+                // TrapContext: rax(0),rbx(8),rcx(16),rdx(24),rbp(32),rsi(40),rdi(48),
+                //   r8(56),r9(64),r10(72),r11(80),r12(88),r13(96),r14(104),r15(112),
+                //   rip(120),cs(128),rflags(136),rsp(144),ss(152)
+                let tc_rip = unsafe { *ctx.add(120 / 8) };
+                let tc_rsp = unsafe { *ctx.add(144 / 8) };
+                let tc_r8 = unsafe { *ctx.add(56 / 8) };
+                let tc_r9 = unsafe { *ctx.add(64 / 8) };
+                let tc_r15 = unsafe { *ctx.add(112 / 8) };
+                crate::console_println!(
+                    "  TC: rip={:#x} rsp={:#x} r8={:#x} r9={:#x} r15={:#x}",
+                    tc_rip,
+                    tc_rsp,
+                    tc_r8,
+                    tc_r9,
+                    tc_r15
+                );
+            }
+            true
+        } else {
+            false
+        };
+        if !extra {
+            crate::console_println!(
+                "[PF] USER addr={:#x} rip={:#x} pid={} fs_base={:#x}",
+                fault_addr_val,
+                rip,
+                crate::process::current_pid(),
+                fs_base
+            );
+        }
     }
 
     // Handle user-mode page faults with lazy allocation
@@ -1103,14 +1184,12 @@ pub fn init() {
             0,      // No IST
         );
 
-        // Timer: naked ISR with CR3 switch, using TSS RSP0 (per-task kernel stack).
-        // No IST — so schedule()/__switch() save/restore the correct kernel stack.
-        // SYSCALL entry uses cli, so timer cannot interrupt syscall handler.
+        // Timer: no IST — uses TSS RSP0 (per-task kernel stack).
         set_naked_handler(
             &mut idt[TIMER_VECTOR],
             timer_isr_stub as *const () as usize,
-            0x8E00, // Base attributes (64-bit interrupt gate, DPL=0, P=1)
-            0,      // No IST — use TSS RSP0 (per-task kernel stack)
+            0x8E00,
+            0,
         );
 
         // Keyboard (IRQ1): naked ISR with IST[3]

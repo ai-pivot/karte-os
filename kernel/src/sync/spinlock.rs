@@ -32,6 +32,17 @@ impl<T> SpinLock<T> {
         SpinLockGuard { lock: self }
     }
 
+    /// Attempt to acquire the lock without blocking.
+    /// Returns Some(guard) if successful, None if already locked.
+    /// Safe to call from ISR context.
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        if self.locked.swap(true, Ordering::Acquire) {
+            None
+        } else {
+            Some(SpinLockGuard { lock: self })
+        }
+    }
+
     fn unlock(&self) {
         self.locked.store(false, Ordering::Release);
     }
