@@ -76,6 +76,7 @@ pub const LINUX_MMAP: usize = 110;
 pub const LINUX_MPROTECT: usize = 111;
 pub const LINUX_MUNMAP: usize = 112;
 pub const LINUX_ARCH_PRCTL: usize = 113;
+pub const LINUX_MADVISE: usize = 114;
 pub const LINUX_GETRANDOM: usize = 114;
 pub const LINUX_SET_TID_ADDRESS: usize = 115;
 
@@ -325,7 +326,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         25 => ERR_INVAL,                                   // mremap (stub)
         26 => 0,                                           // msync (stub)
         27 => 0,                                           // mincore (stub)
-        28 => 0,                                           // madvise (stub)
+        28 => linux_madvise(args[0], args[1], args[2]),  // madvise
         29 => linux_dup(args[0]),                          // dup
         30 => linux_dup2(args[0], args[1]),                // dup2
         31 => linux_pause(),                               // pause
@@ -487,16 +488,15 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
     let our_flags = if has_creat { 0x100 } else { 0 } | (flags & 0x600); // keep O_TRUNC/O_APPEND
     match crate::driver::vfs::open(path_str, our_flags as u32) {
         Ok(fd) => fd as isize,
-        Err(_) => {
-            // If VFS failed, create fake fd for virtual paths
-            let is_virtual = path_str.starts_with(".xbot")
-                || path_str.starts_with("/.xbot")
-                || path_str.starts_with("/proc")
+        Err(e) => {
+            // Only fake virtual pseudo-filesystem paths (/proc, /sys, /dev, /etc, /run)
+            let is_pseudo = path_str.starts_with("/proc")
                 || path_str.starts_with("/sys")
-                || path_str.starts_with("/etc")
                 || path_str.starts_with("/dev")
                 || path_str.starts_with("/run");
-            if has_creat || is_virtual {
+            // /etc/resolv.conf, /etc/localtime etc. — fake these too
+            let is_etc = path_str.starts_with("/etc");
+            if is_pseudo || is_etc {
                 crate::console_println!("[openat] fake '{}' flags={:#x}", path_str, flags);
                 crate::process::with_fd_table(|fd_table| {
                     match fd_table.alloc_fake_fd(alloc::format!("{}", path_str), our_flags as u32) {
@@ -505,6 +505,7 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                     }
                 })
             } else {
+                crate::console_println!("[openat] ERR '{}' flags={:#x} err={:?}", path_str, flags, e);
                 ERR_NOENT
             }
         }
@@ -870,6 +871,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         LINUX_MMAP => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         LINUX_MPROTECT => linux_mprotect(args[0], args[1], args[2]),
         LINUX_MUNMAP => linux_munmap(args[0], args[1]),
+        LINUX_MADVISE => linux_madvise(args[0], args[1], args[2]),
         LINUX_GETRANDOM => linux_getrandom(args[0], args[1], args[2]),
         LINUX_SET_TID_ADDRESS => linux_set_tid_address(args[0]),
         #[cfg(target_arch = "x86_64")]
@@ -1608,12 +1610,24 @@ fn linux_munmap(addr: usize, len: usize) -> isize {
         return -22; // EINVAL
     }
 
-    let user_pt = crate::arch::trap::get_current_user_pt();
-    for vaddr in (start..end).step_by(page_size) {
-        crate::mm::vmm::unmap_user(user_pt, vaddr);
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::trap::with_kernel_cr3(|| {
+            let user_pt = crate::arch::trap::get_user_pt_safe();
+            for vaddr in (start..end).step_by(page_size) {
+                crate::mm::vmm::unmap_user(user_pt, vaddr);
+            }
+            flush_tlb_all();
+        });
     }
-
-    flush_tlb_all();
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let user_pt = crate::arch::trap::get_current_user_pt();
+        for vaddr in (start..end).step_by(page_size) {
+            crate::mm::vmm::unmap_user(user_pt, vaddr);
+        }
+        flush_tlb_all();
+    }
     0
 }
 
@@ -1626,6 +1640,80 @@ fn flush_tlb_all() {
     #[cfg(target_arch = "x86_64")]
     {
         crate::arch::trap::flush_tlb();
+    }
+}
+
+/// Linux madvise(addr, len, advice)
+///
+/// Go runtime depends heavily on MADV_DONTNEED and MADV_FREE:
+///   - `sysUnusedOS` calls madvise(MADV_DONTNEED/FREE) to release pages
+///   - The kernel is expected to zero-fill these pages (or discard them)
+///   - `sysUsedOS` does NOT remap — it assumes pages are zeroed
+///
+/// Without this, Go's memory allocator sees stale heap data where it expects zeros,
+/// causing silent corruption in Go runtime data structures (regexp counters, GC bitmaps, etc.)
+fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+
+    const MADV_NORMAL: usize = 0;
+    const MADV_RANDOM: usize = 1;
+    const MADV_SEQUENTIAL: usize = 2;
+    const MADV_WILLNEED: usize = 3;
+    const MADV_DONTNEED: usize = 4;
+    const MADV_FREE: usize = 8;
+    const MADV_DONTFORK: usize = 10;
+    const MADV_DOFORK: usize = 11;
+    const MADV_MERGEABLE: usize = 12;
+    const MADV_UNMERGEABLE: usize = 13;
+    const MADV_HUGEPAGE: usize = 14;
+    const MADV_NOHUGEPAGE: usize = 15;
+    const MADV_COLLAPSE: usize = 25;
+
+    match advice {
+        MADV_DONTNEED | MADV_FREE => {
+            // Zero-fill pages in the range. Go runtime expects pages to be zeroed
+            // after MADV_DONTNEED/FREE — sysUsedOS does NOT remap.
+            let page_size = crate::mm::pmm::page_size();
+            let start = addr & !(page_size - 1);
+            let end = (addr + len + page_size - 1) & !(page_size - 1);
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                crate::arch::trap::with_kernel_cr3(|| {
+                    let user_pt = crate::arch::trap::get_user_pt_safe();
+                    let mut vaddr = start;
+                    while vaddr < end {
+                        if let Some(frame) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+                            unsafe {
+                                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                            }
+                        }
+                        vaddr += page_size;
+                    }
+                });
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let user_pt = crate::arch::trap::get_current_user_pt();
+                let mut vaddr = start;
+                while vaddr < end {
+                    if let Some(frame) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+                        unsafe {
+                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                        }
+                    }
+                    vaddr += page_size;
+                }
+            }
+            0
+        }
+        // All other advice values: no-op success
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED
+        | MADV_DONTFORK | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE
+        | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_COLLAPSE => 0,
+        _ => 0, // Unknown advice: silently succeed
     }
 }
 
@@ -3961,9 +4049,13 @@ fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) 
     }
 
     let resolved = crate::syscall::resolve_path(path_str);
+    crate::console_println!("[mkdirat] '{}' -> resolved='{}'", path_str, resolved);
 
     match crate::driver::ext4::create_directory(&resolved) {
         Ok(()) => 0,
-        Err(_) => 0,
+        Err(e) => {
+            crate::console_println!("[mkdirat] FAILED '{}' err={}", path_str, e);
+            -1 // EPERM
+        }
     }
 }

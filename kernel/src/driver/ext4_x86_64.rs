@@ -301,65 +301,217 @@ pub fn has_ext4() -> bool {
     EXT4_AVAILABLE.load(Ordering::SeqCst)
 }
 
+// ─── VFS Integration ────────────────────────────────────────────────────
+
+/// Wrapper that implements the VFS FileSystem trait for ext4.
+/// All operations are routed to the ext4_rs functions under kernel CR3.
+pub struct Ext4FileSystem;
+
+impl crate::driver::vfs::FileSystem for Ext4FileSystem {
+    fn name(&self) -> &str {
+        "ext4"
+    }
+
+    fn root_inode(&self) -> u64 {
+        ROOT_INODE as u64
+    }
+
+    fn lookup(&self, dir: u64, name: &str) -> Result<u64, crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let guard = EXT4_FS.lock();
+            let fs = guard.as_ref().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.lookup(dir, name).map_err(|_| crate::driver::vfs::VfsError::NotFound)
+        })
+    }
+
+    fn metadata(&self, inode: u64) -> Result<crate::driver::vfs::VfsMetadata, crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let guard = EXT4_FS.lock();
+            let fs = guard.as_ref().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.metadata(inode).map_err(|_| crate::driver::vfs::VfsError::NotFound)
+        })
+    }
+
+    fn readdir(&self, dir: u64, idx: usize) -> Result<Option<crate::driver::vfs::VfsDirEntry>, crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let guard = EXT4_FS.lock();
+            let fs = guard.as_ref().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            let ext4 = fs.ext4.lock();
+            let entries = ext4.dir_get_entries(dir as u32);
+            if idx >= entries.len() {
+                return Ok(None);
+            }
+            let entry = &entries[idx];
+            let de_type = entry.get_de_type();
+            let file_type = if de_type == 2 {
+                crate::driver::vfs::VfsFileType::Directory
+            } else {
+                crate::driver::vfs::VfsFileType::File
+            };
+            let child_inode_ref = ext4.get_inode_ref(entry.inode);
+            let size = child_inode_ref.inode.size() as usize;
+            Ok(Some(crate::driver::vfs::VfsDirEntry {
+                name: entry.get_name(),
+                file_type,
+                size,
+            }))
+        })
+    }
+
+    fn read_file(&self, inode: u64, offset: usize, buf: &mut [u8]) -> Result<usize, crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let guard = EXT4_FS.lock();
+            let fs = guard.as_ref().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.read_file(inode, offset, buf).map_err(|_| crate::driver::vfs::VfsError::IoError)
+        })
+    }
+
+    fn write_file(&mut self, inode: u64, offset: usize, data: &[u8]) -> Result<usize, crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let mut guard = EXT4_FS.lock();
+            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.write_file(inode, offset, data).map_err(|_| crate::driver::vfs::VfsError::IoError)
+        })
+    }
+
+    fn create_file(&mut self, dir: u64, name: &str) -> Result<u64, crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let mut guard = EXT4_FS.lock();
+            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            let mut ext4 = fs.ext4.lock();
+            let inode_ref = ext4.create(dir as u32, name, 0o100644 as u16)
+                .map_err(|e| {
+                    crate::console_println!("[ext4 vfs] create_file '{}' err={:?}", name, e);
+                    crate::driver::vfs::VfsError::IoError
+                })?;
+            Ok(inode_ref.inode_num as u64)
+        })
+    }
+
+    fn create_dir(&mut self, dir: u64, name: &str) -> Result<u64, crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let mut guard = EXT4_FS.lock();
+            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            let mut ext4 = fs.ext4.lock();
+            let inode_ref = ext4.create(dir as u32, name, 0o40755 as u16)
+                .map_err(|_| crate::driver::vfs::VfsError::IoError)?;
+            Ok(inode_ref.inode_num as u64)
+        })
+    }
+
+    fn unlink(&mut self, dir: u64, name: &str) -> Result<(), crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let mut guard = EXT4_FS.lock();
+            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.unlink(dir, name).map_err(|_| crate::driver::vfs::VfsError::IoError)
+        })
+    }
+
+    fn set_file_size(&mut self, inode: u64, size: usize) -> Result<(), crate::driver::vfs::VfsError> {
+        with_kernel_cr3_ext4(|| {
+            let mut guard = EXT4_FS.lock();
+            let fs = guard.as_mut().ok_or(crate::driver::vfs::VfsError::NotFound)?;
+            fs.set_file_size(inode, size).map_err(|_| crate::driver::vfs::VfsError::IoError)
+        })
+    }
+}
+
+/// Register ext4 as the root filesystem in VFS. Called after successful init().
+pub fn mount_to_vfs() -> Result<(), &'static str> {
+    crate::driver::vfs::mount("/", alloc::boxed::Box::new(Ext4FileSystem))
+        .map_err(|_| "failed to mount ext4 to VFS")
+}
+
+/// Run a closure under kernel CR3 on x86_64. Required for all ext4 file
+/// operations because the AHCI DMA buffer is accessed via identity mapping,
+/// which gets corrupted in user page tables after ELF loading overwrites
+/// identity-mapped PTEs. On RISC-V, this is a no-op (identity mapping is
+/// preserved in user page tables via satp copy).
+#[cfg(target_arch = "x86_64")]
+fn with_kernel_cr3_ext4<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    crate::arch::trap::with_kernel_cr3(f)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn with_kernel_cr3_ext4<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    f()
+}
+
 pub fn read_file(name: &str) -> Option<Vec<u8>> {
     if !has_ext4() {
         return None;
     }
-    let guard = EXT4_FS.lock();
-    let fs = guard.as_ref()?;
-    let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
-    let metadata = fs.metadata(inode).ok()?;
-    let size = metadata.size;
-    if size == 0 {
-        return Some(Vec::new());
-    }
-    let mut buf = alloc::vec![0u8; size];
-    let bytes_read = fs.read_file(inode, 0, &mut buf).ok()?;
-    buf.truncate(bytes_read);
-    Some(buf)
+    with_kernel_cr3_ext4(|| {
+        let guard = EXT4_FS.lock();
+        let fs = guard.as_ref()?;
+        let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
+        let metadata = fs.metadata(inode).ok()?;
+        let size = metadata.size;
+        if size == 0 {
+            return Some(Vec::new());
+        }
+        let mut buf = alloc::vec![0u8; size];
+        let bytes_read = fs.read_file(inode, 0, &mut buf).ok()?;
+        buf.truncate(bytes_read);
+        Some(buf)
+    })
 }
 
 pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result<usize, ()>> {
     if !has_ext4() {
         return None;
     }
-    let guard = EXT4_FS.lock();
-    let fs = guard.as_ref()?;
-    let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
-    drop(guard);
-
-    Some(move |offset: usize, buf: &mut [u8]| -> Result<usize, ()> {
-        if !has_ext4() {
-            return Err(());
-        }
+    with_kernel_cr3_ext4(|| {
         let guard = EXT4_FS.lock();
-        let fs = guard.as_ref().ok_or(())?;
-        fs.read_file(inode, offset, buf).map_err(|_| ())
+        let fs = guard.as_ref()?;
+        let inode = fs.lookup(ROOT_INODE as u64, name).ok()?;
+        drop(guard);
+
+        Some(move |offset: usize, buf: &mut [u8]| -> Result<usize, ()> {
+            if !has_ext4() {
+                return Err(());
+            }
+            with_kernel_cr3_ext4(|| {
+                let guard = EXT4_FS.lock();
+                let fs = guard.as_ref().ok_or(())?;
+                fs.read_file(inode, offset, buf).map_err(|_| ())
+            })
+        })
     })
 }
 
 pub fn lookup_path(name: &str) -> Option<u64> {
-    if !has_ext4() {
-        return None;
-    }
-    let guard = EXT4_FS.lock();
-    let fs = guard.as_ref()?;
-    fs.lookup(ROOT_INODE as u64, name).ok()
+    if !has_ext4() { return None; }
+    with_kernel_cr3_ext4(|| {
+        let guard = EXT4_FS.lock();
+        let fs = guard.as_ref()?;
+        fs.lookup(ROOT_INODE as u64, name).ok()
+    })
 }
 
 pub fn metadata_of(inode: u64) -> Option<VfsMetadata> {
-    if !has_ext4() {
-        return None;
-    }
-    let guard = EXT4_FS.lock();
-    let fs = guard.as_ref()?;
-    fs.metadata(inode).ok()
+    if !has_ext4() { return None; }
+    with_kernel_cr3_ext4(|| {
+        let guard = EXT4_FS.lock();
+        let fs = guard.as_ref()?;
+        fs.metadata(inode).ok()
+    })
 }
 
 pub fn write_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
     if !has_ext4() {
         return Err("ext4 not initialized");
     }
+    with_kernel_cr3_ext4(|| write_file_inner(name, data))
+}
+
+fn write_file_inner(name: &str, data: &[u8]) -> Result<(), &'static str> {
     let mut guard = EXT4_FS.lock();
     let fs = guard.as_mut().ok_or("ext4 not initialized")?;
     let inode = fs.lookup(ROOT_INODE as u64, name).unwrap_or_else(|_| 0);
@@ -413,35 +565,51 @@ pub fn list_directory(path: &str) -> Vec<(String, usize)> {
     if !has_ext4() {
         return result;
     }
-    let guard = EXT4_FS.lock();
-    let Some(fs) = guard.as_ref() else {
-        return result;
-    };
-    let dir_inode = if path.is_empty() {
-        ROOT_INODE as u64
-    } else {
-        match fs.lookup(ROOT_INODE as u64, path) {
-            Ok(inode) => inode,
-            Err(_) => return result,
-        }
-    };
-    let mut idx = 0;
-    loop {
-        match fs.readdir(dir_inode, idx) {
-            Ok(Some(entry)) => {
-                if entry.name != "." && entry.name != ".." {
-                    result.push((entry.name, entry.size));
-                }
-                idx += 1;
+    with_kernel_cr3_ext4(|| {
+        let guard = EXT4_FS.lock();
+        let Some(fs) = guard.as_ref() else {
+            return result;
+        };
+        let dir_inode = if path.is_empty() {
+            ROOT_INODE as u64
+        } else {
+            match fs.lookup(ROOT_INODE as u64, path) {
+                Ok(inode) => inode,
+                Err(_) => return result,
             }
-            Ok(None) => break,
-            Err(_) => break,
+        };
+        let mut idx = 0;
+        loop {
+            match fs.readdir(dir_inode, idx) {
+                Ok(Some(entry)) => {
+                    if entry.name != "." && entry.name != ".." {
+                        result.push((entry.name, entry.size));
+                    }
+                    idx += 1;
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
         }
-    }
-    result
+        result
+    })
 }
 
 pub fn create_directory(path: &str) -> Result<(), &'static str> {
+    if !has_ext4() {
+        return Err("ext4 not initialized");
+    }
+
+    // All ext4 file operations must run under kernel CR3. The AHCI DMA buffer
+    // is accessed via identity mapping, which is overwritten in user page tables
+    // after ELF loading. Without kernel CR3, block I/O reads wrong physical pages.
+    #[cfg(target_arch = "x86_64")]
+    return crate::arch::trap::with_kernel_cr3(|| create_directory_inner(path));
+    #[cfg(not(target_arch = "x86_64"))]
+    create_directory_inner(path)
+}
+
+fn create_directory_inner(path: &str) -> Result<(), &'static str> {
     if !has_ext4() {
         return Err("ext4 not initialized");
     }
@@ -476,31 +644,50 @@ pub fn create_directory(path: &str) -> Result<(), &'static str> {
     let parent_inode = if parent_path.is_empty() {
         ROOT_INODE as u64
     } else {
-        fs.lookup(ROOT_INODE as u64, parent_path).map_err(|_| "parent not found")?
+        fs.lookup(ROOT_INODE as u64, parent_path).map_err(|e| {
+            crate::console_println!("[ext4] create_dir: parent '{}' not found: {:?}", parent_path, e);
+            "parent not found"
+        })?
     };
+    crate::console_println!("[ext4] create_dir '{}' parent_inode={}", dir_name, parent_inode);
+
+    // Debug: dump raw BGDT data to verify read correctness
+    {
+        let bd = KarteBlockDevice::new();
+        let raw = bd.read_offset(4096);
+        crate::console_println!("[ext4] BGDT raw: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]);
+    }
 
     let mut ext4 = fs.ext4.lock();
-    ext4.create(parent_inode as u32, dir_name, 0o40777 as u16)
-        .map_err(|_| "ext4 create_dir failed")?;
-    Ok(())
+    match ext4.create(parent_inode as u32, dir_name, 0o40777 as u16) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            crate::console_println!("[ext4] create_dir FAILED '{}/{}' err={:?}", parent_path, dir_name, e);
+            Err("ext4 create_dir failed")
+        }
+    }
 }
 
 pub fn delete_file(name: &str) -> Result<(), &'static str> {
     if !has_ext4() {
         return Err("ext4 not initialized");
     }
-    let mut guard = EXT4_FS.lock();
-    let fs = guard.as_mut().ok_or("ext4 not initialized")?;
-    let (parent_path, file_name) = split_last_component(name);
-    let parent_inode = if parent_path.is_empty() {
-        ROOT_INODE as u64
-    } else {
-        fs.lookup(ROOT_INODE as u64, parent_path)
-            .map_err(|_| "ext4: parent directory not found")?
-    };
-    fs.unlink(parent_inode, file_name)
-        .map_err(|_| "ext4 unlink failed")?;
-    Ok(())
+    with_kernel_cr3_ext4(|| {
+        let mut guard = EXT4_FS.lock();
+        let fs = guard.as_mut().ok_or("ext4 not initialized")?;
+        let (parent_path, file_name) = split_last_component(name);
+        let parent_inode = if parent_path.is_empty() {
+            ROOT_INODE as u64
+        } else {
+            fs.lookup(ROOT_INODE as u64, parent_path)
+                .map_err(|_| "ext4: parent directory not found")?
+        };
+        fs.unlink(parent_inode, file_name)
+            .map_err(|_| "ext4 unlink failed")?;
+        Ok(())
+    })
 }
 
 #[cfg(feature = "test_mode")]

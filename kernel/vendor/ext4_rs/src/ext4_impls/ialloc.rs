@@ -11,6 +11,8 @@ impl Ext4 {
         let mut iterations = 0u32;
         let max_iterations = bg_count * 2 + 1;
 
+        log::warn!("[ialloc] bg_count={} desc_size={}", bg_count, super_block.desc_size);
+
         while bgid < bg_count {
             iterations += 1;
             if iterations > max_iterations {
@@ -20,6 +22,15 @@ impl Ext4 {
             let mut bg = Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
 
             let mut free_inodes = bg.get_free_inodes_count();
+            let free_blocks = bg.get_free_blocks_count();
+            let inode_bmap = bg.get_inode_bitmap_block(&super_block);
+            let block_bmap = bg.get_block_bitmap_block(&super_block);
+            let inode_tbl = bg.get_inode_table_blk_num();
+            let flags = bg.flags;
+            log::warn!(
+                "[ialloc] bg[{}] free_inodes={} free_blocks={} flags={:#x} ibmap={} bbmap={} itbl={}",
+                bgid, free_inodes, free_blocks, flags, inode_bmap, block_bmap, inode_tbl
+            );
 
             if free_inodes > 0 {
                 let inode_bitmap_block = bg.get_inode_bitmap_block(&super_block);

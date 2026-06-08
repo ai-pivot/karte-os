@@ -254,7 +254,10 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: 112, // LINUX_MUNMAP
             args: [args[0], args[1], 0, 0, 0, 0],
         }),
-        L_MADVISE => Some(Translation::Handled(0)), // stub: success
+        L_MADVISE => Some(Translation::Dispatch {
+            karte_nr: 114, // LINUX_MADVISE
+            args: [args[0], args[1], args[2], 0, 0, 0],
+        }),
 
         // ─── Process management ──────────────────────────────
         L_EXIT_GROUP => Some(Translation::Dispatch {
@@ -551,7 +554,10 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: 111, // LINUX_MPROTECT
             args: [args[0], args[1], args[2], 0, 0, 0],
         }),
-        L_MADVISE => Some(Translation::Handled(0)), // stub
+        L_MADVISE => Some(Translation::Dispatch {
+            karte_nr: 114, // LINUX_MADVISE
+            args: [args[0], args[1], args[2], 0, 0, 0],
+        }),
         L_SOCKET => Some(Translation::Dispatch {
             karte_nr: super::SYS_SOCKET,
             args,

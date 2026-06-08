@@ -231,35 +231,54 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
         mount.fs.root_inode()
     };
 
-    let inode = if relative_path.is_empty() || relative_path == "/" {
-        root_inode
+    let inode_result = if relative_path.is_empty() || relative_path == "/" {
+        Ok(root_inode)
     } else {
         let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
-        walk_path(&*mount.fs, &relative_path)?
+        walk_path(&*mount.fs, &relative_path)
     };
 
-    // If O_CREAT and path resolved to root, try creating the file
-    if flags & O_CREAT != 0 && inode == root_inode {
-        // Check if path is just "/" — can't create that
-        if relative_path.is_empty() || relative_path == "/" {
-            return Err(VfsError::AlreadyExists);
+    match inode_result {
+        Ok(inode) => {
+            // File exists — optionally truncate
+            if flags & O_TRUNC != 0 {
+                let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
+                mount.fs.set_file_size(inode, 0)?;
+            }
+            vfs.open_files.alloc(mount_id, inode, flags)
         }
-        // Create in parent directory
-        let (parent_path, file_name) = split_filename(&relative_path)?;
-        let parent_inode = {
-            let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
-            walk_path(&*mount.fs, parent_path)?
-        };
-        let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
-        let inode = mount.fs.create_file(parent_inode, file_name)?;
-        vfs.open_files.alloc(mount_id, inode, flags)
-    } else {
-        // If O_TRUNC, truncate the file
-        if flags & O_TRUNC != 0 {
-            let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
-            mount.fs.set_file_size(inode, 0)?;
+        Err(walk_err) => {
+            if flags & O_CREAT != 0 {
+                // File doesn't exist but O_CREAT is set — create it
+                let (parent_path, file_name) = split_filename(&relative_path)?;
+                crate::console_println!("[vfs] O_CREAT '{}' parent='{}' name='{}'", relative_path, parent_path, file_name);
+                let parent_inode = {
+                    let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
+                    if parent_path.is_empty() {
+                        mount.fs.root_inode()
+                    } else {
+                        match walk_path(&*mount.fs, parent_path) {
+                            Ok(inode) => inode,
+                            Err(e) => {
+                                crate::console_println!("[vfs] O_CREAT parent '{}' walk err={:?}", parent_path, e);
+                                return Err(e);
+                            }
+                        }
+                    }
+                };
+                let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
+                match mount.fs.create_file(parent_inode, file_name) {
+                    Ok(inode) => vfs.open_files.alloc(mount_id, inode, flags),
+                    Err(e) => {
+                        crate::console_println!("[vfs] O_CREAT create_file '{}' err={:?}", file_name, e);
+                        Err(VfsError::IoError)
+                    }
+                }
+            } else {
+                crate::console_println!("[vfs] open '{}' walk_err={:?} flags={:#x} no O_CREAT", relative_path, walk_err, flags);
+                Err(walk_err)
+            }
         }
-        vfs.open_files.alloc(mount_id, inode, flags)
     }
 }
 

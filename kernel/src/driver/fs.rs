@@ -199,6 +199,13 @@ pub fn init() {
     match crate::driver::ext4::init() {
         Ok(()) => {
             crate::console_println!("[fs] ext4 filesystem mounted");
+            // Register ext4 as the root filesystem in VFS so that
+            // syscalls like openat(O_CREAT) can create files on ext4
+            // through the VFS layer.
+            match crate::driver::ext4::mount_to_vfs() {
+                Ok(()) => crate::console_println!("[fs] ext4 registered in VFS"),
+                Err(e) => crate::console_println!("[fs] ext4 VFS mount failed: {}", e),
+            }
         }
         Err(e) => {
             crate::console_println!("[fs] ext4 unavailable ({})", e);

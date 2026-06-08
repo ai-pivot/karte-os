@@ -667,10 +667,18 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
         }
         print_str(b"\n");
     }
-    if from_user {
-        // Terminate the user process
-        crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
+    // Kernel-mode GP fault during syscall handling (e.g., page table traversal OOB).
+    // If CR3 is a user page table, we can recover by terminating the offending process.
+    // If CR3 is the kernel page table, this is a true kernel bug → halt.
+    let cr3: usize;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys() & !0xFFF;
+    let current_cr3 = cr3 & !0xFFF;
+    if current_cr3 != kernel_cr3 {
+        // Running under a user CR3 — syscall context. Terminate the user process.
+        crate::syscall::dispatch(1, [99, 0, 0, 0, 0, 0]); // exit(99)
     } else {
+        // True kernel-mode fault — unrecoverable
         loop {}
     }
 }
@@ -904,7 +912,11 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 dbg_rax,
                 dbg_rip
             );
-            crate::syscall::sys_exit(99);
+            let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys() & !0xFFF;
+            let current_cr3 = cr3 & !0xFFF;
+            if current_cr3 != kernel_cr3 as u64 {
+                crate::syscall::sys_exit(99);
+            }
             loop {}
         } else {
             // Read RSP0 for debugging
@@ -924,6 +936,11 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 dbg_rax,
                 dbg_rip
             );
+            let kernel_cr3_val = crate::arch::idt::get_kernel_cr3_phys() & !0xFFF;
+            let current_cr3_val = cr3 & !0xFFF;
+            if current_cr3_val != kernel_cr3_val as u64 {
+                crate::syscall::sys_exit(99);
+            }
             loop {}
         }
     }
