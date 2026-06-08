@@ -391,29 +391,29 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
             })
         }
         122 => linux_uname(args[0]),                   // uname (new)
-        131 => linux_sigaltstack(args[0], args[1]), // sigaltstack
-        157 => 0,                                   // prctl (stub)
-        158 => linux_arch_prctl(args[0], args[1]),  // arch_prctl
-        160 => 0,                                   // setrlimit (stub)
-        186 => sys_getpid(),                        // gettid → getpid
-        200 => 0,                                   // tkill (stub)
-        201 => linux_time(args[0]),                 // time
+        131 => linux_sigaltstack(args[0], args[1]),    // sigaltstack
+        157 => 0,                                      // prctl (stub)
+        158 => linux_arch_prctl(args[0], args[1]),     // arch_prctl
+        160 => 0,                                      // setrlimit (stub)
+        186 => sys_getpid(),                           // gettid → getpid
+        200 => 0,                                      // tkill (stub)
+        201 => linux_time(args[0]),                    // time
         202 => linux_futex(args[0], args[1], args[2]), // futex
         203 => linux_sched_setaffinity(args[0], args[1], args[2]), // sched_setaffinity (stub)
         204 => linux_sched_getaffinity(args[0], args[1], args[2]), // sched_getaffinity
-        218 => linux_set_tid_address(args[0]),      // set_tid_address
-        228 => linux_clock_gettime(args[0], args[1]), // clock_gettime
-        231 => sys_exit(args[0] as i32),            // exit_group
+        218 => linux_set_tid_address(args[0]),         // set_tid_address
+        228 => linux_clock_gettime(args[0], args[1]),  // clock_gettime
+        231 => sys_exit(args[0] as i32),               // exit_group
         234 => linux_tgkill(args[0], args[1], args[2]), // tgkill
         257 => linux_openat(args[0], args[1], args[2], args[3]), // openat
         258 => linux_mkdirat(args[0], args[1], args[2], args[3]), // mkdirat
         262 => linux_newfstatat(args[0], args[1], args[2], args[3]), // newfstatat
         263 => sys_unlink(args[1], linux::count_user_string(args[1])), // unlinkat
-        267 => 0,                                   // readlinkat (stub)
-        272 => 0,                                   // unshare (stub)
-        273 => 0,                                   // set_robust_list (stub)
-        274 => 0,                                   // get_robust_list (stub)
-        290 => 4isize,                              // eventfd2 (fake fd)
+        267 => 0,                                      // readlinkat (stub)
+        272 => 0,                                      // unshare (stub)
+        273 => 0,                                      // set_robust_list (stub)
+        274 => 0,                                      // get_robust_list (stub)
+        290 => 4isize,                                 // eventfd2 (fake fd)
         232 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_wait
         233 => epoll::sys_epoll_ctl(args[0], args[1], args[2], args[3]), // epoll_ctl
         281 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_pwait (same as epoll_wait, ignoring sigmask)
@@ -831,12 +831,12 @@ fn linux_uname(buf: usize) -> isize {
         return -14; // EFAULT
     }
     let fields: [&[u8]; 6] = [
-        b"Linux\0",               // sysname
-        b"karteos\0",             // nodename
-        b"6.1.0\0",               // release (fake Linux version)
-        b"#1 SMP KarteOS\0",      // version
-        b"x86_64\0",              // machine
-        b"\0",                    // domainname
+        b"Linux\0",          // sysname
+        b"karteos\0",        // nodename
+        b"6.1.0\0",          // release (fake Linux version)
+        b"#1 SMP KarteOS\0", // version
+        b"x86_64\0",         // machine
+        b"\0",               // domainname
     ];
     let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 390) };
     let mut offset = 0usize;
@@ -891,11 +891,17 @@ fn linux_chdir(path: usize) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 fn linux_gettimeofday(tv: usize, _tz: usize) -> isize {
+    // Return fake time based on uptime.
+    // Epoch offset: 1749427200 (2025-06-09 00:00:00 UTC)
+    const FAKE_EPOCH: u64 = 1749427200;
+    let uptime_ms = crate::arch::platform::uptime_ms();
+    let tv_sec = (uptime_ms / 1000 + FAKE_EPOCH) as i64;
+    let tv_usec = ((uptime_ms % 1000) * 1000) as i64;
     if tv != 0 {
-        let tv_ptr = tv as *mut u64;
+        let tv_ptr = tv as *mut i64;
         unsafe {
-            *tv_ptr = 0; // seconds
-            *(tv_ptr.add(1)) = 0; // microseconds
+            core::ptr::write_volatile(tv_ptr, tv_sec);
+            core::ptr::write_volatile(tv_ptr.add(1), tv_usec);
         }
     }
     0
@@ -945,12 +951,15 @@ fn linux_sysinfo(info: usize) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 fn linux_sched_getaffinity(_pid: usize, size: usize, mask: usize) -> isize {
-    if mask != 0 && size >= 8 {
+    if mask != 0 && size > 0 {
         unsafe {
-            *(mask as *mut u64) = 0xFF; // 8 CPUs
+            // Zero-fill the entire mask
+            core::ptr::write_bytes(mask as *mut u8, 0, size);
+            // Set CPU 0 as available (first byte = 0x01)
+            core::ptr::write_volatile(mask as *mut u8, 0x01u8);
         }
     }
-    8 // return size written
+    size as isize // return mask size in bytes
 }
 
 #[cfg(target_arch = "x86_64")]

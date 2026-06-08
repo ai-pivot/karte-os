@@ -366,27 +366,36 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             args,
         }),
         L_SCHED_GETAFFINITY => {
-            // sched_getaffinity(pid, size, mask) — fake: all CPUs available
-            // Write a mask with all bits set
-            if args[2] != 0 && args[1] >= 8 {
-                let mask = args[2] as *mut u64;
+            // sched_getaffinity(pid, size, mask) — fake: CPU 0 available
+            let size = args[1]; // mask_size in bytes
+            let mask_ptr = args[2] as *mut u8;
+            if mask_ptr as usize != 0 && size > 0 {
                 unsafe {
-                    *mask = 0xFF; // 8 CPUs
+                    // Zero-fill the entire mask
+                    core::ptr::write_bytes(mask_ptr, 0, size);
+                    // Set CPU 0 as available (first byte = 0x01)
+                    core::ptr::write_volatile(mask_ptr, 0x01u8);
                 }
             }
-            Some(Translation::Handled(8)) // return size written
+            Some(Translation::Handled(size as isize))
         }
 
         // ─── Time ────────────────────────────────────────────
         L_GETTIMEOFDAY => {
-            // gettimeofday(tv, tz) — fake: return 0 time
+            // gettimeofday(tv, tz) — return fake time based on uptime
+            // Epoch offset: 1749427200 (2025-06-09 00:00:00 UTC)
+            const FAKE_EPOCH: u64 = 1749427200;
+            let uptime_ms = crate::arch::platform::uptime_ms();
+            let tv_sec = (uptime_ms / 1000 + FAKE_EPOCH) as i64;
+            let tv_usec = ((uptime_ms % 1000) * 1000) as i64;
             if args[0] != 0 {
-                let tv = args[0] as *mut u64;
+                let tv_ptr = args[0] as *mut i64;
                 unsafe {
-                    *tv = 0; // seconds
-                    *(tv.add(1)) = 0; // microseconds
+                    core::ptr::write_volatile(tv_ptr, tv_sec);
+                    core::ptr::write_volatile(tv_ptr.add(1), tv_usec);
                 }
             }
+            // tz is ignored (obsolete)
             Some(Translation::Handled(0))
         }
         L_CLOCK_GETTIME => {
@@ -583,12 +592,12 @@ pub fn sys_uname(buf: usize) -> isize {
         return super::ERR_INVAL;
     }
     let fields: [&[u8]; 6] = [
-        b"Linux\0",           // sysname
-        b"karteos\0",         // nodename
-        b"6.1.0\0",           // release (fake version to satisfy Go)
-        b"#1 SMP KarteOS\0",  // version
-        b"x86_64\0",          // machine
-        b"\0",                // domainname (empty)
+        b"Linux\0",          // sysname
+        b"karteos\0",        // nodename
+        b"6.1.0\0",          // release (fake version to satisfy Go)
+        b"#1 SMP KarteOS\0", // version
+        b"x86_64\0",         // machine
+        b"\0",               // domainname (empty)
     ];
     let mut offset = 0usize;
     for field in &fields {
