@@ -396,6 +396,263 @@ pub const O_CREAT: u32 = 0x100;
 pub const O_TRUNC: u32 = 0x200;
 pub const O_APPEND: u32 = 0x400;
 
+// ─── POSIX Byte-Range File Locking ────────────────────────────────────
+// Required for SQLite WAL mode, which uses fcntl(F_SETLK/F_GETLK) for
+// inter-thread coordination. Multiple Go goroutines (clone'd threads)
+// concurrently access the same database file, so locks must properly
+// track ownership per-fd and detect conflicts between overlapping ranges.
+
+/// Lock types matching Linux flock struct l_type values.
+pub const F_RDLCK: u16 = 0;
+pub const F_WRLCK: u16 = 1;
+pub const F_UNLCK: u16 = 2;
+
+/// fcntl command numbers (Linux x86_64).
+pub const F_GETFD: usize = 1;
+pub const F_SETFD: usize = 2;
+pub const F_GETFL: usize = 3;
+pub const F_SETFL: usize = 4;
+pub const F_GETLK: usize = 5;
+pub const F_SETLK: usize = 6;
+pub const F_SETLKW: usize = 7;
+
+/// Close-on-exec flag (for F_GETFD/F_SETFD).
+pub const FD_CLOEXEC: usize = 1;
+
+/// Linux struct flock (64-bit), laid out for user-space compatibility.
+/// 24 bytes total for 64-bit: l_type(2) + l_whence(2) + padding(4) +
+/// l_start(8) + l_len(8) = 24 bytes. But Go passes a 32-byte struct
+/// with l_pid at the end. We read/write fields individually by offset.
+///
+/// Layout (from <fcntl.h> on x86_64):
+///   offset 0:  l_type   (i16)
+///   offset 2:  l_whence (i16)
+///   offset 4:  l_start  (i64)
+///   offset 12: l_len    (i64)
+///   offset 20: l_pid    (i32)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Flock {
+    pub l_type: i16,
+    pub l_whence: i16,
+    pub l_start: i64,
+    pub l_len: i64,
+    pub l_pid: i32,
+}
+
+impl Flock {
+    pub fn read_from_user(buf: *const u8) -> Self {
+        unsafe {
+            Flock {
+                l_type: core::ptr::read_unaligned(buf as *const i16),
+                l_whence: core::ptr::read_unaligned(buf.add(2) as *const i16),
+                l_start: core::ptr::read_unaligned(buf.add(4) as *const i64),
+                l_len: core::ptr::read_unaligned(buf.add(12) as *const i64),
+                l_pid: core::ptr::read_unaligned(buf.add(20) as *const i32),
+            }
+        }
+    }
+
+    pub fn write_to_user(&self, buf: *mut u8) {
+        unsafe {
+            core::ptr::write_unaligned(buf as *mut i16, self.l_type);
+            core::ptr::write_unaligned(buf.add(2) as *mut i16, self.l_whence);
+            core::ptr::write_unaligned(buf.add(4) as *mut i64, self.l_start);
+            core::ptr::write_unaligned(buf.add(12) as *mut i64, self.l_len);
+            core::ptr::write_unaligned(buf.add(20) as *mut i32, self.l_pid);
+        }
+    }
+
+    /// Resolve the absolute byte offset from l_whence and l_start.
+    /// For SQLite, l_whence is always SEEK_SET (0).
+    pub fn abs_start(&self) -> i64 {
+        match self.l_whence {
+            0 => self.l_start,       // SEEK_SET
+            1 => self.l_start,       // SEEK_CUR (approximate — no file pos available)
+            2 => self.l_start,       // SEEK_END (approximate)
+            _ => self.l_start,
+        }
+    }
+
+    /// The end of the lock range. l_len == 0 means "lock to end of file"
+    /// which we represent as i64::MAX.
+    pub fn abs_end(&self) -> i64 {
+        let start = self.abs_start();
+        if self.l_len == 0 {
+            i64::MAX
+        } else {
+            start + self.l_len
+        }
+    }
+}
+
+/// A granted byte-range lock, owned by a specific fd + inode.
+#[derive(Clone, Debug)]
+struct FileLock {
+    /// The fd that holds this lock.
+    owner_fd: usize,
+    /// Inode number of the locked file (from VFS/ext4).
+    inode: u64,
+    /// Lock type: F_RDLCK or F_WRLCK.
+    lock_type: u16,
+    /// Start byte offset (absolute).
+    start: i64,
+    /// End byte offset (exclusive).
+    end: i64,
+}
+
+/// Global file lock table. All locks are tracked here and checked for
+/// conflicts on every F_SETLK / F_GETLK call.
+static FILE_LOCKS: SpinLock<Vec<FileLock>> = SpinLock::new(Vec::new());
+
+/// Check if two ranges overlap: [a_start, a_end) ∩ [b_start, b_end) ≠ ∅
+fn ranges_overlap(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Find a conflicting lock on the given inode, excluding locks owned by
+/// `owner_fd`. Returns the first conflicting lock found.
+fn find_conflict(
+    inode: u64,
+    owner_fd: usize,
+    lock_type: u16,
+    start: i64,
+    end: i64,
+) -> Option<FileLock> {
+    let locks = FILE_LOCKS.lock();
+    for lock in locks.iter() {
+        if lock.inode != inode {
+            continue;
+        }
+        if lock.owner_fd == owner_fd {
+            continue; // Same fd — own locks don't conflict
+        }
+        if !ranges_overlap(lock.start, lock.end, start, end) {
+            continue; // No range overlap
+        }
+        // Check type compatibility:
+        // Two shared locks (F_RDLCK) can coexist.
+        // Any lock + exclusive lock (F_WRLCK) = conflict.
+        if lock.lock_type == F_WRLCK || lock_type == F_WRLCK {
+            return Some(lock.clone());
+        }
+    }
+    None
+}
+
+/// Remove all locks owned by `owner_fd` on `inode` in the given range.
+fn remove_locks_in_range(inode: u64, owner_fd: usize, start: i64, end: i64) {
+    let mut locks = FILE_LOCKS.lock();
+    locks.retain(|lock| {
+        if lock.inode != inode || lock.owner_fd != owner_fd {
+            return true; // Keep locks on other inodes / other fds
+        }
+        // Remove only the overlapping portion.
+        // For simplicity: if the ranges overlap, remove the lock entirely.
+        // (Splitting locks at boundaries is an optimization for later.)
+        !ranges_overlap(lock.start, lock.end, start, end)
+    });
+}
+
+/// Add a new lock for the given fd/inode.
+fn add_lock(inode: u64, owner_fd: usize, lock_type: u16, start: i64, end: i64) {
+    let mut locks = FILE_LOCKS.lock();
+    locks.push(FileLock {
+        owner_fd,
+        inode,
+        lock_type,
+        start,
+        end,
+    });
+}
+
+/// Remove all locks held by a specific fd (called on close).
+pub fn release_fd_locks(fd: usize) {
+    let mut locks = FILE_LOCKS.lock();
+    locks.retain(|lock| lock.owner_fd != fd);
+}
+
+/// Execute a fcntl lock operation (F_GETLK / F_SETLK / F_SETLKW).
+/// Returns (retval, should_write_flock).
+/// - retval: syscall return value (0 = success, -1 = error)
+/// - If should_write_flock, the caller should write `out_flock` to user buf.
+pub fn fcntl_lock_op(
+    cmd: usize,
+    fd: usize,
+    inode: u64,
+    flock: &Flock,
+) -> (isize, Option<Flock>) {
+    let lock_type = flock.l_type as u16;
+    let start = flock.abs_start();
+    let end = flock.abs_end();
+
+    match cmd {
+        F_GETLK => {
+            // Check for a conflicting lock. If found, write it back.
+            // If not found, set l_type = F_UNLCK.
+            match find_conflict(inode, fd, lock_type, start, end) {
+                Some(conflict) => {
+                    let out = Flock {
+                        l_type: conflict.lock_type as i16,
+                        l_whence: 0,
+                        l_start: conflict.start,
+                        l_len: if conflict.end == i64::MAX {
+                            0
+                        } else {
+                            conflict.end - conflict.start
+                        },
+                        l_pid: 0, // We don't track PID per lock
+                    };
+                    (0, Some(out))
+                }
+                None => {
+                    let mut out = *flock;
+                    out.l_type = F_UNLCK as i16;
+                    (0, Some(out))
+                }
+            }
+        }
+        F_SETLK | F_SETLKW => {
+            if lock_type == F_UNLCK {
+                // Unlock: remove matching locks
+                remove_locks_in_range(inode, fd, start, end);
+                (0, None)
+            } else {
+                // Lock: check for conflict
+                match find_conflict(inode, fd, lock_type, start, end) {
+                    Some(_conflict) => {
+                        if cmd == F_SETLK {
+                            // Non-blocking: return EAGAIN
+                            (-1, None) // -1 = EAGAIN
+                        } else {
+                            // F_SETLKW: blocking — yield and retry.
+                            // In practice, with cooperative goroutines,
+                            // we yield CPU and let the conflicting lock
+                            // holder release before retrying.
+                            // Simple strategy: yield once, then try again.
+                            // (A full wait-queue implementation can be added later.)
+                            crate::sched::schedule();
+                            match find_conflict(inode, fd, lock_type, start, end) {
+                                Some(_) => (-1, None), // Still blocked
+                                None => {
+                                    add_lock(inode, fd, lock_type, start, end);
+                                    (0, None)
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // No conflict — grant the lock
+                        add_lock(inode, fd, lock_type, start, end);
+                        (0, None)
+                    }
+                }
+            }
+        }
+        _ => (-1, None),
+    }
+}
+
 /// File descriptor type — distinguishes regular files from pipe endpoints.
 #[derive(Clone, PartialEq, Debug)]
 pub enum FdType {
@@ -420,6 +677,8 @@ pub enum FdType {
     /// ext4 file descriptor.
     #[cfg(target_arch = "x86_64")]
     Ext4File(crate::driver::ext4::Ext4FileDesc),
+    /// VFS-managed file — routes to the VFS open file table.
+    VfsFile(usize),
 }
 
 /// A file descriptor entry — wraps an in-memory file with seek position
@@ -474,7 +733,7 @@ impl FileDescriptor {
             FdType::Timerfd => {
                 crate::syscall::epoll::timerfd_peek(self.fd_num)
             }
-            FdType::PipeWrite | FdType::File | FdType::FakeFile(_) | FdType::VirtualFile => false,
+            FdType::PipeWrite | FdType::File | FdType::FakeFile(_) | FdType::VirtualFile | FdType::VfsFile(_) => false,
             #[cfg(target_arch = "x86_64")]
             FdType::Ext4File(_) => false,
         }
@@ -492,7 +751,7 @@ impl FileDescriptor {
             FdType::Stdio => self.name != "stdin",
             FdType::PipeWrite => true,
             FdType::PipeRead | FdType::Eventfd | FdType::Timerfd => false,
-            FdType::File | FdType::FakeFile(_) | FdType::VirtualFile => true,
+            FdType::File | FdType::FakeFile(_) | FdType::VirtualFile | FdType::VfsFile(_) => true,
             FdType::Ext4File(desc) => desc.writable,
         }
     }
@@ -561,6 +820,27 @@ impl FdTable {
                     fd_type: FdType::File,
                     pipe_id: None,
                 fd_num: 0,
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Allocate a fd that points to a VFS-managed file. The VFS open file
+    /// table entry (at `vfs_fd`) holds the real inode/offset/flags.
+    /// The FdTable entry just records the vfs_fd for routing read/write/close.
+    pub fn alloc_vfs_fd(&mut self, name: String, vfs_fd: usize, flags: u32) -> Option<usize> {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = Some(FileDescriptor {
+                    name,
+                    pos: 0,
+                    flags,
+                    valid: true,
+                    fd_type: FdType::VfsFile(vfs_fd),
+                    pipe_id: None,
+                    fd_num: 0,
                 });
                 return Some(i);
             }

@@ -282,6 +282,16 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
     }
 }
 
+/// Get the inode number for a given fd in the VFS open file table.
+/// Returns None if fd is not a VFS file.
+pub fn get_inode_for_fd(fd: usize) -> Option<u64> {
+    let vfs = VFS.lock();
+    match vfs.open_files.get(fd) {
+        Some(file) => Some(file.inode),
+        None => None,
+    }
+}
+
 /// Read from fd into buf, return bytes read
 pub fn read(fd: usize, buf: &mut [u8]) -> Result<usize, VfsError> {
     let mut vfs = VFS.lock();

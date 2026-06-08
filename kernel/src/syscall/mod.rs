@@ -387,7 +387,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         106 => 0,                                   // setgid (stub)
         107 => 0,                                   // geteuid (stub: root)
         108 => 0,                                   // getegid (stub: root)
-        72 => 2,                                    // fcntl F_GETFL stub: O_RDWR
+        72 => linux_fcntl(args[0], args[1], args[2]),
         77 => {
             // ftruncate(fd, length) — truncate FakeFile or return success for real files
             let fd = args[0] as i32;
@@ -487,7 +487,15 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
     // Try VFS open with converted flags
     let our_flags = if has_creat { 0x100 } else { 0 } | (flags & 0x600); // keep O_TRUNC/O_APPEND
     match crate::driver::vfs::open(path_str, our_flags as u32) {
-        Ok(fd) => fd as isize,
+        Ok(vfs_fd) => {
+            // Register the VFS fd in the process FdTable
+            crate::process::with_fd_table(|fd_table| {
+                match fd_table.alloc_vfs_fd(alloc::format!("{}", path_str), vfs_fd, our_flags as u32) {
+                    Some(fd) => fd as isize,
+                    None => ERR_NOMEM,
+                }
+            })
+        }
         Err(e) => {
             // Only fake virtual pseudo-filesystem paths (/proc, /sys, /dev, /etc, /run)
             let is_pseudo = path_str.starts_with("/proc")
@@ -1012,6 +1020,19 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
                 fd_table.fake_write(fd, buf, len).unwrap_or(len as isize)
             });
         }
+        Some((FdType::VfsFile(vfs_fd), _, _)) => {
+            // VFS file: write through VFS layer
+            let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+            return match crate::driver::vfs::write(vfs_fd, data) {
+                Ok(n) => {
+                    crate::process::with_fd_table(|fd_table| {
+                        if let Some(f) = fd_table.get_mut(fd as usize) { f.pos += n; }
+                    });
+                    n as isize
+                }
+                Err(_) => ERR_IO,
+            };
+        }
         Some((FdType::File, _, _)) => {
             // Fall through to file write below
         }
@@ -1093,6 +1114,19 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             return crate::process::with_fd_table(|fd_table| {
                 fd_table.fake_read(fd, buf, len).unwrap_or(0)
             });
+        }
+        Some((FdType::VfsFile(vfs_fd), _, _)) => {
+            // VFS file: read through VFS layer
+            let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+            return match crate::driver::vfs::read(vfs_fd, data) {
+                Ok(n) => {
+                    crate::process::with_fd_table(|fd_table| {
+                        if let Some(f) = fd_table.get_mut(fd as usize) { f.pos += n; }
+                    });
+                    n as isize
+                }
+                Err(_) => ERR_IO,
+            };
         }
         _ => {
             // Unknown type — if fd == 0, use TTY
@@ -1650,6 +1684,100 @@ fn flush_tlb_all() {
 ///   - The kernel is expected to zero-fill these pages (or discard them)
 ///   - `sysUsedOS` does NOT remap — it assumes pages are zeroed
 ///
+/// Linux fcntl(fd, cmd, arg) — file control operations.
+///
+/// Implements:
+///   - F_GETFD / F_SETFD: close-on-exec flag
+///   - F_GETFL / F_SETFL: file status flags
+///   - F_GETLK / F_SETLK / F_SETLKW: POSIX advisory byte-range locking
+///
+/// SQLite WAL mode depends critically on byte-range locks to coordinate
+/// concurrent access from multiple Go goroutines (clone'd threads).
+fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
+    use crate::driver::fs::*;
+
+    match cmd {
+        F_GETFD => {
+            // Return close-on-exec flag. We don't track this yet, return 0.
+            0
+        }
+        F_SETFD => {
+            // Set close-on-exec flag. Silently succeed.
+            0
+        }
+        F_GETFL => {
+            // Return file status flags for this fd.
+            crate::process::with_fd_table(|fd_table| {
+                match fd_table.get(fd) {
+                    Some(desc) => desc.flags as isize,
+                    None => -9, // EBADF
+                }
+            })
+        }
+        F_SETFL => {
+            // Set file status flags (e.g., O_NONBLOCK, O_APPEND).
+            crate::process::with_fd_table(|fd_table| {
+                match fd_table.get_mut(fd) {
+                    Some(desc) => {
+                        // Preserve access mode bits, update status flags
+                        desc.flags = (desc.flags & 0x3) | (arg as u32 & !0x3);
+                        0
+                    }
+                    None => -9, // EBADF
+                }
+            })
+        }
+        F_GETLK | F_SETLK | F_SETLKW => {
+            // arg points to struct flock in user memory.
+            if arg == 0 {
+                return -14; // EFAULT
+            }
+            let flock = Flock::read_from_user(arg as *const u8);
+
+            // Look up the inode for this fd — locks are keyed by inode.
+            let inode = crate::process::with_fd_table(|fd_table| {
+                match fd_table.get(fd) {
+                    Some(desc) => {
+                        match desc.fd_type {
+                            FdType::File => {
+                                crate::driver::vfs::get_inode_for_fd(fd)
+                            }
+                            FdType::Ext4File(ref ext4fd) => {
+                                Some(ext4fd.inode_num as u64)
+                            }
+                            FdType::VfsFile(vfs_fd) => {
+                                crate::driver::vfs::get_inode_for_fd(vfs_fd)
+                            }
+                            _ => Some(fd as u64 + 0x10000),
+                        }
+                    }
+                    None => None,
+                }
+            });
+
+            let inode = match inode {
+                Some(ino) => ino,
+                None => return -9, // EBADF
+            };
+
+            let (retval, out_flock) = fcntl_lock_op(cmd, fd, inode, &flock);
+
+            if let Some(out) = out_flock {
+                out.write_to_user(arg as *mut u8);
+            }
+
+            if retval == -1 && (cmd == F_SETLK || cmd == F_SETLKW) {
+                return -11; // EAGAIN
+            }
+            retval
+        }
+        _ => {
+            crate::console_println!("[fcntl] unhandled cmd={} fd={} arg={:#x}", cmd, fd, arg);
+            0
+        }
+    }
+}
+
 /// Without this, Go's memory allocator sees stale heap data where it expects zeros,
 /// causing silent corruption in Go runtime data structures (regexp counters, GC bitmaps, etc.)
 fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
@@ -1881,59 +2009,43 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         return ERR_INVAL;
     }
 
-    #[cfg(target_arch = "x86_64")]
-    static OPEN_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    #[cfg(target_arch = "x86_64")]
-    let oc = OPEN_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Convert flags: Linux x86_64 O_CREAT=0x40, our internal=0x100
+    let linux_o_creat: u32 = if cfg!(target_arch = "x86_64") { 0x40 } else { 0x100 };
+    let has_creat = (flags & linux_o_creat) != 0 || (flags & O_CREAT) != 0;
+    let our_flags = if has_creat { O_CREAT } else { 0 }
+        | (flags & (crate::driver::fs::O_TRUNC | crate::driver::fs::O_APPEND));
 
-    // x86_64 Linux O_CREAT = 0x40, our internal = 0x100
-    let linux_o_creat: u32 = if cfg!(target_arch = "x86_64") {
-        0x40
-    } else {
-        0x100
-    };
-
-    // Check/create file in FS
-    if flags & linux_o_creat != 0 || flags & O_CREAT != 0 {
-        let _ = crate::driver::fs::create_file(&name);
-    }
-    // Verify file exists
-    if crate::driver::fs::read_file_owned(&name).is_none() {
-        // Check if virtual path or O_CREAT — use FakeFile
-        let is_virtual = name.starts_with(".xbot")
-            || name.starts_with("/.xbot")
-            || name.starts_with("/proc")
-            || name.starts_with("/sys")
-            || name.starts_with("/etc")
-            || name.starts_with("/dev")
-            || name.starts_with("/run");
-        if is_virtual || (flags & O_CREAT != 0) || (flags & linux_o_creat != 0) {
+    // Try VFS open first (supports real ext4 files with O_CREAT)
+    match crate::driver::vfs::open(&name, our_flags) {
+        Ok(vfs_fd) => {
+            // Register the VFS fd in the process FdTable
             return crate::process::with_fd_table(|fd_table| {
-                match fd_table.alloc_fake_fd(name.clone(), flags) {
+                match fd_table.alloc_vfs_fd(name.clone(), vfs_fd, flags) {
                     Some(fd) => fd as isize,
                     None => ERR_NOMEM,
                 }
             });
         }
-
-        #[cfg(target_arch = "x86_64")]
-        if oc < 10 {
-            crate::klog!(DEBUG, "[open] ENOENT: {name}");
-        }
-        return ERR_NOENT;
+        Err(_) => {}
     }
 
-    // Allocate fd from current process's FD table
-    let result =
-        crate::process::with_fd_table(|fd_table| match fd_table.alloc(name.clone(), flags) {
-            Some(fd) => fd as isize,
-            None => ERR_NOMEM,
+    // If VFS failed, check for pseudo-filesystem paths
+    let is_pseudo = name.starts_with("/proc")
+        || name.starts_with("/sys")
+        || name.starts_with("/dev")
+        || name.starts_with("/run")
+        || name.starts_with("/etc");
+
+    if is_pseudo {
+        return crate::process::with_fd_table(|fd_table| {
+            match fd_table.alloc_fake_fd(name.clone(), flags) {
+                Some(fd) => fd as isize,
+                None => ERR_NOMEM,
+            }
         });
-    #[cfg(target_arch = "x86_64")]
-    if oc < 10 {
-        crate::klog!(DEBUG, "[open] {name} → fd={result}");
     }
-    result
+
+    ERR_NOENT
 }
 
 /// Syscall 11: Close a file descriptor.
@@ -1962,6 +2074,9 @@ fn sys_close(fd: i32) -> isize {
     if !closed {
         return ERR_INVAL;
     }
+
+    // Release all byte-range locks held by this fd
+    crate::driver::fs::release_fd_locks(fd as usize);
 
     // Handle pipe cleanup
     if let Some((pipe_id, is_read)) = pipe_action {
