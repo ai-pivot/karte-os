@@ -389,16 +389,29 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         108 => 0,                                   // getegid (stub: root)
         72 => linux_fcntl(args[0], args[1], args[2]),
         77 => {
-            // ftruncate(fd, length) — truncate FakeFile or return success for real files
+            // ftruncate(fd, length) — resize file
             let fd = args[0] as i32;
             let length = args[1];
             crate::process::with_fd_table(|fd_table| {
-                if fd_table.fake_truncate(fd, length) {
-                    0
-                } else if get_fd_info(fd).is_some() {
-                    0 // Real file — pretend success
-                } else {
-                    ERR_INVAL
+                let fd_type = fd_table.get(fd as usize).map(|d| d.fd_type.clone());
+                fd_type
+            }).map_or(0, |fd_type| {
+                match fd_type {
+                    FdType::VfsFile(vfs_fd) => {
+                        match crate::driver::vfs::truncate(vfs_fd, length) {
+                            Ok(()) => 0,
+                            Err(_) => -1,
+                        }
+                    }
+                    FdType::FakeFile(_) => {
+                        crate::process::with_fd_table(|fd_table| {
+                            if fd_table.fake_truncate(fd, length) { 0 } else { 0 }
+                        })
+                    }
+                    _ => {
+                        // Ext4File, pipe, etc. — pretend success
+                        0
+                    }
                 }
             })
         }
@@ -1021,9 +1034,12 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             });
         }
         Some((FdType::VfsFile(vfs_fd), _, _)) => {
-            // VFS file: write through VFS layer
+            // VFS file: copy user data to kernel buffer first, because
+            // vfs::write() switches to kernel CR3 where user pages are inaccessible.
             let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-            return match crate::driver::vfs::write(vfs_fd, data) {
+            let mut kbuf = alloc::vec![0u8; len];
+            kbuf.copy_from_slice(data);
+            return match crate::driver::vfs::write(vfs_fd, &kbuf) {
                 Ok(n) => {
                     crate::process::with_fd_table(|fd_table| {
                         if let Some(f) = fd_table.get_mut(fd as usize) { f.pos += n; }
@@ -1116,10 +1132,13 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             });
         }
         Some((FdType::VfsFile(vfs_fd), _, _)) => {
-            // VFS file: read through VFS layer
-            let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-            return match crate::driver::vfs::read(vfs_fd, data) {
+            // VFS file: read into kernel buffer first, then copy to user space.
+            // vfs::read() switches to kernel CR3 where user pages are inaccessible.
+            let mut kbuf = alloc::vec![0u8; len];
+            return match crate::driver::vfs::read(vfs_fd, &mut kbuf) {
                 Ok(n) => {
+                    let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+                    data[..n].copy_from_slice(&kbuf[..n]);
                     crate::process::with_fd_table(|fd_table| {
                         if let Some(f) = fd_table.get_mut(fd as usize) { f.pos += n; }
                     });

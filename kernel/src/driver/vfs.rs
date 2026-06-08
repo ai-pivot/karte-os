@@ -292,6 +292,19 @@ pub fn get_inode_for_fd(fd: usize) -> Option<u64> {
     }
 }
 
+/// Truncate a VFS file to the specified size.
+pub fn truncate(fd: usize, size: usize) -> Result<(), VfsError> {
+    let mut vfs = VFS.lock();
+    let file = vfs.open_files.get(fd).ok_or(VfsError::NotFound)?;
+    let mount_id = file.mount_id;
+    let inode = file.inode;
+    drop(vfs); // Release VFS lock before mutable operation
+
+    let mut vfs = VFS.lock();
+    let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
+    mount.fs.set_file_size(inode, size)
+}
+
 /// Read from fd into buf, return bytes read
 pub fn read(fd: usize, buf: &mut [u8]) -> Result<usize, VfsError> {
     let mut vfs = VFS.lock();
