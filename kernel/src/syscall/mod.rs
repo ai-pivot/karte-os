@@ -390,6 +390,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
                 }
             })
         }
+        122 => linux_uname(args[0]),                   // uname (new)
         131 => linux_sigaltstack(args[0], args[1]), // sigaltstack
         157 => 0,                                   // prctl (stub)
         158 => linux_arch_prctl(args[0], args[1]),  // arch_prctl
@@ -830,12 +831,12 @@ fn linux_uname(buf: usize) -> isize {
         return -14; // EFAULT
     }
     let fields: [&[u8]; 6] = [
-        b"KarteOS\0",               // sysname
-        b"karte-os\0",              // nodename
-        b"6.1.0\0",                 // release (fake Linux version)
-        b"#1 SMP KarteOS x86_64\0", // version
-        b"x86_64\0",                // machine
-        b"(none)\0",                // domainname
+        b"Linux\0",               // sysname
+        b"karteos\0",             // nodename
+        b"6.1.0\0",               // release (fake Linux version)
+        b"#1 SMP KarteOS\0",      // version
+        b"x86_64\0",              // machine
+        b"\0",                    // domainname
     ];
     let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 390) };
     let mut offset = 0usize;

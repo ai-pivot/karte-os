@@ -91,6 +91,7 @@ mod x86_64_syscalls {
     pub const L_SETRLIMIT: usize = 160;
     pub const L_GETPID2: usize = 39;
     pub const L_GETTID: usize = 186;
+    pub const L_UNAME: usize = 122;
     pub const L_TGKILL: usize = 234;
     pub const L_TKILL: usize = 200;
     pub const L_TIME: usize = 201;
@@ -419,6 +420,10 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             let result = sys_sysinfo(args[0]);
             Some(Translation::Handled(result))
         }
+        L_UNAME => {
+            let result = sys_uname(args[0]);
+            Some(Translation::Handled(result))
+        }
         L_GETRLIMIT | L_PRLIMIT64 => Some(Translation::Handled(0)), // stub
         L_GETUID | L_GETGID | L_GETEUID | L_GETEGID => Some(Translation::Handled(0)), // stub: root
         L_SET_TID_ADDR => Some(Translation::Dispatch {
@@ -563,6 +568,43 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
         (p.add(40) as *mut u64).write_volatile(256 * 1024 * 1024);
         // mem_unit: 1
         (p.add(104) as *mut u32).write_volatile(1u32);
+    }
+    0
+}
+
+/// sys_uname: Fill Linux utsname struct in user memory.
+///
+/// struct utsname has 6 fields of 65 bytes each (total 390 bytes).
+/// Fields: sysname, nodename, release, version, machine, domainname.
+/// Go runtime uses this to detect kernel version; without it Go panics
+/// "failed to determine kernel version".
+pub fn sys_uname(buf: usize) -> isize {
+    if buf == 0 {
+        return super::ERR_INVAL;
+    }
+    let fields: [&[u8]; 6] = [
+        b"Linux\0",           // sysname
+        b"karteos\0",         // nodename
+        b"6.1.0\0",           // release (fake version to satisfy Go)
+        b"#1 SMP KarteOS\0",  // version
+        b"x86_64\0",          // machine
+        b"\0",                // domainname (empty)
+    ];
+    let mut offset = 0usize;
+    for field in &fields {
+        let len = field.len().min(65);
+        for i in 0..len {
+            unsafe {
+                ((buf + offset + i) as *mut u8).write_volatile(field[i]);
+            }
+        }
+        // Zero-pad remaining bytes in the 65-byte field
+        for i in len..65 {
+            unsafe {
+                ((buf + offset + i) as *mut u8).write_volatile(0u8);
+            }
+        }
+        offset += 65;
     }
     0
 }
