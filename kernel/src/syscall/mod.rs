@@ -91,6 +91,7 @@ pub const ERR_NOMEM: isize = -12; // ENOMEM — Out of memory
 pub const ERR_NOENT: isize = -2; // ENOENT — No such file or directory
 pub const ERR_IO: isize = -5; // EIO — I/O error
 pub const ERR_ACCES: isize = -13; // EACCES — Permission denied
+pub const ERR_RANGE: isize = -34; // ERANGE — Result too large
 
 // ─── Global FD table (single-process simplification) ────────────────
 

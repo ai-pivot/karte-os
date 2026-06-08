@@ -69,6 +69,7 @@ mod x86_64_syscalls {
     pub const L_FCNTL: usize = 72;
     pub const L_FSYNC: usize = 74;
     pub const L_GETDENTS: usize = 78;
+    pub const L_GETDENTS64: usize = 217;
     pub const L_GETCWD: usize = 79;
     pub const L_CHDIR: usize = 80;
     pub const L_MKDIR: usize = 83;
@@ -340,8 +341,11 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_PIPE,
             args,
         }),
-        L_GETDENTS => Some(Translation::Handled(0)), // stub
-        L_GETCWD => Some(Translation::Handled(0)),   // stub
+        L_GETDENTS | L_GETDENTS64 => Some(Translation::Handled(0)), // stub: empty dir
+        L_GETCWD => {
+            let result = sys_getcwd(args[0], args[1]);
+            Some(Translation::Handled(result))
+        }
         // Note: L_CHDIR(80) removed — conflicts with KarteOS SYS_IOCTL(80)
         L_MKDIR => Some(Translation::Dispatch {
             karte_nr: super::SYS_MKDIR,
@@ -351,9 +355,9 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_UNLINK,
             args: [args[0], count_user_string(args[0]), 0, 0, 0, 0],
         }),
-        L_READLINK | L_READLINKAT => Some(Translation::Handled(0)), // stub
-        L_ACCESS | L_FACCESSAT | L_FACCESSAT2 => Some(Translation::Handled(0)), // stub
-        L_IOCTL => Some(Translation::Handled(0)),                   // stub
+        L_READLINK | L_READLINKAT => Some(Translation::Handled(super::ERR_NOENT)), // ENOENT
+        L_ACCESS | L_FACCESSAT | L_FACCESSAT2 => Some(Translation::Handled(0)),    // stub
+        L_IOCTL => Some(Translation::Handled(0)),                                  // stub
 
         // ─── Scheduling ──────────────────────────────────────
         L_SCHED_YIELD => Some(Translation::Dispatch {
@@ -411,7 +415,10 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         }
 
         // ─── System info ─────────────────────────────────────
-        L_SYSINFO => Some(Translation::Handled(0)), // stub
+        L_SYSINFO => {
+            let result = sys_sysinfo(args[0]);
+            Some(Translation::Handled(result))
+        }
         L_GETRLIMIT | L_PRLIMIT64 => Some(Translation::Handled(0)), // stub
         L_GETUID | L_GETGID | L_GETEUID | L_GETEGID => Some(Translation::Handled(0)), // stub: root
         L_SET_TID_ADDR => Some(Translation::Dispatch {
@@ -488,6 +495,76 @@ pub fn count_user_string(ptr: usize) -> usize {
         len += 1;
     }
     len
+}
+
+// ─── Linux x86_64 syscall implementations ───────────────────────
+
+/// sys_getcwd: Get current working directory path.
+///
+/// Writes the CWD path (including null terminator) to the user buffer.
+/// Defaults to "/" if CWD environment variable is not set.
+/// Returns the number of bytes written (excluding null), or -ERR_RANGE
+/// if the buffer is too small or the pointer is null.
+fn sys_getcwd(buf_ptr: usize, buf_len: usize) -> isize {
+    if buf_ptr == 0 || buf_len == 0 {
+        return super::ERR_RANGE;
+    }
+    let cwd = match crate::env::get("CWD") {
+        Some(s) => s,
+        None => {
+            // Default to "/"
+            if buf_len < 2 {
+                return super::ERR_RANGE;
+            }
+            unsafe {
+                ((buf_ptr + 0) as *mut u8).write_volatile(b'/');
+                ((buf_ptr + 1) as *mut u8).write_volatile(0);
+            }
+            return 1;
+        }
+    };
+    let cwd_bytes = cwd.as_bytes();
+    // Need buf_len to accommodate path + null terminator
+    if cwd_bytes.len() >= buf_len {
+        return super::ERR_RANGE;
+    }
+    for (i, &b) in cwd_bytes.iter().enumerate() {
+        unsafe {
+            ((buf_ptr + i) as *mut u8).write_volatile(b);
+        }
+    }
+    // Append null terminator
+    unsafe {
+        ((buf_ptr + cwd_bytes.len()) as *mut u8).write_volatile(0);
+    }
+    cwd_bytes.len() as isize
+}
+
+/// sys_sysinfo: Fill Linux `sysinfo` struct in user memory.
+///
+/// The Linux sysinfo struct is 112 bytes on x86_64. We populate:
+///   - totalram (u64 at offset 32): 512 MB (QEMU default)
+///   - freeram (u64 at offset 40): 256 MB (half of total)
+///   - mem_unit (u32 at offset 104): 1
+/// All other fields remain zero.
+fn sys_sysinfo(info_ptr: usize) -> isize {
+    if info_ptr == 0 {
+        return super::ERR_INVAL;
+    }
+    unsafe {
+        let p = info_ptr as *mut u8;
+        // Zero out the entire struct (112 bytes)
+        for i in 0..112 {
+            (p.add(i) as *mut u8).write_volatile(0u8);
+        }
+        // totalram: 512 MB
+        (p.add(32) as *mut u64).write_volatile(512 * 1024 * 1024);
+        // freeram: 256 MB
+        (p.add(40) as *mut u64).write_volatile(256 * 1024 * 1024);
+        // mem_unit: 1
+        (p.add(104) as *mut u32).write_volatile(1u32);
+    }
+    0
 }
 
 // ─── RISC-V Linux translation (preserved from original) ──────────
