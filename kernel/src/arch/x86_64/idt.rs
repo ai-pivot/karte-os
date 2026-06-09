@@ -267,16 +267,20 @@ core::arch::global_asm!(
     "push r11", // user RFLAGS
     "push rcx", // user RIP
     "push rbx", // user RSP
+    // Save original user RBX in this task's syscall frame. The global above is
+    // only a bridge while switching stacks; syscalls may schedule before return.
+    "push qword ptr [rip + SYSCALL_SAVED_RBX]",
     // 5. Push placeholder for user CR3 (filled by handler)
     "push 0", // [0] = user CR3 placeholder
     // Stack layout now (rsp = state_ptr):
     //   [0]  user_cr3 (filled by handler)
-    //   [1]  rbx (user RSP)
-    //   [2]  rcx (user RIP)
-    //   [3]  r11 (user RFLAGS)
-    //   [4]  rax (syscall_nr)
-    //   [5]  rdi  [6] rsi  [7] rdx  [8] r10  [9] r8  [10] r9
-    //   [11] rbp  [12] r12  [13] r13  [14] r14  [15] r15
+    //   [1]  original user RBX
+    //   [2]  rbx (user RSP)
+    //   [3]  rcx (user RIP)
+    //   [4]  r11 (user RFLAGS)
+    //   [5]  rax (syscall_nr)
+    //   [6]  rdi  [7] rsi  [8] rdx  [9] r10  [10] r8  [11] r9
+    //   [12] rbp  [13] r12  [14] r13  [15] r14  [16] r15
     // 6. Call handler
     "mov rdi, rsp",
     "call syscall_fast_handler",
@@ -291,10 +295,10 @@ core::arch::global_asm!(
     "78:",
     // Restore return value
     "pop rax",
-    "add rsp, 8", // skip user_cr3 slot
-    "pop rbx",    // user RSP
-    "pop rcx",    // user RIP
-    "pop r11",    // user RFLAGS
+    "add rsp, 16", // skip user_cr3 and saved original RBX slots
+    "pop rbx",     // user RSP
+    "pop rcx",     // user RIP
+    "pop r11",     // user RFLAGS
     // Restore caller-saved arg registers (Go relies on r9=g surviving SYSCALL)
     // Push order was: r9, r8, r10, rdx, rsi, rdi, rax → pop in reverse
     "add rsp, 8", // skip rax (return value)
@@ -317,9 +321,9 @@ core::arch::global_asm!(
     "push r11",  // RFLAGS
     "push 0x1b", // CS (USER_CODE_SEL)
     "push rcx",  // RIP (user code)
-    // Restore original rbx (clobbered by user RSP during entry)
-    // iretq reads from stack, so register values don't matter after push
-    "mov rbx, [rip + SYSCALL_SAVED_RBX]",
+    // Restore original RBX from this syscall's own frame. After the iretq
+    // frame is pushed, rsp = state_base + 96; original RBX is at base + 8.
+    "mov rbx, [rsp - 88]",
     "iretq",
     // ─── Page Fault ISR stub (vector 14) ───────────────────
     // Defined in global_asm! to avoid compiler prologue uncertainty.
@@ -453,38 +457,35 @@ unsafe extern "C" fn restore_user_cr3() {
 
 /// Handler for SYSCALL fast entry (via MSR LSTAR).
 /// Stack layout at state_ptr (rsp when called):
-/// The push order: r15, r14, r13, r12, rbp, r9, r8, r10, rdx, rsi, rdi, rax, r11, rcx, rbx
-/// rsp points to LAST pushed = rbx.
-///   [0]  rbx (user RSP)  [1] rcx (user RIP)  [2] r11 (user RFLAGS)
-///   [3]  rax (syscall_nr)  [4] rdi  [5] rsi  [6] rdx  [7] r10  [8] r8  [9] r9
-///   [10] rbp  [11] r12  [12] r13  [13] r14  [14] r15
+/// The push order: r15, r14, r13, r12, rbp, r9, r8, r10, rdx, rsi, rdi,
+/// rax, r11, rcx, user_rsp, original_rbx, user_cr3_placeholder.
+/// rsp points to the user_cr3 placeholder.
+///   [0]  user_cr3  [1] original RBX  [2] user RSP  [3] user RIP
+///   [4]  user RFLAGS  [5] syscall_nr  [6] rdi  [7] rsi  [8] rdx
+///   [9]  r10  [10] r8  [11] r9  [12] rbp  [13] r12  [14] r13
+///   [15] r14  [16] r15
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
     unsafe {
         let s = state_ptr;
         // CR3 was stored at [0] by handler. Return path reads it from there.
         let user_cr3_slot = s.add(0); // will be filled below
-        let user_rsp = *s.add(1); // rbx
-        let user_rip = *s.add(2); // rcx
-        let user_rflags = *s.add(3); // r11
-        let syscall_nr = *s.add(4); // rax
-        let a0 = *s.add(5); // rdi
-        let a1 = *s.add(6); // rsi
-        let a2 = *s.add(7); // rdx
-        let a3 = *s.add(8); // r10
-        let a4 = *s.add(9); // r8
-        let a5 = *s.add(10); // r9
-        let saved_rbp = *s.add(11); // rbp
-        let saved_r12 = *s.add(12); // r12
-        let saved_r13 = *s.add(13); // r13
-        let saved_r14 = *s.add(14); // r14
-        let saved_r15 = *s.add(15); // r15
-
-        // Read original rbx from global (saved before clobbering with user RSP)
-        let saved_rbx: u64;
-        unsafe {
-            core::arch::asm!("mov {}, [rip + SYSCALL_SAVED_RBX]", out(reg) saved_rbx);
-        }
+        let saved_rbx = *s.add(1); // original user RBX
+        let user_rsp = *s.add(2); // rbx used as temporary user RSP
+        let user_rip = *s.add(3); // rcx
+        let user_rflags = *s.add(4); // r11
+        let syscall_nr = *s.add(5); // rax
+        let a0 = *s.add(6); // rdi
+        let a1 = *s.add(7); // rsi
+        let a2 = *s.add(8); // rdx
+        let a3 = *s.add(9); // r10
+        let a4 = *s.add(10); // r8
+        let a5 = *s.add(11); // r9
+        let saved_rbp = *s.add(12); // rbp
+        let saved_r12 = *s.add(13); // r12
+        let saved_r13 = *s.add(14); // r13
+        let saved_r14 = *s.add(15); // r14
+        let saved_r15 = *s.add(16); // r15
 
         // Save user CR3 on the stack for the return path.
         // This prevents concurrent SYSCALLs from overwriting a global variable.
@@ -699,7 +700,9 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     if !from_user {
         // Kernel PF accessing user memory — try lazy alloc (common during syscall)
         // Only print as WARNING if NOT in user address space
-        if fault_addr_val < crate::process::USER_MMAP_BASE || fault_addr_val >= crate::process::USER_MMAP_LIMIT {
+        if fault_addr_val < crate::process::USER_MMAP_BASE
+            || fault_addr_val >= crate::process::USER_MMAP_LIMIT
+        {
             crate::console_println!(
                 "[PF] KERN FATAL addr={:#x} rip={:#x} cr3={:#x}",
                 fault_addr_val,
@@ -915,21 +918,29 @@ unsafe extern "C" fn invalid_opcode_isr_stub() {
     );
 }
 
-/// Naked stub for keyboard ISR (IRQ1). Uses IST[3] for stack isolation.
-/// Written as naked function because `extern "x86-interrupt"` with `patch_ist_index`
-/// can cause stack corruption on `iretq`.
-unsafe extern "C" fn keyboard_isr_stub() {
-    core::arch::asm!(
-        // Balance compiler prologue (push rax). Since this is not a naked
-        // function, the compiler emits `push rax` before our asm! block.
-        "pop rax",
-        // Save callee-saved registers
+/// Keyboard ISR (IRQ1). Uses IST[3] for stack isolation.
+/// Interrupt handlers must preserve all GP registers, including caller-saved
+/// registers, because they can interrupt user code immediately after SYSCALL.
+#[unsafe(naked)]
+unsafe extern "C" fn keyboard_isr_stub() -> ! {
+    core::arch::naked_asm!(
+        // Save all GP registers. Rust calls below may clobber caller-saved
+        // registers such as RAX, which may still hold a syscall return value.
         "push r15",
         "push r14",
         "push r13",
         "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
         "push rbp",
         "push rbx",
+        "push rax",
         // Read scancode from PS/2 data port
         "xor rax, rax",
         "in al, 0x60",
@@ -938,8 +949,17 @@ unsafe extern "C" fn keyboard_isr_stub() {
         // Send EOI
         "call {eoi}",
         // Restore and return
+        "pop rax",
         "pop rbx",
         "pop rbp",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
         "pop r12",
         "pop r13",
         "pop r14",
@@ -947,22 +967,30 @@ unsafe extern "C" fn keyboard_isr_stub() {
         "iretq",
         handle = sym crate::driver::keyboard::handle_scancode,
         eoi = sym super::lapic::local_eoi,
-        options(noreturn)
     );
 }
 
-/// Naked stub for COM1 UART ISR (IRQ4). Uses IST[4] for stack isolation.
-unsafe extern "C" fn com1_isr_stub() {
-    core::arch::asm!(
-        // Balance compiler prologue (push rax). Since this is not a naked
-        // function, the compiler emits `push rax` before our asm! block.
-        "pop rax",
+/// COM1 UART ISR (IRQ4). Uses IST[4] for stack isolation.
+/// Save the complete user register state; terminal responses can interrupt
+/// user code right after a syscall returns, before userspace reads RAX.
+#[unsafe(naked)]
+unsafe extern "C" fn com1_isr_stub() -> ! {
+    core::arch::naked_asm!(
         "push r15",
         "push r14",
         "push r13",
         "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
         "push rbp",
         "push rbx",
+        "push rax",
         // Handle UART: drain ALL interrupt types to prevent interrupt storm.
         // Read IIR to identify interrupt type, then handle accordingly.
         "mov dx, 0x3FA",       // IIR (Interrupt Identification Register)
@@ -985,8 +1013,17 @@ unsafe extern "C" fn com1_isr_stub() {
         "5:",
         "3:",
         "call {eoi}",
+        "pop rax",
         "pop rbx",
         "pop rbp",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
         "pop r12",
         "pop r13",
         "pop r14",
@@ -994,7 +1031,6 @@ unsafe extern "C" fn com1_isr_stub() {
         "iretq",
         poll = sym crate::driver::tty::poll_uart,
         eoi = sym super::lapic::local_eoi,
-        options(noreturn)
     );
 }
 
@@ -1177,7 +1213,7 @@ pub fn init() {
             &mut idt[SYSCALL_VECTOR],
             syscall_isr_stub as *const () as usize,
             0xEE00, // Base attributes (DPL=3, 64-bit interrupt gate, P=1)
-            0,       // IST index 0 = no IST, use TSS.RSP0 (per-task kernel stack)
+            0,      // IST index 0 = no IST, use TSS.RSP0 (per-task kernel stack)
         );
 
         idt

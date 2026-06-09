@@ -103,15 +103,22 @@ pub const ERR_RANGE: isize = -34; // ERANGE — Result too large
 #[derive(Clone, Copy)]
 struct VmaRegion {
     start: usize,
-    end: usize,   // exclusive (first byte past the region)
-    prot: usize,  // PROT_* bit flags (0 = PROT_NONE)
+    end: usize,  // exclusive (first byte past the region)
+    prot: usize, // PROT_* bit flags (0 = PROT_NONE)
     active: bool,
 }
 
 const MAX_VMAS: usize = 256;
 
 static VMA_TABLE: spin::Mutex<[VmaRegion; MAX_VMAS]> = spin::Mutex::new(
-    [const { VmaRegion { start: 0, end: 0, prot: 0, active: false } }; MAX_VMAS],
+    [const {
+        VmaRegion {
+            start: 0,
+            end: 0,
+            prot: 0,
+            active: false,
+        }
+    }; MAX_VMAS],
 );
 
 /// Check if `addr` falls within a VMA that permits access (prot != PROT_NONE).
@@ -391,7 +398,38 @@ pub fn dispatch_syscall_linux(
 /// This is ONLY called from the SYSCALL instruction path (MSR LSTAR).
 #[cfg(target_arch = "x86_64")]
 fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
-    dispatch_linux_syscall(nr, args)
+    let result = dispatch_linux_syscall(nr, args);
+    if result < 0 && nr != 4 && nr != 5 && nr != 6 && nr != 39 && nr != 3 && nr != 11 && nr != 334 {
+        // Skip stat/fstat/lstat (ENOENT is normal), close, munmap, rseq
+        let path_arg = if nr == 257 {
+            args[1]
+        } else if nr == 2 {
+            args[0]
+        } else {
+            0
+        };
+        if nr == 257 || nr == 2 {
+            let len = linux::count_user_string(path_arg);
+            if len > 0 && len <= 80 {
+                let mut b = [0u8; 80];
+                unsafe {
+                    let src = path_arg as *const u8;
+                    for i in 0..len {
+                        b[i] = core::ptr::read_volatile(src.add(i));
+                    }
+                }
+                crate::console_println!(
+                    "[syserr] nr={} ret={} path={}",
+                    nr,
+                    result,
+                    core::str::from_utf8(&b[..len]).unwrap_or("?")
+                );
+            }
+        } else {
+            crate::console_println!("[syserr] nr={} ret={}", nr, result);
+        }
+    }
+    result
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -405,7 +443,9 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
             if result > 0 && (result as usize) > len {
                 crate::console_println!(
                     "[write] BAD RETURN: fd={} len={} got={:#x}",
-                    args[0], len, result
+                    args[0],
+                    len,
+                    result
                 );
             }
             result
@@ -423,7 +463,9 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
             if args[3] & 0x10 != 0 && r > 0 && (r as usize) != args[0] {
                 crate::console_println!(
                     "[mmap] MAP_FIXED BUG: addr={:#x} returned={:#x} len={:#x}",
-                    args[0], r, args[1]
+                    args[0],
+                    r,
+                    args[1]
                 );
             }
             r
@@ -1750,7 +1792,12 @@ fn linux_mmap(
     if dc < 5 {
         crate::console_println!(
             "[mmap] #{} addr={:#x} len={:#x} prot={} flags={:#x} -> {:#x} (lazy)",
-            dc, addr, len, prot, flags, target_addr
+            dc,
+            addr,
+            len,
+            prot,
+            flags,
+            target_addr
         );
     }
 
@@ -2125,9 +2172,8 @@ fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
         }
 
         // All other advice values: no-op success
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK
-        | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE
-        | MADV_NOHUGEPAGE | MADV_COLLAPSE => 0,
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK | MADV_DOFORK
+        | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_COLLAPSE => 0,
         _ => 0, // Unknown advice: silently succeed
     }
 }
@@ -2637,7 +2683,6 @@ fn sys_unlink(path: usize, path_len: usize) -> isize {
         _ => return ERR_INVAL,
     };
     let name = resolve_path(&name);
-
 
     // Try to delete from VFS/ext4/RamFS. If the file doesn't exist,
     // still return success — SQLite's WAL mode cleanup tries to delete
@@ -4313,6 +4358,8 @@ fn linux_clone(
 
 use crate::sync::spinlock::SpinLock;
 use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// A waiter in the futex queue.

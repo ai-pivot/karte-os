@@ -271,9 +271,7 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
                         let vfs_fd = vfs.open_files.alloc(mount_id, ino, flags)?;
                         Ok(vfs_fd)
                     }
-                    Err(e) => {
-                        Err(VfsError::IoError)
-                    }
+                    Err(e) => Err(VfsError::IoError),
                 }
             } else {
                 Err(VfsError::NotFound)
