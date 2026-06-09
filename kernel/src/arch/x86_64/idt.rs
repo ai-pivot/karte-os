@@ -229,11 +229,22 @@ core::arch::global_asm!(
     // On SYSCALL: rcx=return RIP, r11=return RFLAGS (saved by CPU)
     //             rax=syscall_nr, rdi/rsi/rdx/r10/r8/r9=args
     //             rsp=user RSP (NOT switched), CPL=0
+    //
+    // CRITICAL: Use per-task kernel stack from TSS.RSP0 instead of global
+    // SYSCALL_KSP. When Timer ISR fires during SYSCALL handler (after sti),
+    // it saves state on the SAME kernel stack (CPL=0, IST=0 → no stack switch).
+    // __switch() saves/restores per-task SPs. If multiple tasks share a global
+    // SYSCALL_KSP stack, __switch restores a stale SP whose data was overwritten
+    // by another task's SYSCALL. Using TSS.RSP0 (updated on every context switch)
+    // ensures each task has its own kernel stack.
 
-    // 1. Save original rbx (will be clobbered by user RSP), then save user RSP
+    // 1. Save original rbx (will be clobbered by user RSP), then switch to kernel stack
     "mov [rip + SYSCALL_SAVED_RBX], rbx",
     "mov rbx, rsp",
-    "lea rsp, [rip + SYSCALL_KSP]",
+    // Load per-task kernel stack from TSS.RSP0.
+    // TSS_RSP0_ADDR holds the address of TSS.privilege_stack_table[0].
+    // Double-indirect load: [TSS_RSP0_ADDR] → ptr to RSP0, [ptr] → RSP0 value.
+    "mov rsp, [rip + TSS_RSP0_ADDR]",
     "mov rsp, [rsp]",
     // 2. Disable interrupts — SYSCALL instruction does NOT clear IF,
     //    and timer ISR uses the same SpinLock (UART) as console_println!
@@ -672,26 +683,37 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     let page_size = crate::mm::pmm::page_size();
     let page_addr = fault_addr_val & !(page_size - 1);
 
+    // Determine if we should try lazy allocation for user-space addresses.
+    // This applies to:
+    //   1. User-mode faults (from_user = true)
+    //   2. Kernel-mode faults with user CR3 (kernel accessing user memory during syscall)
+    // Kernel-mode with kernel CR3 should NOT try lazy allocation — those are real kernel bugs.
+    let kernel_cr3_val = unsafe { KERNEL_CR3 };
+    let can_lazy_alloc = from_user || raw_cr3 != kernel_cr3_val;
+
     // Print concise PF info
     let mut fs_base: u64 = 0;
     unsafe {
         core::arch::asm!("rdmsr", "shl rdx, 32", "or rdx, rax", out("edx") fs_base, out("eax") _, in("ecx") 0xC0000100u32)
     };
     if !from_user {
-        // Kernel PF — always print (these are serious)
-        crate::console_println!(
-            "[PF] KERN addr={:#x} rip={:#x} cr3={:#x}",
-            fault_addr_val,
-            rip,
-            raw_cr3
-        );
+        // Kernel PF accessing user memory — try lazy alloc (common during syscall)
+        // Only print as WARNING if NOT in user address space
+        if fault_addr_val < crate::process::USER_MMAP_BASE || fault_addr_val >= crate::process::USER_MMAP_LIMIT {
+            crate::console_println!(
+                "[PF] KERN FATAL addr={:#x} rip={:#x} cr3={:#x}",
+                fault_addr_val,
+                rip,
+                raw_cr3
+            );
+        }
     } else {
         // User PF — rate-limit logging. Go's mmap lazy allocation triggers
         // thousands of PFs; printing each one to UART causes severe slowdown.
         static PF_LOG_COUNT: core::sync::atomic::AtomicUsize =
             core::sync::atomic::AtomicUsize::new(0);
         let n = PF_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 20 {
+        if n < 30 {
             crate::console_println!(
                 "[PF] USER addr={:#x} rip={:#x} pid={} fs_base={:#x}",
                 fault_addr_val,
@@ -710,7 +732,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         }
 
         // Lazy allocation for heap
-        if from_user
+        if can_lazy_alloc
             && fault_addr_val >= crate::process::USER_HEAP_BASE
             && fault_addr_val < crate::process::USER_HEAP_LIMIT
         {
@@ -742,7 +764,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         }
 
         // Try lazy allocation for stack
-        if from_user
+        if can_lazy_alloc
             && fault_addr_val >= crate::process::USER_STACK_BASE
             && fault_addr_val < crate::process::USER_STACK_TOP
         {
@@ -765,26 +787,38 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             break 'handler true;
         }
 
-        // Try lazy allocation for mmap region
-        if from_user
+        // Try lazy allocation for mmap region — check VMA validity
+        if can_lazy_alloc
             && fault_addr_val >= crate::process::USER_MMAP_BASE
             && fault_addr_val < crate::process::USER_MMAP_LIMIT
         {
-            super::trap::with_kernel_cr3(|| {
-                let user_pt = super::trap::get_user_pt_safe();
-                if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                    unsafe {
-                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            // Check if this address is within a valid VMA (not PROT_NONE)
+            if let Some(vma_prot) = crate::syscall::vma_check(fault_addr_val) {
+                let pte_flags = crate::syscall::prot_to_pte_flags(vma_prot);
+                super::trap::with_kernel_cr3(|| {
+                    let user_pt = super::trap::get_user_pt_safe();
+                    // Double-check: only allocate if not already mapped
+                    let needs_alloc = match crate::mm::vmm::translate_user(user_pt, page_addr) {
+                        None => true,
+                        Some(f) => f == page_addr, // stale identity mapping
+                    };
+                    if needs_alloc {
+                        if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                            unsafe {
+                                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                            }
+                            crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
+                        }
                     }
-                    crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                }
-            });
-            break 'handler true;
+                });
+                break 'handler true;
+            }
+            // No valid VMA — fall through to segfault
         }
 
         // Try lazy allocation for Go's low-address regions (e.g., Go uses memory near 0x400000+)
-        // This handles any user-mode fault in the ELF-loaded region
-        if from_user
+        // This handles any fault in the ELF-loaded region
+        if can_lazy_alloc
             && fault_addr_val >= 0x400000
             && fault_addr_val < crate::process::USER_HEAP_BASE
         {
@@ -1126,13 +1160,24 @@ pub fn init() {
 
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
-        // Syscall (int 0x80): DPL=3, using software IST index 1
-        // (hardware IST=2 → TSS interrupt_stack_table[1])
+        // Syscall (int 0x80): DPL=3, NO IST — use per-task kernel stack (TSS.RSP0).
+        //
+        // CRITICAL: We must NOT use IST for int $0x80. IST is a fixed stack that
+        // is the same for every invocation. When init (shell) does int $0x80,
+        // its TrapContext is saved on IST. Then __switch saves init's SP (pointing
+        // into IST). When xbot runs and also does int $0x80, the CPU pushes a new
+        // TrapContext to the SAME IST top, overwriting init's saved context. When
+        // xbot exits and we __switch back to init, init's saved SP points to
+        // overwritten garbage → Double Fault.
+        //
+        // Using IST index 0 (= no IST) makes the CPU use TSS.RSP0 instead, which
+        // is per-task (updated by schedule() and gdt::set_kernel_rsp0()). Each
+        // task's TrapContext lives on its own kernel stack, safely isolated.
         set_naked_handler(
             &mut idt[SYSCALL_VECTOR],
             syscall_isr_stub as *const () as usize,
             0xEE00, // Base attributes (DPL=3, 64-bit interrupt gate, P=1)
-            super::gdt::SYSCALL_IST_INDEX, // Software IST index 1
+            0,       // IST index 0 = no IST, use TSS.RSP0 (per-task kernel stack)
         );
 
         idt

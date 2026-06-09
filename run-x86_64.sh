@@ -6,14 +6,22 @@
 #   echo '{}' > /tmp/config.json && tools/mkdisk.sh put /tmp/config.json .xbot/config.json
 #
 # 退出 QEMU: Ctrl+A 然后按 X
+# 串口输出同时写入日志: /tmp/karte-os-x86_64.log
 
 cd "$(dirname "$0")"
 
-exec qemu-system-x86_64 \
+LOG=/tmp/karte-os-x86_64.log
+
+echo "串口日志写入: $LOG"
+echo "查看日志: tail -f $LOG"
+echo "---"
+
+qemu-system-x86_64 \
   -machine pc -cpu qemu64 -m 512M \
   -cdrom target/karte-os-x86_64.iso \
   -serial stdio \
   -display none -no-reboot \
   -drive file=disk.img,format=raw,if=none,id=hd0 \
   -device ich9-ahci,id=ahci \
-  -device ide-hd,drive=hd0,bus=ahci.0
+  -device ide-hd,drive=hd0,bus=ahci.0 \
+  2>&1 | tee "$LOG"

@@ -229,6 +229,7 @@ pub fn init_for_cpu(cpu_id: usize) {
 pub static TSS_RSP0_ADDR_ATOMIC: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+#[unsafe(no_mangle)]
 pub static mut TSS_RSP0_ADDR: u64 = 0;
 
 /// Set TSS.RSP0 for a specific CPU without calling current_hart().

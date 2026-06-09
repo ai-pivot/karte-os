@@ -93,6 +93,143 @@ pub const ERR_IO: isize = -5; // EIO — I/O error
 pub const ERR_ACCES: isize = -13; // EACCES — Permission denied
 pub const ERR_RANGE: isize = -34; // ERANGE — Result too large
 
+// ─── VMA (Virtual Memory Area) tracking ────────────────────────────
+//
+// Tracks all mmap'd regions so the PF handler can distinguish valid
+// lazy-allocated pages from illegal accesses, and madvise/mprotect
+// can operate on the correct address ranges.
+
+/// A single VMA region descriptor.
+#[derive(Clone, Copy)]
+struct VmaRegion {
+    start: usize,
+    end: usize,   // exclusive (first byte past the region)
+    prot: usize,  // PROT_* bit flags (0 = PROT_NONE)
+    active: bool,
+}
+
+const MAX_VMAS: usize = 256;
+
+static VMA_TABLE: spin::Mutex<[VmaRegion; MAX_VMAS]> = spin::Mutex::new(
+    [const { VmaRegion { start: 0, end: 0, prot: 0, active: false } }; MAX_VMAS],
+);
+
+/// Check if `addr` falls within a VMA that permits access (prot != PROT_NONE).
+/// Returns Some(prot) if valid, None if no VMA covers this address or VMA is PROT_NONE.
+pub fn vma_check(addr: usize) -> Option<usize> {
+    let table = VMA_TABLE.lock();
+    for vma in table.iter() {
+        if vma.active && addr >= vma.start && addr < vma.end {
+            if vma.prot == 0 {
+                return None; // PROT_NONE — access is illegal
+            }
+            return Some(vma.prot);
+        }
+    }
+    None
+}
+
+/// Add or update a VMA entry for [start, end) with the given prot.
+/// For MAP_FIXED, removes any overlapping entries first.
+fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) {
+    let mut table = VMA_TABLE.lock();
+    if map_fixed {
+        // Phase 1: Collect indices of overlapping entries and compute splits
+        // (using indices to avoid nested borrows)
+        let mut splits: alloc::vec::Vec<(usize, usize, usize)> = alloc::vec::Vec::new();
+        for i in 0..MAX_VMAS {
+            let vma = &table[i];
+            if vma.active && vma.start < end && vma.end > start {
+                if vma.start < start && vma.end > end {
+                    // Split: right part will be a new entry
+                    splits.push((end, vma.end, vma.prot));
+                    // Left part: just trim
+                    table[i].end = start;
+                } else if vma.start < start {
+                    table[i].end = start;
+                } else if vma.end > end {
+                    table[i].start = end;
+                } else {
+                    table[i].active = false;
+                }
+            }
+        }
+        // Phase 2: Insert split entries
+        for (s, e, p) in splits {
+            for i in 0..MAX_VMAS {
+                if !table[i].active {
+                    table[i].start = s;
+                    table[i].end = e;
+                    table[i].prot = p;
+                    table[i].active = true;
+                    break;
+                }
+            }
+        }
+    }
+    // Find a free slot and add the new VMA
+    for i in 0..MAX_VMAS {
+        if !table[i].active {
+            table[i].start = start;
+            table[i].end = end;
+            table[i].prot = prot;
+            table[i].active = true;
+            return;
+        }
+    }
+    crate::console_println!("[vma] ENOMEM: no free VMA slots");
+}
+
+/// Remove all VMA entries overlapping [start, end).
+fn vma_remove_range(start: usize, end: usize) {
+    let mut table = VMA_TABLE.lock();
+    let mut splits: alloc::vec::Vec<(usize, usize, usize)> = alloc::vec::Vec::new();
+    for i in 0..MAX_VMAS {
+        let vma = &table[i];
+        if vma.active && vma.start < end && vma.end > start {
+            if vma.start < start && vma.end > end {
+                splits.push((end, vma.end, vma.prot));
+                table[i].end = start;
+            } else if vma.start < start {
+                table[i].end = start;
+            } else if vma.end > end {
+                table[i].start = end;
+            } else {
+                table[i].active = false;
+            }
+        }
+    }
+    for (s, e, p) in splits {
+        for i in 0..MAX_VMAS {
+            if !table[i].active {
+                table[i].start = s;
+                table[i].end = e;
+                table[i].prot = p;
+                table[i].active = true;
+                break;
+            }
+        }
+    }
+}
+
+/// Update prot for all VMA entries overlapping [start, end).
+fn vma_update_prot(start: usize, end: usize, new_prot: usize) {
+    let mut table = VMA_TABLE.lock();
+    for vma in table.iter_mut() {
+        if vma.active && vma.start < end && vma.end > start {
+            vma.prot = new_prot;
+        }
+    }
+}
+
+/// Clear all VMA entries (called on process exit).
+pub fn vma_clear() {
+    let mut table = VMA_TABLE.lock();
+    for vma in table.iter_mut() {
+        vma.active = false;
+    }
+}
+
 // ─── Global FD table (single-process simplification) ────────────────
 
 extern crate alloc;
@@ -280,7 +417,17 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         6 => linux_lstat(args[0], args[1]),         // lstat
         7 => linux_poll(args[0], args[1], args[2]), // poll
         8 => linux_lseek(args[0], args[1], args[2]), // lseek
-        9 => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
+        9 => {
+            let r = linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]);
+            // Validate: for MAP_FIXED, return must be == addr or negative
+            if args[3] & 0x10 != 0 && r > 0 && (r as usize) != args[0] {
+                crate::console_println!(
+                    "[mmap] MAP_FIXED BUG: addr={:#x} returned={:#x} len={:#x}",
+                    args[0], r, args[1]
+                );
+            }
+            r
+        }
         10 => linux_mprotect(args[0], args[1], args[2]),
         11 => linux_munmap(args[0], args[1]), // munmap
         12 => sys_brk(args[0]),
@@ -1093,6 +1240,9 @@ pub fn sys_exit(code: i32) -> isize {
     let my_pid = crate::process::current_pid();
     crate::process::kill_clone_children(my_pid);
 
+    // Clear VMA table — the process is exiting, its address space is gone.
+    vma_clear();
+
     // 2. Mark ourselves as Exited in the scheduler
     crate::sched::mark_current_exited();
     crate::process::set_exit_code(code as usize);
@@ -1378,7 +1528,6 @@ fn sys_brk(addr: usize) -> isize {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let _lock = MMAP_LOCK.lock();
         crate::arch::trap::with_kernel_cr3(|| {
             let user_pt = crate::arch::trap::get_user_pt_safe();
             let page_size = crate::mm::pmm::page_size();
@@ -1487,10 +1636,6 @@ const MAP_ANONYMOUS: usize = 0x20;
 /// Full Linux mmap6 implementation for Go runtime support.
 /// Global lock for mmap/mprotect — prevents race conditions when multiple
 /// CLONE_VM threads concurrently modify the shared page table.
-#[cfg(target_arch = "x86_64")]
-static MMAP_LOCK: crate::sync::int_spinlock::IntSpinLock<()> =
-    crate::sync::int_spinlock::IntSpinLock::new(());
-
 fn linux_mmap(
     addr: usize,
     len: usize,
@@ -1499,53 +1644,38 @@ fn linux_mmap(
     _fd: usize,
     _offset: usize,
 ) -> isize {
-    let _prot_str = |p: usize| -> alloc::string::String {
-        let mut s = alloc::string::String::new();
-        if p == 0 {
-            s.push_str("NONE");
-        }
-        if p & 1 != 0 {
-            s.push_str("R");
-        }
-        if p & 2 != 0 {
-            s.push_str("W");
-        }
-        if p & 4 != 0 {
-            s.push_str("X");
-        }
-        s
-    };
     if len == 0 {
         return -22; // EINVAL
     }
 
     let page_size = crate::mm::pmm::page_size();
     let aligned_len = (len + page_size - 1) & !(page_size - 1);
+    let map_fixed = (flags & 0x10) != 0;
+    let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
 
     // Bump allocator for mmap addresses.
-    // This avoids O(n*p) search for large PROT_NONE reservations (Go heap arenas).
     static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
 
-    let target_addr = if addr != 0 && (flags & 0x10) != 0 {
-        // MAP_FIXED at specific address
+    let target_addr = if addr != 0 && map_fixed {
+        // MAP_FIXED: exact address required
         addr & !(page_size - 1)
     } else if addr != 0 {
-        // Hint address: use it if valid
+        // Hint: use if valid, otherwise kernel chooses
         let aligned_addr = addr & !(page_size - 1);
         if aligned_addr >= crate::process::USER_MMAP_BASE {
             aligned_addr
         } else {
-            0 // Will use bump allocator below
+            0
         }
     } else {
-        0 // Kernel chooses
+        0
     };
 
     let target_addr = if target_addr != 0 {
         target_addr
     } else {
-        // Bump allocator
+        // Bump allocator for kernel-chosen addresses
         loop {
             let base = NEXT_MMAP_ADDR.load(core::sync::atomic::Ordering::Relaxed);
             let candidate = if base < crate::process::USER_MMAP_BASE {
@@ -1555,12 +1685,6 @@ fn linux_mmap(
             };
             let end_addr = candidate.checked_add(aligned_len).unwrap_or(0);
             if end_addr > crate::process::USER_MMAP_LIMIT || end_addr == 0 {
-                crate::console_println!(
-                    "[mmap] ENOMEM: candidate={:#x} end={:#x} len={:#x}",
-                    candidate,
-                    end_addr,
-                    aligned_len
-                );
                 return -12; // ENOMEM
             }
             if NEXT_MMAP_ADDR
@@ -1577,132 +1701,64 @@ fn linux_mmap(
         }
     };
 
-    // Debug: log first few mmap calls
+    let end = target_addr + aligned_len;
+
+    // Register the VMA entry. For MAP_FIXED, removes overlapping entries.
+    vma_add(target_addr, end, prot, map_fixed);
+
+    // PROT_NONE (prot=0): reserve VA only. No PTEs, no frames.
+    // The PF handler will refuse to allocate for PROT_NONE VMAs → SIGSEGV.
+    if prot == 0 {
+        return target_addr as isize;
+    }
+
+    // MAP_ANONYMOUS with PROT_R/W/X: lazy allocation.
+    // No PTEs are created. The PF handler allocates zeroed frames on demand.
+    // This is the standard Linux behavior for anonymous mmap.
+    //
+    // Non-anonymous mmap (file-backed) is not yet supported; treat as anonymous.
+
+    // For MAP_FIXED on an existing mapping: unmap old PTEs in the range
+    // so the PF handler will allocate fresh zeroed frames.
+    if map_fixed {
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::trap::with_kernel_cr3(|| {
+            let user_pt = crate::arch::trap::get_user_pt_safe();
+            let mut vaddr = target_addr;
+            while vaddr < end {
+                crate::mm::vmm::unmap_user(user_pt, vaddr);
+                vaddr += page_size;
+            }
+            flush_tlb_all();
+        });
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let user_pt = crate::arch::trap::get_current_user_pt();
+            let mut vaddr = target_addr;
+            while vaddr < end {
+                crate::mm::vmm::unmap_user(user_pt, vaddr);
+                vaddr += page_size;
+            }
+            flush_tlb_all();
+        }
+    }
+
+    // Log first few mmap calls for debugging
     static MMAP_DEBUG_COUNT: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
-    let debug_count = MMAP_DEBUG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if debug_count < 5 {
+    let dc = MMAP_DEBUG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if dc < 5 {
         crate::console_println!(
-            "[mmap] #{} addr={:#x} len={:#x} prot={} flags={:#x} -> {:#x}",
-            debug_count,
-            addr,
-            len,
-            prot,
-            flags,
-            target_addr
+            "[mmap] #{} addr={:#x} len={:#x} prot={} flags={:#x} -> {:#x} (lazy)",
+            dc, addr, len, prot, flags, target_addr
         );
     }
 
-    // Switch to kernel CR3 for safe page table access
-    #[cfg(target_arch = "x86_64")]
-    let result = {
-        let _lock = MMAP_LOCK.lock();
-        crate::arch::trap::with_kernel_cr3(|| -> isize {
-            let user_pt = crate::arch::trap::get_user_pt_safe();
-
-            // PROT_NONE (prot=0): just reserve virtual address space, don't allocate frames.
-            if prot == 0 {
-                return target_addr as isize;
-            }
-
-            let end = target_addr + aligned_len;
-            let pte_flags = prot_to_pte_flags(prot);
-            let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
-            let mut vaddr = target_addr;
-            while vaddr < end {
-                if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
-                    crate::mm::vmm::unmap_user(user_pt, vaddr);
-                }
-                let frame = match crate::mm::pmm::alloc_frame() {
-                    Some(f) => f,
-                    None => return -12,
-                };
-                if is_anonymous {
-                    unsafe {
-                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                    }
-                }
-                crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
-                vaddr += page_size;
-            }
-
-            flush_tlb_all();
-            if addr == 0 && end > crate::process::current_brk() {
-                crate::process::set_current_brk(end);
-            }
-            if crate::mm::vmm::translate_user(user_pt, target_addr).is_none() {
-                return -12;
-            }
-            if crate::process::current_pid() >= 2 {
-                crate::klog!(
-                    DEBUG,
-                    "[mmap] → {:#x} len={:#x} prot={}({}) flags={:#x}",
-                    target_addr,
-                    len,
-                    _prot_str(prot),
-                    prot,
-                    flags
-                );
-            }
-            target_addr as isize
-        })
-    };
-
-    #[cfg(not(target_arch = "x86_64"))]
-    let result = {
-        let user_pt = crate::arch::trap::get_current_user_pt();
-
-        if prot == 0 {
-            return target_addr as isize;
-        }
-
-        let end = target_addr + aligned_len;
-        let pte_flags = prot_to_pte_flags(prot);
-        let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
-        let mut vaddr = target_addr;
-        while vaddr < end {
-            if let Some(_paddr) = crate::mm::vmm::translate_user(user_pt, vaddr) {
-                crate::mm::vmm::unmap_user(user_pt, vaddr);
-            }
-            let frame = match crate::mm::pmm::alloc_frame() {
-                Some(f) => f,
-                None => return -12,
-            };
-            if is_anonymous {
-                unsafe {
-                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                }
-            }
-            crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
-            vaddr += page_size;
-        }
-
-        flush_tlb_all();
-        if addr == 0 && end > crate::process::current_brk() {
-            crate::process::set_current_brk(end);
-        }
-        if crate::mm::vmm::translate_user(user_pt, target_addr).is_none() {
-            return -12;
-        }
-        if crate::process::current_pid() >= 2 {
-            crate::klog!(
-                DEBUG,
-                "[mmap] → {:#x} len={:#x} prot={}({}) flags={:#x}",
-                target_addr,
-                len,
-                _prot_str(prot),
-                prot,
-                flags
-            );
-        }
-        target_addr as isize
-    };
-
-    result
+    target_addr as isize
 }
 
 /// Convert Linux prot flags to KarteOS PTEFlags.
-fn prot_to_pte_flags(prot: usize) -> crate::mm::vmm::PTEFlags {
+pub fn prot_to_pte_flags(prot: usize) -> crate::mm::vmm::PTEFlags {
     let readable = prot & PROT_READ != 0;
     let writable = prot & PROT_WRITE != 0;
     let executable = prot & PROT_EXEC != 0;
@@ -1743,6 +1799,8 @@ fn prot_to_pte_flags(prot: usize) -> crate::mm::vmm::PTEFlags {
 }
 
 /// Linux mprotect(addr, len, prot) — change page protections.
+/// Updates VMA entries and existing PTE flags. Does NOT allocate new frames;
+/// the PF handler will use the updated VMA prot on first access.
 fn linux_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     if addr == 0 || len == 0 {
         return -22; // EINVAL
@@ -1752,58 +1810,38 @@ fn linux_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     let start = addr & !(page_size - 1);
     let end = (addr + len + page_size - 1) & !(page_size - 1);
 
-    #[cfg(target_arch = "x86_64")]
-    let result = {
-        let _lock = MMAP_LOCK.lock();
-        crate::arch::trap::with_kernel_cr3(|| -> isize {
-            let user_pt = crate::arch::trap::get_user_pt_safe();
-            let pte_flags = prot_to_pte_flags(prot);
+    // Update VMA prot for this range
+    vma_update_prot(start, end, prot);
 
-            for vaddr in (start..end).step_by(page_size) {
-                if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
-                    let frame = match crate::mm::pmm::alloc_frame() {
-                        Some(f) => f,
-                        None => return -12,
-                    };
-                    unsafe {
-                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                    }
-                    crate::mm::vmm::map_user(user_pt, vaddr, frame, pte_flags);
-                } else {
-                    crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
-                }
-            }
-            flush_tlb_all();
-            0
-        })
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let result = {
-        let user_pt = crate::arch::trap::get_current_user_pt();
-        let pte_flags = prot_to_pte_flags(prot);
+    // Update existing PTE flags (only for already-mapped pages)
+    let pte_flags = prot_to_pte_flags(prot);
+
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::trap::with_kernel_cr3(|| {
+        let user_pt = crate::arch::trap::get_user_pt_safe();
         for vaddr in (start..end).step_by(page_size) {
-            if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
-                let frame = match crate::mm::pmm::alloc_frame() {
-                    Some(f) => f,
-                    None => return -12,
-                };
-                unsafe {
-                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                }
-                crate::mm::vmm::map_user(user_pt, vaddr, frame, pte_flags);
-            } else {
+            if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
+                crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
+            }
+            // Unmapped pages: no action needed — PF handler will use VMA prot
+        }
+        flush_tlb_all();
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let user_pt = crate::arch::trap::get_current_user_pt();
+        for vaddr in (start..end).step_by(page_size) {
+            if crate::mm::vmm::translate_user(user_pt, vaddr).is_some() {
                 crate::mm::vmm::mprotect_user(user_pt, vaddr, pte_flags);
             }
         }
         flush_tlb_all();
-        0
-    };
-
-    result
+    }
+    0
 }
 
-/// Linux munmap(addr, len) — unmap pages.
-/// Does not free physical frames (Go may remap the same region).
+/// Linux munmap(addr, len) — unmap pages and free physical frames.
+/// Also removes corresponding VMA entries.
 fn linux_munmap(addr: usize, len: usize) -> isize {
     if addr == 0 || len == 0 {
         return -22; // EINVAL
@@ -1820,16 +1858,18 @@ fn linux_munmap(addr: usize, len: usize) -> isize {
         return -22; // EINVAL
     }
 
+    // Remove VMA entries
+    vma_remove_range(start, end);
+
+    // Free physical frames and unmap PTEs
     #[cfg(target_arch = "x86_64")]
-    {
-        crate::arch::trap::with_kernel_cr3(|| {
-            let user_pt = crate::arch::trap::get_user_pt_safe();
-            for vaddr in (start..end).step_by(page_size) {
-                crate::mm::vmm::unmap_user(user_pt, vaddr);
-            }
-            flush_tlb_all();
-        });
-    }
+    crate::arch::trap::with_kernel_cr3(|| {
+        let user_pt = crate::arch::trap::get_user_pt_safe();
+        for vaddr in (start..end).step_by(page_size) {
+            crate::mm::vmm::unmap_user(user_pt, vaddr);
+        }
+        flush_tlb_all();
+    });
     #[cfg(not(target_arch = "x86_64"))]
     {
         let user_pt = crate::arch::trap::get_current_user_pt();
@@ -1961,8 +2001,26 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     }
 }
 
-/// Without this, Go's memory allocator sees stale heap data where it expects zeros,
-/// causing silent corruption in Go runtime data structures (regexp counters, GC bitmaps, etc.)
+/// Linux madvise(addr, len, advice)
+///
+/// Professional implementation that handles the full lifecycle of Go's memory
+/// allocator:
+///
+///   1. `sysReserve` → mmap(PROT_NONE) — reserve VA
+///   2. `sysMap`     → mmap(PROT_R/W, MAP_FIXED) — commit (pages become accessible)
+///   3. `sysUsed`    → just accesses memory (PF allocates zeroed frames)
+///   4. `sysUnused`  → madvise(MADV_DONTNEED) — decommit (release physical frames)
+///   5. Go repeats 2-4 as needed
+///
+/// Key behaviors:
+///   - MADV_DONTNEED: release physical frames (decommit). PTEs are removed.
+///     Next access triggers PF → fresh zeroed frame allocated. This is how Linux
+///     works — the process must handle SIGSEGV if it accesses MADV_DONTNEED'd
+///     memory without re-mmap'ing, but Go always re-mmaps before accessing.
+///   - MADV_FREE: same as MADV_DONTNEED for our purposes (lazy decommit).
+///   - MADV_POPULATE_READ / MADV_POPULATE_WRITE: pre-fault pages (commit).
+///     Allocate physical frames for all pages in the range that don't have them.
+///   - MADV_WILLNEED: same as MADV_POPULATE_READ (pre-fault).
 fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
     if len == 0 {
         return 0;
@@ -1980,50 +2038,96 @@ fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
     const MADV_UNMERGEABLE: usize = 13;
     const MADV_HUGEPAGE: usize = 14;
     const MADV_NOHUGEPAGE: usize = 15;
+    const MADV_POPULATE_READ: usize = 22;
+    const MADV_POPULATE_WRITE: usize = 23;
     const MADV_COLLAPSE: usize = 25;
+
+    let page_size = crate::mm::pmm::page_size();
+    let start = addr & !(page_size - 1);
+    let end = (addr + len + page_size - 1) & !(page_size - 1);
 
     match advice {
         MADV_DONTNEED | MADV_FREE => {
-            // Zero-fill pages in the range. Go runtime expects pages to be zeroed
-            // after MADV_DONTNEED/FREE — sysUsedOS does NOT remap.
-            let page_size = crate::mm::pmm::page_size();
-            let start = addr & !(page_size - 1);
-            let end = (addr + len + page_size - 1) & !(page_size - 1);
-
+            // Decommit: release physical frames and remove PTEs.
+            // The VMA entry is kept — Go will re-commit via mmap(PROT_R/W, MAP_FIXED).
+            // Next PF in this range with a valid VMA will allocate a fresh zeroed frame.
             #[cfg(target_arch = "x86_64")]
-            {
-                crate::arch::trap::with_kernel_cr3(|| {
-                    let user_pt = crate::arch::trap::get_user_pt_safe();
-                    let mut vaddr = start;
-                    while vaddr < end {
-                        if let Some(frame) = crate::mm::vmm::translate_user(user_pt, vaddr) {
-                            unsafe {
-                                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                            }
-                        }
-                        vaddr += page_size;
-                    }
-                });
-            }
+            crate::arch::trap::with_kernel_cr3(|| {
+                let user_pt = crate::arch::trap::get_user_pt_safe();
+                let mut vaddr = start;
+                while vaddr < end {
+                    // unmap_user frees the physical frame and removes the PTE
+                    crate::mm::vmm::unmap_user(user_pt, vaddr);
+                    vaddr += page_size;
+                }
+                flush_tlb_all();
+            });
             #[cfg(not(target_arch = "x86_64"))]
             {
                 let user_pt = crate::arch::trap::get_current_user_pt();
                 let mut vaddr = start;
                 while vaddr < end {
-                    if let Some(frame) = crate::mm::vmm::translate_user(user_pt, vaddr) {
-                        unsafe {
-                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    crate::mm::vmm::unmap_user(user_pt, vaddr);
+                    vaddr += page_size;
+                }
+                flush_tlb_all();
+            }
+            0
+        }
+
+        MADV_POPULATE_READ | MADV_POPULATE_WRITE | MADV_WILLNEED => {
+            // Pre-fault: allocate physical frames for all pages in the range
+            // that don't currently have PTE mappings. Uses VMA prot for flags.
+            let vma_prot = vma_check(start);
+            let pte_flags = if let Some(prot) = vma_prot {
+                prot_to_pte_flags(prot)
+            } else {
+                // No VMA — use RW as default (matches mmap default)
+                prot_to_pte_flags(1 | 2) // PROT_READ | PROT_WRITE
+            };
+
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::trap::with_kernel_cr3(|| {
+                let user_pt = crate::arch::trap::get_user_pt_safe();
+                let mut vaddr = start;
+                while vaddr < end {
+                    let needs_alloc = match crate::mm::vmm::translate_user(user_pt, vaddr) {
+                        None => true,
+                        Some(f) => f == vaddr, // identity-mapped stale entry
+                    };
+                    if needs_alloc {
+                        if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                            unsafe { core::ptr::write_bytes(frame as *mut u8, 0, page_size) };
+                            crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
+                        }
+                        // If alloc_frame fails, silently skip — PF will retry on access
+                    }
+                    vaddr += page_size;
+                }
+                flush_tlb_all();
+            });
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let user_pt = crate::arch::trap::get_current_user_pt();
+                let mut vaddr = start;
+                while vaddr < end {
+                    if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
+                        if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                            unsafe { core::ptr::write_bytes(frame as *mut u8, 0, page_size) };
+                            crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
                         }
                     }
                     vaddr += page_size;
                 }
+                flush_tlb_all();
             }
             0
         }
+
         // All other advice values: no-op success
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTFORK
-        | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE
-        | MADV_COLLAPSE => 0,
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK
+        | MADV_DOFORK | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE
+        | MADV_NOHUGEPAGE | MADV_COLLAPSE => 0,
         _ => 0, // Unknown advice: silently succeed
     }
 }
