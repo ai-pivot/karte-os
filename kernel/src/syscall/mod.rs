@@ -499,13 +499,13 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         29 => linux_dup(args[0]),                          // dup
         30 => linux_dup2(args[0], args[1]),                // dup2
         31 => linux_pause(),                               // pause
-        32 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]), // execve(path, argv, envp)
-        33 => 0,                                 // chdir (stub — use Linux 80)
-        34 => 0,                                 // fchdir (stub)
-        35 => linux_nanosleep(args[0], args[1]), // nanosleep
-        36 => 0,                                 // alarm (stub)
-        37 => 0,                                 // setitimer (stub)
-        38 => 0,                                 // getpid... wait, Linux getpid is 39
+        32 => linux_dup(args[0]),                          // dup
+        33 => 0,                                           // chdir (stub — use Linux 80)
+        34 => 0,                                           // fchdir (stub)
+        35 => linux_nanosleep(args[0], args[1]),           // nanosleep
+        36 => 0,                                           // alarm (stub)
+        37 => 0,                                           // setitimer (stub)
+        38 => 0,                                           // getpid... wait, Linux getpid is 39
 
         // ─── Process management ───────────────────────────────────
         39 => sys_getpid(),                                  // getpid
@@ -528,9 +528,9 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
 
         56 => linux_clone(args[0], args[1], args[2], args[3], args[4]), // clone
         57 => sys_fork(),                                               // fork
-        58 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]), // vfork → execve
-        59 => sys_exit(args[0] as i32),                                               // exit
-        60 => sys_exit(args[0] as i32), // exit (same as 59)
+        58 => 0, // vfork stub: parent continues, no child created
+        59 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]), // execve
+        60 => sys_exit(args[0] as i32), // exit
 
         // ─── More file ops ────────────────────────────────────────
         61 => linux_wait4(args[0], args[1], args[2]), // wait4
@@ -1299,7 +1299,7 @@ pub fn sys_exit(code: i32) -> isize {
     );
 
     // If init (the shell) exits, no process remains → shut down the system.
-    if crate::sched::is_init_running() {
+    if my_pid == 1 {
         crate::klog!(INFO, "[init] Shell exited, shutting down...");
         crate::arch::platform::shutdown();
     }
@@ -1324,7 +1324,23 @@ pub fn sys_exit(code: i32) -> isize {
         crate::sched::wake_task(parent_idx);
     }
 
-    // 4. Switch to another ready child task (or back to init).
+    // 4. Switch to kernel CR3 before context switch.
+    //    When called from PF/exception handlers (IST stack), CR3 may still be
+    //    the dying process's user page table. Go's mmap lazy allocation can
+    //    overwrite identity mapping entries in the user page table, causing
+    //    __switch to read corrupted data from other tasks' kernel stacks.
+    //    Kernel CR3 has a complete, untampered identity mapping.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let kcr3 = crate::mm::vmm::kernel_cr3();
+        if kcr3 != 0 {
+            unsafe {
+                core::arch::asm!("mov cr3, {}", in(reg) kcr3);
+            }
+        }
+    }
+
+    // 5. Switch to another ready child task (or back to init).
     //    No Exited clone children can be scheduled.
     crate::sched::schedule_exit();
 
@@ -3091,25 +3107,7 @@ fn sys_shutdown(_fd: i32) -> isize {
 /// `path` = pointer to file path string, `path_len` = length.
 /// Returns child PID on success, or negative error code.
 fn sys_exec(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
-    // Save the current SYSCALL_KSP (init's kernel stack) so we can restore it
-    // before returning. This prevents timer ISR from changing SYSCALL_KSP
-    // to a child process's stack, which would cause shell's return path
-    // to corrupt the child's TrapContext.
-    #[cfg(target_arch = "x86_64")]
-    let saved_ksp = crate::arch::idt::get_syscall_ksp();
-
-    let result = sys_exec_impl(path, path_len, argv_ptr, envp_ptr);
-
-    // Restore SYSCALL_KSP with interrupts disabled to prevent timer ISR
-    // from overwriting it between the restore and the iretq return.
-    #[cfg(target_arch = "x86_64")]
-    {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            unsafe { crate::arch::idt::SYSCALL_KSP = saved_ksp };
-        });
-    }
-
-    result
+    sys_exec_impl(path, path_len, argv_ptr, envp_ptr)
 }
 
 fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize) -> isize {

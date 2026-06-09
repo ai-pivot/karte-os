@@ -52,6 +52,7 @@ pm_entry:
     # Enable PAE (CR4.PAE = bit 5), OSFXSR (bit 9), OSXMMEXCPT (bit 10)
     mov %cr4, %eax
     or $((1 << 5) | (1 << 9) | (1 << 10)), %eax
+    and $~(1 << 23), %eax             # CET disabled (no user shadow stacks yet)
     mov %eax, %cr4
 
     # Enable long mode (EFER.LME = bit 8)

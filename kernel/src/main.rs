@@ -62,6 +62,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // Initialize kernel logger before any subsystem that uses `log::`
     crate::kernel_log::init();
 
+    #[cfg(target_arch = "x86_64")]
+    arch::cet::disable();
+
     arch::trap::init();
     #[cfg(target_arch = "riscv64")]
     mm::pmm::init();
@@ -319,7 +322,6 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 }
 
                 crate::console_println!("[init]   user_cr3={:#x}", proc.page_table_root << 12);
-
                 // Register process in the global process table
                 #[cfg(target_arch = "riscv64")]
                 unsafe {
@@ -346,80 +348,33 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 }
 
                 #[cfg(target_arch = "riscv64")]
-                unsafe {
-                    riscv::register::sstatus::set_sie()
+                let user_page_table = if proc.page_table_root == 0 {
+                    let satp: usize;
+                    unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
+                    satp
+                } else {
+                    (8usize << 60) | proc.page_table_root
                 };
 
-                // On x86_64, do NOT enable interrupts here. The Timer ISR
-                // fires on the boot stack which is too small. Let iretq
-                // restore RFLAGS with IF=1 to atomically enable interrupts
-                // upon entering user mode.
-
-                // Architecture-specific first user entry
-                #[cfg(target_arch = "riscv64")]
-                {
-                    // Calculate user satp (Sv39 mode = 8)
-                    let user_satp = if proc.page_table_root == 0 {
-                        let satp: usize;
-                        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
-                        satp
-                    } else {
-                        (8usize << 60) | proc.page_table_root
-                    };
-
-                    // Build TrapContext on kernel stack for first U-mode entry.
-                    let ctx_words = core::mem::size_of::<arch::trap::TrapContext>() / 8;
-                    let trap_ctx_base =
-                        proc.kernel_stack_top - core::mem::size_of::<arch::trap::TrapContext>();
-                    unsafe {
-                        let ctx = trap_ctx_base as *mut usize;
-                        for i in 0..ctx_words {
-                            *ctx.add(i) = 0;
-                        }
-                        *ctx.add(2) = proc.kernel_stack_top;
-                        *ctx.add(32) = 0x20;
-                        *ctx.add(33) = proc.entry;
-                        *ctx.add(34) = proc.user_stack_top;
-                    }
-
-                    crate::console_println!("[init] Entering user mode...");
-                    crate::console_println!(
-                        "[init]   user_satp={:#x}, page_table_ppn={:#x}",
-                        user_satp,
-                        proc.page_table_root
-                    );
-
-                    unsafe { riscv::register::sstatus::clear_sie() };
-                    arch::trap::first_enter_user(
-                        unsafe { &mut *(trap_ctx_base as *mut arch::trap::TrapContext) },
-                        user_satp,
-                    );
-                }
-
                 #[cfg(target_arch = "x86_64")]
-                {
-                    // CR3 = physical address of PML4 table (ppn << 12)
-                    let user_cr3 = if proc.page_table_root == 0 {
-                        0u64
-                    } else {
-                        (proc.page_table_root << 12) as u64
-                    };
+                let user_page_table = if proc.page_table_root == 0 {
+                    0usize
+                } else {
+                    proc.page_table_root << 12
+                };
 
-                    crate::console_println!("[init] Entering user mode...");
+                crate::console_println!("[init] Entering user mode...");
 
-                    // Disable interrupts before first_enter_user
-                    x86_64::instructions::interrupts::disable();
+                crate::sched::add_user_process(
+                    proc.entry,
+                    proc.user_stack_top,
+                    proc.kernel_stack_top,
+                    user_page_table,
+                    idx,
+                )
+                .expect("Failed to register init task");
 
-                    // Initialize SYSCALL kernel stack pointer for Go's syscall instruction
-                    arch::idt::set_syscall_ksp(proc.kernel_stack_top as u64);
-
-                    arch::trap::first_enter_user(
-                        proc.entry,
-                        proc.user_stack_top - 8, // RSP must point into mapped stack region
-                        proc.kernel_stack_top,
-                        user_cr3,
-                    );
-                }
+                crate::sched::start_first_task();
             }
             Err(e) => {
                 crate::console_println!("[init] Failed to load user program: {}", e);

@@ -200,7 +200,10 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
             // Huge page at this level — must split to create a 4KB entry.
             let huge_ppn = entry.ppn();
             let huge_paddr = huge_ppn << 12;
-            let sub_page_size = if level == 2 { 1 << 21 } else { 1 << 12 };
+            // Page size at the next level down:
+            //   level 3 (PDP) splits to level 2 (PD) → 2MB sub-pages
+            //   level 2 (PD) splits to level 1 (PT) → 4KB sub-pages
+            let sub_page_size = if level == 3 { 1 << 21 } else { 1 << 12 };
             let new_table = PageTable::zeroed();
             let new_ppn = (new_table as *const PageTable as usize) >> 12;
             for i in 0..512 {

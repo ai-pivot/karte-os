@@ -9,6 +9,7 @@
 //! via the `x86_64` crate.
 
 pub mod boot;
+pub mod cet;
 pub mod console;
 pub mod emergency_stack;
 pub mod gdt;

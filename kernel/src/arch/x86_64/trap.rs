@@ -186,6 +186,12 @@ pub unsafe extern "C" fn trap_return_user() {
             //   +32: ss         (+0x20)
             //   +40: kernel_sp  (+0x28)
             //   +48: user_cr3   (+0x30) ← per-process page table root
+            //
+            // Keep DS/ES valid for user code. String instructions such as
+            // `rep stos*` implicitly use ES even in 64-bit mode.
+            "mov ax, [rsp + 0x20]",
+            "mov ds, ax",
+            "mov es, ax",
 
             // ── Update TSS.RSP0 before returning to Ring 3 ──
             // kernel_sp is at rsp+0x28 (after 15 pops, rsp points to iretq frame).
@@ -441,7 +447,10 @@ where
 {
     let cr3 = x86_64::registers::control::Cr3::read();
     let user_cr3 = cr3.0.start_address().as_u64() as usize;
-    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
+    let mut kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
+    if kernel_cr3 == 0 {
+        kernel_cr3 = crate::mm::vmm::kernel_cr3() as usize;
+    }
     let need_switch = user_cr3 != kernel_cr3;
     if need_switch {
         activate_page_table(kernel_cr3);

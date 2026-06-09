@@ -122,21 +122,16 @@ impl<T> Drop for BlockingMutexGuard<'_, T> {
     }
 }
 
-// ── Lightweight variant for single-hart (init) context ────────────────
+// ── Lightweight variant for scheduler-friendly shared state ───────────
 //
-// When the scheduler is running, the init process (shell) is not a normal
-// schedulable task — it has no TCB slot. If init tries to lock a
-// BlockingMutex that's already held, schedule_block() would be wrong
-// because init can't be blocked.
-//
-// For init-only state (like the global ext4 instance), we use a simpler
-// approach: a SpinLock that briefly spins, then yields via schedule()
-// instead of blocking. This avoids the block/wake machinery entirely.
+// Some global subsystems, such as filesystem state, are shared by both
+// process context and early/idle kernel context. This lock briefly spins, then
+// yields via schedule() instead of entering the block/wake machinery.
 
-/// A lightweight mutex suitable for single-hart init context.
+/// A lightweight mutex suitable for scheduler-friendly shared state.
 ///
 /// Uses a short spin loop with scheduler yields. Not as efficient as
-/// BlockingMutex for multi-task contention, but safe to use from init.
+/// BlockingMutex for multi-task contention, but avoids requiring a sleep queue.
 pub struct YieldMutex<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,

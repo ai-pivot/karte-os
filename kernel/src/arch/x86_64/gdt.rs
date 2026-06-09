@@ -146,6 +146,12 @@ pub fn init_for_cpu(cpu_id: usize) {
                     + IST_STACKS[cpu_id * NUM_IST + 5].len() as u64,
             );
             PER_CPU_TSS[cpu_id].interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = pf_stack_top;
+
+            if cpu_id == 0 {
+                let rsp0_ptr = core::ptr::addr_of_mut!(PER_CPU_TSS[0].privilege_stack_table[0]);
+                TSS_RSP0_ADDR = rsp0_ptr as u64;
+                TSS_RSP0_ADDR_ATOMIC.store(rsp0_ptr as u64, Ordering::Relaxed);
+            }
         }
 
         let mut gdt = GlobalDescriptorTable::new();
@@ -237,8 +243,14 @@ pub static mut TSS_RSP0_ADDR: u64 = 0;
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn set_kernel_rsp0_for_cpu(cpu_id: usize, kernel_stack_top: u64) {
     unsafe {
-        let tss = &mut PER_CPU_TSS[cpu_id.min(MAX_CPUS - 1)];
+        let cpu_id = cpu_id.min(MAX_CPUS - 1);
+        let tss = &mut PER_CPU_TSS[cpu_id];
         tss.privilege_stack_table[0] = x86_64::VirtAddr::new_truncate(kernel_stack_top);
+        if cpu_id == 0 {
+            let rsp0_ptr = core::ptr::addr_of_mut!(PER_CPU_TSS[0].privilege_stack_table[0]);
+            TSS_RSP0_ADDR = rsp0_ptr as u64;
+            TSS_RSP0_ADDR_ATOMIC.store(rsp0_ptr as u64, Ordering::Relaxed);
+        }
     }
 }
 

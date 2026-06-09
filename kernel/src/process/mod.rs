@@ -31,6 +31,8 @@ pub const USER_STACK_TOP: usize = 0x8000_0000; // 2GB — top of user stack
 pub const USER_STACK_BASE: usize = 0x7F00_0000; // 16MB stack region (address space)
 pub const USER_STACK_PAGES: usize = 512; // 2 MB pre-mapped stack (Go g0 needs ~1MB+)
 pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack
+#[cfg(target_arch = "x86_64")]
+const CET_TRANSITION_STACK_PAGE: usize = 0xffff_ffff_ffff_f000;
 
 /// Process identifier allocator
 pub(crate) static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
@@ -188,6 +190,22 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
         let kstack_base = kernel_stack_top - KERNEL_STACK_PAGES * 4096;
         for addr in (kstack_base..kernel_stack_top).step_by(4096) {
             vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+        }
+
+        // Some x86_64 emulators/CPUs can perform a CET/shadow-stack transition
+        // access while the user CR3 is already active but before Ring 3 code
+        // runs. Keep the canonical top shadow-stack page mapped supervisor-only
+        // in every user page table. User mode cannot access it because the leaf
+        // PTE intentionally lacks the USER bit.
+        if vmm::translate_user(user_pt, CET_TRANSITION_STACK_PAGE).is_none() {
+            let transition_frame =
+                pmm::alloc_frame().expect("Out of memory for CET transition page");
+            vmm::map(
+                user_pt,
+                CET_TRANSITION_STACK_PAGE,
+                transition_frame,
+                vmm::PTEFlags::KRW,
+            );
         }
     }
 }
@@ -1047,14 +1065,14 @@ pub fn set_ppid(idx: usize, ppid: usize) {
 }
 
 /// Get current process pid.
-/// Init (shell) has a fixed PID of 1 since it's not in the process table.
 pub fn current_pid() -> usize {
     let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
-    if idx >= crate::sched::MAX_TASKS {
-        return 1; // init process
-    }
     let table = PROCESS_TABLE.lock();
-    table[idx].as_ref().map(|p| p.pid).unwrap_or(0)
+    table
+        .get(idx)
+        .and_then(|p| p.as_ref())
+        .map(|p| p.pid)
+        .unwrap_or(0)
 }
 
 /// Get the current process's FD table as a mutable reference.

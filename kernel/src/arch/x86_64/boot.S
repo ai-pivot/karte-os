@@ -129,6 +129,7 @@ _start:
     # ── Enable PAE, OSFXSR (SSE), OSXMMEXCPT (SIMD exceptions) ──
     movl %cr4, %eax
     orl $((1 << 5) | (1 << 9) | (1 << 10)), %eax
+    andl $~(1 << 23), %eax             # CET disabled (no user shadow stacks yet)
     movl %eax, %cr4
 
     # ── Load CR3 ──

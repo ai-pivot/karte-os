@@ -222,6 +222,8 @@ pub fn start_secondary_harts(total: usize) {
 extern "C" fn secondary_cpu_entry(cpu_id: usize) -> ! {
     crate::console_println!("[smp] CPU {} entering secondary_cpu_entry", cpu_id);
 
+    crate::arch::cet::disable();
+
     // Initialize per-CPU GDT + TSS
     crate::arch::gdt::init_for_cpu(cpu_id);
 

@@ -49,9 +49,6 @@ static mut KERNEL_CR3: u64 = 0;
 /// Kernel stack pointer for SYSCALL fast entry.
 #[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_KSP: u64 = 0;
-/// Saved init (shell) SYSCALL_KSP value, restored when timer ISR switches back to init.
-pub(crate) static INIT_SYSCALL_KSP: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
 /// Temporarily saved original rbx (clobbered by user RSP during SYSCALL entry).
 #[unsafe(no_mangle)]
 static mut SYSCALL_SAVED_RBX: u64 = 0;
@@ -95,10 +92,6 @@ pub fn set_syscall_ksp(ksp: u64) {
         SYSCALL_KSP = ksp;
         KERNEL_CR3_PHYS = crate::mm::vmm::kernel_cr3();
     }
-    // Save the first call (init/shell) as the default for init
-    if INIT_SYSCALL_KSP.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-        INIT_SYSCALL_KSP.store(ksp, core::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 pub fn get_syscall_ksp() -> u64 {
@@ -107,7 +100,9 @@ pub fn get_syscall_ksp() -> u64 {
 
 pub fn cache_kernel_cr3() {
     unsafe {
-        KERNEL_CR3 = crate::mm::vmm::kernel_cr3();
+        let kernel_cr3 = crate::mm::vmm::kernel_cr3();
+        KERNEL_CR3 = kernel_cr3;
+        KERNEL_CR3_PHYS = kernel_cr3;
     }
 }
 
@@ -419,11 +414,6 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     crate::sched::schedule();
     if let Some(ksp) = crate::sched::current_kernel_stack() {
         unsafe { crate::arch::idt::SYSCALL_KSP = ksp };
-    } else {
-        unsafe {
-            crate::arch::idt::SYSCALL_KSP =
-                crate::arch::idt::INIT_SYSCALL_KSP.load(core::sync::atomic::Ordering::Relaxed)
-        };
     }
     let target_root = crate::process::current_page_table_root();
     if target_root != 0 {
@@ -1199,12 +1189,9 @@ pub fn init() {
         // Syscall (int 0x80): DPL=3, NO IST — use per-task kernel stack (TSS.RSP0).
         //
         // CRITICAL: We must NOT use IST for int $0x80. IST is a fixed stack that
-        // is the same for every invocation. When init (shell) does int $0x80,
-        // its TrapContext is saved on IST. Then __switch saves init's SP (pointing
-        // into IST). When xbot runs and also does int $0x80, the CPU pushes a new
-        // TrapContext to the SAME IST top, overwriting init's saved context. When
-        // xbot exits and we __switch back to init, init's saved SP points to
-        // overwritten garbage → Double Fault.
+        // is the same for every invocation. If two user tasks enter through this
+        // gate, their saved frames would reuse the same IST top. Switching back
+        // to an older task would then restore overwritten garbage → Double Fault.
         //
         // Using IST index 0 (= no IST) makes the CPU use TSS.RSP0 instead, which
         // is per-task (updated by schedule() and gdt::set_kernel_rsp0()). Each
