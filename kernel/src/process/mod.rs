@@ -243,6 +243,31 @@ impl Process {
         // huge pages as needed for 4KB mappings.
         copy_kernel_mappings(user_pt, kernel_stack_top);
 
+        // 4.5 Switch to kernel CR3 for ELF loading.
+        // The ELF loader writes frame data via identity-mapped physical addresses
+        // (e.g., `write_bytes(frame as *mut u8, 0, 4096)`). This requires a stable
+        // identity mapping. But as vmm::map() splits 2MB huge pages in the user
+        // page table, the identity mapping can become fragmented/corrupted. Running
+        // on the kernel CR3 (which has a complete, untampered identity mapping)
+        // ensures all physical frame writes go to the correct destination.
+        let saved_cr3: u64;
+        #[cfg(target_arch = "x86_64")]
+        {
+            saved_cr3 = {
+                let cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+                cr3
+            };
+            let kcr3 = crate::mm::vmm::kernel_cr3() as u64;
+            if kcr3 != 0 {
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) kcr3) };
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            saved_cr3 = 0;
+        }
+
         // 5. Load ELF segments into user page table. map() will split any
         // 2MB huge pages (PS=1) that overlap with ELF segment addresses.
         let mut max_vaddr = 0usize;
@@ -305,6 +330,12 @@ impl Process {
             if segment.vaddr + segment.mem_size > max_vaddr {
                 max_vaddr = segment.vaddr + segment.mem_size;
             }
+        }
+
+        // 5.5 Restore CR3 after ELF segment loading.
+        #[cfg(target_arch = "x86_64")]
+        if saved_cr3 != 0 {
+            unsafe { core::arch::asm!("mov cr3, {}", in(reg) saved_cr3) };
         }
 
         // 6. Map user stack in user page table (URW, no execute)
@@ -564,6 +595,31 @@ impl Process {
         // huge pages as needed for 4KB mappings.
         copy_kernel_mappings(user_pt, kernel_stack_top);
 
+        // 4.5 Switch to kernel CR3 for ELF loading.
+        // The ELF loader writes frame data via identity-mapped physical addresses
+        // (e.g., `write_bytes(frame as *mut u8, 0, 4096)`). This requires a stable
+        // identity mapping. But as vmm::map() splits 2MB huge pages in the user
+        // page table, the identity mapping can become fragmented/corrupted. Running
+        // on the kernel CR3 (which has a complete, untampered identity mapping)
+        // ensures all physical frame writes go to the correct destination.
+        let saved_cr3: u64;
+        #[cfg(target_arch = "x86_64")]
+        {
+            saved_cr3 = {
+                let cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+                cr3
+            };
+            let kcr3 = crate::mm::vmm::kernel_cr3() as u64;
+            if kcr3 != 0 {
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) kcr3) };
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            saved_cr3 = 0;
+        }
+
         // 5. Load ELF segments page-by-page. map() will split any 2MB huge
         // pages (PS=1) that overlap with ELF segment addresses.
         let mut max_vaddr = 0usize;
@@ -647,6 +703,14 @@ impl Process {
                 max_vaddr = seg.vaddr + seg.mem_size;
             }
         } // end for seg_idx
+
+        // 5.5 Restore CR3 after ELF segment loading.
+        // All frame writes (via identity-mapped physical addresses) are done.
+        // Restore the original CR3 so subsequent page table setup works correctly.
+        #[cfg(target_arch = "x86_64")]
+        if saved_cr3 != 0 {
+            unsafe { core::arch::asm!("mov cr3, {}", in(reg) saved_cr3) };
+        }
 
         // 6. Map user stack in user page table (URW, no execute)
         // Map from USER_STACK_TOP downward for USER_STACK_PAGES.

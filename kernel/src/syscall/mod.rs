@@ -108,7 +108,7 @@ struct VmaRegion {
     active: bool,
 }
 
-const MAX_VMAS: usize = 256;
+const MAX_VMAS: usize = 1024;
 
 static VMA_TABLE: spin::Mutex<[VmaRegion; MAX_VMAS]> = spin::Mutex::new(
     [const {
@@ -138,7 +138,8 @@ pub fn vma_check(addr: usize) -> Option<usize> {
 
 /// Add or update a VMA entry for [start, end) with the given prot.
 /// For MAP_FIXED, removes any overlapping entries first.
-fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) {
+/// Returns Ok(()) on success, Err(()) if no free VMA slot is available.
+fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result<(), ()> {
     let mut table = VMA_TABLE.lock();
     if map_fixed {
         // Phase 1: Collect indices of overlapping entries and compute splits
@@ -181,10 +182,10 @@ fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) {
             table[i].end = end;
             table[i].prot = prot;
             table[i].active = true;
-            return;
+            return Ok(());
         }
     }
-    crate::console_println!("[vma] ENOMEM: no free VMA slots");
+    Err(())
 }
 
 /// Remove all VMA entries overlapping [start, end).
@@ -1762,7 +1763,9 @@ fn linux_mmap(
     let end = target_addr + aligned_len;
 
     // Register the VMA entry. For MAP_FIXED, removes overlapping entries.
-    vma_add(target_addr, end, prot, map_fixed);
+    if vma_add(target_addr, end, prot, map_fixed).is_err() {
+        return -12; // ENOMEM — VMA table full
+    }
 
     // PROT_NONE (prot=0): reserve VA only. No PTEs, no frames.
     // The PF handler will refuse to allocate for PROT_NONE VMAs → SIGSEGV.
@@ -1805,9 +1808,9 @@ fn linux_mmap(
     static MMAP_DEBUG_COUNT: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
     let dc = MMAP_DEBUG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if dc < 5 {
+    if dc < 20 {
         crate::console_println!(
-            "[mmap] #{} addr={:#x} len={:#x} prot={} flags={:#x} -> {:#x} (lazy)",
+            "[mmap] #{} addr={:#x} len={:#x} prot={} flags={:#x} -> {:#x}",
             dc,
             addr,
             len,

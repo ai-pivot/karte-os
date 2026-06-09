@@ -541,12 +541,6 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _erro
             core::arch::asm!("mov cr3, {}", in(reg) kcr3);
         }
     }
-    // NOTE: error_code is always 0 for double faults on x86_64.
-    // InterruptStackFrame fields are correctly parsed by x86-interrupt ABI:
-    //   instruction_pointer = actual RIP
-    //   code_segment = actual CS
-    //   cpu_flags = actual RFLAGS
-    //   stack_pointer = actual RSP (of the faulting context)
     crate::console_println!(
         "[DF] RIP={:#x} CS={:#x} RSP={:#x} RFLAGS={:#x}",
         frame.instruction_pointer.as_u64(),
@@ -554,13 +548,10 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _erro
         frame.stack_pointer.as_u64(),
         frame.cpu_flags,
     );
-    // Print current CR3 for debugging
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
-    crate::console_println!("[DF] CR3={:#x}", cr3);
-    // Print current task info
     let current = crate::sched::CURRENT_RUNNING.load(core::sync::atomic::Ordering::Relaxed);
-    crate::console_println!("[DF] CURRENT_RUNNING={}", current);
+    crate::console_println!("[DF] CR3={:#x} CURRENT_RUNNING={}", cr3, current);
     loop {}
 }
 
@@ -840,13 +831,6 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         if from_user {
             let pid = crate::process::current_pid();
             // User-mode unhandled PF — terminate the process (segfault)
-            crate::console_println!(
-                "[PF] USER SEGFAULT pid={} fault={:#x} rip={:#x} err={:#x}",
-                pid,
-                fault_addr_val,
-                rip,
-                error_code
-            );
             crate::syscall::sys_exit(99);
             loop {}
         } else {
