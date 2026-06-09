@@ -1074,20 +1074,6 @@ pub fn add_clone_process(
         let ctx = trap_ctx_base as *mut crate::arch::trap::TrapContext;
         *ctx = parent_ctx.clone();
 
-        // Debug: validate parent's TrapContext.rip
-        let parent_rip = parent_ctx.rip;
-        if parent_rip < 0x400000 {
-            crate::console_println!(
-                "[clone] WARNING: parent_rip={:#x} is below 0x400000! TrapContext may be corrupted!",
-                parent_rip
-            );
-            // Dump first 8 words of parent's TrapContext
-            let p = parent_ctx as *const crate::arch::trap::TrapContext as *const u64;
-            for i in 0..8 {
-                crate::console_println!("  parent_ctx[{}] = {:#x}", i, unsafe { *p.add(i) });
-            }
-        }
-
         // Modifications for clone child:
         (*ctx).rax = 0; // Child returns 0 from clone
         (*ctx).rsp = new_user_sp as u64; // Use new user stack
@@ -1098,15 +1084,6 @@ pub fn add_clone_process(
         // load this into r15 register (overwriting __switch's r15). Both paths
         // need to agree on the TLS value.
         (*ctx).r15 = tls as u64;
-        // Debug: print child's TrapContext.rip to verify
-        crate::console_println!(
-            "[clone] child TrapContext: rip={:#x} rsp={:#x} r8={:#x} r9={:#x} r12={:#x}",
-            (*ctx).rip,
-            (*ctx).rsp,
-            (*ctx).r8,
-            (*ctx).r9,
-            (*ctx).r12
-        );
     }
 
     TASK_SPS[tid].store(switch_sp, Ordering::Relaxed);

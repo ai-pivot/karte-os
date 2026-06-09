@@ -518,12 +518,6 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                     }
                 })
             } else {
-                crate::console_println!(
-                    "[openat] ERR '{}' flags={:#x} err={:?}",
-                    path_str,
-                    flags,
-                    e
-                );
                 ERR_NOENT
             }
         }
@@ -979,16 +973,6 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         crate::arch::ioapic::unmask_external_irqs();
     }
 
-    // Syscall trace — print syscalls in the critical window to find capacity overflow
-    #[cfg(target_arch = "x86_64")]
-    {
-        static SC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-        let n = SC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n > 200 {
-            crate::console_println!("[sc] #{} id={}", n, id);
-        }
-    }
-
     // Try Linux compat layer first.
     let result = if let Some(translation) = linux::translate(id, args) {
         match translation {
@@ -999,14 +983,6 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
         dispatch_inner(id, args)
     };
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        static SC2: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-        let n2 = SC2.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n2 > 200 {
-            crate::console_println!("[sc] #{} id={} -> {}", n2, id, result);
-        }
-    }
     result
 }
 
@@ -1532,7 +1508,6 @@ fn linux_mmap(
         s
     };
     if len == 0 {
-        crate::console_println!("[mmap] EINVAL: len=0");
         return -22; // EINVAL
     }
 
@@ -2551,15 +2526,6 @@ fn sys_unlink(path: usize, path_len: usize) -> isize {
     };
     let name = resolve_path(&name);
 
-    // Debug: log unlink for SQLite-related files
-    if name.contains("xbot")
-        || name.contains(".db")
-        || name.contains("shm")
-        || name.contains("wal")
-        || name.contains("journal")
-    {
-        crate::console_println!("[unlink] '{}'", name);
-    }
 
     // Try to delete from VFS/ext4/RamFS. If the file doesn't exist,
     // still return success — SQLite's WAL mode cleanup tries to delete
@@ -3060,10 +3026,6 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
     let mut proc = if crate::driver::ext4::has_ext4() {
         let read_opt = crate::driver::ext4::read_file_range(&name);
-        crate::console_println!(
-            "[exec] read_file_range returned {}",
-            if read_opt.is_some() { "Some" } else { "None" }
-        );
         match read_opt {
             Some(read_fn) => {
                 match crate::process::Process::from_elf_streaming(read_fn, argv, envp, 0) {
@@ -3949,7 +3911,6 @@ pub const TERM_ECHO_OFF: usize = 3; // Disable echo
 ///   cmd=TIOCGWINSZ: Returns (cols << 16 | rows) packed into usize
 pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
     // Log all ioctl calls for debugging TUI init
-    crate::console_println!("[ioctl] fd={} cmd={:#x} arg={:#x}", fd, cmd, arg);
     if fd != 0 && fd != 1 {
         return ERR_INVAL;
     }
@@ -4430,12 +4391,10 @@ fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) 
     }
 
     let resolved = crate::syscall::resolve_path(path_str);
-    crate::console_println!("[mkdirat] '{}' -> resolved='{}'", path_str, resolved);
 
     match crate::driver::ext4::create_directory(&resolved) {
         Ok(()) => 0,
         Err(e) => {
-            crate::console_println!("[mkdirat] FAILED '{}' err={}", path_str, e);
             -1 // EPERM
         }
     }

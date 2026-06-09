@@ -178,7 +178,6 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
             }
         }
 
-        crate::console_println!("[copy_km] done PDP copy, mapping VGA...");
         // Map VGA text buffer at 0xB8000 (needed for console_putchar in trap path)
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xB9000, 0xB9000, vmm::PTEFlags::KRW);
@@ -560,8 +559,6 @@ impl Process {
             let is_executable = seg.flags & 1 != 0; // PF_X
             let num_pages = (page_end - page_start) / page_size;
 
-            crate::console_print!("[ELF] seg {} {} pages\n", seg_idx, num_pages);
-
             for vaddr in (page_start..page_end).step_by(page_size) {
                 // Always allocate a fresh frame for ELF segments.
                 // Do NOT reuse identity-mapped frames (from copy_kernel_mappings),
@@ -596,9 +593,6 @@ impl Process {
                 };
 
                 total_pages += 1;
-                if total_pages % 2000 == 0 {
-                    crate::console_print!("[ELF] {} pages mapped\n", total_pages);
-                }
 
                 // Determine what portion of this page comes from the file
                 let copy_start = core::cmp::max(vaddr, seg_vaddr_start);
@@ -634,8 +628,7 @@ impl Process {
             if seg.vaddr + seg.mem_size > max_vaddr {
                 max_vaddr = seg.vaddr + seg.mem_size;
             }
-            crate::console_print!("[ELF] seg {} done, total_pages={}\n", seg_idx, total_pages);
-        }
+        } // end for seg_idx
 
         // 6. Map user stack in user page table (URW, no execute)
         // Map from USER_STACK_TOP downward for USER_STACK_PAGES.

@@ -514,56 +514,7 @@ unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
         };
         crate::process::set_trap_ctx_ptr(&mut ctx as *mut _ as usize);
 
-        // Debug: trace r14 for clone syscall to diagnose "morestack on g0"
-        if syscall_nr == 56 && crate::process::current_pid() >= 2 {}
-
-        // Debug: trace clone syscall — print user_rip (RCX) to verify TrapContext
-        if syscall_nr == 56 {
-            crate::console_println!(
-                "[sys:clone] user_rip={:#x} user_rsp_from_stack={:#x} saved_rbx_orig={:#x}",
-                user_rip,
-                user_rsp,
-                saved_rbx
-            );
-        }
-        // Debug: trace eventfd writes (nr=1) and eventfd2 (nr=290)
-        if syscall_nr == 1 && a0 >= 200 {
-            static SWDBG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            let n = SWDBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 10 {
-                crate::console_println!("[sys:wr] fd={} buf={:#x} len={}", a0, a1, a2);
-            }
-        }
-        if syscall_nr == 290 {
-            crate::console_println!("[sys:eventfd2] initval={} flags={}", a0, a1);
-        }
-        // Trace futex operations
-        if syscall_nr == 202 {
-            static FUTDBG: core::sync::atomic::AtomicUsize =
-                core::sync::atomic::AtomicUsize::new(0);
-            let n = FUTDBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 30 {
-                crate::console_println!(
-                    "[sys:futex] uaddr={:#x} op={} val={} a3={:#x}",
-                    a0,
-                    a1,
-                    a2,
-                    a3
-                );
-            }
-        }
-        // Trace epoll_pwait returns
-        if syscall_nr == 281 {
-            static EPDBG: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            let n = EPDBG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 20 {
-                crate::console_println!("[sys:epoll_pwait] epfd={}", a0);
-            }
-        }
-
         let result = crate::syscall::dispatch_syscall_linux(syscall_nr, a0, a1, a2, a3, a4, a5);
-
-        if syscall_nr == 56 && crate::process::current_pid() >= 2 {}
 
         crate::process::set_trap_ctx_ptr(0);
 
@@ -580,7 +531,7 @@ extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
     );
 }
 
-extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
+extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _error_code: u64) -> ! {
     // Switch to kernel CR3 for reliable output
     let kcr3 = crate::mm::vmm::kernel_cr3();
     if kcr3 != 0 {
@@ -588,25 +539,26 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
             core::arch::asm!("mov cr3, {}", in(reg) kcr3);
         }
     }
-    // WARNING: The InterruptStackFrame fields are shifted by 8 bytes relative
-    // to the actual CPU push order. The `error_code` parameter contains the
-    // actual RIP of the faulting context.
-    // Real layout:  [SS, RSP, RFLAGS, CS, RIP] ← pushed by CPU
-    // What we get:  error_code=RIP, instruction_pointer=CS, code_segment=RFLAGS,
-    //                cpu_flags=RSP, stack_pointer=SS
-    let actual_rip = error_code;
-    let actual_cs = frame.instruction_pointer.as_u64();
-    let actual_rflags = frame.code_segment.0 as u64;
-    let actual_rsp = frame.cpu_flags;
-    let actual_ss = frame.stack_pointer.as_u64();
+    // NOTE: error_code is always 0 for double faults on x86_64.
+    // InterruptStackFrame fields are correctly parsed by x86-interrupt ABI:
+    //   instruction_pointer = actual RIP
+    //   code_segment = actual CS
+    //   cpu_flags = actual RFLAGS
+    //   stack_pointer = actual RSP (of the faulting context)
     crate::console_println!(
-        "[DF] RIP={:#x} CS={:#x} RSP={:#x} SS={:#x} RFLAGS={:#x}",
-        actual_rip,
-        actual_cs,
-        actual_rsp,
-        actual_ss,
-        actual_rflags
+        "[DF] RIP={:#x} CS={:#x} RSP={:#x} RFLAGS={:#x}",
+        frame.instruction_pointer.as_u64(),
+        frame.code_segment.0 as u64,
+        frame.stack_pointer.as_u64(),
+        frame.cpu_flags,
     );
+    // Print current CR3 for debugging
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+    crate::console_println!("[DF] CR3={:#x}", cr3);
+    // Print current task info
+    let current = crate::sched::CURRENT_RUNNING.load(core::sync::atomic::Ordering::Relaxed);
+    crate::console_println!("[DF] CURRENT_RUNNING={}", current);
     loop {}
 }
 

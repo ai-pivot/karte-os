@@ -682,18 +682,8 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                 return Some(Translation::Handled(super::ERR_NOENT));
             }
             #[cfg(target_arch = "x86_64")]
-            if path_len < 100 {
-                let name = super::read_user_path(path_ptr, path_len);
-                if let Some(ref n) = name {
-                    if n.contains("xbot")
-                        || n.contains("session")
-                        || n.contains(".db")
-                        || n.contains("shm")
-                        || n.contains("wal")
-                    {
-                        crate::console_println!("[openat:compat] '{}' flags={:#x}", n, flags);
-                    }
-                }
+            {
+                let _ = (path_ptr, path_len, flags); // suppress unused warnings
             }
             Some(Translation::Dispatch {
                 karte_nr: super::SYS_OPEN,

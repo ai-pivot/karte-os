@@ -260,11 +260,6 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
                         match walk_path(&*mount.fs, parent_path) {
                             Ok(inode) => inode,
                             Err(e) => {
-                                crate::console_println!(
-                                    "[vfs] O_CREAT parent '{}' walk err={:?}",
-                                    parent_path,
-                                    e
-                                );
                                 return Err(e);
                             }
                         }
@@ -277,22 +272,11 @@ pub fn open(path: &str, flags: u32) -> Result<usize, VfsError> {
                         Ok(vfs_fd)
                     }
                     Err(e) => {
-                        crate::console_println!(
-                            "[vfs] O_CREAT create_file '{}' err={:?}",
-                            file_name,
-                            e
-                        );
                         Err(VfsError::IoError)
                     }
                 }
             } else {
-                crate::console_println!(
-                    "[vfs] open '{}' walk_err={:?} flags={:#x} no O_CREAT",
-                    relative_path,
-                    walk_err,
-                    flags
-                );
-                Err(walk_err)
+                Err(VfsError::NotFound)
             }
         }
     }
