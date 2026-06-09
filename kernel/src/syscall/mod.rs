@@ -263,6 +263,14 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
         1 => {
             let result = sys_write(args[0] as i32, args[1], args[2]);
+            // Validate write return: must be 0..len or negative errno
+            let len = args[2];
+            if result > 0 && (result as usize) > len {
+                crate::console_println!(
+                    "[write] BAD RETURN: fd={} len={} got={:#x}",
+                    args[0], len, result
+                );
+            }
             result
         }
         2 => linux_open(args[0], args[1], args[2]), // open (deprecated, use openat)
@@ -1573,7 +1581,7 @@ fn linux_mmap(
     static MMAP_DEBUG_COUNT: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
     let debug_count = MMAP_DEBUG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if debug_count < 30 {
+    if debug_count < 5 {
         crate::console_println!(
             "[mmap] #{} addr={:#x} len={:#x} prot={} flags={:#x} -> {:#x}",
             debug_count,

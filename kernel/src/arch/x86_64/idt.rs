@@ -678,6 +678,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         core::arch::asm!("rdmsr", "shl rdx, 32", "or rdx, rax", out("edx") fs_base, out("eax") _, in("ecx") 0xC0000100u32)
     };
     if !from_user {
+        // Kernel PF — always print (these are serious)
         crate::console_println!(
             "[PF] KERN addr={:#x} rip={:#x} cr3={:#x}",
             fault_addr_val,
@@ -685,55 +686,12 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             raw_cr3
         );
     } else {
-        // Extra debug for very-low-RIP faults (clone issue)
-        let extra = if rip < 0x400000 {
-            // Dump stack for diagnosis
-            let rsp_pages = rsp_val & !0xFFF;
-            let stack_ok = rsp_pages > 0x1000 && rsp_pages < 0x800000000000;
-            crate::console_println!(
-                "[PF] USER LOW-RIP! addr={:#x} rip={:#x} pid={} slot={} fs_base={:#x} rsp={:#x} err={} stack_ok={}",
-                fault_addr_val,
-                rip,
-                crate::process::current_pid(),
-                crate::sched::current_running_slot(),
-                fs_base,
-                rsp_val,
-                error_code,
-                stack_ok
-            );
-            if stack_ok {
-                // Dump 8 words at RSP
-                for i in 0..8 {
-                    let val = unsafe { *((rsp_val + i * 8) as *const u64) };
-                    crate::console_println!("  [rsp+{:#x}] = {:#x}", i * 8, val);
-                }
-            }
-            // Also dump the kernel stack TrapContext to see what rip was set to
-            let ksp = crate::arch::idt::get_syscall_ksp();
-            if ksp > 0 {
-                let ctx = ksp as *const u64;
-                // TrapContext: rax(0),rbx(8),rcx(16),rdx(24),rbp(32),rsi(40),rdi(48),
-                //   r8(56),r9(64),r10(72),r11(80),r12(88),r13(96),r14(104),r15(112),
-                //   rip(120),cs(128),rflags(136),rsp(144),ss(152)
-                let tc_rip = unsafe { *ctx.add(120 / 8) };
-                let tc_rsp = unsafe { *ctx.add(144 / 8) };
-                let tc_r8 = unsafe { *ctx.add(56 / 8) };
-                let tc_r9 = unsafe { *ctx.add(64 / 8) };
-                let tc_r15 = unsafe { *ctx.add(112 / 8) };
-                crate::console_println!(
-                    "  TC: rip={:#x} rsp={:#x} r8={:#x} r9={:#x} r15={:#x}",
-                    tc_rip,
-                    tc_rsp,
-                    tc_r8,
-                    tc_r9,
-                    tc_r15
-                );
-            }
-            true
-        } else {
-            false
-        };
-        if !extra {
+        // User PF — rate-limit logging. Go's mmap lazy allocation triggers
+        // thousands of PFs; printing each one to UART causes severe slowdown.
+        static PF_LOG_COUNT: core::sync::atomic::AtomicUsize =
+            core::sync::atomic::AtomicUsize::new(0);
+        let n = PF_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
             crate::console_println!(
                 "[PF] USER addr={:#x} rip={:#x} pid={} fs_base={:#x}",
                 fault_addr_val,
@@ -852,26 +810,21 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         unsafe {
             core::arch::asm!("mov {}, cr3", out(reg) cr3);
         }
-        let (dbg_rax, dbg_rip) = unsafe { (CLONE_DBG_RAX, CLONE_DBG_RIP) };
         if from_user {
             let pid = crate::process::current_pid();
+            // User-mode unhandled PF — terminate the process (segfault)
             crate::console_println!(
-                "[PF] pid={} fault={:#x} err={:#x} CR3={:#x} dbg_rax={:#x} dbg_rip={:#x}",
+                "[PF] USER SEGFAULT pid={} fault={:#x} rip={:#x} err={:#x}",
                 pid,
                 fault_addr_val,
-                error_code,
-                cr3,
-                dbg_rax,
-                dbg_rip
+                rip,
+                error_code
             );
-            let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys() & !0xFFF;
-            let current_cr3 = cr3 & !0xFFF;
-            if current_cr3 != kernel_cr3 as u64 {
-                crate::syscall::sys_exit(99);
-            }
+            crate::syscall::sys_exit(99);
             loop {}
         } else {
-            // Read RSP0 for debugging
+            // Kernel PF — fatal
+            let (dbg_rax, dbg_rip) = unsafe { (CLONE_DBG_RAX, CLONE_DBG_RIP) };
             let mut rsp0: u64 = 0;
             unsafe {
                 let rsp0_ptr = crate::arch::gdt::TSS_RSP0_ADDR;
@@ -880,19 +833,13 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 }
             }
             crate::console_println!(
-                "[PF] KERNEL fault={:#x} err={:#x} CR3={:#x} RSP0={:#x} dbg_rax={:#x} dbg_rip={:#x}",
+                "[PF] KERN FATAL fault={:#x} rip={:#x} err={:#x} CR3={:#x} RSP0={:#x}",
                 fault_addr_val,
+                rip,
                 error_code,
                 cr3,
-                rsp0,
-                dbg_rax,
-                dbg_rip
+                rsp0
             );
-            let kernel_cr3_val = crate::arch::idt::get_kernel_cr3_phys() & !0xFFF;
-            let current_cr3_val = cr3 & !0xFFF;
-            if current_cr3_val != kernel_cr3_val as u64 {
-                crate::syscall::sys_exit(99);
-            }
             loop {}
         }
     }
