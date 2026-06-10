@@ -715,16 +715,17 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
     let fault_addr = x86_64::registers::control::Cr2::read();
     let fault_addr_val = fault_addr.map(|a| a.as_u64()).unwrap_or(0) as usize;
 
-    // Read raw CPU-pushed frame values
     // Read CPU interrupt frame from known stack offsets:
-    // ISR stub pushes 9 regs (9×8 = 72 bytes), then CPU pushed error_code + iretq frame
+    // ISR stub pushes: user_cr3, then 9 regs (9×8 = 72 bytes).
+    // Above that: CPU-pushed error_code + iretq frame.
+    // Total offset from stack_ptr to error_code = 72 (regs) + 8 (user_cr3) = 80.
     let sp = stack_ptr as usize;
-    let error_code = unsafe { *((sp + 72) as *const u64) };
-    let rip = unsafe { *((sp + 80) as *const u64) };
-    let cs = unsafe { *((sp + 88) as *const u64) };
-    let rflags = unsafe { *((sp + 96) as *const u64) };
-    let rsp_val = unsafe { *((sp + 104) as *const u64) };
-    let ss = unsafe { *((sp + 112) as *const u64) };
+    let error_code = unsafe { *((sp + 80) as *const u64) };
+    let rip = unsafe { *((sp + 88) as *const u64) };
+    let cs = unsafe { *((sp + 96) as *const u64) };
+    let rflags = unsafe { *((sp + 104) as *const u64) };
+    let rsp_val = unsafe { *((sp + 112) as *const u64) };
+    let ss = unsafe { *((sp + 120) as *const u64) };
 
     let from_user = cs & 0x3 != 0;
     let page_size = crate::mm::pmm::page_size();
