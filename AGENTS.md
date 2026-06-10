@@ -6,72 +6,31 @@
 
 ### RISC-V 64 (primary)
 ```bash
-make build          # Build kernel (cargo build --release)
-make run            # Run in QEMU (single core)
-make debug          # Run with GDB stub (-S -s)
+make                # Build & run on RISC-V (default)
+make shell          # Build all + deploy programs + run — ONE COMMAND
+make deploy         # Create disk.img + deploy all user programs
 make test           # Build test kernel + run tests in QEMU
-make build-test     # Build test kernel only
-make boot-test      # Boot test (normal mode, verifies init sequence)
 make clean          # Clean all artifacts
-cd user && make     # Build user programs (hello.elf, shell.elf, ls/cat/echo/mkdir/rm/env/pwd/grep/sed/wc/head/tail.elf)
-tools/mkdisk.sh init  # Create 64MB FAT32 disk.img
-tools/mkdisk.sh put <file>  # Copy host file to disk (accessible in OS)
-tools/mkdisk.sh list   # List files on disk
+
+# Disk image management:
+tools/mkdisk.sh deploy          # Create disk + install all programs
+tools/mkdisk.sh put <file>      # Copy host file to disk
+tools/mkdisk.sh get <file>      # Copy file from disk to host
+tools/mkdisk.sh list            # List files on disk
+
+# Host shared folder:
+make share-riscv HOST_DIR=/tmp/share
 ```
 
 ### x86_64 (secondary)
 ```bash
-cd user && make ARCH=x86_64 clean && make ARCH=x86_64  # Build user programs for x86_64
-touch user/hello.elf user/heap_test.elf user/file_test.elf user/spawn_test.elf  # Stubs for cfg-gated includes
-cargo +nightly build --release --target x86_64-unknown-none -p karte-os-kernel -Z build-std=core,alloc
-mkdir -p target/x86_64-iso/boot/grub
-cp target/x86_64-unknown-none/release/karte-os-kernel target/x86_64-iso/boot/karte-os-kernel
-cat > target/x86_64-iso/boot/grub/grub.cfg << 'EOF'
-set timeout=0
-set default=0
-menuentry "KarteOS" {
-    multiboot2 /boot/karte-os-kernel
-    boot
-}
-EOF
-grub-mkrescue -o target/karte-os-x86_64.iso target/x86_64-iso
+make shell-x86      # Build all + deploy programs + run — ONE COMMAND
+make iso-x86        # Build ISO + deploy all programs (production build)
+make deploy-x86     # Create disk.img + deploy all x86_64 programs
+make test-x86       # Run x86_64 tests in QEMU
 
-# Run with AHCI/SATA (recommended for xbot testing, requires 512M RAM):
-qemu-system-x86_64 -machine pc -cpu qemu64 -m 512M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot \
-    -drive file=disk.img,format=raw,if=none,id=hd0 -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0
-
-# x86_64 xbot test — build kernel + ISO + run xbot-cli-static with output captured to file:
-rm -f /tmp/qemu-serial.sock
-cd /home/user/src/karte-os
-qemu-system-x86_64 -machine pc -cpu qemu64 -m 512M \
-    -cdrom target/karte-os-x86_64.iso \
-    -chardev socket,id=s0,path=/tmp/qemu-serial.sock,server=on,wait=off \
-    -serial chardev:s0 \
-    -display none -no-reboot \
-    -drive file=disk.img,format=raw,if=none,id=hd0 \
-    -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 &
-QEMU_PID=$!
-sleep 6  # wait for boot
-python3 -c "
-import socket, time
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect('/tmp/qemu-serial.sock')
-time.sleep(1)
-s.send(b'xbot-cli-static\n')
-time.sleep(10)
-output = b''
-s.settimeout(1)
-while True:
-    try:
-        data = s.recv(4096)
-        if not data: break
-        output += data
-    except: break
-open('/tmp/qemu-xbot.log', 'wb').write(output)
-s.close()
-"
-kill $QEMU_PID 2>/dev/null; wait $QEMU_PID 2>/dev/null
-cat /tmp/qemu-xbot.log  # view output
+# Host shared folder:
+make share-x86 HOST_DIR=/tmp/share
 ```
 
 QEMU exit: `Ctrl+A` then `X`.

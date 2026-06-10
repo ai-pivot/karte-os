@@ -4,6 +4,9 @@
 # Usage:
 #   ./tools/mkdisk.sh init          # Create a new 64MB ext4 disk.img
 #   ./tools/mkdisk.sh init-fat32    # Create a new 64MB FAT32 disk.img
+#   ./tools/mkdisk.sh deploy        # Create disk + deploy ALL user programs
+#   ./tools/mkdisk.sh deploy-riscv  # Deploy RISC-V user programs to disk
+#   ./tools/mkdisk.sh deploy-x86    # Deploy x86_64 user programs to disk
 #   ./tools/mkdisk.sh format        # Format existing disk.img as ext4
 #   ./tools/mkdisk.sh format-fat32  # Format existing disk.img as FAT32
 #   ./tools/mkdisk.sh list          # List files on disk.img
@@ -17,46 +20,128 @@ set -e
 DISK="${DISK:-disk.img}"
 SIZE="${SIZE:-64}"  # MB
 MOUNT="/tmp/karteos-mnt"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 
-# ── ext4 commands ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+#  Filesystem creation
+# ═══════════════════════════════════════════════════════════════════
 
 cmd_init() {
-    echo "Creating ${SIZE}MB ext4 disk image: $DISK"
-    dd if=/dev/zero of="$DISK" bs=1M count="$SIZE" status=progress
-    mkfs.ext4 -O ^64bit -O ^has_journal -O ^metadata_csum -O ^flex_bg -O ^extra_isize -b 4096 -L karteos "$DISK"
-    echo "Done. ext4 filesystem created (block size: 4096)."
+    echo "[disk] Creating ${SIZE}MB ext4 disk image: $DISK"
+    dd if=/dev/zero of="$DISK" bs=1M count="$SIZE" status=progress 2>/dev/null
+    mkfs.ext4 -O ^64bit -O ^has_journal -O ^metadata_csum -O ^flex_bg -O ^extra_isize \
+        -b 4096 -L karteos "$DISK" >/dev/null 2>&1
+    echo "[disk] Done."
 }
 
 cmd_format() {
-    if [ ! -f "$DISK" ]; then
-        echo "Error: $DISK not found. Run 'init' first."
-        exit 1
-    fi
-    echo "Formatting $DISK as ext4 (4096-byte blocks)..."
-    mkfs.ext4 -b 4096 -L karteos "$DISK"
-    echo "Done."
+    [ -f "$DISK" ] || { echo "Error: $DISK not found."; exit 1; }
+    echo "[disk] Formatting $DISK as ext4..."
+    mkfs.ext4 -b 4096 -L karteos "$DISK" >/dev/null 2>&1
+    echo "[disk] Done."
 }
 
-# ── FAT32 commands ────────────────────────────────────────────────────
-
 cmd_init_fat32() {
-    echo "Creating ${SIZE}MB FAT32 disk image: $DISK"
-    dd if=/dev/zero of="$DISK" bs=1M count="$SIZE" status=progress
-    mkfs.vfat -F 32 "$DISK"
-    echo "Done. FAT32 filesystem created."
+    echo "[disk] Creating ${SIZE}MB FAT32 disk image: $DISK"
+    dd if=/dev/zero of="$DISK" bs=1M count="$SIZE" status=progress 2>/dev/null
+    mkfs.vfat -F 32 "$DISK" >/dev/null 2>&1
+    echo "[disk] Done."
 }
 
 cmd_format_fat32() {
-    if [ ! -f "$DISK" ]; then
-        echo "Error: $DISK not found. Run 'init' first."
-        exit 1
-    fi
-    echo "Formatting $DISK as FAT32..."
-    mkfs.vfat -F 32 "$DISK"
-    echo "Done."
+    [ -f "$DISK" ] || { echo "Error: $DISK not found."; exit 1; }
+    echo "[disk] Formatting $DISK as FAT32..."
+    mkfs.vfat -F 32 "$DISK" >/dev/null 2>&1
+    echo "[disk] Done."
 }
 
-# ── Shared commands (mount-based, works for both ext4 and FAT32) ──────
+# ═══════════════════════════════════════════════════════════════════
+#  Deploy — batch-install user programs into disk image
+# ═══════════════════════════════════════════════════════════════════
+
+# Deploy user programs for a specific architecture.
+# Strips .elf extension so shell can find them as bare commands.
+_deploy_arch() {
+    local arch="$1"
+    local user_dir="$PROJ_DIR/user"
+    local count=0
+
+    echo "[deploy] Building user programs for $arch..."
+    cd "$user_dir" && make "ARCH=$arch" clean > /dev/null 2>&1 && make "ARCH=$arch" > /dev/null 2>&1
+    cd "$PROJ_DIR"
+
+    echo "[deploy] Installing $arch programs into $DISK..."
+
+    local fs_type=$(_detect_fs)
+    case "$fs_type" in
+        ext*)
+            _mount
+            for elf in "$user_dir"/*.elf; do
+                [ -f "$elf" ] || continue
+                local base="$(basename "$elf" .elf)"
+                # Skip RISC-V assembly programs on x86_64 (they're empty stubs)
+                if [ "$arch" = "x86_64" ]; then
+                    case "$base" in
+                        hello|heap_test|file_test|spawn_test)
+                            # Check if it's a real binary (not an empty stub)
+                            local size
+                            size=$(stat -c%s "$elf" 2>/dev/null || echo "0")
+                            [ "$size" -lt 100 ] && continue
+                            ;;
+                    esac
+                fi
+                sudo cp "$elf" "$MOUNT/$base"
+                count=$((count + 1))
+            done
+            sudo sync
+            _unmount
+            ;;
+        FAT*)
+            for elf in "$user_dir"/*.elf; do
+                [ -f "$elf" ] || continue
+                local base="$(basename "$elf" .elf)"
+                if [ "$arch" = "x86_64" ]; then
+                    case "$base" in
+                        hello|heap_test|file_test|spawn_test)
+                            local size
+                            size=$(stat -c%s "$elf" 2>/dev/null || echo "0")
+                            [ "$size" -lt 100 ] && continue
+                            ;;
+                    esac
+                fi
+                mcopy -i "$DISK" "$elf" "::$base" 2>/dev/null || true
+                count=$((count + 1))
+            done
+            ;;
+        *)
+            echo "Error: Unknown filesystem. Run 'init' first."
+            exit 1
+            ;;
+    esac
+    echo "[deploy] Installed $count programs ($arch)."
+}
+
+cmd_deploy() {
+    # Create disk if it doesn't exist
+    [ -f "$DISK" ] || cmd_init
+    # Deploy RISC-V by default (primary architecture)
+    _deploy_arch riscv64
+}
+
+cmd_deploy_riscv() {
+    [ -f "$DISK" ] || cmd_init
+    _deploy_arch riscv64
+}
+
+cmd_deploy_x86() {
+    [ -f "$DISK" ] || cmd_init
+    _deploy_arch x86_64
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  File operations (mount-based, works for both ext4 and FAT32)
+# ═══════════════════════════════════════════════════════════════════
 
 _mount() {
     mkdir -p "$MOUNT"
@@ -69,16 +154,11 @@ _unmount() {
 }
 
 _detect_fs() {
-    local fs_type
-    fs_type=$(file "$DISK" | grep -o 'ext[234]\|FAT\|data' | head -1)
-    echo "$fs_type"
+    file "$DISK" | grep -o 'ext[234]\|FAT\|data' | head -1
 }
 
 cmd_list() {
-    if [ ! -f "$DISK" ]; then
-        echo "Error: $DISK not found."
-        exit 1
-    fi
+    [ -f "$DISK" ] || { echo "Error: $DISK not found."; exit 1; }
     local fs_type=$(_detect_fs)
     case "$fs_type" in
         ext*)
@@ -90,11 +170,9 @@ cmd_list() {
             ;;
         FAT*)
             echo "Files on $DISK (FAT32):"
-            mdir -i "$DISK" :: 2>/dev/null || echo "(empty or not formatted)"
+            mdir -i "$DISK" :: 2>/dev/null || echo "(empty)"
             ;;
         *)
-            echo "Files on $DISK:"
-            # Try mount-based approach
             _mount 2>/dev/null && {
                 ls -la "$MOUNT" 2>/dev/null || echo "(empty)"
                 _unmount
@@ -104,101 +182,80 @@ cmd_list() {
 }
 
 cmd_put() {
-    if [ ! -f "$DISK" ]; then
-        echo "Error: $DISK not found. Run 'init' first."
-        exit 1
-    fi
+    [ -f "$DISK" ] || { echo "Error: $DISK not found. Run 'init' first."; exit 1; }
     local src="$1"
     local dst="${2:-$(basename "$src")}"
-    if [ ! -f "$src" ]; then
-        echo "Error: source file '$src' not found."
-        exit 1
-    fi
+    [ -f "$src" ] || { echo "Error: source '$src' not found."; exit 1; }
 
     local fs_type=$(_detect_fs)
     case "$fs_type" in
         ext*)
-            echo "Copying $src -> $DISK::$dst (ext4)"
+            echo "[disk] $src -> $DISK::$dst (ext4)"
             _mount
             sudo cp "$src" "$MOUNT/$dst"
             sudo sync
             _unmount
-            echo "Done. File size: $(wc -c < "$src") bytes"
             ;;
         FAT*)
-            echo "Copying $src -> $DISK::$dst (FAT32)"
+            echo "[disk] $src -> $DISK::$dst (FAT32)"
             mcopy -i "$DISK" "$src" "::$dst"
-            echo "Done. File size: $(wc -c < "$src") bytes"
             ;;
         *)
-            echo "Error: Unknown filesystem. Format disk first."
-            exit 1
+            echo "Error: Unknown filesystem."; exit 1
             ;;
     esac
+    echo "[disk] Done ($(wc -c < "$src") bytes)"
 }
 
 cmd_get() {
-    if [ ! -f "$DISK" ]; then
-        echo "Error: $DISK not found."
-        exit 1
-    fi
+    [ -f "$DISK" ] || { echo "Error: $DISK not found."; exit 1; }
     local src="$1"
     local dst="${2:-$(basename "$src")}"
 
     local fs_type=$(_detect_fs)
     case "$fs_type" in
         ext*)
-            echo "Copying $DISK::$src -> $dst (ext4)"
+            echo "[disk] $DISK::$src -> $dst (ext4)"
             _mount
             cp "$MOUNT/$src" "$dst"
             _unmount
-            echo "Done."
             ;;
         FAT*)
-            echo "Copying $DISK::$src -> $dst (FAT32)"
+            echo "[disk] $DISK::$src -> $dst (FAT32)"
             mcopy -i "$DISK" "::$src" "$dst"
-            echo "Done."
             ;;
         *)
-            echo "Error: Unknown filesystem."
-            exit 1
+            echo "Error: Unknown filesystem."; exit 1
             ;;
     esac
+    echo "[disk] Done."
 }
 
 cmd_rm() {
-    if [ ! -f "$DISK" ]; then
-        echo "Error: $DISK not found."
-        exit 1
-    fi
+    [ -f "$DISK" ] || { echo "Error: $DISK not found."; exit 1; }
     local file="$1"
     local fs_type=$(_detect_fs)
     case "$fs_type" in
         ext*)
-            echo "Deleting $file from $DISK (ext4)"
+            echo "[disk] Deleting $file from $DISK (ext4)"
             _mount
             sudo rm "$MOUNT/$file"
             sudo sync
             _unmount
-            echo "Done."
             ;;
         FAT*)
-            echo "Deleting $file from $DISK (FAT32)"
+            echo "[disk] Deleting $file from $DISK (FAT32)"
             mdel -i "$DISK" "::$file"
-            echo "Done."
             ;;
         *)
-            echo "Error: Unknown filesystem."
-            exit 1
+            echo "Error: Unknown filesystem."; exit 1
             ;;
     esac
+    echo "[disk] Done."
 }
 
 cmd_info() {
-    if [ ! -f "$DISK" ]; then
-        echo "Error: $DISK not found."
-        exit 1
-    fi
+    [ -f "$DISK" ] || { echo "Error: $DISK not found."; exit 1; }
     echo "Disk image: $DISK"
     echo "Size: $(du -h "$DISK" | cut -f1)"
     echo "Type: $(file "$DISK" | cut -d: -f2 | xargs)"
@@ -219,11 +276,18 @@ cmd_info() {
     esac
 }
 
+# ═══════════════════════════════════════════════════════════════════
+#  CLI dispatch
+# ═══════════════════════════════════════════════════════════════════
+
 case "${1:-help}" in
     init)         cmd_init ;;
     init-fat32)   cmd_init_fat32 ;;
     format)       cmd_format ;;
     format-fat32) cmd_format_fat32 ;;
+    deploy)       cmd_deploy ;;
+    deploy-riscv) cmd_deploy_riscv ;;
+    deploy-x86)   cmd_deploy_x86 ;;
     list|ls)      cmd_list ;;
     put|cp)       shift; cmd_put "$@" ;;
     get)          shift; cmd_get "$@" ;;
@@ -234,11 +298,18 @@ case "${1:-help}" in
         echo ""
         echo "Usage: $0 <command> [args...]"
         echo ""
-        echo "Commands:"
-        echo "  init                 Create new ${SIZE}MB ext4 disk image (default)"
-        echo "  init-fat32           Create new ${SIZE}MB FAT32 disk image"
-        echo "  format               Format existing disk as ext4"
-        echo "  format-fat32         Format existing disk as FAT32"
+        echo "Create / Format:"
+        echo "  init                 Create ${SIZE}MB ext4 disk (default)"
+        echo "  init-fat32           Create ${SIZE}MB FAT32 disk"
+        echo "  format               Re-format as ext4"
+        echo "  format-fat32         Re-format as FAT32"
+        echo ""
+        echo "Deploy (one-command setup):"
+        echo "  deploy               Create disk + install all RISC-V programs"
+        echo "  deploy-riscv         Install RISC-V user programs into disk"
+        echo "  deploy-x86           Install x86_64 user programs into disk"
+        echo ""
+        echo "File operations:"
         echo "  list                 List files on disk"
         echo "  put <src> [dst]      Copy host file to disk"
         echo "  get <src> [dst]      Copy file from disk to host"

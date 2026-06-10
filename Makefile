@@ -1,19 +1,19 @@
 .PHONY: build run debug clean doc check build-test test boot-test smp-test \
-        shell disk user-build user-clean \
+        deploy deploy-riscv deploy-x86 user-build user-clean \
         run-riscv run-x86 build-riscv build-x86 shell-riscv shell-x86 \
-        setup-riscv setup-x86 usb-image usb-write run-9p
+        iso-riscv iso-x86 setup-riscv setup-x86 \
+        share-riscv share-x86 usb-image usb-write
 
 # ═══════════════════════════════════════════════════════════════
 #  KarteOS — Dual-Architecture Makefile
 #
-#  Quick Start:
-#    make run          → Build & run on RISC-V (default)
-#    make run-riscv    → Same as above
-#    make run-x86      → Build & run on x86_64
-#    make shell        → Build user programs + kernel + run (RISC-V)
-#    make shell-x86    → Build user programs + kernel + run (x86_64)
-#    make test         → Run RISC-V integration tests
-#    make disk         → Create disk.img (FAT32 + ext4)
+#  The simplest way to build and run:
+#
+#    make              → Build & run RISC-V (default)
+#    make iso-x86      → Build x86_64 kernel + ISO + deploy programs → run
+#    make deploy       → Create disk.img with all RISC-V programs
+#    make deploy-x86   → Create disk.img with all x86_64 programs
+#    make test-all     → Run tests on both architectures
 #
 #  Requirements:
 #    RISC-V:  rust stable (1.93+), qemu-system-riscv64, gcc-riscv64-linux-gnu
@@ -47,47 +47,124 @@ QEMU_X86_FLAGS := \
   -netdev user,id=net0 \
   -device virtio-net-pci,netdev=net0
 
+# Shared folder default
+HOST_DIR ?= /tmp/karteos-share
+
 # ═══════════════════════════════════════════════════════════════
-#  Disk image (auto-created if missing)
+#  Disk image — auto-created with user programs
 # ═══════════════════════════════════════════════════════════════
+
+## Create disk.img and deploy all RISC-V user programs (one command!)
+deploy: disk.img
+	@echo "[deploy] Installing RISC-V programs..."
+	@cd user && $(MAKE) ARCH=riscv64 clean > /dev/null 2>&1 && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
+	@bash tools/mkdisk.sh deploy-riscv
+
+## Create disk.img and deploy all x86_64 user programs
+deploy-x86: disk.img
+	@echo "[deploy] Installing x86_64 programs..."
+	@cd user && $(MAKE) ARCH=x86_64 clean > /dev/null 2>&1 && $(MAKE) ARCH=x86_64 > /dev/null 2>&1
+	@bash tools/mkdisk.sh deploy-x86
+
+## Create empty disk.img if missing
 disk.img:
 	@echo "[disk] Creating 64MB disk image..."
-	@tools/mkdisk.sh init
-	@echo "[disk] Done. Use 'tools/mkdisk.sh put <file>' to add files."
+	@bash tools/mkdisk.sh init
 
 disk: disk.img
+
+# ═══════════════════════════════════════════════════════════════
+#  Internal helpers — build user programs + kernel
+# ═══════════════════════════════════════════════════════════════
+
+# Build RISC-V user programs + kernel (force rebuild for include_bytes)
+_build-riscv-kernel:
+	@cd user && $(MAKE) ARCH=riscv64 clean > /dev/null 2>&1 && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
+	@rm -f $(KERNEL_RV)
+	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
+	cargo build --release -p karte-os-kernel
+
+# Build x86_64 user programs + kernel + ISO
+_build-x86-iso:
+	@cd user && $(MAKE) ARCH=x86_64 clean > /dev/null 2>&1 && $(MAKE) ARCH=x86_64 > /dev/null 2>&1
+	@touch user/hello.elf user/heap_test.elf user/file_test.elf user/spawn_test.elf
+	@rm -f $(KERNEL_X86)
+	@rm -rf target/$(TARGET_X86)/release/.fingerprint/karte-os-kernel-*
+	cargo +nightly build --release --target $(TARGET_X86) -p karte-os-kernel -Z build-std=core,alloc
+	@mkdir -p $(ISO_DIR)/boot/grub
+	@cp $(KERNEL_X86) $(ISO_DIR)/boot/karte-os-kernel
+	@printf 'set timeout=0\nset default=0\nmenuentry "KarteOS" {\n    multiboot2 /boot/karte-os-kernel\n    boot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
+	grub-mkrescue -o $(ISO_FILE) $(ISO_DIR) 2>/dev/null
+	@echo "[x86_64] ISO ready: $(ISO_FILE)"
 
 # ═══════════════════════════════════════════════════════════════
 #  RISC-V 64 (primary, stable Rust)
 # ═══════════════════════════════════════════════════════════════
 
-## Build RISC-V kernel
+## Build RISC-V kernel only
 build-riscv:
-	@cd user && $(MAKE) ARCH=riscv64 clean && $(MAKE) ARCH=riscv64
-	@# Force kernel rebuild to pick up correct user binaries
-	@rm -f $(KERNEL_RV)
-	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
-	cargo build --release -p karte-os-kernel
+	@$(MAKE) _build-riscv-kernel
 
-## Run on RISC-V QEMU
-run-riscv: build-riscv disk.img
+## Run on RISC-V QEMU (build + run)
+run-riscv: _build-riscv-kernel disk.img
 	$(QEMU_RV) $(QEMU_RV_FLAGS) -kernel $(KERNEL_RV)
 
 ## Debug on RISC-V (GDB stub)
-debug-riscv: build-riscv disk.img
+debug-riscv: _build-riscv-kernel disk.img
 	$(QEMU_RV) $(QEMU_RV_FLAGS) -kernel $(KERNEL_RV) -S -s
 
-## Build user programs + kernel + run shell (RISC-V)
-shell-riscv: disk.img
-	@cd user && $(MAKE) ARCH=riscv64 clean && $(MAKE) ARCH=riscv64
-	@rm -f $(KERNEL_RV)
-	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
-	cargo build --release -p karte-os-kernel
+## Build + deploy + run shell (RISC-V) — the one-command experience
+shell-riscv: deploy
+	@$(MAKE) _build-riscv-kernel
 	$(QEMU_RV) $(QEMU_RV_FLAGS) -kernel $(KERNEL_RV)
 
-## Run RISC-V tests
+## Build ISO-like image for RISC-V (kernel + disk with programs)
+iso-riscv: deploy
+	@$(MAKE) _build-riscv-kernel
+	@echo "[riscv] Ready. Run: $(QEMU_RV) $(QEMU_RV_FLAGS) -kernel $(KERNEL_RV)"
+
+# ═══════════════════════════════════════════════════════════════
+#  x86_64 (secondary, nightly Rust + GRUB ISO)
+# ═══════════════════════════════════════════════════════════════
+
+## Build x86_64 kernel + ISO only (no deploy)
+build-x86:
+	@$(MAKE) _build-x86-iso
+
+## Run on x86_64 QEMU (build ISO + run)
+run-x86: _build-x86-iso disk.img
+	$(QEMU_X86) $(QEMU_X86_FLAGS)
+
+## Debug on x86_64 (GDB stub)
+debug-x86: _build-x86-iso disk.img
+	$(QEMU_X86) $(QEMU_X86_FLAGS) -S -s
+
+## Build + deploy + run shell (x86_64) — the one-command experience
+shell-x86: deploy-x86
+	@$(MAKE) _build-x86-iso
+	$(QEMU_X86) $(QEMU_X86_FLAGS)
+
+## Build ISO with all user programs deployed (x86_64) — the one-command build
+iso-x86: deploy-x86 _build-x86-iso
+	@echo "[x86_64] Complete! ISO + disk with all programs ready."
+	@echo "[x86_64] Run: make run-x86  (or make shell-x86 to rebuild+run)"
+
+# ═══════════════════════════════════════════════════════════════
+#  Default targets
+# ═══════════════════════════════════════════════════════════════
+build: build-riscv
+run:   run-riscv
+debug: debug-riscv
+shell: shell-riscv
+iso:   iso-riscv
+
+# ═══════════════════════════════════════════════════════════════
+#  Testing
+# ═══════════════════════════════════════════════════════════════
+
+## Run RISC-V integration tests (96 tests)
 test:
-	@cd user && $(MAKE) ARCH=riscv64 clean && $(MAKE) ARCH=riscv64
+	@cd user && $(MAKE) ARCH=riscv64 clean > /dev/null 2>&1 && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
 	@rm -f $(KERNEL_RV)
 	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
 	cargo build --release -p karte-os-kernel --features test_mode
@@ -96,9 +173,9 @@ test:
 	@echo "Restoring normal kernel build..."
 	@rm -f $(KERNEL_RV)
 	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
-	@cargo build --release -p karte-os-kernel
+	@cargo build --release -p karte-os-kernel > /dev/null 2>&1
 
-## Run x86_64 integration tests in QEMU
+## Run x86_64 integration tests (103 tests)
 test-x86:
 	@bash scripts/run-tests-x86_64.sh
 
@@ -107,20 +184,17 @@ test-all: test test-x86
 
 ## Build test kernel only
 build-test:
-	@$(MAKE) user-build ARCH=riscv64
+	@cd user && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
 	cargo build --release -p karte-os-kernel --features test_mode
 
 ## Boot test (verify shell starts)
-boot-test: build-riscv disk.img
+boot-test: _build-riscv-kernel disk.img
 	@echo "Running boot test..."
 	@timeout 10 $(QEMU_RV) $(QEMU_RV_FLAGS) -kernel $(KERNEL_RV) 2>&1 | grep -qa "KarteOS Shell" \
 		&& echo "Boot test passed" || echo "Boot test failed"
 
-## SMP test
-smp-test: disk.img
-	@$(MAKE) user-build ARCH=riscv64
-	@rm -f $(KERNEL_RV)
-	cargo build --release -p karte-os-kernel
+## SMP test (4 cores)
+smp-test: _build-riscv-kernel disk.img
 	@timeout 15 $(QEMU_RV) -machine virt -cpu rv64 -bios default -nographic -m 128M -smp 4 \
 		-drive id=blk0,file=disk.img,format=raw,if=none -device virtio-blk-device,drive=blk0 \
 		-netdev user,id=net0 -device virtio-net-device,netdev=net0 \
@@ -128,52 +202,22 @@ smp-test: disk.img
 		&& echo "SMP test passed" || echo "SMP test failed"
 
 # ═══════════════════════════════════════════════════════════════
-#  x86_64 (secondary, nightly Rust + GRUB ISO)
+#  Host-shared folder (virtio-9p)
 # ═══════════════════════════════════════════════════════════════
 
-## Build x86_64 kernel (needs nightly + grub-mkrescue)
-build-x86:
-	@cd user && $(MAKE) ARCH=x86_64 clean && $(MAKE) ARCH=x86_64
-	@# Create stub files for RISC-V-only assembly programs (cfg-gated out)
-	@touch user/hello.elf user/heap_test.elf user/file_test.elf user/spawn_test.elf
-	@# Force kernel rebuild to pick up new user binaries
-	@rm -f $(KERNEL_X86)
-	@rm -rf target/$(TARGET_X86)/release/.fingerprint/karte-os-kernel-*
-	cargo +nightly build --release --target $(TARGET_X86) -p karte-os-kernel -Z build-std=core,alloc
-	@mkdir -p $(ISO_DIR)/boot/grub
-	@cp $(KERNEL_X86) $(ISO_DIR)/boot/karte-os-kernel
-	@printf 'set timeout=0\nset default=0\nmenuentry "KarteOS" {\n    multiboot2 /boot/karte-os-kernel\n    boot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
-	grub-mkrescue -o $(ISO_FILE) $(ISO_DIR) 2>/dev/null
-	@echo "[x86_64] Build complete: $(ISO_FILE)"
+## Run RISC-V with host shared folder (HOST_DIR=/path/to/share)
+share-riscv: _build-riscv-kernel disk.img
+	@mkdir -p $(HOST_DIR)
+	$(QEMU_RV) $(QEMU_RV_FLAGS) -kernel $(KERNEL_RV) \
+	  -fsdev local,id=share1,path=$(HOST_DIR),security_model=none \
+	  -device virtio-9p-device,fsdev=share1,mount_tag=hostshare
 
-## Run on x86_64 QEMU
-run-x86: build-x86 disk.img
-	$(QEMU_X86) $(QEMU_X86_FLAGS)
-
-## Debug on x86_64 (GDB stub)
-debug-x86: build-x86 disk.img
-	$(QEMU_X86) $(QEMU_X86_FLAGS) -S -s
-
-## Build user programs + kernel + run shell (x86_64)
-shell-x86: disk.img
-	@cd user && $(MAKE) ARCH=x86_64 clean && $(MAKE) ARCH=x86_64
-	@touch user/hello.elf user/heap_test.elf user/file_test.elf user/spawn_test.elf
-	@rm -f $(KERNEL_X86)
-	@rm -rf target/$(TARGET_X86)/release/.fingerprint/karte-os-kernel-*
-	cargo +nightly build --release --target $(TARGET_X86) -p karte-os-kernel -Z build-std=core,alloc
-	@mkdir -p $(ISO_DIR)/boot/grub
-	@cp $(KERNEL_X86) $(ISO_DIR)/boot/karte-os-kernel
-	@printf 'set timeout=0\nset default=0\nmenuentry "KarteOS" {\n    multiboot2 /boot/karte-os-kernel\n    boot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
-	grub-mkrescue -o $(ISO_FILE) $(ISO_DIR) 2>/dev/null
-	$(QEMU_X86) $(QEMU_X86_FLAGS)
-
-# ═══════════════════════════════════════════════════════════════
-#  Default targets (RISC-V)
-# ═══════════════════════════════════════════════════════════════
-build: build-riscv
-run:   run-riscv
-debug: debug-riscv
-shell: shell-riscv
+## Run x86_64 with host shared folder (HOST_DIR=/path/to/share)
+share-x86: _build-x86-iso disk.img
+	@mkdir -p $(HOST_DIR)
+	$(QEMU_X86) $(QEMU_X86_FLAGS) \
+	  -fsdev local,id=share1,path=$(HOST_DIR),security_model=none \
+	  -device virtio-9p-pci,fsdev=share1,mount_tag=hostshare
 
 # ═══════════════════════════════════════════════════════════════
 #  Common targets
@@ -200,7 +244,7 @@ doc:
 check:
 	cargo check --release -p karte-os-kernel
 
-## Format code
+## Format all code
 fmt:
 	cargo fmt
 	@cd user && for f in *.rs; do rustfmt --edition 2024 $$f 2>/dev/null; done; true
@@ -218,65 +262,71 @@ setup-x86:
 	rustup component add rust-src --toolchain nightly
 	sudo apt-get install -y qemu-system-x86_64 grub-common xorriso
 
-## Show help
-help:
-	@echo ""
-	@echo "KarteOS — Dual-Architecture OS (RISC-V 64 + x86_64)"
-	@echo ""
-	@echo "  Quick Start:"
-	@echo "    make run          Build & run on RISC-V (default)"
-	@echo "    make run-x86      Build & run on x86_64"
-	@echo "    make shell        Build all + run interactive shell (RISC-V)"
-	@echo "    make shell-x86    Build all + run interactive shell (x86_64)"
-	@echo "    make disk         Create disk.img if missing"
-	@echo ""
-	@echo "  Testing (RISC-V):"
-	@echo "    make test         Run 70 integration tests"
-	@echo "    make boot-test    Verify boot reaches shell"
-	@echo "    make smp-test     Test with 4 CPU cores"
-	@echo ""
-	@echo "  Development:"
-	@echo "    make build-riscv  Build RISC-V kernel only"
-	@echo "    make build-x86    Build x86_64 kernel + ISO"
-	@echo "    make debug        Run with GDB stub (-S -s)"
-	@echo "    make fmt          Format all code"
-	@echo "    make clean        Remove all build artifacts"
-	@echo ""
-	@echo "  Setup (Ubuntu/Debian):"
-	@echo "    make setup-riscv  Install RISC-V toolchain"
-	@echo "    make setup-x86    Install x86_64 toolchain"
-	@echo ""
-	@echo "  Disk image tools:"
-	@echo "    tools/mkdisk.sh init          Create 64MB disk"
-	@echo "    tools/mkdisk.sh put <file>    Copy file to disk"
-	@echo "    tools/mkdisk.sh list          List files on disk"
-	@echo ""
-	@echo "  USB / Installation:"
-	@echo "    make usb-image    Create bootable USB disk image"
-	@echo "    make usb-write    Write to USB drive (set USB_DEV=/dev/sdX)"
-	@echo ""
-	@echo "  QEMU exit: Ctrl+A then X"
-	@echo ""
-
 # ═══════════════════════════════════════════════════════════════
 #  USB / Installation (x86_64)
 # ═══════════════════════════════════════════════════════════════
 
-## Create bootable USB image (512MB by default, set USB_SIZE_MB=...)
-usb-image: build-x86 disk.img
+## Create bootable USB image (set USB_SIZE_MB=... for size)
+usb-image: _build-x86-iso disk.img
 	@echo "[usb] Creating bootable USB image..."
 	sudo tools/mkusb.sh image
 	@echo "[usb] Image: target/karte-os-usb.img"
-	@echo "[usb] Write to USB: dd if=target/karte-os-usb.img of=/dev/sdX bs=4M status=progress"
+	@echo "[usb] Write: dd if=target/karte-os-usb.img of=/dev/sdX bs=4M status=progress"
 
-## Write directly to USB drive (set USB_DEV=/dev/sdX)
-usb-write: build-x86 disk.img
+## Write directly to USB drive (USB_DEV=/dev/sdX)
+usb-write: _build-x86-iso disk.img
 	@test -n "$(USB_DEV)" || (echo "Usage: make usb-write USB_DEV=/dev/sdX" && exit 1)
 	sudo tools/mkusb.sh $(USB_DEV)
 
-## Run x86_64 QEMU with virtio-9p host directory sharing
-## Usage: make run-9p HOST_DIR=/path/to/share
-run-9p: build-x86 disk.img
-	$(QEMU_X86) $(QEMU_X86_FLAGS) \
-	  -fsdev local,id=share1,path=$(HOST_DIR),security_model=none \
-	  -device virtio-9p-pci,fsdev=share1,mount_tag=hostshare
+# ═══════════════════════════════════════════════════════════════
+#  Help
+# ═══════════════════════════════════════════════════════════════
+
+## Show this help
+help:
+	@echo ""
+	@echo "╔═══════════════════════════════════════════════════════════╗"
+	@echo "║  KarteOS — Dual-Architecture OS (RISC-V 64 + x86_64)    ║"
+	@echo "╚═══════════════════════════════════════════════════════════╝"
+	@echo ""
+	@echo "  One-Command Build & Run:"
+	@echo "    make                Build & run on RISC-V (default)"
+	@echo "    make shell          Build all + deploy programs + run (RISC-V)"
+	@echo "    make shell-x86      Build all + deploy programs + run (x86_64)"
+	@echo "    make iso-x86        Build x86_64 ISO + deploy all programs"
+	@echo ""
+	@echo "  Deploy Programs to Disk:"
+	@echo "    make deploy         Create disk.img + deploy all RISC-V programs"
+	@echo "    make deploy-x86     Create disk.img + deploy all x86_64 programs"
+	@echo "    make disk           Create empty disk.img only"
+	@echo ""
+	@echo "  Host Shared Folder:"
+	@echo "    make share-riscv    Run with host dir mounted (HOST_DIR=/path)"
+	@echo "    make share-x86      Same, x86_64"
+	@echo ""
+	@echo "  Testing (199 tests total):"
+	@echo "    make test           Run RISC-V integration tests (96)"
+	@echo "    make test-x86       Run x86_64 integration tests (103)"
+	@echo "    make test-all       Run both architectures"
+	@echo "    make boot-test      Verify boot reaches shell"
+	@echo "    make smp-test       Test 4-core SMP"
+	@echo ""
+	@echo "  Development:"
+	@echo "    make build-riscv    Build RISC-V kernel only"
+	@echo "    make build-x86      Build x86_64 kernel + ISO only"
+	@echo "    make debug          Run with GDB stub (-S -s)"
+	@echo "    make fmt            Format all code"
+	@echo "    make clean          Remove all build artifacts"
+	@echo ""
+	@echo "  Disk Image Tools:"
+	@echo "    tools/mkdisk.sh deploy          One-command: disk + all programs"
+	@echo "    tools/mkdisk.sh put <file>      Copy file to disk"
+	@echo "    tools/mkdisk.sh get <file>      Copy file from disk"
+	@echo "    tools/mkdisk.sh list            List files on disk"
+	@echo ""
+	@echo "  Setup (Ubuntu/Debian):"
+	@echo "    make setup-riscv    Install RISC-V toolchain"
+	@echo "    make setup-x86      Install x86_64 toolchain"
+	@echo ""
+	@echo "  QEMU exit: Ctrl+A then X"
+	@echo ""
