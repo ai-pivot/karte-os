@@ -150,16 +150,13 @@ pub fn sys_epoll_wait(
         }
     }
 
-    let output =
-        unsafe { core::slice::from_raw_parts_mut(events_ptr as *mut EpollEvent, max_events) };
-
-    // Try to collect ready events
-    let mut ready_count = 0usize;
+    // Collect ready events before writing to user memory
+    let mut ready_events: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
 
     let mut instances = EPOLL_INSTANCES.lock();
     if let Some(instance) = instances.get_mut(&epfd) {
         for (&fd, entry) in &mut instance.entries {
-            if ready_count >= max_events {
+            if ready_events.len() >= max_events {
                 break;
             }
 
@@ -197,14 +194,33 @@ pub fn sys_epoll_wait(
             entry.last_revents = revents;
 
             if revents != 0 {
-                output[ready_count].events = revents;
-                output[ready_count].data = entry.event.data;
-                ready_count += 1;
+                ready_events.push((revents, entry.event.data));
             }
         }
     }
 
+    let ready_count = ready_events.len();
     if ready_count > 0 {
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::trap::with_user_cr3(|| {
+            let output = unsafe {
+                core::slice::from_raw_parts_mut(events_ptr as *mut EpollEvent, max_events)
+            };
+            for (i, &(rev, data)) in ready_events.iter().enumerate() {
+                output[i].events = rev;
+                output[i].data = data;
+            }
+        });
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let output = unsafe {
+                core::slice::from_raw_parts_mut(events_ptr as *mut EpollEvent, max_events)
+            };
+            for (i, &(rev, data)) in ready_events.iter().enumerate() {
+                output[i].events = rev;
+                output[i].data = data;
+            }
+        }
         return ready_count as isize;
     }
 

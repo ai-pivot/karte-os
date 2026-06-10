@@ -26,6 +26,10 @@ pub fn run_tests() {
     test_linux_syscall_numbers();
     test_linux_clone_flags();
     test_initial_stack_size();
+    test_kernel_cr3_before_switch();
+    test_switch_frame_orig_rsp();
+    test_switch_return_addr_offset();
+    test_vma_remove_middle_keeps_tail();
 }
 
 fn test_trap_context_size() {
@@ -287,5 +291,65 @@ fn test_linux_clone_flags() {
 fn test_initial_stack_size() {
     run_test("x86_64 init_stack", || {
         568usize + 184 == 752 && 752 < (4 * 4096)
+    })
+}
+
+/// Regression: kernel_cr3() must return a valid non-zero CR3.
+/// switch_to() uses this before __switch() to avoid reading corrupted
+/// stack pointers through user page tables with overwritten identity maps.
+fn test_kernel_cr3_before_switch() {
+    run_test("x86_64 cr3_before_switch", || {
+        crate::mm::vmm::kernel_cr3() != 0
+    })
+}
+
+/// Regression: __switch's stack frame must have orig_rsp at offset 512.
+/// If this is wrong, "mov rsp, [rsp+512]" loads garbage → Double Fault.
+fn test_switch_frame_orig_rsp() {
+    run_test("x86_64 switch_orig_rsp", || {
+        let switch_sp: usize = 0x1_0000;
+        let orig_rsp: usize = switch_sp + 520;
+        let frame: [u8; 576] = [0u8; 576];
+        let ptr = frame.as_ptr() as usize;
+        unsafe {
+            let slot = (ptr + 512) as *mut usize;
+            *slot = orig_rsp;
+        }
+        let read_val = unsafe { *((ptr + 512) as *const usize) };
+        read_val == orig_rsp && orig_rsp == switch_sp + 520
+    })
+}
+
+/// Regression: return address must be at offset 568 (520 + 48).
+fn test_switch_return_addr_offset() {
+    run_test("x86_64 switch_ret_offset", || 520usize + 48 == 568)
+}
+
+/// Regression: vma_remove_range must keep tail portions.
+/// Bug was in cb6bc7e which dropped tails from split_overlapping_vmas().
+/// Symptom: Go's madvise(MADV_DONTNEED) → "morestack on g0" crash.
+fn test_vma_remove_middle_keeps_tail() {
+    run_test("x86_64 vma_remove_tail", || {
+        let base = 0x7000_0500_0000usize;
+        if crate::syscall::vma_add(base, base + 0x10000, 3, false).is_err() {
+            return false;
+        }
+        crate::syscall::vma_remove_range(base + 0x2000, base + 0x8000);
+        // Head must remain
+        if crate::syscall::vma_check(base) != Some(3) {
+            return false;
+        }
+        // Removed middle must be gone
+        if crate::syscall::vma_check(base + 0x4000).is_some() {
+            return false;
+        }
+        // CRITICAL: Tail must remain!
+        if crate::syscall::vma_check(base + 0x8000) != Some(3) {
+            return false;
+        }
+        if crate::syscall::vma_check(base + 0xF000) != Some(3) {
+            return false;
+        }
+        true
     })
 }

@@ -466,6 +466,27 @@ where
     result
 }
 
+/// Temporarily switch to the user page table to access user-space memory.
+/// Used by syscall handlers that run under kernel CR3 after the entry switch.
+/// MUST be called with interrupts disabled (cli) to prevent Timer ISR from
+/// changing CR3 concurrently.
+pub fn with_user_cr3<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let user_root = crate::process::current_page_table_root();
+    if user_root == 0 {
+        // No user page table — already in the right context
+        return f();
+    }
+    let user_cr3 = user_root << 12;
+    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
+    activate_page_table(user_cr3);
+    let result = f();
+    activate_page_table(kernel_cr3);
+    result
+}
+
 /// Get the user page table reference via kernel CR3 (safe for PT operations).
 /// Use this instead of `get_current_user_pt()` when you need to call map/unmap/translate.
 pub fn get_user_pt_safe() -> &'static mut crate::mm::vmm::PageTable {

@@ -960,12 +960,21 @@ impl FdTable {
                 _ => return None,
             }
         };
-        // Copy data
+        // Copy data to user buffer (with CR3 switch on x86_64)
         {
             let slot = self.fds.get(fd as usize)?;
             let desc = slot.as_ref()?;
             match &desc.fd_type {
                 FdType::FakeFile(data) => {
+                    #[cfg(target_arch = "x86_64")]
+                    crate::arch::trap::with_user_cr3(|| {
+                        for i in 0..to_read {
+                            unsafe {
+                                core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i])
+                            };
+                        }
+                    });
+                    #[cfg(not(target_arch = "x86_64"))]
                     for i in 0..to_read {
                         unsafe { core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i]) };
                     }
@@ -974,6 +983,19 @@ impl FdTable {
                     // Generate pseudo-random bytes using LCG PRNG
                     static PRNG: core::sync::atomic::AtomicU64 =
                         core::sync::atomic::AtomicU64::new(0xDEADBEEFCAFE1234);
+                    #[cfg(target_arch = "x86_64")]
+                    crate::arch::trap::with_user_cr3(|| {
+                        for i in 0..to_read {
+                            let prev = PRNG.load(core::sync::atomic::Ordering::Relaxed);
+                            let next = prev
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            PRNG.store(next, core::sync::atomic::Ordering::Relaxed);
+                            let byte = ((next >> ((i % 8) * 8)) & 0xFF) as u8;
+                            unsafe { core::ptr::write_volatile((buf + i) as *mut u8, byte) };
+                        }
+                    });
+                    #[cfg(not(target_arch = "x86_64"))]
                     for i in 0..to_read {
                         let prev = PRNG.load(core::sync::atomic::Ordering::Relaxed);
                         let next = prev

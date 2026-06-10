@@ -1303,6 +1303,11 @@ pub fn kill_clone_children(parent_pid: usize) {
                 if p.child_tid_ptr != 0 {
                     let tid_ptr = p.child_tid_ptr;
                     drop(table);
+                    #[cfg(target_arch = "x86_64")]
+                    crate::arch::trap::with_user_cr3(|| unsafe {
+                        core::ptr::write_volatile(tid_ptr as *mut i32, 0);
+                    });
+                    #[cfg(not(target_arch = "x86_64"))]
                     unsafe {
                         core::ptr::write_volatile(tid_ptr as *mut i32, 0);
                     }

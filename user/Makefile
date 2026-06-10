@@ -1,4 +1,4 @@
-ARCH ?= riscv64
+ARCH ?= x86_64
 
 ifeq ($(ARCH),riscv64)
     CROSS = riscv64-linux-gnu-

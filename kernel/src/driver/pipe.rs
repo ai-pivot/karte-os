@@ -68,6 +68,11 @@ impl Pipe {
         let to_read = core::cmp::min(len, self.data_len);
         for i in 0..to_read {
             let byte = self.buffer[self.read_pos];
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::trap::with_user_cr3(|| {
+                unsafe { core::ptr::write_volatile((buf + i) as *mut u8, byte) };
+            });
+            #[cfg(not(target_arch = "x86_64"))]
             unsafe {
                 core::ptr::write_volatile((buf + i) as *mut u8, byte);
             }

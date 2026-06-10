@@ -472,12 +472,30 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
 /// Unmap a single page from the user page table (clear PTE present bit).
 /// Returns the physical address that was mapped, or None if not mapped.
 pub fn unmap_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
-    let (pt, vpn) = walk_to_pt(root, vaddr)?;
+    let (pt, vpn) = match walk_to_pt(root, vaddr) {
+        Some(r) => r,
+        None => return None,
+    };
     let entry = pt.entries[vpn];
     if !entry.is_valid() {
         return None;
     }
     let paddr = (entry.ppn() << 12) | (vaddr & 0xFFF);
+
+    // Warn if unmap targets ELF region (0x400000..HEAP_BASE) — this usually
+    // means mmap/madvise is corrupting loaded binary data.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let heap_base = crate::process::USER_HEAP_BASE;
+        if vaddr >= 0x400000 && vaddr < heap_base {
+            crate::console_println!(
+                "[WARN] unmap_user ELF region vaddr={:#x} paddr={:#x}",
+                vaddr,
+                paddr
+            );
+        }
+    }
+
     // Clear the PTE (set to zero)
     pt.entries[vpn] = PTE(0);
     Some(paddr)

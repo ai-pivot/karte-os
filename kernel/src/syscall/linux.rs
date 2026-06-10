@@ -373,12 +373,12 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             let size = args[1]; // mask_size in bytes
             let mask_ptr = args[2] as *mut u8;
             if mask_ptr as usize != 0 && size > 0 {
-                unsafe {
-                    // Zero-fill the entire mask
+                // Zero-fill the entire mask
+                crate::arch::trap::with_user_cr3(|| unsafe {
                     core::ptr::write_bytes(mask_ptr, 0, size);
                     // Set CPU 0 as available (first byte = 0x01)
                     core::ptr::write_volatile(mask_ptr, 0x01u8);
-                }
+                });
             }
             Some(Translation::Handled(size as isize))
         }
@@ -390,11 +390,9 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             let tv_sec = (uptime_ms / 1000 + super::FAKE_EPOCH) as i64;
             let tv_usec = ((uptime_ms % 1000) * 1000) as i64;
             if args[0] != 0 {
-                let tv_ptr = args[0] as *mut i64;
-                unsafe {
-                    core::ptr::write_volatile(tv_ptr, tv_sec);
-                    core::ptr::write_volatile(tv_ptr.add(1), tv_usec);
-                }
+                let tv_ptr = args[0];
+                crate::syscall::user_write::<i64>(tv_ptr, tv_sec);
+                crate::syscall::user_write::<i64>(tv_ptr + 8, tv_usec);
             }
             // tz is ignored (obsolete)
             Some(Translation::Handled(0))
@@ -402,11 +400,9 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_CLOCK_GETTIME => {
             // clock_gettime(clockid, tp) — fake
             if args[1] != 0 {
-                let tp = args[1] as *mut u64;
-                unsafe {
-                    *tp = 0; // seconds
-                    *(tp.add(1)) = 0; // nanoseconds
-                }
+                let tp = args[1];
+                crate::syscall::user_write::<u64>(tp, 0);
+                crate::syscall::user_write::<u64>(tp + 8, 0);
             }
             Some(Translation::Handled(0))
         }
@@ -417,10 +413,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_TIME => {
             // time(tloc) — return 0
             if args[0] != 0 {
-                let tloc = args[0] as *mut u64;
-                unsafe {
-                    *tloc = 0;
-                }
+                crate::syscall::user_write::<u64>(args[0], 0);
             }
             Some(Translation::Handled(0))
         }
@@ -454,6 +447,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_SYSLOG,
             args: [args[1], args[2], 0, 0, 0, 0], // skip type arg, pass buf + len
         }),
+
         // ─── epoll / eventfd ─────────────────────────────────
         L_EPOLL_CREATE1 => {
             // Return a fake fd
@@ -519,11 +513,23 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
 }
 
 /// Count the length of a NUL-terminated string in user memory (max 256 bytes).
+/// Switches to user CR3 temporarily since syscall runs under kernel CR3.
 pub fn count_user_string(ptr: usize) -> usize {
     if ptr == 0 {
         return 0;
     }
     let mut len = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::trap::with_user_cr3(|| {
+        while len < 256 {
+            let b = unsafe { core::ptr::read_volatile((ptr + len) as *const u8) };
+            if b == 0 {
+                break;
+            }
+            len += 1;
+        }
+    });
+    #[cfg(not(target_arch = "x86_64"))]
     while len < 256 {
         let b = unsafe { core::ptr::read_volatile((ptr + len) as *const u8) };
         if b == 0 {
@@ -553,10 +559,8 @@ fn sys_getcwd(buf_ptr: usize, buf_len: usize) -> isize {
             if buf_len < 2 {
                 return super::ERR_RANGE;
             }
-            unsafe {
-                ((buf_ptr + 0) as *mut u8).write_volatile(b'/');
-                ((buf_ptr + 1) as *mut u8).write_volatile(0);
-            }
+            crate::syscall::user_write::<u8>(buf_ptr, b'/');
+            crate::syscall::user_write::<u8>(buf_ptr + 1, 0);
             return 1;
         }
     };
@@ -565,15 +569,9 @@ fn sys_getcwd(buf_ptr: usize, buf_len: usize) -> isize {
     if cwd_bytes.len() >= buf_len {
         return super::ERR_RANGE;
     }
-    for (i, &b) in cwd_bytes.iter().enumerate() {
-        unsafe {
-            ((buf_ptr + i) as *mut u8).write_volatile(b);
-        }
-    }
+    crate::syscall::user_write_bytes(buf_ptr, cwd_bytes);
     // Append null terminator
-    unsafe {
-        ((buf_ptr + cwd_bytes.len()) as *mut u8).write_volatile(0);
-    }
+    crate::syscall::user_write::<u8>(buf_ptr + cwd_bytes.len(), 0);
     cwd_bytes.len() as isize
 }
 
@@ -588,19 +586,14 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
     if info_ptr == 0 {
         return super::ERR_INVAL;
     }
-    unsafe {
-        let p = info_ptr as *mut u8;
-        // Zero out the entire struct (112 bytes)
-        for i in 0..112 {
-            (p.add(i) as *mut u8).write_volatile(0u8);
-        }
-        // totalram: 512 MB
-        (p.add(32) as *mut u64).write_volatile(512 * 1024 * 1024);
-        // freeram: 256 MB
-        (p.add(40) as *mut u64).write_volatile(256 * 1024 * 1024);
-        // mem_unit: 1
-        (p.add(104) as *mut u32).write_volatile(1u32);
-    }
+    // Zero out the entire struct (112 bytes)
+    crate::syscall::user_write_bytes(info_ptr, &[0u8; 112]);
+    // totalram: 512 MB
+    crate::syscall::user_write::<u64>(info_ptr + 32, 512 * 1024 * 1024);
+    // freeram: 256 MB
+    crate::syscall::user_write::<u64>(info_ptr + 40, 256 * 1024 * 1024);
+    // mem_unit: 1
+    crate::syscall::user_write::<u32>(info_ptr + 104, 1u32);
     0
 }
 
@@ -624,18 +617,11 @@ pub fn sys_uname(buf: usize) -> isize {
     ];
     let mut offset = 0usize;
     for field in &fields {
+        // Build a 65-byte padded buffer for this field
+        let mut padded = [0u8; 65];
         let len = field.len().min(65);
-        for i in 0..len {
-            unsafe {
-                ((buf + offset + i) as *mut u8).write_volatile(field[i]);
-            }
-        }
-        // Zero-pad remaining bytes in the 65-byte field
-        for i in len..65 {
-            unsafe {
-                ((buf + offset + i) as *mut u8).write_volatile(0u8);
-            }
-        }
+        padded[..len].copy_from_slice(&field[..len]);
+        crate::syscall::user_write_bytes(buf + offset, &padded);
         offset += 65;
     }
     0
@@ -666,21 +652,16 @@ fn sys_fstat(fd: i32, stat_ptr: usize) -> isize {
     if stat_ptr == 0 {
         return super::ERR_INVAL;
     }
-    unsafe {
-        let p = stat_ptr as *mut u8;
-        // Zero out the entire struct (144 bytes)
-        for i in 0..144 {
-            (p.add(i) as *mut u8).write_volatile(0u8);
-        }
-        // st_ino = fd + 1 (fake inode number, non-zero to be valid)
-        (p.add(8) as *mut u64).write_volatile((fd as u64).wrapping_add(1));
-        // st_nlink = 1
-        (p.add(16) as *mut u64).write_volatile(1u64);
-        // st_mode = S_IFREG | 0644 = 0x81A4
-        (p.add(24) as *mut u32).write_volatile(0x81A4u32);
-        // st_blksize = 4096
-        (p.add(56) as *mut u64).write_volatile(4096u64);
-    }
+    // Zero out the entire struct (144 bytes)
+    crate::syscall::user_write_bytes(stat_ptr, &[0u8; 144]);
+    // st_ino = fd + 1 (fake inode number, non-zero to be valid)
+    crate::syscall::user_write::<u64>(stat_ptr + 8, (fd as u64).wrapping_add(1));
+    // st_nlink = 1
+    crate::syscall::user_write::<u64>(stat_ptr + 16, 1u64);
+    // st_mode = S_IFREG | 0644 = 0x81A4
+    crate::syscall::user_write::<u32>(stat_ptr + 24, 0x81A4u32);
+    // st_blksize = 4096
+    crate::syscall::user_write::<u64>(stat_ptr + 56, 4096u64);
     0
 }
 

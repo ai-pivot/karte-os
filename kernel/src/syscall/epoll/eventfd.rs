@@ -69,6 +69,11 @@ pub fn eventfd_read(fd: i32, buf: usize, len: usize) -> isize {
         }
         *counter = 0;
         // Write the 8-byte value to user buffer
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::trap::with_user_cr3(|| unsafe {
+            core::ptr::write_volatile(buf as *mut u64, val);
+        });
+        #[cfg(not(target_arch = "x86_64"))]
         unsafe {
             core::ptr::write_volatile(buf as *mut u64, val);
         }
@@ -84,6 +89,10 @@ pub fn eventfd_write(fd: i32, buf: usize, len: usize) -> isize {
     if len < 8 {
         return -22; // EINVAL
     }
+    #[cfg(target_arch = "x86_64")]
+    let val =
+        crate::arch::trap::with_user_cr3(|| unsafe { core::ptr::read_volatile(buf as *const u64) });
+    #[cfg(not(target_arch = "x86_64"))]
     let val = unsafe { core::ptr::read_volatile(buf as *const u64) };
     if val == u64::MAX {
         return -22; // EINVAL

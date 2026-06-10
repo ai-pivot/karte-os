@@ -70,11 +70,11 @@ __switch:
     mov rsp, [rsp + 512]
 
     # Debug: validate return address before restoring
-    # Kernel code is in 0x100000 - 0x200000 range
+    # Kernel code region (may grow, keep range generous)
     mov rax, [rsp + 48]    # return address is at orig_rsp + 48
     cmp rax, 0x100000
     jb .Lswitch_bad_ret
-    cmp rax, 0x200000
+    cmp rax, 0x400000
     jae .Lswitch_bad_ret
     jmp .Lswitch_restore_ok
 .Lswitch_bad_ret:

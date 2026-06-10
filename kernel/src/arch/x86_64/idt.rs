@@ -144,17 +144,14 @@ core::arch::global_asm!(
     ".type syscall_isr_stub, @function",
     "syscall_isr_stub:",
     "cli",
+    // Switch to kernel CR3. Syscalls execute entirely in kernel address space.
+    // User memory is accessed via with_user_cr3() / UserPtr helpers.
+    "mov rcx, cr3",
+    "push rcx", // [bottom] user CR3 — restore before iretq
+    "mov rcx, [rip + KERNEL_CR3_PHYS]",
+    "mov cr3, rcx",
     // Save registers (9 slots, 72 bytes)
-    // Stack layout from rsp (growing down):
-    //   [0] = rax (syscall nr)   — last push
-    //   [1] = rax (placeholder for return value)
-    //   [2] = rdi (a0)
-    //   [3] = rsi (a1)
-    //   [4] = rdx (a2)
-    //   [5] = r8  (a4)
-    //   [6] = r9  (a5)
-    //   [7] = r10 (a3)
-    //   [8] = r11                  — first push
+    // Stack: [0]=rax(nr) [1]=rax(ret) [2]=rdi [3]=rsi [4]=rdx [5]=r8 [6]=r9 [7]=r10 [8]=r11 [9]=user_cr3
     "push r11",
     "push r10",
     "push r9",
@@ -164,13 +161,6 @@ core::arch::global_asm!(
     "push rdi",
     "push rax", // [1] placeholder for return value
     "push rax", // [0] syscall number
-    // IMPORTANT: Do NOT enable interrupts (sti) here!
-    // The Timer ISR shares the RSP0 kernel stack (via IST). If it fires
-    // between sti and the call below, its pushes will clobber our
-    // saved registers on the stack, corrupting syscall arguments.
-    // Instead, iretq will restore IF from the user-mode RFLAGS on
-    // the CPU-pushed iretq frame (user has IF=1), re-enabling
-    // interrupts when we return to Ring 3.
     "mov rdi, rsp",
     "call syscall_handler_impl",
     // Store return value at slot [1] (offset 8)
@@ -184,6 +174,9 @@ core::arch::global_asm!(
     "pop r9",     // [6]
     "pop r10",    // [7]
     "pop r11",    // [8]
+    // Restore user CR3 before returning to Ring 3
+    "pop rcx", // [9] user CR3
+    "mov cr3, rcx",
     "iretq",
     // ─── Timer ISR stub ──────────────────────────────────
     ".globl timer_isr_stub",
@@ -255,6 +248,9 @@ core::arch::global_asm!(
     //    and timer ISR uses the same SpinLock (UART) as console_println!
     //    iretq will restore RFLAGS (with IF=1) on return to user mode.
     "cli",
+    // Do NOT switch CR3 here. The user page table has kernel identity mappings
+    // (via copy_kernel_mappings). Switching CR3 would break user memory access
+    // (syscall handler needs to read user buffers for paths, data, etc.).
     "push r15",
     "push r14",
     "push r13",
@@ -275,8 +271,14 @@ core::arch::global_asm!(
     // Save original user RBX in this task's syscall frame. The global above is
     // only a bridge while switching stacks; syscalls may schedule before return.
     "push qword ptr [rip + SYSCALL_SAVED_RBX]",
-    // 5. Push placeholder for user CR3 (filled by handler)
-    "push 0", // [0] = user CR3 placeholder
+    // 5. Save user CR3 and switch to kernel CR3.
+    // The user page table's identity mapping may be corrupted by ELF loading,
+    // so we switch to the kernel page table for the entire syscall.
+    // User memory access will use with_user_cr3() helper in Rust.
+    "mov rax, cr3",
+    "push rax", // [0] = user CR3 (saved from hardware)
+    "mov rax, [rip + KERNEL_CR3_PHYS]",
+    "mov cr3, rax", // Switch to kernel page table
     // Stack layout now (rsp = state_ptr):
     //   [0]  user_cr3 (filled by handler)
     //   [1]  original user RBX
@@ -489,10 +491,11 @@ unsafe extern "C" fn restore_user_cr3() {
 ///   [15] r14  [16] r15
 #[unsafe(no_mangle)]
 unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
+    // CR3 was already switched to kernel CR3 by syscall_entry assembly.
+    // User CR3 is saved on the stack at [0] for the return path.
     unsafe {
         let s = state_ptr;
-        // CR3 was stored at [0] by handler. Return path reads it from there.
-        let user_cr3_slot = s.add(0); // will be filled below
+        let user_cr3_slot = s.add(0); // filled by assembly with actual user CR3
         let saved_rbx = *s.add(1); // original user RBX
         let user_rsp = *s.add(2); // rbx used as temporary user RSP
         let user_rip = *s.add(3); // rcx
@@ -510,15 +513,9 @@ unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
         let saved_r14 = *s.add(15); // r14
         let saved_r15 = *s.add(16); // r15
 
-        // Save user CR3 on the stack for the return path.
-        // This prevents concurrent SYSCALLs from overwriting a global variable.
-        let target_root = crate::process::current_page_table_root();
-        let cr3_val = if target_root != 0 {
-            (target_root << 12) as u64
-        } else {
-            0
-        };
-        core::ptr::write_volatile(user_cr3_slot as *mut u64, cr3_val);
+        // User CR3 was saved by syscall_entry assembly at stack slot [0].
+        // No need to write it again — the assembly return path reads [0] directly.
+        let _ = user_cr3_slot; // used by assembly return path
 
         // Build a TrapContext on the kernel stack so that linux_clone
         // can read the parent's full register state.
@@ -644,6 +641,17 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
             print_hex(rdx);
         }
         print_str(b"\n");
+        // Print CR3 for debugging
+        {
+            let cr3_val: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_val) };
+            print_str(b" CR3=");
+            print_hex(cr3_val);
+            let kc3 = crate::arch::idt::get_kernel_cr3_phys() as u64;
+            print_str(b" KC3=");
+            print_hex(kc3);
+        }
+        print_str(b"\n");
     }
     // Kernel-mode GP fault during syscall handling (e.g., page table traversal OOB).
     // If CR3 is a user page table, we can recover by terminating the offending process.
@@ -741,10 +749,41 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         }
     }
 
-    // Handle user-mode page faults with lazy allocation
+    // Handle user-mode page faults
     let handled = 'handler: {
-        // Only handle "page not present" faults (error_code bit 0 = 0).
+        // If page is present (error_code bit 0 = 1), this is a protection violation.
+        // Check if VMA allows the access and upgrade PTE permissions if needed.
         if error_code & 1 != 0 {
+            if can_lazy_alloc && from_user {
+                // Protection fault: page exists but wrong permissions.
+                // This can happen when mprotect changes permissions or when
+                // pages are re-mapped without proper user flags.
+                // Upgrade PTE to URW for any valid user address region.
+                let vma_allows = crate::syscall::vma_check(fault_addr_val).is_some();
+                let elf_region =
+                    fault_addr_val >= 0x400000 && fault_addr_val < crate::process::USER_HEAP_BASE;
+                let heap_region = fault_addr_val >= crate::process::USER_HEAP_BASE
+                    && fault_addr_val < crate::process::USER_HEAP_LIMIT;
+                let mmap_region = fault_addr_val >= crate::process::USER_MMAP_BASE
+                    && fault_addr_val < crate::process::USER_MMAP_LIMIT;
+                let stack_region = fault_addr_val >= crate::process::USER_STACK_BASE
+                    && fault_addr_val < crate::process::USER_STACK_TOP;
+
+                if vma_allows || elf_region || heap_region || mmap_region || stack_region {
+                    super::trap::with_kernel_cr3(|| {
+                        let user_pt = super::trap::get_user_pt_safe();
+                        if let Some(frame) = crate::mm::vmm::translate_user(user_pt, page_addr) {
+                            crate::mm::vmm::map(
+                                user_pt,
+                                page_addr,
+                                frame,
+                                crate::mm::vmm::PTEFlags::URW,
+                            );
+                        }
+                    });
+                    break 'handler true;
+                }
+            }
             break 'handler false;
         }
 

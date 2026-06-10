@@ -22,7 +22,7 @@ echo "---"
 # -q: 安静模式（不打印 script 自身的开始/结束消息）
 exec script -q -f -c \
   "qemu-system-x86_64 \
-    -machine pc -cpu qemu64 -m 512M \
+    -machine pc -cpu qemu64 -m 1024M \
     -cdrom target/karte-os-x86_64.iso \
     -serial stdio \
     -display none -no-reboot \

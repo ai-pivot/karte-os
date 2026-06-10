@@ -7,6 +7,9 @@
 //!   a0 = return value (>= 0 success, < 0 error)
 
 pub mod linux;
+pub mod user_ptr;
+
+pub use user_ptr::{UserPtr, UserSlice, UserSliceMut};
 
 #[cfg(target_arch = "x86_64")]
 pub mod epoll;
@@ -220,10 +223,23 @@ pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result
 }
 
 /// Remove all VMA entries overlapping [start, end).
+/// Re-inserts tail fragments (portions of VMAs outside the removed range).
 pub fn vma_remove_range(start: usize, end: usize) {
     let mut table = VMA_TABLE.lock();
-    let _tails = split_overlapping_vmas(&mut table, start, end);
-    // We don't re-insert tails — we're removing, not splitting for insertion
+    let tails = split_overlapping_vmas(&mut table, start, end);
+    for (s, e, p) in tails {
+        for i in 0..MAX_VMAS {
+            if !table[i].active {
+                table[i] = VmaRegion {
+                    start: s,
+                    end: e,
+                    prot: p,
+                    active: true,
+                };
+                break;
+            }
+        }
+    }
 }
 
 /// Update prot for all VMA entries overlapping [start, end).
@@ -247,6 +263,74 @@ pub fn vma_clear() {
 // ─── Global FD table (single-process simplification) ────────────────
 
 extern crate alloc;
+
+// ─── User memory access helpers (CR3-aware for x86_64) ──────────
+// Syscall handlers run under kernel CR3 on x86_64. These helpers
+// temporarily switch to user CR3 for accessing user-space memory.
+
+/// Read a value from user space with automatic CR3 switching on x86_64.
+#[inline]
+pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut val = T::default();
+        crate::arch::trap::with_user_cr3(|| {
+            val = unsafe { core::ptr::read_volatile(addr as *const T) };
+        });
+        val
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        core::ptr::read_volatile(addr as *const T)
+    }
+}
+
+/// Write a value to user space with automatic CR3 switching on x86_64.
+#[inline]
+pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::trap::with_user_cr3(|| {
+        unsafe { core::ptr::write_volatile(addr as *mut T, val) };
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        core::ptr::write_volatile(addr as *mut T, val)
+    }
+}
+
+/// Read a slice of bytes from user space with automatic CR3 switching on x86_64.
+#[inline]
+pub(crate) fn user_read_bytes(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec::Vec::with_capacity(len);
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::trap::with_user_cr3(|| {
+        for i in 0..len {
+            let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+            buf.push(byte);
+        }
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    for i in 0..len {
+        let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+        buf.push(byte);
+    }
+    buf
+}
+
+/// Write a slice of bytes to user space with automatic CR3 switching on x86_64.
+#[inline]
+pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::trap::with_user_cr3(|| {
+        for (i, &byte) in src.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+        }
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    for (i, &byte) in src.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+    }
+}
 
 /// Check if a path refers to a pseudo-filesystem that doesn't exist on disk.
 fn is_pseudo_path(path: &str) -> bool {
@@ -276,12 +360,24 @@ fn fill_stat_buffer(buf: &mut [u8; 144], st_mode: u32, st_size: i64, st_ino: u64
 
 /// Read a null-terminated user string from the given address.
 /// Returns the string as a Vec<u8> (without the null terminator).
+/// Switches to user CR3 temporarily since syscall runs under kernel CR3.
 fn read_user_string(addr: usize) -> Option<alloc::vec::Vec<u8>> {
     let mut buf = alloc::vec::Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::trap::with_user_cr3(|| {
+        for i in 0..4096 {
+            let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+            if byte == 0 {
+                return;
+            }
+            buf.push(byte);
+        }
+    });
+    #[cfg(not(target_arch = "x86_64"))]
     for i in 0..4096 {
         let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
         if byte == 0 {
-            return Some(buf);
+            break;
         }
         buf.push(byte);
     }
@@ -291,13 +387,31 @@ fn read_user_string(addr: usize) -> Option<alloc::vec::Vec<u8>> {
 /// Read an argv-style pointer array from user space.
 /// `ptr_array` is the address of a null-terminated array of `*const u8` pointers.
 /// Each pointer points to a null-terminated string.
+/// Switches to user CR3 temporarily since syscall runs under kernel CR3.
 fn read_user_argv(ptr_array: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
     let mut result = alloc::vec::Vec::new();
+    // First, read the pointer array under user CR3
+    let mut ptrs = alloc::vec::Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::trap::with_user_cr3(|| {
+        for i in 0..256 {
+            let ptr = unsafe { core::ptr::read_volatile((ptr_array + i * 8) as *const usize) };
+            if ptr == 0 {
+                break;
+            }
+            ptrs.push(ptr);
+        }
+    });
+    #[cfg(not(target_arch = "x86_64"))]
     for i in 0..256 {
         let ptr = unsafe { core::ptr::read_volatile((ptr_array + i * 8) as *const usize) };
         if ptr == 0 {
             break;
         }
+        ptrs.push(ptr);
+    }
+    // Then read each string
+    for ptr in ptrs {
         if let Some(s) = read_user_string(ptr) {
             result.push(s);
         } else {
@@ -312,7 +426,7 @@ fn read_user_argv(ptr_array: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
 fn read_user_envp(ptr_array: usize) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
     let mut result = alloc::vec::Vec::new();
     for i in 0..256 {
-        let ptr = unsafe { core::ptr::read_volatile((ptr_array + i * 8) as *const usize) };
+        let ptr = user_read::<usize>(ptr_array + i * 8);
         if ptr == 0 {
             break;
         }
@@ -437,6 +551,19 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
+    // TEMP: trace first 50 syscalls for debugging chroma null bytes
+    static SYSCALL_TRACE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let tc = SYSCALL_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if tc < 80 {
+        crate::console_println!(
+            "[sys] #{} nr={} a0={:#x} a1={:#x} a2={:#x}",
+            tc,
+            nr,
+            args[0],
+            args[1],
+            args[2]
+        );
+    }
     match nr {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
         1 => {
@@ -717,9 +844,7 @@ fn linux_stat(pathname: usize, statbuf: usize) -> isize {
                     };
                     let mut stat_buf = [0u8; 144];
                     fill_stat_buffer(&mut stat_buf, st_mode, meta.size as i64, ino);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(stat_buf.as_ptr(), statbuf as *mut u8, 144);
-                    }
+                    user_write_bytes(statbuf, &stat_buf[..144]);
                     return 0;
                 }
             }
@@ -728,9 +853,7 @@ fn linux_stat(pathname: usize, statbuf: usize) -> isize {
             if is_pseudo {
                 let mut stat_buf = [0u8; 144];
                 fill_stat_buffer(&mut stat_buf, 0x41FFu32, 0, 0); // S_IFDIR | 0777
-                unsafe {
-                    core::ptr::copy_nonoverlapping(stat_buf.as_ptr(), statbuf as *mut u8, 144);
-                }
+                user_write_bytes(statbuf, &stat_buf[..144]);
                 return 0;
             }
 
@@ -793,9 +916,7 @@ fn linux_fstat(fd: usize, statbuf: usize) -> isize {
 
     let mut stat_buf = [0u8; 144];
     fill_stat_buffer(&mut stat_buf, st_mode, st_size as i64, st_ino);
-    unsafe {
-        core::ptr::copy_nonoverlapping(stat_buf.as_ptr(), statbuf as *mut u8, 144);
-    }
+    user_write_bytes(statbuf, &stat_buf[..144]);
     0
 }
 
@@ -838,12 +959,7 @@ fn linux_pread64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi:
     match crate::driver::vfs::pread(fd as usize, &mut data, offset) {
         Ok(n) => {
             // Copy to user space
-            let dst = buf as *mut u8;
-            unsafe {
-                for i in 0..n {
-                    core::ptr::write_volatile(dst.add(i), data[i]);
-                }
-            }
+            user_write_bytes(buf, &data[..n]);
             return n as isize;
         }
         Err(_) => {}
@@ -862,13 +978,7 @@ fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi
     }
 
     // Read from user space into kernel buffer
-    let mut data = alloc::vec![0u8; count];
-    let src = buf as *const u8;
-    unsafe {
-        for i in 0..count {
-            data[i] = core::ptr::read_volatile(src.add(i));
-        }
-    }
+    let data = user_read_bytes(buf, count);
 
     // Try VFS pwrite (offset-based, no fd position update)
     match crate::driver::vfs::pwrite(fd as usize, &data, offset) {
@@ -963,17 +1073,14 @@ fn linux_uname(buf: usize) -> isize {
         b"x86_64\0",         // machine
         b"\0",               // domainname
     ];
-    let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 390) };
+    let mut uts_buf = [0u8; 390];
     let mut offset = 0usize;
     for field in &fields {
         let len = field.len().min(65);
-        dst[offset..offset + len].copy_from_slice(&field[..len]);
-        // Zero-fill remaining bytes
-        for i in len..65 {
-            dst[offset + i] = 0;
-        }
+        uts_buf[offset..offset + len].copy_from_slice(&field[..len]);
         offset += 65;
     }
+    user_write_bytes(buf, &uts_buf);
     0
 }
 
@@ -983,9 +1090,7 @@ fn linux_wait4(pid: usize, status_ptr: usize, options: usize) -> isize {
     // Write exit status if requested
     let result = sys_waitpid(pid);
     if result >= 0 && status_ptr != 0 {
-        unsafe {
-            *(status_ptr as *mut i32) = ((result & 0xFF) << 8) as i32; // WEXITSTATUS encoding
-        }
+        user_write::<i32>(status_ptr, ((result & 0xFF) << 8) as i32); // WEXITSTATUS encoding
     }
     let _ = options;
     result
@@ -999,9 +1104,7 @@ fn linux_getcwd(buf: usize, size: usize) -> isize {
     // Return "/" as the working directory
     let cwd = b"/\0";
     let len = cwd.len().min(size);
-    unsafe {
-        core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf as *mut u8, len);
-    }
+    user_write_bytes(buf, &cwd[..len]);
     (len - 1) as isize // return length without NUL
 }
 
@@ -1020,11 +1123,8 @@ fn linux_gettimeofday(tv: usize, _tz: usize) -> isize {
     let tv_sec = (uptime_ms / 1000 + FAKE_EPOCH) as i64;
     let tv_usec = ((uptime_ms % 1000) * 1000) as i64;
     if tv != 0 {
-        let tv_ptr = tv as *mut i64;
-        unsafe {
-            core::ptr::write_volatile(tv_ptr, tv_sec);
-            core::ptr::write_volatile(tv_ptr.add(1), tv_usec);
-        }
+        user_write::<i64>(tv, tv_sec);
+        user_write::<i64>(tv + 8, tv_usec);
     }
     0
 }
@@ -1032,9 +1132,7 @@ fn linux_gettimeofday(tv: usize, _tz: usize) -> isize {
 #[cfg(target_arch = "x86_64")]
 fn linux_time(tloc: usize) -> isize {
     if tloc != 0 {
-        unsafe {
-            *(tloc as *mut u64) = 0;
-        }
+        user_write::<u64>(tloc, 0);
     }
     0
 }
@@ -1046,11 +1144,8 @@ fn linux_clock_gettime(_clockid: usize, tp: usize) -> isize {
         let uptime_ms = crate::arch::platform::uptime_ms();
         let secs = uptime_ms / 1000;
         let nsecs = (uptime_ms % 1000) * 1_000_000;
-        let tp_ptr = tp as *mut u64;
-        unsafe {
-            *tp_ptr = secs; // seconds
-            *(tp_ptr.add(1)) = nsecs; // nanoseconds
-        }
+        user_write::<u64>(tp, secs);
+        user_write::<u64>(tp + 8, nsecs);
     }
     0
 }
@@ -1059,14 +1154,16 @@ fn linux_clock_gettime(_clockid: usize, tp: usize) -> isize {
 fn linux_sysinfo(info: usize) -> isize {
     if info != 0 {
         // struct sysinfo is ~80 bytes, zero-fill
-        unsafe {
-            core::ptr::write_bytes(info as *mut u8, 0, 80);
-            // Set some reasonable values
-            *(info as *mut u64) = 512 * 1024 / 4; // totalram (in pages, ~512MB)
-            *(info as *mut u64).add(1) = 256 * 1024 / 4; // freeram
-            *(info as *mut u64).add(3) = 1; // procs
-            *(info as *mut u64).add(12) = 4096; // mem_unit
-        }
+        crate::arch::trap::with_user_cr3(|| {
+            unsafe {
+                core::ptr::write_bytes(info as *mut u8, 0, 80);
+                // Set some reasonable values
+                *(info as *mut u64) = 512 * 1024 / 4; // totalram (in pages, ~512MB)
+                *(info as *mut u64).add(1) = 256 * 1024 / 4; // freeram
+                *(info as *mut u64).add(3) = 1; // procs
+                *(info as *mut u64).add(12) = 4096; // mem_unit
+            }
+        });
     }
     0
 }
@@ -1074,12 +1171,14 @@ fn linux_sysinfo(info: usize) -> isize {
 #[cfg(target_arch = "x86_64")]
 fn linux_sched_getaffinity(_pid: usize, size: usize, mask: usize) -> isize {
     if mask != 0 && size > 0 {
-        unsafe {
+        crate::arch::trap::with_user_cr3(|| {
             // Zero-fill the entire mask
-            core::ptr::write_bytes(mask as *mut u8, 0, size);
-            // Set CPU 0 as available (first byte = 0x01)
-            core::ptr::write_volatile(mask as *mut u8, 0x01u8);
-        }
+            unsafe {
+                core::ptr::write_bytes(mask as *mut u8, 0, size);
+            }
+        });
+        // Set CPU 0 as available (first byte = 0x01)
+        user_write::<u8>(mask, 0x01u8);
     }
     size as isize // return mask size in bytes
 }
@@ -1189,8 +1288,8 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
     if buf == 0 || len == 0 || len > 4096 {
         return ERR_INVAL;
     }
-    let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-    crate::arch::platform::print(core::str::from_utf8(data).unwrap_or("[invalid utf8]"));
+    let data = user_read_bytes(buf, len);
+    crate::arch::platform::print(core::str::from_utf8(&data).unwrap_or("[invalid utf8]"));
     len as isize
 }
 
@@ -1242,9 +1341,7 @@ pub fn sys_exit(code: i32) -> isize {
     if let Some(proc) = crate::process::current() {
         if proc.child_tid_ptr != 0 {
             let tid_ptr = proc.child_tid_ptr;
-            unsafe {
-                core::ptr::write_volatile(tid_ptr as *mut i32, 0);
-            }
+            user_write::<i32>(tid_ptr, 0);
             linux_futex(tid_ptr, 1, 1);
         }
     }
@@ -1297,7 +1394,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         Some((FdType::Stdio, _, _)) => {
             // Stdio: write to console
             for i in 0..len {
-                let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+                let byte = user_read::<u8>(buf + i);
                 crate::arch::platform::console_putchar(byte);
             }
             return len as isize;
@@ -1315,10 +1412,8 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         Some((FdType::VfsFile(vfs_fd), _, _)) => {
             // VFS file: copy user data to kernel buffer first, because
             // vfs::write() switches to kernel CR3 where user pages are inaccessible.
-            let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-            let mut kbuf = alloc::vec![0u8; len];
-            kbuf.copy_from_slice(data);
-            return match crate::driver::vfs::write(vfs_fd, &kbuf) {
+            let data = user_read_bytes(buf, len);
+            return match crate::driver::vfs::write(vfs_fd, &data) {
                 Ok(n) => {
                     crate::process::with_fd_table(|fd_table| {
                         if let Some(f) = fd_table.get_mut(fd as usize) {
@@ -1336,7 +1431,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         _ => {
             // Unknown fd — still try to write to console instead of failing
             for i in 0..len {
-                let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+                let byte = user_read::<u8>(buf + i);
                 crate::arch::platform::console_putchar(byte);
             }
             return len as isize;
@@ -1362,7 +1457,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             data.resize(end, 0);
         }
         for i in 0..len {
-            data[pos + i] = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+            data[pos + i] = user_read::<u8>(buf + i);
         }
         let _ = crate::driver::fs::write_file_owned(&name, &data);
     }
@@ -1394,9 +1489,13 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         }
         Some((FdType::Stdio, _, _)) => {
             // Stdio stdin (fd 0 default): blocking read from TTY
+            // TTY read needs to write to user memory — use intermediate buffer
+            let mut kbuf = alloc::vec![0u8; len];
             loop {
-                let result = crate::driver::tty::read(buf, len);
+                let result = crate::driver::tty::read(kbuf.as_mut_ptr() as usize, len);
                 if result > 0 {
+                    let user_buf = UserSliceMut::new(buf, len).unwrap();
+                    user_buf.copy_from_slice(&kbuf[..result as usize]);
                     return result;
                 }
                 crate::driver::tty::poll_uart();
@@ -1406,26 +1505,20 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         Some((FdType::File, _, _)) => {
             // Fall through to file read below
         }
-        Some((FdType::FakeFile(_), _, _)) => {
-            // FakeFile: read from in-memory buffer
+        Some((FdType::FakeFile(_), _, _)) | Some((FdType::Urandom, _, _)) => {
+            // FakeFile/urandom: fake_read writes to user buf via with_user_cr3
             return crate::process::with_fd_table(|fd_table| {
                 fd_table.fake_read(fd, buf, len).unwrap_or(0)
-            });
-        }
-        Some((FdType::Urandom, _, _)) => {
-            // /dev/urandom: generate random bytes
-            return crate::process::with_fd_table(|fd_table| {
-                fd_table.fake_read(fd, buf, len).unwrap_or(0)
-            });
+            }) as isize;
         }
         Some((FdType::VfsFile(vfs_fd), _, _)) => {
             // VFS file: read into kernel buffer first, then copy to user space.
-            // vfs::read() switches to kernel CR3 where user pages are inaccessible.
             let mut kbuf = alloc::vec![0u8; len];
             return match crate::driver::vfs::read(vfs_fd, &mut kbuf) {
                 Ok(n) => {
-                    let data = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-                    data[..n].copy_from_slice(&kbuf[..n]);
+                    if let Some(user_buf) = UserSliceMut::new(buf, len) {
+                        user_buf.copy_from_slice(&kbuf[..n]);
+                    }
                     crate::process::with_fd_table(|fd_table| {
                         if let Some(f) = fd_table.get_mut(fd as usize) {
                             f.pos += n;
@@ -1463,9 +1556,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         return 0; // EOF
     }
     let to_read = core::cmp::min(len, data.len() - pos);
-    for i in 0..to_read {
-        unsafe { core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i]) };
-    }
+    user_write_bytes(buf, &data[pos..pos + to_read]);
 
     // Update seek position
     crate::process::with_fd_table(|fd_table| {
@@ -2104,10 +2195,20 @@ fn linux_rt_sigaction(sig: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
     if oldact_ptr != 0 {
         // struct sigaction { handler(8), sa_mask(8), sa_flags(8), sa_restorer(8) }
         // We only record the handler; write zeros for the rest.
+        let handler_val =
+            SIGNAL_STATE.handlers[sig - 1].load(core::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::trap::with_user_cr3(|| unsafe {
+            let oldact = oldact_ptr as *mut [usize; 4];
+            (*oldact)[0] = handler_val;
+            (*oldact)[1] = 0;
+            (*oldact)[2] = 0;
+            (*oldact)[3] = 0;
+        });
+        #[cfg(not(target_arch = "x86_64"))]
         unsafe {
             let oldact = oldact_ptr as *mut [usize; 4];
-            (*oldact)[0] =
-                SIGNAL_STATE.handlers[sig - 1].load(core::sync::atomic::Ordering::Relaxed);
+            (*oldact)[0] = handler_val;
             (*oldact)[1] = 0;
             (*oldact)[2] = 0;
             (*oldact)[3] = 0;
@@ -2115,7 +2216,7 @@ fn linux_rt_sigaction(sig: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
     }
     // Set new handler if provided
     if act_ptr != 0 {
-        let handler = unsafe { core::ptr::read_volatile(act_ptr as *const usize) };
+        let handler = user_read::<usize>(act_ptr);
         SIGNAL_STATE.handlers[sig - 1].store(handler, core::sync::atomic::Ordering::Relaxed);
     }
     0
@@ -2126,16 +2227,21 @@ fn linux_rt_sigaction(sig: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
 fn linux_rt_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
     // Return old mask if requested
     if oldset_ptr != 0 && how != 3 {
+        let mask_val = SIGNAL_STATE
+            .mask
+            .load(core::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::trap::with_user_cr3(|| unsafe {
+            *(oldset_ptr as *mut u64) = mask_val;
+        });
+        #[cfg(not(target_arch = "x86_64"))]
         unsafe {
-            let oldset = oldset_ptr as *mut u64;
-            *oldset = SIGNAL_STATE
-                .mask
-                .load(core::sync::atomic::Ordering::Relaxed);
+            *(oldset_ptr as *mut u64) = mask_val;
         }
     }
     // Apply new mask if provided
     if set_ptr != 0 {
-        let new_mask = unsafe { core::ptr::read_volatile(set_ptr as *const u64) };
+        let new_mask = user_read::<u64>(set_ptr);
         match how {
             0 => {
                 // SIG_BLOCK: add signals to mask
@@ -2173,24 +2279,35 @@ fn linux_sigaltstack(ss_ptr: usize, oss_ptr: usize) -> isize {
     // Return old state if requested
     if oss_ptr != 0 {
         // struct stack_t { ss_sp(8), ss_flags(8), ss_size(8) }
+        let ss_sp = SIGNAL_STATE
+            .altstack_sp
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let ss_flags = SIGNAL_STATE
+            .altstack_flags
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let ss_size = SIGNAL_STATE
+            .altstack_size
+            .load(core::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::trap::with_user_cr3(|| unsafe {
+            let oss = oss_ptr as *mut [usize; 3];
+            (*oss)[0] = ss_sp;
+            (*oss)[1] = ss_flags;
+            (*oss)[2] = ss_size;
+        });
+        #[cfg(not(target_arch = "x86_64"))]
         unsafe {
             let oss = oss_ptr as *mut [usize; 3];
-            (*oss)[0] = SIGNAL_STATE
-                .altstack_sp
-                .load(core::sync::atomic::Ordering::Relaxed);
-            (*oss)[1] = SIGNAL_STATE
-                .altstack_flags
-                .load(core::sync::atomic::Ordering::Relaxed);
-            (*oss)[2] = SIGNAL_STATE
-                .altstack_size
-                .load(core::sync::atomic::Ordering::Relaxed);
+            (*oss)[0] = ss_sp;
+            (*oss)[1] = ss_flags;
+            (*oss)[2] = ss_size;
         }
     }
     // Set new state if provided
     if ss_ptr != 0 {
-        let ss_sp = unsafe { core::ptr::read_volatile(ss_ptr as *const usize) };
-        let ss_flags = unsafe { core::ptr::read_volatile((ss_ptr + 8) as *const usize) };
-        let ss_size = unsafe { core::ptr::read_volatile((ss_ptr + 16) as *const usize) };
+        let ss_sp = user_read::<usize>(ss_ptr);
+        let ss_flags = user_read::<usize>(ss_ptr + 8);
+        let ss_size = user_read::<usize>(ss_ptr + 16);
         SIGNAL_STATE
             .altstack_sp
             .store(ss_sp, core::sync::atomic::Ordering::Relaxed);
@@ -2210,7 +2327,6 @@ fn linux_getrandom(buf: usize, count: usize, _flags: usize) -> isize {
     if buf == 0 || count == 0 {
         return ERR_INVAL;
     }
-    let buf_ptr = buf as *mut u8;
     for i in 0..count {
         // LCG: next = state * 6364136223846793005 + 1442695040888963407
         let prev = PRNG_STATE.load(core::sync::atomic::Ordering::Relaxed);
@@ -2220,9 +2336,7 @@ fn linux_getrandom(buf: usize, count: usize, _flags: usize) -> isize {
         PRNG_STATE.store(next, core::sync::atomic::Ordering::Relaxed);
         // Use bytes from the state
         let byte = ((next >> (i % 8 * 8)) & 0xFF) as u8;
-        unsafe {
-            core::ptr::write_volatile(buf_ptr.add(i), byte);
-        }
+        user_write::<u8>(buf + i, byte);
     }
     count as isize
 }
@@ -2275,13 +2389,7 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         || name.contains("shm")
         || name.contains("wal")
     {
-        crate::console_println!(
-            "[sys_open] '{}' linux_flags={:#x} has_creat={} our_flags={:#x}",
-            name,
-            flags,
-            has_creat,
-            our_flags
-        );
+        // Silently skip debug logging for these paths
     }
 
     // Try VFS open first (supports real ext4 files with O_CREAT)
@@ -2429,14 +2537,25 @@ fn sys_waitpid(pid: usize) -> isize {
 }
 
 /// Read a byte string from user memory and strip trailing NUL bytes.
+/// Switches to user CR3 temporarily since syscall runs under kernel CR3.
 fn read_user_path(ptr: usize, len: usize) -> Option<alloc::string::String> {
     if ptr == 0 || len == 0 || len > 512 {
         return None;
     }
     let mut buf = alloc::vec::Vec::new();
-    for i in 0..len {
-        let byte = unsafe { core::ptr::read_volatile((ptr + i) as *const u8) };
-        buf.push(byte);
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::trap::with_user_cr3(|| {
+        for i in 0..len {
+            let byte = unsafe { core::ptr::read_volatile((ptr + i) as *const u8) };
+            buf.push(byte);
+        }
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        for i in 0..len {
+            let byte = unsafe { core::ptr::read_volatile((ptr + i) as *const u8) };
+            buf.push(byte);
+        }
     }
     while buf.last() == Some(&0) {
         buf.pop();
@@ -2526,18 +2645,18 @@ fn sys_ls(buf: usize, len: usize) -> isize {
             if written >= len {
                 break;
             }
-            unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b) };
+            user_write::<u8>(buf + written, b);
             written += 1;
         }
         // Tab
         if written < len {
-            unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b'\t') };
+            user_write::<u8>(buf + written, b'\t');
             written += 1;
         }
         // Size (write digits directly)
         if size == 0 {
             if written < len {
-                unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b'0') };
+                user_write::<u8>(buf + written, b'0');
                 written += 1;
             }
         } else {
@@ -2553,13 +2672,13 @@ fn sys_ls(buf: usize, len: usize) -> isize {
                 if written >= len {
                     break;
                 }
-                unsafe { core::ptr::write_volatile((buf + written) as *mut u8, tmp[j]) };
+                user_write::<u8>(buf + written, tmp[j]);
                 written += 1;
             }
         }
         // Newline
         if written < len {
-            unsafe { core::ptr::write_volatile((buf + written) as *mut u8, b'\n') };
+            user_write::<u8>(buf + written, b'\n');
             written += 1;
         }
     }
@@ -2609,19 +2728,13 @@ fn sys_setenv(key: usize, key_len: usize, val: usize, val_len: usize) -> isize {
     if key == 0 || key_len == 0 || key_len > 128 || val == 0 || val_len > 4096 {
         return ERR_INVAL;
     }
-    let mut kbuf = alloc::vec::Vec::new();
-    for i in 0..key_len {
-        kbuf.push(unsafe { core::ptr::read_volatile((key + i) as *const u8) });
-    }
+    let mut kbuf = user_read_bytes(key, key_len);
     while kbuf.last() == Some(&0) {
         kbuf.pop();
     }
     let key_str = alloc::string::String::from_utf8(kbuf).unwrap_or_default();
 
-    let mut vbuf = alloc::vec::Vec::new();
-    for i in 0..val_len {
-        vbuf.push(unsafe { core::ptr::read_volatile((val + i) as *const u8) });
-    }
+    let mut vbuf = user_read_bytes(val, val_len);
     while vbuf.last() == Some(&0) {
         vbuf.pop();
     }
@@ -2644,10 +2757,7 @@ fn sys_getenv(key: usize, key_len: usize, buf: usize, buf_len: usize) -> isize {
     if key == 0 || key_len == 0 || key_len > 128 {
         return ERR_INVAL;
     }
-    let mut kbuf = alloc::vec::Vec::new();
-    for i in 0..key_len {
-        kbuf.push(unsafe { core::ptr::read_volatile((key + i) as *const u8) });
-    }
+    let mut kbuf = user_read_bytes(key, key_len);
     while kbuf.last() == Some(&0) {
         kbuf.pop();
     }
@@ -2666,9 +2776,7 @@ fn sys_getenv(key: usize, key_len: usize, buf: usize, buf_len: usize) -> isize {
 
     if buf != 0 && buf_len > 0 {
         let copy_len = core::cmp::min(val.len(), buf_len);
-        for i in 0..copy_len {
-            unsafe { core::ptr::write_volatile((buf + i) as *mut u8, val.as_bytes()[i]) };
-        }
+        user_write_bytes(buf, &val.as_bytes()[..copy_len]);
         copy_len as isize
     } else {
         val.len() as isize
@@ -2768,7 +2876,7 @@ fn parse_sockaddr_in(addr_ptr: usize, addr_len: usize) -> Result<(u16, [u8; 4]),
         return Err(ERR_INVAL);
     }
 
-    let data = unsafe { core::slice::from_raw_parts(addr_ptr as *const u8, addr_len.min(16)) };
+    let data = user_read_bytes(addr_ptr, addr_len.min(16));
 
     // family (bytes 0-1), port (bytes 2-3, big-endian), ip (bytes 4-7, big-endian)
     let family = u16::from_le_bytes([data[0], data[1]]);
@@ -2891,7 +2999,7 @@ fn sys_sendto(
         return ERR_IO;
     }
 
-    let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+    let data = user_read_bytes(buf, len);
 
     // If destination address is provided, parse it
     let dest = if addr_ptr != 0 && addr_len >= 8 {
@@ -2908,7 +3016,7 @@ fn sys_sendto(
         None => (None, None),
     };
 
-    crate::net::iface::NetStack::send(fd as usize, data, ip, port)
+    crate::net::iface::NetStack::send(fd as usize, &data, ip, port)
 }
 
 /// Syscall 76: recvfrom(fd, buf, len, flags) → bytes_received
@@ -2921,10 +3029,13 @@ fn sys_recvfrom(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_IO;
     }
 
-    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+    let mut kbuf = alloc::vec![0u8; len];
 
-    match crate::net::iface::NetStack::recv(fd as usize, user_buf) {
-        Ok((n, _src_ip, _src_port)) => n as isize,
+    match crate::net::iface::NetStack::recv(fd as usize, &mut kbuf) {
+        Ok((n, _src_ip, _src_port)) => {
+            user_write_bytes(buf, &kbuf[..n]);
+            n as isize
+        }
         Err(e) => e,
     }
 }
@@ -2942,7 +3053,7 @@ fn sys_shutdown(fd: i32) -> isize {
     crate::net::iface::NetStack::shutdown(fd as usize)
 }
 
-/// Syscall 80: Read kernel log buffer (for dmesg).
+/// Syscall 81: Read kernel log buffer (for dmesg).
 /// `buf` = user buffer, `len` = buffer size, `offset` = read offset (0 = start).
 /// Returns number of bytes read, or negative error code.
 fn sys_syslog(buf: usize, len: usize, offset: usize) -> isize {
@@ -2950,8 +3061,9 @@ fn sys_syslog(buf: usize, len: usize, offset: usize) -> isize {
         return ERR_INVAL;
     }
 
-    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-    let read = crate::kernel_log::log_peek(user_buf, offset);
+    let mut kbuf = alloc::vec![0u8; len];
+    let read = crate::kernel_log::log_peek(&mut kbuf, offset);
+    user_write_bytes(buf, &kbuf[..read]);
     read as isize
 }
 
@@ -2968,11 +3080,7 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
     }
 
     // Read path from user memory
-    let mut path_buf = alloc::vec::Vec::new();
-    for i in 0..path_len {
-        let byte = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
-        path_buf.push(byte);
-    }
+    let mut path_buf = user_read_bytes(path, path_len);
     // Strip trailing NUL
     while path_buf.last() == Some(&0) {
         path_buf.pop();
@@ -3496,10 +3604,8 @@ fn sys_pipe(fd_ptr: usize) -> isize {
     match (read_fd, write_fd) {
         (Some(rfd), Some(wfd)) => {
             // Write fd pair to user space
-            unsafe {
-                core::ptr::write_volatile(fd_ptr as *mut i32, rfd as i32);
-                core::ptr::write_volatile((fd_ptr + 4) as *mut i32, wfd as i32);
-            }
+            user_write::<i32>(fd_ptr, rfd as i32);
+            user_write::<i32>(fd_ptr + 4, wfd as i32);
             ERR_OK
         }
         _ => {
@@ -3941,13 +4047,18 @@ pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
                         f
                     }
                 };
+                user_write::<u32>(arg, 0); // c_iflag
+                user_write::<u32>(arg + 4, 0); // c_oflag
+                user_write::<u32>(arg + 8, 0); // c_cflag
+                user_write::<u32>(arg + 12, lflag); // c_lflag
+                user_write::<u8>(arg + 16, 0); // c_line
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::trap::with_user_cr3(|| unsafe {
+                    core::ptr::write_bytes((arg + 17) as *mut u8, 0, 19);
+                });
+                #[cfg(not(target_arch = "x86_64"))]
                 unsafe {
-                    *(arg as *mut u32) = 0; // c_iflag
-                    *((arg + 4) as *mut u32) = 0; // c_oflag
-                    *((arg + 8) as *mut u32) = 0; // c_cflag
-                    *((arg + 12) as *mut u32) = lflag; // c_lflag
-                    *((arg + 16) as *mut u8) = 0; // c_line
-                    core::ptr::write_bytes((arg + 17) as *mut u8, 0, 19); // c_cc
+                    core::ptr::write_bytes((arg + 17) as *mut u8, 0, 19);
                 }
             }
             0
@@ -3958,7 +4069,7 @@ pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
             //                  c_line: u8, c_cc: [u8; 19] }
             // Parse lflag to determine mode.
             if arg != 0 {
-                let lflag = unsafe { *((arg + 12) as *const u32) };
+                let lflag = user_read::<u32>(arg + 12);
                 let icanon = (lflag & 0x0002) != 0; // ICANON
                 let echo = (lflag & 0x0008) != 0; // ECHO
                 if !icanon {
@@ -3986,12 +4097,10 @@ pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
                 }
             };
             if arg != 0 {
-                unsafe {
-                    *(arg as *mut u16) = rows as u16;
-                    *((arg + 2) as *mut u16) = cols as u16;
-                    *((arg + 4) as *mut u16) = 0; // xpixel
-                    *((arg + 6) as *mut u16) = 0; // ypixel
-                }
+                user_write::<u16>(arg, rows as u16);
+                user_write::<u16>(arg + 2, cols as u16);
+                user_write::<u16>(arg + 4, 0); // xpixel
+                user_write::<u16>(arg + 6, 0); // ypixel
             }
             0
         }
@@ -4182,9 +4291,7 @@ fn linux_clone(
 
         // CLONE_PARENT_SETTID: write child PID to parent's memory
         if (flags & 0x100000) != 0 && parent_tid_ptr != 0 {
-            unsafe {
-                core::ptr::write_volatile(parent_tid_ptr as *mut i32, child_pid as i32);
-            }
+            user_write::<i32>(parent_tid_ptr, child_pid as i32);
         }
 
         child_pid as isize
@@ -4224,7 +4331,7 @@ static FUTEX_QUEUES: SpinLock<BTreeMap<usize, Vec<FutexWaiter>>> = SpinLock::new
 fn futex_wait(uaddr: usize, expected_val: u32) -> isize {
     // 1. Volatile read of *uaddr from user space.
     //    SSTATUS.SUM is set in trap_handler, allowing S-mode to read U-mode pages.
-    let current_val = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+    let current_val = user_read::<u32>(uaddr);
     if current_val != expected_val {
         return -11; // EAGAIN: value changed, don't block
     }
@@ -4335,7 +4442,7 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
                 return EINVAL;
             }
             let val = unsafe { crate::arch::idt::rdmsr(MSR_FS_BASE) };
-            unsafe { core::ptr::write_volatile(addr as *mut u64, val) };
+            user_write::<u64>(addr, val);
             0
         }
         ARCH_GET_GS => {
@@ -4343,7 +4450,7 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
                 return EINVAL;
             }
             let val = unsafe { crate::arch::idt::rdmsr(MSR_GS_BASE) };
-            unsafe { core::ptr::write_volatile(addr as *mut u64, val) };
+            user_write::<u64>(addr, val);
             0
         }
         _ => EINVAL,
@@ -4377,12 +4484,9 @@ fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) 
     }
 
     let mut buf = [0u8; 256];
-    unsafe {
-        let src = path_ptr as *const u8;
-        for i in 0..actual_len.min(256) {
-            buf[i] = core::ptr::read_volatile(src.add(i));
-        }
-    }
+    let read_len = actual_len.min(256);
+    let user_data = user_read_bytes(path_ptr, read_len);
+    buf[..read_len].copy_from_slice(&user_data[..read_len]);
     let path_str = match core::str::from_utf8(&buf[..actual_len.min(256)]) {
         Ok(s) => s.trim_end_matches('\0'),
         Err(_) => return -22,

@@ -69,6 +69,12 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     mm::pmm::init();
     // x86_64 pmm init is done earlier (via multiboot2 or fallback)
     mm::vmm::init();
+
+    // Re-cache kernel CR3 now that VMM is initialized (the first cache
+    // during idt::init() captured 0 because KERNEL_PAGE_TABLE was null).
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::idt::cache_kernel_cr3();
+
     mm::heap::init();
 
     // ── Test mode ──

@@ -249,6 +249,20 @@ fn switch_to(current: usize, next: usize) {
     {
         let next_fs_base = TASK_FS_BASE[next].load(Ordering::Relaxed);
         crate::arch::trap::PENDING_FS_BASE.store(next_fs_base, Ordering::Relaxed);
+
+        let effective_kcr3 = {
+            let idt_val = crate::arch::idt::get_kernel_cr3_phys() as u64;
+            if idt_val != 0 {
+                idt_val
+            } else {
+                crate::mm::vmm::kernel_cr3()
+            }
+        };
+        if effective_kcr3 != 0 {
+            unsafe {
+                core::arch::asm!("mov cr3, {}", in(reg) effective_kcr3);
+            }
+        }
     }
 
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
@@ -474,7 +488,7 @@ fn build_initial_stack(init: UserTaskInit) -> usize {
         let mxcsr_ptr = (switch_sp as *mut u8).add(24) as *mut u32;
         *mxcsr_ptr = 0x1F80;
         let sw = switch_sp as *mut usize;
-        *sw.add(512 / 8) = switch_sp + 520;
+        *sw.add(512 / 8) = switch_sp + 520; // orig_rsp for __switch pop sequence
         *sw.add(568 / 8) = first_task_shim as *const () as usize;
 
         let mut ctx = crate::arch::trap::TrapContext::new_for_user(
@@ -500,7 +514,7 @@ fn build_clone_stack(init: CloneTaskInit<'_>) -> usize {
         let mxcsr_ptr = (switch_sp as *mut u8).add(24) as *mut u32;
         *mxcsr_ptr = 0x1F80;
         let sw = switch_sp as *mut usize;
-        *sw.add(512 / 8) = switch_sp + 520;
+        *sw.add(512 / 8) = switch_sp + 520; // orig_rsp for __switch pop sequence
         *sw.add(520 / 8) = init.tls;
         *sw.add(568 / 8) = first_task_shim as *const () as usize;
 
@@ -602,6 +616,7 @@ pub fn add_clone_process(
 }
 
 pub fn start_first_task() -> ! {
+    crate::console_println!("[sched] Starting first task...");
     let next = {
         let mut sched = SCHEDULER.lock();
         let next = find_next_ready_user(&sched, IDLE_SLOT).expect("no initial user task");
@@ -615,7 +630,7 @@ pub fn start_first_task() -> ! {
         LAST_SCHEDULED.store(next, Ordering::Relaxed);
         next
     };
-
+    crate::console_println!("[sched] Switching to next task: {}", next);
     switch_to(IDLE_SLOT, next);
     idle_loop()
 }
