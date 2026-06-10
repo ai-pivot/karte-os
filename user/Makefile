@@ -28,7 +28,7 @@ ASM_TARGETS =
 endif
 
 RUST_TARGETS = shell.elf ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf \
- grep.elf sed.elf wc.elf head.elf tail.elf tui-demo.elf
+ grep.elf sed.elf wc.elf head.elf tail.elf tui-demo.elf dmesg.elf
 
 TARGETS = $(ASM_TARGETS) $(RUST_TARGETS)
 
@@ -75,6 +75,9 @@ tail.elf: tail.rs syscall.rs $(LD_SCRIPT)
 
 tui-demo.elf: tui-demo.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -o $@ tui-demo.rs
+
+dmesg.elf: dmesg.rs syscall.rs $(LD_SCRIPT)
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ dmesg.rs
 
 # Assembly programs (RISC-V only)
 ifeq ($(ARCH),riscv64)

@@ -66,6 +66,7 @@ pub const SYS_ACCEPT: usize = 74; // accept(fd, addr_ptr, addr_len_ptr) → fd
 pub const SYS_SENDTO: usize = 75; // sendto(fd, buf, len, flags, addr_ptr, addr_len) → sent
 pub const SYS_RECVFROM: usize = 76; // recvfrom(fd, buf, len, flags, addr_ptr, addr_len_ptr) → received
 pub const SYS_SHUTDOWN: usize = 77; // shutdown(fd, how) → 0
+pub const SYS_SYSLOG: usize = 81; // syslog(buf, len, offset) → bytes_read
 
 // ─── Linux compatibility syscalls (translated from Linux x86_64 numbers) ──
 pub const LINUX_CLONE: usize = 100;
@@ -1149,6 +1150,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_SENDTO => sys_sendto(args[0] as i32, args[1], args[2], args[3], args[4], args[5]),
         SYS_RECVFROM => sys_recvfrom(args[0] as i32, args[1], args[2]),
         SYS_SHUTDOWN => sys_shutdown(args[0] as i32),
+        SYS_SYSLOG => sys_syslog(args[0], args[1], args[2]),
 
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
         LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
@@ -2938,6 +2940,19 @@ fn sys_shutdown(fd: i32) -> isize {
     }
 
     crate::net::iface::NetStack::shutdown(fd as usize)
+}
+
+/// Syscall 80: Read kernel log buffer (for dmesg).
+/// `buf` = user buffer, `len` = buffer size, `offset` = read offset (0 = start).
+/// Returns number of bytes read, or negative error code.
+fn sys_syslog(buf: usize, len: usize, offset: usize) -> isize {
+    if buf == 0 || len == 0 {
+        return ERR_INVAL;
+    }
+
+    let user_buf = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+    let read = crate::kernel_log::log_peek(user_buf, offset);
+    read as isize
 }
 
 /// Syscall 32: Execute (spawn) a program by file path.

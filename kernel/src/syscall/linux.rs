@@ -112,6 +112,7 @@ mod x86_64_syscalls {
     pub const L_PRLIMIT64: usize = 302;
     pub const L_GETRANDOM: usize = 318;
     pub const L_ARCH_PRCTL: usize = 158;
+    pub const L_SYSLOG: usize = 103;
     pub const L_PRCTL: usize = 157;
     pub const L_SET_ROBUST_LIST: usize = 273;
     pub const L_GET_ROBUST_LIST: usize = 274;
@@ -449,7 +450,10 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             args,
         }),
         L_PRCTL => Some(Translation::Handled(0)), // stub
-
+        L_SYSLOG => Some(Translation::Dispatch {
+            karte_nr: super::SYS_SYSLOG,
+            args: [args[1], args[2], 0, 0, 0, 0], // skip type arg, pass buf + len
+        }),
         // ─── epoll / eventfd ─────────────────────────────────
         L_EPOLL_CREATE1 => {
             // Return a fake fd

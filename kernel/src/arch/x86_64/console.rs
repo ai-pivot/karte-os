@@ -11,6 +11,9 @@ pub fn console_putchar(c: u8) {
 /// Print a raw string to the console.
 pub fn print(s: &str) {
     for byte in s.bytes() {
+        // Write to log buffer first (lock-free, never fails)
+        crate::kernel_log::log_write_byte(byte);
+        // Then write to UART + VGA
         if byte == b'\n' {
             console_putchar(b'\r');
         }
