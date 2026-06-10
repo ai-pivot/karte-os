@@ -338,18 +338,14 @@ core::arch::global_asm!(
     ".globl page_fault_isr_stub",
     ".type page_fault_isr_stub, @function",
     "page_fault_isr_stub:",
-    // NO compiler prologue — we control every instruction.
-    // Stack layout after our pushes (high→low):
-    //   SS, RSP, RFLAGS, CS, RIP, error_code, <our saves>
-
-    // Switch to kernel CR3. PF handler accesses kernel data structures
-    // (VMA table, console buffer) that require kernel page table.
-    "mov rax, cr3",
-    "push rax",             // save user CR3
-    "mov rax, [rip + KERNEL_CR3_PHYS]",
-    "cmp rax, 0",
-    "je 2f",                // skip if KERNEL_CR3_PHYS not initialized yet
-    "mov cr3, rax",
+    // Switch to kernel CR3 BEFORE touching any register saves.
+    // Use RCX as scratch (saved below). Do NOT use RAX — it holds user value.
+    "mov rcx, cr3",
+    "push rcx",             // save user CR3
+    "mov rcx, [rip + KERNEL_CR3_PHYS]",
+    "cmp rcx, 0",
+    "je 2f",                // skip if not initialized yet
+    "mov cr3, rcx",
     "2:",
 
     // Save caller-saved GP registers (9 regs)
@@ -362,10 +358,10 @@ core::arch::global_asm!(
     "push r9",
     "push r10",
     "push r11",
-    // Pass raw stack pointer to handler.
     // After 9 pushes, the stack contains:
     //   [rsp+72] error_code  [rsp+80] RIP  [rsp+88] CS
     //   [rsp+96] RFLAGS  [rsp+104] RSP  [rsp+112] SS
+    //   [rsp+120] user CR3
     "mov rdi, rsp",
     "call page_fault_handler_raw",
     // Restore GP registers
