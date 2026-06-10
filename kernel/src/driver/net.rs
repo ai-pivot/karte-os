@@ -8,8 +8,6 @@ use core::result::Result::{self, Err, Ok};
 const VIRTIO_MMIO_MAGIC: usize = 0x000;
 const VIRTIO_MMIO_VERSION: usize = 0x004;
 const VIRTIO_MMIO_DEVICE_ID: usize = 0x008;
-#[allow(dead_code)]
-const VIRTIO_MMIO_VENDOR_ID: usize = 0x00c;
 const VIRTIO_MMIO_DEVICE_FEATURES: usize = 0x010;
 const VIRTIO_MMIO_DRIVER_FEATURES: usize = 0x020;
 const VIRTIO_MMIO_GUEST_PAGE_SIZE: usize = 0x028;
@@ -50,8 +48,6 @@ const VIRTIO_MMIO_STRIDE: usize = 0x1000;
 const VIRTIO_MAX_DEVICES: usize = 8;
 
 /// VirtQueue descriptor flags
-#[allow(dead_code)]
-const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
 
 /// VirtQueue size
@@ -79,15 +75,6 @@ struct VringDesc {
     len: u32,
     flags: u16,
     next: u16,
-}
-
-/// VirtQueue available ring header (followed by `ring[queue_size]`)
-#[allow(dead_code)]
-#[repr(C)]
-struct VringAvail {
-    flags: u16,
-    idx: u16,
-    ring: [u16; 0], // dynamically sized via pointer arithmetic
 }
 
 /// VirtQueue used ring element

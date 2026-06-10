@@ -26,8 +26,6 @@ static FRAME_ALLOCATOR: Mutex<Option<FrameAllocator>> = Mutex::new(None);
 
 struct FrameAllocator {
     start: usize,
-    #[allow(dead_code)]
-    end: usize,
     // Bitmap: each bit represents one 4KB frame
     bitmap: &'static mut [u64],
     total_frames: usize,
@@ -74,7 +72,6 @@ impl FrameAllocator {
 
         let allocator = Self {
             start: managed_start,
-            end,
             bitmap,
             total_frames: managed_frames,
             next_free: bitmap_frames,
@@ -344,12 +341,17 @@ pub fn run_tests() {
         let frames: [Option<usize>; 4] =
             [alloc_frame(), alloc_frame(), alloc_frame(), alloc_frame()];
 
+        #[cfg(target_arch = "riscv64")]
+        let mem_end = MEMORY_START + MEMORY_SIZE;
+        #[cfg(target_arch = "x86_64")]
+        let mem_end = MEMORY_START + unsafe { MEMORY_SIZE };
+
         let mut valid = true;
         for f in &frames {
             match f {
                 Some(addr) => {
-                    // Should be above kernel end and below 128MB
-                    if *addr < 0x8020_0000 || *addr >= 0x8020_0000 + 128 * 1024 * 1024 {
+                    // Should be within managed physical memory range
+                    if *addr < MEMORY_START || *addr >= mem_end {
                         valid = false;
                     }
                 }

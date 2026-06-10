@@ -459,7 +459,6 @@ impl NetStack {
         let _ = stack.socket_set.remove(meta.handle);
         stack.socket_metas[fd] = None;
 
-        crate::console_println!("[net] Closed socket fd={}", fd);
         0
     }
 

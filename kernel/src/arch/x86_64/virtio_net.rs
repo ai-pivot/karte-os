@@ -4,6 +4,7 @@
 //! as virtio_blk.rs. Provides `init_net_device()`, `send_raw()`, `recv_raw()`
 //! — the same API as the RISC-V MMIO driver in `driver/net.rs`.
 
+use core::sync::atomic::{AtomicU16, Ordering};
 use x86_64::instructions::port::Port;
 
 // VirtIO Legacy register offsets
@@ -74,6 +75,12 @@ impl QueueMem {
 static mut RX_QUEUE: QueueMem = QueueMem::zeroed();
 static mut TX_QUEUE: QueueMem = QueueMem::zeroed();
 static mut NET_DEV: Option<NetDev> = None;
+
+/// Round-robin counter for TX descriptor selection.
+static TX_NEXT_DESC: AtomicU16 = AtomicU16::new(0);
+
+/// Tracks the last processed index in the RX used ring.
+static RX_LAST_SEEN_USED: AtomicU16 = AtomicU16::new(0);
 
 struct NetDev {
     io_base: u16,
@@ -214,7 +221,7 @@ fn prepare_rx() {
                 next: 0,
             };
             let avail = mem.avail_buf.as_mut_ptr() as *mut u8;
-            let avail_idx = core::ptr::read_volatile(avail.add(2) as *const u16);
+            let avail_idx = core::ptr::read_volatile(avail.add(2) as *mut u16);
             let slot = (avail_idx as usize) % QUEUE_SIZE;
             let ring_ptr = avail.add(4) as *mut u16;
             core::ptr::write_volatile(ring_ptr.add(slot), i as u16);
@@ -243,7 +250,10 @@ pub fn send_raw(data: &[u8]) {
 
     unsafe {
         let mem = tx_queue();
-        let desc_idx: usize = 0;
+
+        // Round-robin TX descriptor selection
+        let desc_idx = TX_NEXT_DESC.fetch_add(1, Ordering::Relaxed) % (QUEUE_SIZE as u16);
+        let desc_idx = desc_idx as usize;
         let buf_offset = desc_idx * NET_MAX_PACKET_SIZE;
         mem.data[buf_offset..buf_offset + VIRTIO_NET_HDR_SIZE].fill(0);
         mem.data[buf_offset + VIRTIO_NET_HDR_SIZE..buf_offset + total_len].copy_from_slice(data);
@@ -255,7 +265,7 @@ pub fn send_raw(data: &[u8]) {
             next: 0,
         };
         let avail = mem.avail_buf.as_mut_ptr() as *mut u8;
-        let avail_idx = core::ptr::read_volatile(avail.add(2) as *const u16);
+        let avail_idx = core::ptr::read_volatile(avail.add(2) as *mut u16);
         let slot = (avail_idx as usize) % QUEUE_SIZE;
         let ring_ptr = avail.add(4) as *mut u16;
         core::ptr::write_volatile(ring_ptr.add(slot), desc_idx as u16);
@@ -270,26 +280,37 @@ pub fn recv_raw(buf: &mut [u8]) -> Option<usize> {
     unsafe {
         let mem = rx_queue();
         let used_ptr = mem.used_buf.as_ptr() as *const u8;
-        let ring_base = used_ptr.add(4) as *const VringUsedElem;
-        let elem = core::ptr::read_volatile(ring_base);
-        if elem.len == 0 {
-            return None;
+
+        // Track used ring index properly
+        let last_seen = RX_LAST_SEEN_USED.load(Ordering::Acquire);
+        let used_idx = core::ptr::read_volatile(used_ptr.add(2) as *mut u16);
+        if used_idx == last_seen {
+            return None; // no new completed descriptors
         }
+
+        let slot = (last_seen as usize) % QUEUE_SIZE;
+        let ring_base = used_ptr.add(4) as *const VringUsedElem;
+        let elem = core::ptr::read_volatile(ring_base.add(slot));
+
         let total_len = elem.len as usize;
         if total_len < VIRTIO_NET_HDR_SIZE || total_len > NET_MAX_PACKET_SIZE {
+            // Advance past invalid entry
+            RX_LAST_SEEN_USED.store(last_seen.wrapping_add(1), Ordering::Release);
             return None;
         }
         let payload_len = total_len - VIRTIO_NET_HDR_SIZE;
         if payload_len > buf.len() {
+            RX_LAST_SEEN_USED.store(last_seen.wrapping_add(1), Ordering::Release);
             return None;
         }
+
         let desc_id = elem.id as usize;
         buf[..payload_len].copy_from_slice(&mem.data[VIRTIO_NET_HDR_SIZE..total_len]);
-        // Clear used entry
-        core::ptr::write_volatile(
-            ring_base as *mut VringUsedElem,
-            VringUsedElem { id: 0, len: 0 },
-        );
+
+        // Do NOT clear the used entry — VirtIO used ring is device-writes / driver-reads.
+        // Just advance our tracking index.
+        RX_LAST_SEEN_USED.store(last_seen.wrapping_add(1), Ordering::Release);
+
         // Re-queue descriptor
         let buf_offset = desc_id * NET_MAX_PACKET_SIZE;
         let buf_addr = &mem.data[buf_offset] as *const _ as u64;
@@ -300,7 +321,7 @@ pub fn recv_raw(buf: &mut [u8]) -> Option<usize> {
             next: 0,
         };
         let avail = mem.avail_buf.as_mut_ptr() as *mut u8;
-        let avail_idx = core::ptr::read_volatile(avail.add(2) as *const u16);
+        let avail_idx = core::ptr::read_volatile(avail.add(2) as *mut u16);
         let slot = (avail_idx as usize) % QUEUE_SIZE;
         let ring_ptr = avail.add(4) as *mut u16;
         core::ptr::write_volatile(ring_ptr.add(slot), desc_id as u16);

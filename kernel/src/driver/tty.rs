@@ -80,13 +80,6 @@ impl RingBuffer {
         Some(byte)
     }
 
-    #[inline]
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.tail.load(Ordering::Relaxed) == self.head.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
     fn len(&self) -> usize {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Relaxed);

@@ -11,6 +11,9 @@ pub mod linux;
 #[cfg(target_arch = "x86_64")]
 pub mod epoll;
 
+/// Fake epoch base for gettimeofday / clock_gettime (2025-06-09 00:00:00 UTC).
+const FAKE_EPOCH: u64 = 1749427200;
+
 // ─── Syscall numbers ──────────────────────────────────────────────
 
 // Level 1: Core
@@ -92,6 +95,7 @@ pub const ERR_NOENT: isize = -2; // ENOENT — No such file or directory
 pub const ERR_IO: isize = -5; // EIO — I/O error
 pub const ERR_ACCES: isize = -13; // EACCES — Permission denied
 pub const ERR_RANGE: isize = -34; // ERANGE — Result too large
+pub const ERR_INTR: isize = -4; // EINTR — Interrupted system call
 
 // ─── VMA (Virtual Memory Area) tracking ────────────────────────────
 //
@@ -427,36 +431,6 @@ pub fn dispatch_syscall_linux(
 #[cfg(target_arch = "x86_64")]
 fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
     let result = dispatch_linux_syscall(nr, args);
-    if result < 0 && nr != 4 && nr != 5 && nr != 6 && nr != 39 && nr != 3 && nr != 11 && nr != 334 {
-        // Skip stat/fstat/lstat (ENOENT is normal), close, munmap, rseq
-        let path_arg = if nr == 257 {
-            args[1]
-        } else if nr == 2 {
-            args[0]
-        } else {
-            0
-        };
-        if nr == 257 || nr == 2 {
-            let len = linux::count_user_string(path_arg);
-            if len > 0 && len <= 80 {
-                let mut b = [0u8; 80];
-                unsafe {
-                    let src = path_arg as *const u8;
-                    for i in 0..len {
-                        b[i] = core::ptr::read_volatile(src.add(i));
-                    }
-                }
-                crate::console_println!(
-                    "[syserr] nr={} ret={} path={}",
-                    nr,
-                    result,
-                    core::str::from_utf8(&b[..len]).unwrap_or("?")
-                );
-            }
-        } else {
-            crate::console_println!("[syserr] nr={} ret={}", nr, result);
-        }
-    }
     result
 }
 
@@ -485,19 +459,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         6 => linux_lstat(args[0], args[1]),         // lstat
         7 => linux_poll(args[0], args[1], args[2]), // poll
         8 => linux_lseek(args[0], args[1], args[2]), // lseek
-        9 => {
-            let r = linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]);
-            // Validate: for MAP_FIXED, return must be == addr or negative
-            if args[3] & 0x10 != 0 && r > 0 && (r as usize) != args[0] {
-                crate::console_println!(
-                    "[mmap] MAP_FIXED BUG: addr={:#x} returned={:#x} len={:#x}",
-                    args[0],
-                    r,
-                    args[1]
-                );
-            }
-            r
-        }
+        9 => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         10 => linux_mprotect(args[0], args[1], args[2]),
         11 => linux_munmap(args[0], args[1]), // munmap
         12 => sys_brk(args[0]),
@@ -533,7 +495,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         35 => linux_nanosleep(args[0], args[1]),           // nanosleep
         36 => 0,                                           // alarm (stub)
         37 => 0,                                           // setitimer (stub)
-        38 => 0,                                           // getpid... wait, Linux getpid is 39
+        38 => 0,                                           // gethostname (stub)
 
         // ─── Process management ───────────────────────────────────
         39 => sys_getpid(),                                  // getpid
@@ -605,7 +567,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
                         if fd_table.fake_truncate(fd, length) {
                             0
                         } else {
-                            0
+                            ERR_INVAL
                         }
                     }),
                     _ => {
@@ -638,7 +600,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         272 => 0,                                      // unshare (stub)
         273 => 0,                                      // set_robust_list (stub)
         274 => 0,                                      // get_robust_list (stub)
-        290 => 4isize,                                 // eventfd2 (fake fd)
+        290 => epoll::eventfd::sys_eventfd2(args[0], args[1]), // eventfd2
         232 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_wait
         233 => epoll::sys_epoll_ctl(args[0], args[1], args[2], args[3]), // epoll_ctl
         281 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_pwait (same as epoll_wait, ignoring sigmask)
@@ -647,7 +609,6 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         293 => 0,                                                                  // pipe2 (stub)
         302 => 0,                                          // prlimit64 (stub)
         285 => 0, // fallocate → success (SQLite WAL needs this)
-        302 => 0, // prctl → success
         318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
         334 => -38, // rseq → ENOSYS (Go gracefully degrades)
         435 => -38, // clone3: ENOSYS
@@ -862,7 +823,6 @@ fn linux_lseek(_fd: usize, _offset: usize, _whence: usize) -> isize {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[cfg(target_arch = "x86_64")]
 fn linux_pread64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi: usize) -> isize {
     let offset = (offset_hi as u64) << 32 | (offset_lo as u64);
     let offset = offset as usize;
@@ -915,14 +875,6 @@ fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi
         Err(_) => {}
     }
 
-    // Fallback: check if fd is stdout/stderr
-    if fd == 1 || fd == 2 {
-        for &b in &data {
-            crate::arch::uart::putchar(b);
-        }
-        return count as isize;
-    }
-
     // Fallback for non-VFS fds (pipes, etc.): ignore offset, do regular write
     sys_write(fd, buf, count)
 }
@@ -963,7 +915,7 @@ fn linux_dup2(oldfd: usize, newfd: usize) -> isize {
 #[cfg(target_arch = "x86_64")]
 fn linux_pause() -> isize {
     // Stub: pretend interrupted
-    -4 // EINTR
+    ERR_INTR
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1063,9 +1015,6 @@ fn linux_chdir(path: usize) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 fn linux_gettimeofday(tv: usize, _tz: usize) -> isize {
-    // Return fake time based on uptime.
-    // Epoch offset: 1749427200 (2025-06-09 00:00:00 UTC)
-    const FAKE_EPOCH: u64 = 1749427200;
     let uptime_ms = crate::arch::platform::uptime_ms();
     let tv_sec = (uptime_ms / 1000 + FAKE_EPOCH) as i64;
     let tv_usec = ((uptime_ms % 1000) * 1000) as i64;
@@ -1334,15 +1283,6 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         return ERR_INVAL;
     }
 
-    // Fast path for stdout/stderr
-    if fd == 1 || fd == 2 {
-        for i in 0..len {
-            let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
-            crate::arch::platform::console_putchar(byte);
-        }
-        return len as isize;
-    }
-
     let fd_info = get_fd_info(fd);
 
     match fd_info {
@@ -1495,17 +1435,6 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             };
         }
         _ => {
-            // Unknown type — if fd == 0, use TTY
-            if fd == 0 {
-                loop {
-                    let result = crate::driver::tty::read(buf, len);
-                    if result > 0 {
-                        return result;
-                    }
-                    crate::driver::tty::poll_uart();
-                    crate::sched::schedule();
-                }
-            }
             return ERR_INVAL;
         }
     }
@@ -1782,22 +1711,6 @@ fn linux_mmap(
             }
             flush_tlb_all();
         }
-    }
-
-    // Log first few mmap calls for debugging
-    static MMAP_DEBUG_COUNT: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
-    let dc = MMAP_DEBUG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if dc < 20 {
-        crate::console_println!(
-            "[mmap] #{} addr={:#x} len={:#x} prot={} flags={:#x} -> {:#x}",
-            dc,
-            addr,
-            len,
-            prot,
-            flags,
-            target_addr
-        );
     }
 
     target_addr as isize

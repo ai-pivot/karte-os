@@ -5,16 +5,11 @@ use core::fmt;
 use core::option::Option::{self, None, Some};
 use core::result::Result::Ok;
 
-#[allow(unused)]
-const UART_BASE: usize = 0x1000_0000;
-
 // Register offsets
 const THR: usize = 0; // Transmit Holding Register (write)
 const RBR: usize = 0; // Receive Buffer Register (read)
 const IER: usize = 1; // Interrupt Enable Register
 const FCR: usize = 2; // FIFO Control Register (write)
-#[allow(unused)]
-const ISR: usize = 2; // Interrupt Status Register (read)
 const LCR: usize = 3; // Line Control Register
 const MCR: usize = 4; // Modem Control Register
 const LSR: usize = 5; // Line Status Register

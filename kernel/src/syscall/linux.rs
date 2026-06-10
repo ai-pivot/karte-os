@@ -385,10 +385,8 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         // ─── Time ────────────────────────────────────────────
         L_GETTIMEOFDAY => {
             // gettimeofday(tv, tz) — return fake time based on uptime
-            // Epoch offset: 1749427200 (2025-06-09 00:00:00 UTC)
-            const FAKE_EPOCH: u64 = 1749427200;
             let uptime_ms = crate::arch::platform::uptime_ms();
-            let tv_sec = (uptime_ms / 1000 + FAKE_EPOCH) as i64;
+            let tv_sec = (uptime_ms / 1000 + super::FAKE_EPOCH) as i64;
             let tv_usec = ((uptime_ms % 1000) * 1000) as i64;
             if args[0] != 0 {
                 let tv_ptr = args[0] as *mut i64;
@@ -462,9 +460,9 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             // No events ready, return 0
             Some(Translation::Handled(0))
         }
-        L_EVENTFD2 => {
-            Some(Translation::Handled(4)) // fake fd 4
-        }
+        L_EVENTFD2 => Some(Translation::Handled(
+            crate::syscall::epoll::eventfd::sys_eventfd2(args[0], args[1]),
+        )),
 
         // ─── Misc stubs ──────────────────────────────────────
         // Note: L_POLL(7) removed — conflicts with KarteOS SYS_PIPE(7)

@@ -72,7 +72,7 @@ fn r32(b: u16, o: u16) -> u32 {
 fn w32(b: u16, o: u16, v: u32) {
     unsafe { Port::<u32>::new(b + o).write(v) }
 }
-fn aup(v: usize, a: usize) -> usize {
+fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }
 
@@ -118,8 +118,8 @@ pub fn init(io_base: u16) -> Result<(), &'static str> {
     let qs = core::cmp::min(qmax, QSZ);
 
     let desc_sz = qs * core::mem::size_of::<Desc>();
-    let total = aup(
-        desc_sz + aup(4 + qs * 2 + 2, 4) + aup(4 + qs * 8 + 2, 4),
+    let total = align_up(
+        desc_sz + align_up(4 + qs * 2 + 2, 4) + align_up(4 + qs * 8 + 2, 4),
         PAGE,
     ) + PAGE * 3;
     let np = (total + PAGE - 1) / PAGE;
@@ -131,7 +131,7 @@ pub fn init(io_base: u16) -> Result<(), &'static str> {
         core::ptr::write_bytes(base as *mut u8, 0, np * PAGE);
     }
 
-    let avail_off = aup(desc_sz, 4);
+    let avail_off = align_up(desc_sz, 4);
     unsafe {
         core::ptr::write((base + avail_off + 2) as *mut u16, 0u16);
     }
@@ -164,9 +164,9 @@ pub fn read_block(block_id: usize, buf: &mut [u8]) -> Result<(), &'static str> {
     let (base, io) = (b.qmem, b.io_base);
 
     let desc_sz = QSZ * core::mem::size_of::<Desc>();
-    let av = aup(desc_sz, 4);
-    let uv = av + aup(4 + QSZ * 2 + 2, 4);
-    let ro = uv + aup(4 + QSZ * 8 + 2, 4);
+    let av = align_up(desc_sz, 4);
+    let uv = av + align_up(4 + QSZ * 2 + 2, 4);
+    let ro = uv + align_up(4 + QSZ * 8 + 2, 4);
     let do_ = ro + PAGE;
     let so = do_ + PAGE;
 
@@ -236,9 +236,9 @@ pub fn write_block(block_id: usize, buf: &[u8]) -> Result<(), &'static str> {
     let (base, io) = (b.qmem, b.io_base);
 
     let desc_sz = QSZ * core::mem::size_of::<Desc>();
-    let av = aup(desc_sz, 4);
-    let uv = av + aup(4 + QSZ * 2 + 2, 4);
-    let ro = uv + aup(4 + QSZ * 8 + 2, 4);
+    let av = align_up(desc_sz, 4);
+    let uv = av + align_up(4 + QSZ * 2 + 2, 4);
+    let ro = uv + align_up(4 + QSZ * 8 + 2, 4);
     let do_ = ro + PAGE;
     let so = do_ + PAGE;
 

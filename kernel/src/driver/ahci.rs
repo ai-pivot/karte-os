@@ -440,16 +440,6 @@ pub fn init(abar: usize, _abar_size: usize) -> Result<(), &'static str> {
             reg_write(base, AHCI_GHC, ghc | GHC_AHCI_ENABLE);
         }
 
-        // Reset the controller (optional, helps in some environments)
-        // reg_write(base, AHCI_GHC, GHC_HBA_RESET);
-        // Wait for reset to complete
-        // for _ in 0..1000000 {
-        //     if (reg_read(base, AHCI_GHC) & GHC_HBA_RESET) == 0 { break; }
-        //     core::hint::spin_loop();
-        // }
-        // Re-enable AHCI
-        // reg_write(base, AHCI_GHC, GHC_AHCI_ENABLE);
-
         // Disable interrupts for polling mode
         reg_write(base, AHCI_GHC, reg_read(base, AHCI_GHC) & !GHC_INTR_ENABLE);
 
