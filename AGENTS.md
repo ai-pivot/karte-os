@@ -105,6 +105,7 @@ Filesystem: ext4 (preferred, via vendored `ext4_rs` crate) → FAT32 (fallback, 
 - `user/wc.rs` — Word/line/byte count (stdin or file)
 - `user/head.rs` — Output first N lines (stdin or file)
 - `user/tail.rs` — Output last N lines (stdin or file)
+- `user/dmesg.rs` — Print kernel log buffer (via sys_syslog)
 - User programs are embedded into the kernel via `include_bytes!()` at compile time
 - **Build before kernel**: `cd user && make` (or `make ARCH=x86_64`) generates `*.elf` files that the kernel references
 - **RISC-V assembly programs** (.S files) are cfg-gated and only included on riscv64
@@ -148,6 +149,8 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | 75 | sendto | (fd, buf, len, flags, addr_ptr, addr_len) — send data |
 | 76 | recvfrom | (fd, buf, len) — receive data |
 | 77 | shutdown | (fd) — close/shutdown socket |
+| 80 | ioctl | (fd, cmd, arg) — terminal I/O control (TCSETS, TIOCGWINSZ) |
+| 81 | syslog | (buf, len, offset) — read kernel log buffer (for dmesg) |
 
 ## GOTCHAS
 
@@ -155,6 +158,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **`console_println!` macro** is `#[macro_export]` — call as `crate::console_println!`
 - **sbi** 0.3.0 (NOT sbi-rt): `sbi::timer::set_timer()`, `sbi::system_reset::system_reset()`, `sbi::hsm::hart_start()`
 - **Direct UART MMIO** for console output — DBCN not available on QEMU SBI 1.0
+- **Kernel log buffer**: `console_println!` writes to both UART and a 32KB lock-free ring buffer. User-space `dmesg` reads it via `sys_syslog(81)`. Ring buffer is always active, even before filesystem is available.
 - **SSTATUS.SUM** must be set in trap_handler for S-mode to access U-mode pages
 - **sfence.vma** required after mapping new user pages (TLB stale otherwise)
 - **Compressed instructions** — trap skip must check instruction length (16-bit vs 32-bit)
