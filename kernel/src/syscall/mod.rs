@@ -299,21 +299,31 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
 }
 
 /// Read a slice of bytes from user space with automatic CR3 switching on x86_64.
+///
+/// CRITICAL: Vec is pre-allocated under kernel CR3. Inside with_user_cr3(),
+/// we only write via raw pointer — NO push/alloc/dealloc to prevent heap
+/// corruption when user page table identity mappings are damaged.
 #[inline]
 pub(crate) fn user_read_bytes(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
     let mut buf = alloc::vec::Vec::with_capacity(len);
+    let dst = buf.as_mut_ptr() as *mut u8;
     #[cfg(target_arch = "x86_64")]
     crate::arch::trap::with_user_cr3(|| {
         for i in 0..len {
-            let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
-            buf.push(byte);
+            unsafe {
+                let byte = core::ptr::read_volatile((addr + i) as *const u8);
+                core::ptr::write(dst.add(i), byte);
+            }
         }
     });
     #[cfg(not(target_arch = "x86_64"))]
     for i in 0..len {
-        let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
-        buf.push(byte);
+        unsafe {
+            let byte = core::ptr::read_volatile((addr + i) as *const u8);
+            core::ptr::write(dst.add(i), byte);
+        }
     }
+    unsafe { buf.set_len(len) };
     buf
 }
 
@@ -361,8 +371,12 @@ fn fill_stat_buffer(buf: &mut [u8; 144], st_mode: u32, st_size: i64, st_ino: u64
 /// Read a null-terminated user string from the given address.
 /// Returns the string as a Vec<u8> (without the null terminator).
 /// Switches to user CR3 temporarily since syscall runs under kernel CR3.
+/// Read a NUL-terminated string from user space.
+/// CRITICAL: Pre-allocate buffer, only write via raw pointer inside with_user_cr3.
 fn read_user_string(addr: usize) -> Option<alloc::vec::Vec<u8>> {
-    let mut buf = alloc::vec::Vec::new();
+    let mut buf = alloc::vec::Vec::with_capacity(4096);
+    let dst = buf.as_mut_ptr() as *mut u8;
+    let mut actual_len = 0usize;
     #[cfg(target_arch = "x86_64")]
     crate::arch::trap::with_user_cr3(|| {
         for i in 0..4096 {
@@ -370,7 +384,8 @@ fn read_user_string(addr: usize) -> Option<alloc::vec::Vec<u8>> {
             if byte == 0 {
                 return;
             }
-            buf.push(byte);
+            unsafe { core::ptr::write(dst.add(actual_len), byte) };
+            actual_len += 1;
         }
     });
     #[cfg(not(target_arch = "x86_64"))]
@@ -379,27 +394,31 @@ fn read_user_string(addr: usize) -> Option<alloc::vec::Vec<u8>> {
         if byte == 0 {
             break;
         }
-        buf.push(byte);
+        unsafe { core::ptr::write(dst.add(actual_len), byte) };
+        actual_len += 1;
     }
-    Some(buf) // max 4096 bytes, return what we have
+    unsafe { buf.set_len(actual_len) };
+    Some(buf)
 }
 
 /// Read an argv-style pointer array from user space.
 /// `ptr_array` is the address of a null-terminated array of `*const u8` pointers.
 /// Each pointer points to a null-terminated string.
-/// Switches to user CR3 temporarily since syscall runs under kernel CR3.
+/// CRITICAL: Pre-allocate buffers, only raw ptr writes inside with_user_cr3.
 fn read_user_argv(ptr_array: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-    let mut result = alloc::vec::Vec::new();
-    // First, read the pointer array under user CR3
-    let mut ptrs = alloc::vec::Vec::new();
+    // Pre-allocate pointer array buffer (256 entries max)
+    let mut ptr_buf = alloc::vec::Vec::with_capacity(256);
+    let ptr_dst = ptr_buf.as_mut_ptr() as *mut usize;
+    let mut ptr_count = 0usize;
     #[cfg(target_arch = "x86_64")]
     crate::arch::trap::with_user_cr3(|| {
         for i in 0..256 {
             let ptr = unsafe { core::ptr::read_volatile((ptr_array + i * 8) as *const usize) };
             if ptr == 0 {
-                break;
+                return;
             }
-            ptrs.push(ptr);
+            unsafe { core::ptr::write(ptr_dst.add(i), ptr) };
+            ptr_count += 1;
         }
     });
     #[cfg(not(target_arch = "x86_64"))]
@@ -408,10 +427,13 @@ fn read_user_argv(ptr_array: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         if ptr == 0 {
             break;
         }
-        ptrs.push(ptr);
+        unsafe { core::ptr::write(ptr_dst.add(i), ptr) };
+        ptr_count += 1;
     }
-    // Then read each string
-    for ptr in ptrs {
+    unsafe { ptr_buf.set_len(ptr_count) };
+    // Now read each string (read_user_string handles CR3 safely)
+    let mut result = alloc::vec::Vec::new();
+    for &ptr in ptr_buf.iter() {
         if let Some(s) = read_user_string(ptr) {
             result.push(s);
         } else {
@@ -2537,26 +2559,30 @@ fn sys_waitpid(pid: usize) -> isize {
 }
 
 /// Read a byte string from user memory and strip trailing NUL bytes.
-/// Switches to user CR3 temporarily since syscall runs under kernel CR3.
+/// CRITICAL: Pre-allocate buffer, only raw ptr writes inside with_user_cr3.
 fn read_user_path(ptr: usize, len: usize) -> Option<alloc::string::String> {
     if ptr == 0 || len == 0 || len > 512 {
         return None;
     }
-    let mut buf = alloc::vec::Vec::new();
+    let mut buf = alloc::vec::Vec::with_capacity(len);
+    let dst = buf.as_mut_ptr() as *mut u8;
     #[cfg(target_arch = "x86_64")]
     crate::arch::trap::with_user_cr3(|| {
         for i in 0..len {
-            let byte = unsafe { core::ptr::read_volatile((ptr + i) as *const u8) };
-            buf.push(byte);
+            unsafe {
+                let byte = core::ptr::read_volatile((ptr + i) as *const u8);
+                core::ptr::write(dst.add(i), byte);
+            }
         }
     });
     #[cfg(not(target_arch = "x86_64"))]
-    {
-        for i in 0..len {
-            let byte = unsafe { core::ptr::read_volatile((ptr + i) as *const u8) };
-            buf.push(byte);
+    for i in 0..len {
+        unsafe {
+            let byte = core::ptr::read_volatile((ptr + i) as *const u8);
+            core::ptr::write(dst.add(i), byte);
         }
     }
+    unsafe { buf.set_len(len) };
     while buf.last() == Some(&0) {
         buf.pop();
     }

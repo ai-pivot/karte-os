@@ -640,6 +640,18 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
             print_str(b" RDX=");
             print_hex(rdx);
         }
+        {
+            let rsi: u64;
+            unsafe { core::arch::asm!("mov {}, rsi", out(reg) rsi) };
+            print_str(b" RSI=");
+            print_hex(rsi);
+        }
+        {
+            let r8: u64;
+            unsafe { core::arch::asm!("mov {}, r8", out(reg) r8) };
+            print_str(b" R8=");
+            print_hex(r8);
+        }
         print_str(b"\n");
         // Print CR3 for debugging
         {

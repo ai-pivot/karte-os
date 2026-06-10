@@ -4,17 +4,18 @@
 //! accessible under user CR3. These types enforce at **compile time**
 //! that every access to user memory goes through the correct CR3 switch.
 //!
-//! # Design
+//! # Critical rule: NO heap operations inside with_user_cr3()
 //!
-//! ```text
-//! UserPtr<T>   — pointer to a single user-space value
-//! UserSliceMut — mutable slice of user memory (for read/write)
-//! UserSlice    — immutable slice of user memory (for read only)
-//! ```
+//! `with_user_cr3()` switches to the user page table, whose identity mappings
+//! may be corrupted by mmap huge-page splits. The kernel heap allocator's
+//! metadata (linked list nodes at ~0x406000) relies on identity-mapped PTEs.
+//! If a `Vec::push` triggers alloc/dealloc under user CR3, it may read
+//! corrupted HoleList nodes → GP fault in `linked_list_allocator`.
 //!
-//! These types are **zero-cost** — they're just `usize` addresses at runtime.
-//! All methods handle CR3 switching internally.
+//! All methods below pre-allocate buffers under kernel CR3, then only do
+//! raw `read_volatile`/`write_volatile` inside `with_user_cr3()`.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// A pointer to a single value in user space.
@@ -58,6 +59,7 @@ impl<T: Copy + Default> UserPtr<T> {
     }
 
     /// Read a value from user space (with CR3 switch on x86_64).
+    /// No heap operations inside the CR3 switch.
     #[inline]
     pub fn read(&self) -> T {
         let mut val = T::default();
@@ -73,6 +75,7 @@ impl<T: Copy + Default> UserPtr<T> {
     }
 
     /// Write a value to user space (with CR3 switch on x86_64).
+    /// No heap operations inside the CR3 switch.
     #[inline]
     pub fn write(&self, val: T) {
         #[cfg(target_arch = "x86_64")]
@@ -126,45 +129,66 @@ impl UserSlice {
     }
 
     /// Read all bytes from user space into a Vec.
+    ///
+    /// CRITICAL: Vec is pre-allocated under kernel CR3.
+    /// Inside with_user_cr3(), we only write to the Vec's raw buffer
+    /// via pointer — NO push/alloc/dealloc.
     pub fn read_to_vec(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.len);
+        // SAFETY: with_capacity allocated len bytes. We write exactly len bytes
+        // via raw pointer, then set_len. No alloc/dealloc inside with_user_cr3.
+        let dst = buf.as_mut_ptr() as *mut u8;
         #[cfg(target_arch = "x86_64")]
         crate::arch::trap::with_user_cr3(|| {
             for i in 0..self.len {
-                let byte = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
-                buf.push(byte);
+                unsafe {
+                    let byte = core::ptr::read_volatile((self.addr + i) as *const u8);
+                    core::ptr::write(dst.add(i), byte);
+                }
             }
         });
         #[cfg(not(target_arch = "x86_64"))]
         for i in 0..self.len {
-            let byte = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
-            buf.push(byte);
+            unsafe {
+                let byte = core::ptr::read_volatile((self.addr + i) as *const u8);
+                core::ptr::write(dst.add(i), byte);
+            }
         }
+        unsafe { buf.set_len(self.len) };
         buf
     }
 
     /// Read a NUL-terminated string from user space (max 4096 bytes).
-    pub fn read_cstring(&self) -> Option<alloc::string::String> {
-        let mut buf = Vec::new();
+    ///
+    /// CRITICAL: Vec is pre-allocated under kernel CR3.
+    /// Inside with_user_cr3(), we only write via raw pointer.
+    pub fn read_cstring(&self) -> Option<String> {
+        let max_len = self.len.min(4096);
+        let mut buf = Vec::with_capacity(max_len);
+        let dst = buf.as_mut_ptr() as *mut u8;
+        let mut actual_len = 0usize;
         #[cfg(target_arch = "x86_64")]
         crate::arch::trap::with_user_cr3(|| {
-            for i in 0..self.len.min(4096) {
+            for i in 0..max_len {
                 let byte = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
                 if byte == 0 {
                     return;
                 }
-                buf.push(byte);
+                unsafe { core::ptr::write(dst.add(actual_len), byte) };
+                actual_len += 1;
             }
         });
         #[cfg(not(target_arch = "x86_64"))]
-        for i in 0..self.len.min(4096) {
+        for i in 0..max_len {
             let byte = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
             if byte == 0 {
                 break;
             }
-            buf.push(byte);
+            unsafe { core::ptr::write(dst.add(actual_len), byte) };
+            actual_len += 1;
         }
-        alloc::string::String::from_utf8(buf).ok()
+        unsafe { buf.set_len(actual_len) };
+        String::from_utf8(buf).ok()
     }
 }
 
@@ -199,24 +223,34 @@ impl UserSliceMut {
     }
 
     /// Read all bytes from user space into a Vec.
+    ///
+    /// CRITICAL: Same as UserSlice::read_to_vec — no heap ops inside with_user_cr3.
     pub fn read_to_vec(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.len);
+        let dst = buf.as_mut_ptr() as *mut u8;
         #[cfg(target_arch = "x86_64")]
         crate::arch::trap::with_user_cr3(|| {
             for i in 0..self.len {
-                let byte = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
-                buf.push(byte);
+                unsafe {
+                    let byte = core::ptr::read_volatile((self.addr + i) as *const u8);
+                    core::ptr::write(dst.add(i), byte);
+                }
             }
         });
         #[cfg(not(target_arch = "x86_64"))]
         for i in 0..self.len {
-            let byte = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
-            buf.push(byte);
+            unsafe {
+                let byte = core::ptr::read_volatile((self.addr + i) as *const u8);
+                core::ptr::write(dst.add(i), byte);
+            }
         }
+        unsafe { buf.set_len(self.len) };
         buf
     }
 
     /// Write bytes to user space from a source slice.
+    ///
+    /// CRITICAL: Only write_volatile inside with_user_cr3 — no heap ops.
     pub fn copy_from_slice(&self, src: &[u8]) {
         let n = src.len().min(self.len);
         #[cfg(target_arch = "x86_64")]
@@ -232,6 +266,8 @@ impl UserSliceMut {
     }
 
     /// Write a single byte to user space at offset.
+    ///
+    /// CRITICAL: Only write_volatile inside with_user_cr3 — no heap ops.
     #[inline]
     pub fn write_byte_at(&self, offset: usize, byte: u8) {
         if offset >= self.len {
