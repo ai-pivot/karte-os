@@ -197,6 +197,7 @@ fn set_current_process_for_slot(slot: usize) {
 
 #[cfg(target_arch = "x86_64")]
 fn save_fs_base(slot: usize) {
+    // Read the CURRENT hardware FS_BASE from MSR and save it.
     if slot >= MAX_TASKS {
         return;
     }
@@ -238,8 +239,6 @@ fn restore_task_arch_state(slot: usize) {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn restore_task_arch_state(_slot: usize) {}
-
-
 
 fn switch_to(current: usize, next: usize) {
     save_fs_base(current);
@@ -480,7 +479,7 @@ fn build_initial_stack(init: UserTaskInit) -> usize {
 
         let mut ctx = crate::arch::trap::TrapContext::new_for_user(
             init.entry,
-            init.user_stack_top - 8,
+            init.user_stack_top,
             init.kernel_stack_top,
         );
         ctx.user_cr3 = init.user_page_table as u64;
@@ -651,6 +650,20 @@ pub fn set_task_fs_base(slot: usize, val: u64) {
     if slot < MAX_TASKS {
         TASK_FS_BASE[slot].store(val, Ordering::Relaxed);
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn get_task_fs_base(slot: usize) -> u64 {
+    if slot < MAX_TASKS {
+        TASK_FS_BASE[slot].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn get_task_fs_base(_slot: usize) -> u64 {
+    0
 }
 
 #[cfg(target_arch = "x86_64")]

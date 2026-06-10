@@ -161,6 +161,56 @@ pub fn trap_return_user_addr() -> usize {
 pub unsafe extern "C" fn trap_return_user() {
     unsafe {
         core::arch::naked_asm!(
+            // ── Do ALL kernel housekeeping BEFORE restoring GP registers ──
+            // These operations clobber RAX, RCX, RDX. They must happen before
+            // the pop sequence so user-mode register values are preserved.
+
+            // ── Disable interrupts before ANY kernel housekeeping ──
+            // This prevents Timer ISR from firing between FS_BASE wrmsr and
+            // iretq, which would corrupt TASK_FS_BASE with stale MSR values.
+            "cli",
+
+            // ── Restore FS_BASE for TLS ──
+            // schedule() sets PENDING_FS_BASE before __switch.
+            "mov rax, [rip + {pending_fs_base}]",
+            "test rax, rax",
+            "jz 4f",
+            "mov rcx, 0xC0000100",  // IA32_FS_BASE MSR
+            "mov rdx, rax",
+            "shr rdx, 32",
+            "mov eax, eax",
+            "wrmsr",
+            "xor rax, rax",
+            "mov [rip + {pending_fs_base}], rax",
+            "4:",
+
+            // ── Set DS/ES from ss field before pops clobber rsp-relative offsets ──
+            // ss is at rsp + 120 + 32 = rsp + 0x98
+            "mov ax, [rsp + 0x98]",
+            "mov ds, ax",
+            "mov es, ax",
+
+            // ── Update TSS.RSP0 and SYSCALL_KSP ──
+            // kernel_sp is at rsp + 160 = rsp + 0xA0
+            // user_cr3  is at rsp + 168 = rsp + 0xA8
+            "mov rax, [rsp + 0xA0]",
+            "cmp rax, 0",
+            "je 3f",
+            "mov rcx, [rip + {tss_rsp0_addr}]",
+            "test rcx, rcx",
+            "jz 3f",
+            "mov [rcx], rax",
+            "mov [rip + {syscall_ksp}], rax",
+            "3:",
+
+            // ── Switch to user page table if user_cr3 is set ──
+            // Interrupts already disabled (cli above).
+            "cmp qword ptr [rsp + 0xA8], 0",
+            "je 2f",
+            "mov rax, [rsp + 0xA8]",
+            "mov cr3, rax",
+            "2:",
+
             // ── Restore general-purpose registers ──
             "pop rax",
             "pop rbx",
@@ -184,56 +234,9 @@ pub unsafe extern "C" fn trap_return_user() {
             //   +16: rflags     (+0x10)
             //   +24: rsp        (+0x18)
             //   +32: ss         (+0x20)
-            //   +40: kernel_sp  (+0x28)
-            //   +48: user_cr3   (+0x30) ← per-process page table root
-            //
-            // Keep DS/ES valid for user code. String instructions such as
-            // `rep stos*` implicitly use ES even in 64-bit mode.
-            "mov ax, [rsp + 0x20]",
-            "mov ds, ax",
-            "mov es, ax",
+            //   +40: kernel_sp  (+0x28)  ← already consumed above
+            //   +48: user_cr3   (+0x30)  ← already consumed above
 
-            // ── Update TSS.RSP0 before returning to Ring 3 ──
-            // kernel_sp is at rsp+0x28 (after 15 pops, rsp points to iretq frame).
-            // This ensures timer ISR uses the correct kernel stack for each task.
-            "mov rax, [rsp + 0x28]",          // rax = kernel_sp
-            "cmp rax, 0",
-            "je 3f",                          // skip if kernel_sp == 0
-            "mov rcx, [rip + {tss_rsp0_addr}]", // rcx = &TSS.RSP0
-            "test rcx, rcx",
-            "jz 3f",                          // skip if TSS_RSP0_ADDR == 0
-            "mov [rcx], rax",                 // TSS.RSP0 = kernel_sp
-            // Also update SYSCALL_KSP so the next SYSCALL uses this task's kernel stack
-            "mov [rip + {syscall_ksp}], rax", // SYSCALL_KSP = kernel_sp
-            "3:",
-            // ── Switch to user page table if user_cr3 is set ──
-            // CR3 write implicitly flushes the TLB (non-global pages).
-            // cli ensures no interrupt fires between CR3 write and iretq.
-            // NOTE: user_cr3 is stored as the full physical address of the
-            // PML4 table (already shifted by callers), so we use it directly.
-            "cli",
-
-            // ── Restore FS_BASE for TLS (Go goroutine getg()) ──
-            // schedule() sets PENDING_FS_BASE before __switch to the target task's FS_BASE.
-            // This is critical for clone'd threads which enter via trap_return_user
-            // (bypassing schedule()'s post-__switch FS_BASE restore).
-            "mov rax, [rip + {pending_fs_base}]",
-            "test rax, rax",
-            "jz 4f",
-            "mov rcx, 0xC0000100",  // IA32_FS_BASE MSR
-            "mov rdx, rax",
-            "shr rdx, 32",           // rdx = high 32 bits
-            "mov eax, eax",          // eax = low 32 bits (zero-extends, clears upper)
-            "wrmsr",
-            "xor rax, rax",
-            "mov [rip + {pending_fs_base}], rax", // clear after use
-            "4:",
-
-            "cmp qword ptr [rsp + 0x30], 0",
-            "je 2f", // skip if user_cr3 == 0
-            "mov rax, [rsp + 0x30]",
-            "mov cr3, rax", // switch to user page table
-            "2:",
             // ── Return to Ring 3 ──
             "iretq",
             tss_rsp0_addr = sym super::super::gdt::TSS_RSP0_ADDR,

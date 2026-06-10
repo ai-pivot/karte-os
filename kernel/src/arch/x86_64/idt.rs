@@ -195,7 +195,7 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    // Call handler. User page tables have kernel mappings (copy_kernel_mappings),
+    // Call handler. User page tables have kernel_mappings (copy_kernel_mappings),
     // so we don't need to switch CR3. The handler's activate_page_table will
     // install the correct task's page table after schedule().
     "mov rdi, rsp",
@@ -421,6 +421,23 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     } else {
         let kernel_pt = crate::mm::vmm::get_kernel_page_table();
         super::trap::activate_page_table(kernel_pt as *const _ as usize);
+    }
+
+    // ── Restore FS_BASE for the current task ──
+    let fs_base = super::trap::PENDING_FS_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    if fs_base != 0 {
+        let high = (fs_base >> 32) as u32;
+        let low = fs_base as u32;
+        unsafe {
+            core::arch::asm!(
+                "mov rcx, 0xC0000100",
+                "wrmsr",
+                in("edx") high,
+                in("eax") low,
+                out("rcx") _,
+            );
+        }
+        super::trap::PENDING_FS_BASE.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -831,6 +848,13 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         if from_user {
             let pid = crate::process::current_pid();
             // User-mode unhandled PF — terminate the process (segfault)
+            crate::console_println!(
+                "[PF] UNHANDLED addr={:#x} rip={:#x} pid={} error={:#x}",
+                fault_addr_val,
+                rip,
+                pid,
+                error_code
+            );
             crate::syscall::sys_exit(99);
             loop {}
         } else {

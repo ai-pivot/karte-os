@@ -270,24 +270,16 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         // ── Load user program ──
         crate::console_println!("[init] Loading user program...");
 
-        // Load init program.
-        // On x86_64: try xbot-cli-static from ext4 (like Linux init=).
-        // Falls back to shell if not found.
+        // Load init program (shell).
         let init_result = {
             #[cfg(target_arch = "x86_64")]
             {
-                // Shell is always the init process. xbot-cli-static and other
-                // programs are loaded from ext4 at runtime via shell's exec command.
-                if crate::driver::ext4::has_ext4() {
-                    crate::console_println!(
-                        "[init] ext4 ready, xbot-cli-static available for exec"
-                    );
-                }
                 process::Process::from_elf(
                     include_bytes!("../../user/target/x86_64/shell.elf"),
                     alloc::vec![b"shell".to_vec()],
                     alloc::vec![],
                 )
+                .unwrap()
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
@@ -296,13 +288,14 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     alloc::vec![b"shell".to_vec()],
                     alloc::vec![],
                 )
+                .unwrap()
             }
         };
 
-        // init (shell) is always loaded from embedded bytes.
-        // External programs loaded via `run` will use ext4/FAT32/RamFS.
-        match init_result {
-            Ok(proc) => {
+        // init (shell or xbot) is loaded.
+        {
+            let proc = init_result;
+            {
                 crate::console_println!(
                     "[init] User process loaded: pid={}, entry={:#x}",
                     proc.pid,
@@ -375,9 +368,6 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 .expect("Failed to register init task");
 
                 crate::sched::start_first_task();
-            }
-            Err(e) => {
-                crate::console_println!("[init] Failed to load user program: {}", e);
             }
         }
 

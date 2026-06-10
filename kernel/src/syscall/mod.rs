@@ -623,7 +623,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         302 => 0, // prctl → success
         318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
         334 => -38, // rseq → ENOSYS (Go gracefully degrades)
-        435 => 0, // clone3 (stub → use clone)
+        435 => -38, // clone3: ENOSYS
         _ => {
             -38 // ENOSYS
         }
@@ -4330,11 +4330,8 @@ fn linux_clone(
             None => return ERR_NOMEM,
         };
 
-        // Save FS_BASE for the child process (use scheduler slot, NOT process index!)
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::sched::set_task_fs_base(tid, tls as u64);
-        }
+        // FS_BASE is already set by spawn_clone_task (using the correct sched slot).
+        // Do NOT call set_task_fs_base here — child_idx is process index, not sched slot!
 
         // CLONE_PARENT_SETTID: write child PID to parent's memory
         if (flags & 0x100000) != 0 && parent_tid_ptr != 0 {
@@ -4481,11 +4478,8 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
             0
         }
         ARCH_SET_FS => {
-            // Go runtime uses %fs:-8 to store the g pointer (getg()).
-            // Go writes the actual g pointer to [addr-8] BEFORE calling arch_prctl.
             let slot = crate::sched::current_sched_slot();
             unsafe { crate::arch::idt::wrmsr(MSR_FS_BASE, addr as u64) };
-            // Save to per-task array for context switch restore (use scheduler slot!)
             crate::sched::set_task_fs_base(slot, addr as u64);
             0
         }

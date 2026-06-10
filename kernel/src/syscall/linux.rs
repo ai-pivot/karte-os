@@ -277,11 +277,8 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
 
         // ─── clone/fork ──────────────────────────────────────
         // Linux clone(flags, stack, parent_tid, tls, child_tid)
-        // We delegate to the kernel's linux_clone handler
-        L_CLONE => Some(Translation::Dispatch {
-            karte_nr: 100, // LINUX_CLONE syscall number (handled in dispatch)
-            args,
-        }),
+        // TEMPORARILY DISABLED: return -ENOSYS to force single-threaded mode
+        L_CLONE => Some(Translation::Handled(-38)), // -ENOSYS
         L_FORK => Some(Translation::Dispatch {
             karte_nr: super::SYS_FORK,
             args,
