@@ -124,8 +124,18 @@ pub fn init_syscall_msrs() {
 }
 
 // ─── ISR stubs defined via global_asm! ─────────────────────────
-// We use global_asm! because naked_asm! doesn't support `sym` references
-// reliably on nightly. global_asm! with `sym` works correctly.
+// We use global_asm! for timer/syscall/syscall_entry/page_fault because
+// naked_asm! in Rust doesn't reliably support `sym` references on nightly.
+//
+// NOTE: The keyboard_isr_stub and com1_isr_stub (defined below as naked
+// functions) have the same 15-register save/restore sequence as
+// timer_isr_stub, but with DIFFERENT push orders and handler logic:
+//   - timer (global_asm!): push rax → r15  (ascending)
+//   - keyboard/com1 (naked_asm!): push r15 → rax (descending)
+// This means the push/pop sequences CANNOT be shared via a Rust macro.
+// Additionally, naked_asm! doesn't support nested macro expansion to
+// multiple string parameters, so extracting push_all/pop_all macros
+// is not feasible. Keep these sequences in sync manually.
 
 core::arch::global_asm!(
     ".section .text",
@@ -1036,46 +1046,11 @@ extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
 
 // ─── IDT init ─────────────────────────────────────────────────
 
-fn set_naked_handler(
-    entry: &mut x86_64::structures::idt::Entry<x86_64::structures::idt::HandlerFunc>,
-    addr: usize,
-    attr: u64,
-    ist_index: u16,
-) {
-    // Hardware IST: 0 = no IST, 1-7 = table[0-6].
+/// Core IDT entry write: encodes handler address, attributes, and IST index
+/// into a 128-bit IDT descriptor. Both typed and raw wrappers call this.
+fn write_idt_entry(ptr: *mut u64, addr: usize, attr: u64, ist_index: u16) {
     // Hardware IST: 0 = no IST (use RSP0), 1-7 = IST table[0-6].
     // ist_index=0 means "no IST" — must map to hw_ist=0, NOT 1.
-    let hw_ist = if ist_index == 0 {
-        0u64
-    } else {
-        (ist_index as u64 + 1) & 0x7
-    };
-    let attr_with_ist = (attr & !(0x7)) | hw_ist as u64;
-
-    let selector: u64 = 0x0008;
-    let lo = ((addr as u64 & 0xFFFF) << 0)
-        | (selector << 16)
-        | (attr_with_ist << 32)
-        | (((addr as u64 >> 16) & 0xFFFF) << 48);
-    let hi = (addr as u64 >> 32) & 0xFFFFFFFF;
-    unsafe {
-        let ptr = entry as *mut _ as *mut u64;
-        *ptr = lo;
-        *ptr.add(1) = hi;
-    }
-}
-
-/// Same as set_naked_handler but for IDT entries that push an error code
-/// (e.g., Page Fault #PF, Double Fault #DF, General Protection #GP).
-/// Set a naked handler on any IDT entry (raw pointer version).
-/// Works for both error-code and non-error-code entries since the
-/// IDT entry format is identical — only the handler code differs.
-unsafe fn set_naked_handler_raw(
-    entry: *mut u128, // raw pointer to IDT entry (128 bits)
-    addr: usize,
-    attr: u64,
-    ist_index: u16,
-) {
     let hw_ist = if ist_index == 0 {
         0u64
     } else {
@@ -1090,10 +1065,28 @@ unsafe fn set_naked_handler_raw(
         | (((addr as u64 >> 16) & 0xFFFF) << 48);
     let hi = (addr as u64 >> 32) & 0xFFFFFFFF;
     unsafe {
-        let ptr = entry as *mut u64;
         *ptr = lo;
         *ptr.add(1) = hi;
     }
+}
+
+/// Set a naked handler on a typed IDT entry (for entries with HandlerFunc).
+/// Set a naked handler on any IDT entry.
+/// Works for both typed `Entry<HandlerFunc>` and raw pointer access.
+/// The `ist_index` parameter uses 0-based software index (0 = no IST).
+fn set_naked_handler(
+    entry: &mut x86_64::structures::idt::Entry<x86_64::structures::idt::HandlerFunc>,
+    addr: usize,
+    attr: u64,
+    ist_index: u16,
+) {
+    write_idt_entry(entry as *mut _ as *mut u64, addr, attr, ist_index);
+}
+
+/// Set a naked handler via raw pointer (for entries with specific error code types).
+/// Same as `set_naked_handler` but takes a raw `*mut u128` for flexibility.
+unsafe fn set_naked_handler_raw(entry: *mut u128, addr: usize, attr: u64, ist_index: u16) {
+    write_idt_entry(entry as *mut u64, addr, attr, ist_index);
 }
 
 /// Patch the IST index in an IDT entry (bits 32..34 of the low 64-bit word).

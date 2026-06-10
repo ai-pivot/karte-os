@@ -136,40 +136,64 @@ pub fn vma_check(addr: usize) -> Option<usize> {
     None
 }
 
+/// Split or remove VMA entries that overlap with [start, end).
+/// For each overlapping VMA:
+/// - If it fully contains [start, end), split into two (tail re-inserted)
+/// - If [start, end) covers its tail, truncate it
+/// - If [start, end) covers its head, move start forward
+/// - If [start, end) fully covers it, deactivate it
+///
+/// Returns a Vec of (start, end, prot) for any tail splits that need re-insertion.
+fn split_overlapping_vmas(
+    table: &mut [VmaRegion; MAX_VMAS],
+    start: usize,
+    end: usize,
+) -> alloc::vec::Vec<(usize, usize, usize)> {
+    let mut tails = alloc::vec::Vec::new();
+    for i in 0..MAX_VMAS {
+        let vma = &table[i];
+        if !vma.active || vma.start >= end || vma.end <= start {
+            continue;
+        }
+        // Overlap exists
+        let vma_end = vma.end;
+        let vma_prot = vma.prot;
+
+        if vma.start < start && vma.end > end {
+            // Fully contains: split into [vma_start, start) + [end, vma_end)
+            table[i].end = start;
+            tails.push((end, vma_end, vma_prot));
+        } else if vma.start < start {
+            // Overlaps tail: truncate
+            table[i].end = start;
+        } else if vma.end > end {
+            // Overlaps head: move start
+            table[i].start = end;
+        } else {
+            // Fully covered: deactivate
+            table[i].active = false;
+        }
+    }
+    tails
+}
+
 /// Add or update a VMA entry for [start, end) with the given prot.
 /// For MAP_FIXED, removes any overlapping entries first.
 /// Returns Ok(()) on success, Err(()) if no free VMA slot is available.
 pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result<(), ()> {
     let mut table = VMA_TABLE.lock();
     if map_fixed {
-        // Phase 1: Collect indices of overlapping entries and compute splits
-        // (using indices to avoid nested borrows)
-        let mut splits: alloc::vec::Vec<(usize, usize, usize)> = alloc::vec::Vec::new();
-        for i in 0..MAX_VMAS {
-            let vma = &table[i];
-            if vma.active && vma.start < end && vma.end > start {
-                if vma.start < start && vma.end > end {
-                    // Split: right part will be a new entry
-                    splits.push((end, vma.end, vma.prot));
-                    // Left part: just trim
-                    table[i].end = start;
-                } else if vma.start < start {
-                    table[i].end = start;
-                } else if vma.end > end {
-                    table[i].start = end;
-                } else {
-                    table[i].active = false;
-                }
-            }
-        }
-        // Phase 2: Insert split entries
-        for (s, e, p) in splits {
+        let tails = split_overlapping_vmas(&mut table, start, end);
+        // Re-insert the tail portions
+        for (s, e, p) in tails {
             for i in 0..MAX_VMAS {
                 if !table[i].active {
-                    table[i].start = s;
-                    table[i].end = e;
-                    table[i].prot = p;
-                    table[i].active = true;
+                    table[i] = VmaRegion {
+                        start: s,
+                        end: e,
+                        prot: p,
+                        active: true,
+                    };
                     break;
                 }
             }
@@ -178,10 +202,12 @@ pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result
     // Find a free slot and add the new VMA
     for i in 0..MAX_VMAS {
         if !table[i].active {
-            table[i].start = start;
-            table[i].end = end;
-            table[i].prot = prot;
-            table[i].active = true;
+            table[i] = VmaRegion {
+                start,
+                end,
+                prot,
+                active: true,
+            };
             return Ok(());
         }
     }
@@ -191,33 +217,8 @@ pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result
 /// Remove all VMA entries overlapping [start, end).
 pub fn vma_remove_range(start: usize, end: usize) {
     let mut table = VMA_TABLE.lock();
-    let mut splits: alloc::vec::Vec<(usize, usize, usize)> = alloc::vec::Vec::new();
-    for i in 0..MAX_VMAS {
-        let vma = &table[i];
-        if vma.active && vma.start < end && vma.end > start {
-            if vma.start < start && vma.end > end {
-                splits.push((end, vma.end, vma.prot));
-                table[i].end = start;
-            } else if vma.start < start {
-                table[i].end = start;
-            } else if vma.end > end {
-                table[i].start = end;
-            } else {
-                table[i].active = false;
-            }
-        }
-    }
-    for (s, e, p) in splits {
-        for i in 0..MAX_VMAS {
-            if !table[i].active {
-                table[i].start = s;
-                table[i].end = e;
-                table[i].prot = p;
-                table[i].active = true;
-                break;
-            }
-        }
-    }
+    let _tails = split_overlapping_vmas(&mut table, start, end);
+    // We don't re-insert tails — we're removing, not splitting for insertion
 }
 
 /// Update prot for all VMA entries overlapping [start, end).
@@ -241,6 +242,32 @@ pub fn vma_clear() {
 // ─── Global FD table (single-process simplification) ────────────────
 
 extern crate alloc;
+
+/// Check if a path refers to a pseudo-filesystem that doesn't exist on disk.
+fn is_pseudo_path(path: &str) -> bool {
+    path.starts_with("/proc")
+        || path.starts_with("/sys")
+        || path.starts_with("/dev")
+        || path.starts_with("/run")
+        || path.starts_with("/etc")
+        || path.starts_with("/tmp")
+}
+
+/// Fill a Linux x86_64 stat structure buffer (144 bytes).
+/// Layout: st_dev(0-8), st_ino(8-16), st_nlink(16-24), st_mode(24-28),
+///         st_uid(28-32), st_gid(32-36), pad(36-48), st_size(48-56),
+///         st_blksize(56-64), st_blocks(64-72)
+#[cfg(target_arch = "x86_64")]
+fn fill_stat_buffer(buf: &mut [u8; 144], st_mode: u32, st_size: i64, st_ino: u64) {
+    unsafe {
+        core::ptr::write_bytes(buf.as_mut_ptr(), 0, 144);
+        *((buf.as_mut_ptr() as usize + 8) as *mut u64) = st_ino;
+        *((buf.as_mut_ptr() as usize + 16) as *mut u64) = 1; // st_nlink
+        *((buf.as_mut_ptr() as usize + 24) as *mut u32) = st_mode;
+        *((buf.as_mut_ptr() as usize + 48) as *mut i64) = st_size;
+        *((buf.as_mut_ptr() as usize + 56) as *mut i64) = 4096; // st_blksize
+    }
+}
 
 /// Read a null-terminated user string from the given address.
 /// Returns the string as a Vec<u8> (without the null terminator).
@@ -647,21 +674,9 @@ fn linux_open(path: usize, flags: usize, _mode: usize) -> isize {
 /// Linux openat(dirfd, pathname, flags, mode) — open file
 /// Stack-based implementation to avoid heap allocator issues in syscall context.
 fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> isize {
-    let path_len = linux::count_user_string(pathname);
-    if path_len == 0 || path_len > 256 {
-        return ERR_NOENT; // -2
-    }
-    // Read path into stack buffer
-    let mut buf = [0u8; 256];
-    unsafe {
-        let src = pathname as *const u8;
-        for i in 0..path_len {
-            buf[i] = core::ptr::read_volatile(src.add(i));
-        }
-    }
-    let path_str = match core::str::from_utf8(&buf[..path_len]) {
-        Ok(s) => s,
-        Err(_) => return ERR_NOENT,
+    let path_str = match read_user_path(pathname, linux::count_user_string(pathname)) {
+        Some(s) if !s.is_empty() => s,
+        _ => return ERR_NOENT,
     };
 
     // Convert Linux x86_64 flags to our internal flags
@@ -671,7 +686,7 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
 
     // Try VFS open with converted flags
     let our_flags = if has_creat { 0x100 } else { 0 } | (flags & 0x600); // keep O_TRUNC/O_APPEND
-    match crate::driver::vfs::open(path_str, our_flags as u32) {
+    match crate::driver::vfs::open(&path_str, our_flags as u32) {
         Ok(vfs_fd) => {
             // Register the VFS fd in the process FdTable
             crate::process::with_fd_table(|fd_table| {
@@ -687,10 +702,7 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
         }
         Err(e) => {
             // Only fake virtual pseudo-filesystem paths (/proc, /sys, /dev, /etc, /run)
-            let is_pseudo = path_str.starts_with("/proc")
-                || path_str.starts_with("/sys")
-                || path_str.starts_with("/dev")
-                || path_str.starts_with("/run");
+            let is_pseudo = is_pseudo_path(&path_str);
             // /etc/resolv.conf, /etc/localtime etc. — fake these too
             let is_etc = path_str.starts_with("/etc");
 
@@ -727,62 +739,42 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
 fn linux_stat(pathname: usize, statbuf: usize) -> isize {
     if statbuf != 0 {
         // Try to read the path
-        let path_len = linux::count_user_string(pathname);
-        let mut buf = [0u8; 256];
-        if path_len > 0 && path_len <= 256 {
-            unsafe {
-                let src = pathname as *const u8;
-                for i in 0..path_len {
-                    buf[i] = core::ptr::read_volatile(src.add(i));
-                }
-            }
-            if let Ok(s) = core::str::from_utf8(&buf[..path_len]) {
-                let resolved = crate::syscall::resolve_path(s);
+        if let Some(s) = read_user_path(pathname, linux::count_user_string(pathname)) {
+            let resolved = crate::syscall::resolve_path(&s);
 
-                // Check if it's a pseudo path (/proc, /sys, /dev, /etc, /run)
-                let is_pseudo = resolved.starts_with("/proc")
-                    || resolved.starts_with("/sys")
-                    || resolved.starts_with("/dev")
-                    || resolved.starts_with("/run")
-                    || resolved.starts_with("/etc");
+            // Check if it's a pseudo path (/proc, /sys, /dev, /etc, /run)
+            let is_pseudo = is_pseudo_path(&resolved);
 
-                // Try VFS walk to get real inode and metadata
-                if let Ok(ino) = crate::driver::vfs::walk_path_resolved(&resolved) {
-                    if let Ok(meta) = crate::driver::vfs::inode_metadata(ino) {
-                        let st_mode = if meta.is_dir() {
-                            0x41FFu32 // S_IFDIR | 0777
-                        } else {
-                            0x81A4u32 // S_IFREG | 0644
-                        };
-                        unsafe {
-                            let p = statbuf as *mut u8;
-                            core::ptr::write_bytes(p, 0, 144);
-                            *((p as usize + 8) as *mut u64) = ino; // st_ino
-                            *((p as usize + 16) as *mut u64) = 1; // st_nlink = 1
-                            *((p as usize + 24) as *mut u32) = st_mode; // st_mode
-                            *((p as usize + 48) as *mut i64) = meta.size as i64; // st_size
-                            *((p as usize + 56) as *mut i64) = 4096; // st_blksize
-                        }
-                        return 0;
-                    }
-                }
-
-                // Pseudo-filesystem paths: fake as directory (for MkdirAll compatibility)
-                if is_pseudo {
+            // Try VFS walk to get real inode and metadata
+            if let Ok(ino) = crate::driver::vfs::walk_path_resolved(&resolved) {
+                if let Ok(meta) = crate::driver::vfs::inode_metadata(ino) {
+                    let st_mode = if meta.is_dir() {
+                        0x41FFu32 // S_IFDIR | 0777
+                    } else {
+                        0x81A4u32 // S_IFREG | 0644
+                    };
+                    let mut stat_buf = [0u8; 144];
+                    fill_stat_buffer(&mut stat_buf, st_mode, meta.size as i64, ino);
                     unsafe {
-                        let p = statbuf as *mut u8;
-                        core::ptr::write_bytes(p, 0, 144);
-                        *((p as usize + 16) as *mut u64) = 1; // st_nlink = 1
-                        *((p as usize + 24) as *mut u32) = 0x41FFu32; // S_IFDIR | 0777
-                        *((p as usize + 56) as *mut i64) = 4096; // st_blksize
+                        core::ptr::copy_nonoverlapping(stat_buf.as_ptr(), statbuf as *mut u8, 144);
                     }
                     return 0;
                 }
-
-                // Real filesystem path not found — return ENOENT so Go's MkdirAll
-                // knows it needs to create the directory
-                return -2; // ENOENT
             }
+
+            // Pseudo-filesystem paths: fake as directory (for MkdirAll compatibility)
+            if is_pseudo {
+                let mut stat_buf = [0u8; 144];
+                fill_stat_buffer(&mut stat_buf, 0x41FFu32, 0, 0); // S_IFDIR | 0777
+                unsafe {
+                    core::ptr::copy_nonoverlapping(stat_buf.as_ptr(), statbuf as *mut u8, 144);
+                }
+                return 0;
+            }
+
+            // Real filesystem path not found — return ENOENT so Go's MkdirAll
+            // knows it needs to create the directory
+            return -2; // ENOENT
         }
 
         // Couldn't parse path — return ENOENT
@@ -837,22 +829,10 @@ fn linux_fstat(fd: usize, statbuf: usize) -> isize {
         }
     });
 
+    let mut stat_buf = [0u8; 144];
+    fill_stat_buffer(&mut stat_buf, st_mode, st_size as i64, st_ino);
     unsafe {
-        let p = statbuf as *mut u8;
-        core::ptr::write_bytes(p, 0, 144);
-        // st_dev = 0 (offset 0)
-        // st_ino (offset 8)
-        *((p as usize + 8) as *mut u64) = st_ino;
-        // st_nlink = 1 (offset 16)
-        *((p as usize + 16) as *mut u64) = 1;
-        // st_mode (offset 24)
-        *((p as usize + 24) as *mut u32) = st_mode;
-        // st_rdev = 0 (offset 40)
-        // st_size (offset 48)
-        *((p as usize + 48) as *mut i64) = st_size as i64;
-        // st_blksize = 4096 (offset 56)
-        *((p as usize + 56) as *mut i64) = 4096;
-        // st_blocks = 0 (offset 64)
+        core::ptr::copy_nonoverlapping(stat_buf.as_ptr(), statbuf as *mut u8, 144);
     }
     0
 }
@@ -2404,11 +2384,7 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     }
 
     // If VFS failed, check for pseudo-filesystem paths
-    let is_pseudo = name.starts_with("/proc")
-        || name.starts_with("/sys")
-        || name.starts_with("/dev")
-        || name.starts_with("/run")
-        || name.starts_with("/etc");
+    let is_pseudo = is_pseudo_path(&name);
 
     // /dev/urandom and /dev/random need real random bytes
     // Match both "/dev/urandom" and "dev/urandom" (SQLite may use relative path)
@@ -3697,18 +3673,16 @@ fn sys_dup2(old_fd: i32, new_fd: i32) -> isize {
 /// `redir_stdout` = fd to use as stdout for the child (-1 = keep default)
 fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32) -> isize {
     // Read path from user memory
-    let name = if path_len > 0 && path_len < 256 {
-        let mut buf = [0u8; 256];
-        for i in 0..path_len {
-            buf[i] = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
+    let name = match read_user_path(path, path_len) {
+        Some(s) if !s.is_empty() => {
+            // Strip leading '/' if present (fs root convention)
+            if s.starts_with('/') {
+                alloc::string::String::from(&s[1..])
+            } else {
+                s
+            }
         }
-        let len = buf.iter().position(|&b| b == 0).unwrap_or(path_len);
-        let s = core::str::from_utf8(&buf[..len]).unwrap_or("");
-        // Strip leading '/' if present (fs root convention)
-        let name = if s.starts_with('/') { &s[1..] } else { s };
-        alloc::string::String::from(name)
-    } else {
-        return ERR_INVAL;
+        _ => return ERR_INVAL,
     };
 
     // Build argv from CMD_ARGS env var (for backward compat with .S programs)
