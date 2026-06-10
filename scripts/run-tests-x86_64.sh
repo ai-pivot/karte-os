@@ -60,6 +60,8 @@ timeout $TIMEOUT_SECS qemu-system-x86_64 \
     -display none -no-reboot \
     -drive file=disk.img,format=raw,if=none,id=hd0 \
     -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 \
+    -netdev user,id=net0 \
+    -device virtio-net-pci,netdev=net0 \
     > "$OUTPUT_LOG" 2>&1 || true
 
 echo ""

@@ -2872,7 +2872,6 @@ fn parse_sockaddr_in(addr_ptr: usize, addr_len: usize) -> Result<(u16, [u8; 4]),
 /// domain: 2 = AF_INET
 /// type:   1 = SOCK_STREAM (TCP), 2 = SOCK_DGRAM (UDP), 3 = SOCK_RAW (ICMP)
 #[allow(unused_variables)]
-#[cfg(target_arch = "riscv64")]
 fn sys_socket(domain: usize, socket_type: usize, _protocol: usize) -> isize {
     if domain != 2 {
         return ERR_INVAL;
@@ -2892,13 +2891,7 @@ fn sys_socket(domain: usize, socket_type: usize, _protocol: usize) -> isize {
     crate::net::iface::NetStack::create_socket(stype)
 }
 
-#[cfg(target_arch = "x86_64")]
-fn sys_socket(_domain: usize, _socket_type: usize, _protocol: usize) -> isize {
-    ERR_IO // Network not available on x86_64
-}
-
 /// Syscall 71: bind(fd, addr_ptr, addr_len) → 0
-#[cfg(target_arch = "riscv64")]
 fn sys_bind(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
     if fd < 0 {
         return ERR_INVAL;
@@ -2916,13 +2909,7 @@ fn sys_bind(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
     crate::net::iface::NetStack::bind(fd as usize, port)
 }
 
-#[cfg(target_arch = "x86_64")]
-fn sys_bind(_fd: i32, _addr_ptr: usize, _addr_len: usize) -> isize {
-    ERR_IO
-}
-
 /// Syscall 72: connect(fd, addr_ptr, addr_len) → 0
-#[cfg(target_arch = "riscv64")]
 fn sys_connect(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
     if fd < 0 {
         return ERR_INVAL;
@@ -2940,13 +2927,7 @@ fn sys_connect(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
     crate::net::iface::NetStack::connect(fd as usize, ip, port)
 }
 
-#[cfg(target_arch = "x86_64")]
-fn sys_connect(_fd: i32, _addr_ptr: usize, _addr_len: usize) -> isize {
-    ERR_IO
-}
-
 /// Syscall 73: listen(fd, backlog) → 0
-#[cfg(target_arch = "riscv64")]
 fn sys_listen(fd: i32, _backlog: usize) -> isize {
     if fd < 0 {
         return ERR_INVAL;
@@ -2960,13 +2941,7 @@ fn sys_listen(fd: i32, _backlog: usize) -> isize {
     crate::net::iface::NetStack::bind(fd as usize, 0)
 }
 
-#[cfg(target_arch = "x86_64")]
-fn sys_listen(_fd: i32, _backlog: usize) -> isize {
-    ERR_IO
-}
-
 /// Syscall 74: accept(fd) → new_fd
-#[cfg(target_arch = "riscv64")]
 fn sys_accept(fd: i32) -> isize {
     if fd < 0 {
         return ERR_INVAL;
@@ -2983,13 +2958,8 @@ fn sys_accept(fd: i32) -> isize {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-fn sys_accept(_fd: i32) -> isize {
-    ERR_IO
-}
-
 /// Syscall 75: sendto(fd, buf, len, flags, addr_ptr, addr_len) → bytes_sent
-#[cfg(target_arch = "riscv64")]
+#[allow(unused_variables)]
 fn sys_sendto(
     fd: i32,
     buf: usize,
@@ -3026,21 +2996,7 @@ fn sys_sendto(
     crate::net::iface::NetStack::send(fd as usize, data, ip, port)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[allow(unused_variables)]
-fn sys_sendto(
-    fd: i32,
-    buf: usize,
-    len: usize,
-    flags: usize,
-    addr_ptr: usize,
-    addr_len: usize,
-) -> isize {
-    ERR_IO
-}
-
 /// Syscall 76: recvfrom(fd, buf, len, flags) → bytes_received
-#[cfg(target_arch = "riscv64")]
 fn sys_recvfrom(fd: i32, buf: usize, len: usize) -> isize {
     if fd < 0 || buf == 0 || len == 0 {
         return ERR_INVAL;
@@ -3058,13 +3014,7 @@ fn sys_recvfrom(fd: i32, buf: usize, len: usize) -> isize {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-fn sys_recvfrom(_fd: i32, _buf: usize, _len: usize) -> isize {
-    ERR_IO
-}
-
 /// Syscall 77: shutdown(fd, how) → 0
-#[cfg(target_arch = "riscv64")]
 fn sys_shutdown(fd: i32) -> isize {
     if fd < 0 {
         return ERR_INVAL;
@@ -3075,11 +3025,6 @@ fn sys_shutdown(fd: i32) -> isize {
     }
 
     crate::net::iface::NetStack::shutdown(fd as usize)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn sys_shutdown(_fd: i32) -> isize {
-    ERR_IO
 }
 
 /// Syscall 32: Execute (spawn) a program by file path.

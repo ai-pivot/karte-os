@@ -25,6 +25,7 @@ pub mod switch;
 pub mod trap;
 pub mod uart;
 pub mod virtio_blk;
+pub mod virtio_net;
 
 #[cfg(feature = "test_mode")]
 pub mod test;

@@ -485,13 +485,32 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             args: [args[0], args[1], 0, 0, 0, 0],
         }),
 
-        // ─── Network (stubs for now) ─────────────────────────
+        // ─── Network ─────────────────────────
         // Note: L_SOCKET(41), L_CONNECT(42), L_LISTEN(50) removed —
         // conflict with KarteOS SYS_MKDIR(41), SYS_UNLINK(42),
         // SYS_SETENV(50). Also L_GETSOCKNAME(51) conflicts with
         // SYS_GETENV(51), L_GETPEERNAME(52) conflicts with SYS_CHDIR(52).
-        L_BIND | L_ACCEPT | L_SENDTO | L_RECVFROM | L_SHUTDOWN | L_SETSOCKOPT | L_GETSOCKOPT
-        | L_SENDMSG | L_RECVMSG => Some(Translation::Handled(super::ERR_IO)),
+        L_BIND => Some(Translation::Dispatch {
+            karte_nr: super::SYS_BIND,
+            args,
+        }),
+        L_ACCEPT => Some(Translation::Dispatch {
+            karte_nr: super::SYS_ACCEPT,
+            args: [args[0], 0, 0, 0, 0, 0],
+        }),
+        L_SENDTO => Some(Translation::Dispatch {
+            karte_nr: super::SYS_SENDTO,
+            args,
+        }),
+        L_RECVFROM => Some(Translation::Dispatch {
+            karte_nr: super::SYS_RECVFROM,
+            args: [args[0], args[1], args[2], 0, 0, 0],
+        }),
+        L_SHUTDOWN => Some(Translation::Dispatch {
+            karte_nr: super::SYS_SHUTDOWN,
+            args: [args[0], args[1], 0, 0, 0, 0],
+        }),
+        L_SETSOCKOPT | L_GETSOCKOPT | L_SENDMSG | L_RECVMSG => Some(Translation::Handled(0)),
 
         _ => None, // Unknown — let KarteOS dispatch handle it
     }

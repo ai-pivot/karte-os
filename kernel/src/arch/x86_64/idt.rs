@@ -420,6 +420,12 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     crate::driver::tty::poll_uart();
     crate::arch::platform::tick_uptime();
     crate::sched::tick_sleep_queue();
+
+    // Poll network stack (~10ms interval, same as RISC-V)
+    if crate::net::iface::NetStack::is_initialized() {
+        crate::net::iface::NetStack::poll();
+    }
+
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::sched::schedule();
     if let Some(ksp) = crate::sched::current_kernel_stack() {

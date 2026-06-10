@@ -17,7 +17,6 @@ pub mod env;
 pub mod kernel_log;
 pub mod lang_items;
 pub mod mm;
-#[cfg(target_arch = "riscv64")]
 pub mod net;
 pub mod platform;
 pub mod process;
@@ -343,6 +342,13 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 {
                     crate::console_println!("[init] Initializing network...");
                     if let Some(mac) = driver::net::init_net_device() {
+                        net::iface::NetStack::init(mac);
+                    }
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::console_println!("[init] Initializing network...");
+                    if let Some(mac) = crate::arch::virtio_net::init_net_device() {
                         net::iface::NetStack::init(mac);
                     }
                 }

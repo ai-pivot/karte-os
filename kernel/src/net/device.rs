@@ -1,7 +1,11 @@
 //! smoltcp Device trait implementation wrapping VirtIO Net.
 //!
-//! This adapter bridges the VirtIO Net MMIO driver (raw packet I/O)
+//! This adapter bridges the VirtIO Net driver (raw packet I/O)
 //! with smoltcp's token-based Device interface.
+//!
+//! Architecture-specific dispatch:
+//! - RISC-V: calls `crate::driver::net::send_raw/recv_raw` (MMIO driver)
+//! - x86_64: calls `crate::arch::x86_64::virtio_net::send_raw/recv_raw` (PCI driver)
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
@@ -73,7 +77,10 @@ impl TxToken for VirtTxToken {
 
         // Actually transmit via VirtIO Net driver
         if write_len > 0 {
+            #[cfg(target_arch = "riscv64")]
             crate::driver::net::send_raw(&buf[..write_len]);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::virtio_net::send_raw(&buf[..write_len]);
         }
 
         result
@@ -108,7 +115,11 @@ impl NetDevice {
         drop(state); // Release lock before calling recv_raw (which also locks)
 
         let mut buf = [0u8; MAX_FRAME];
-        match crate::driver::net::recv_raw(&mut buf) {
+        #[cfg(target_arch = "riscv64")]
+        let result = crate::driver::net::recv_raw(&mut buf);
+        #[cfg(target_arch = "x86_64")]
+        let result = crate::arch::virtio_net::recv_raw(&mut buf);
+        match result {
             Some(len) => {
                 let mut state = NET_STATE.lock();
                 state.rx_buf[..len].copy_from_slice(&buf[..len]);

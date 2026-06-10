@@ -43,7 +43,9 @@ QEMU_X86_FLAGS := \
   -cdrom $(ISO_FILE) -serial stdio -display none -no-reboot \
   -drive file=disk.img,format=raw,if=none,id=hd0 \
   -device ich9-ahci,id=ahci \
-  -device ide-hd,drive=hd0,bus=ahci.0
+  -device ide-hd,drive=hd0,bus=ahci.0 \
+  -netdev user,id=net0 \
+  -device virtio-net-pci,netdev=net0
 
 # ═══════════════════════════════════════════════════════════════
 #  Disk image (auto-created if missing)
