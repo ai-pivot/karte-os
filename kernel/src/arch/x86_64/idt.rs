@@ -340,7 +340,17 @@ core::arch::global_asm!(
     "page_fault_isr_stub:",
     // NO compiler prologue — we control every instruction.
     // Stack layout after our pushes (high→low):
-    //   SS, RSP, RFLAGS, CS, RIP, error_code, <our 9 saves>
+    //   SS, RSP, RFLAGS, CS, RIP, error_code, <our saves>
+
+    // Switch to kernel CR3. PF handler accesses kernel data structures
+    // (VMA table, console buffer) that require kernel page table.
+    "mov rax, cr3",
+    "push rax",             // save user CR3
+    "mov rax, [rip + KERNEL_CR3_PHYS]",
+    "cmp rax, 0",
+    "je 2f",                // skip if KERNEL_CR3_PHYS not initialized yet
+    "mov cr3, rax",
+    "2:",
 
     // Save caller-saved GP registers (9 regs)
     "push rax",
@@ -368,6 +378,12 @@ core::arch::global_asm!(
     "pop rdx",
     "pop rcx",
     "pop rax",
+    // Restore user CR3
+    "pop rcx",
+    "cmp rcx, 0",
+    "je 3f",
+    "mov cr3, rcx",
+    "3:",
     "add rsp, 8", // skip error_code (CPU-pushed)
     "iretq",
 );
@@ -890,17 +906,18 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             && fault_addr_val >= 0x400000
             && fault_addr_val < crate::process::USER_HEAP_BASE
         {
-            let user_pt = super::trap::get_current_user_pt();
-            if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
-                if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                    unsafe {
-                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+            super::trap::with_kernel_cr3(|| {
+                let user_pt = super::trap::get_user_pt_safe();
+                if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                    if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                        unsafe {
+                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                        }
+                        crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
+                        super::trap::flush_tlb();
                     }
-                    crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
-                    super::trap::flush_tlb();
-                    break 'handler true;
                 }
-            }
+            });
             break 'handler true;
         }
 
