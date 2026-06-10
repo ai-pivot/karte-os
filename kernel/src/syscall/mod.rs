@@ -139,7 +139,7 @@ pub fn vma_check(addr: usize) -> Option<usize> {
 /// Add or update a VMA entry for [start, end) with the given prot.
 /// For MAP_FIXED, removes any overlapping entries first.
 /// Returns Ok(()) on success, Err(()) if no free VMA slot is available.
-fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result<(), ()> {
+pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result<(), ()> {
     let mut table = VMA_TABLE.lock();
     if map_fixed {
         // Phase 1: Collect indices of overlapping entries and compute splits
@@ -189,7 +189,7 @@ fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result<(),
 }
 
 /// Remove all VMA entries overlapping [start, end).
-fn vma_remove_range(start: usize, end: usize) {
+pub fn vma_remove_range(start: usize, end: usize) {
     let mut table = VMA_TABLE.lock();
     let mut splits: alloc::vec::Vec<(usize, usize, usize)> = alloc::vec::Vec::new();
     for i in 0..MAX_VMAS {

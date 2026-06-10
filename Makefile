@@ -96,6 +96,13 @@ test:
 	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
 	@cargo build --release -p karte-os-kernel
 
+## Run x86_64 integration tests in QEMU
+test-x86:
+	@bash scripts/run-tests-x86_64.sh
+
+## Run ALL tests (RISC-V + x86_64)
+test-all: test test-x86
+
 ## Build test kernel only
 build-test:
 	@$(MAKE) user-build ARCH=riscv64

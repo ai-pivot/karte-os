@@ -26,5 +26,8 @@ pub mod trap;
 pub mod uart;
 pub mod virtio_blk;
 
+#[cfg(feature = "test_mode")]
+pub mod test;
+
 // Re-export core types used by the rest of the kernel
 pub use trap::TrapContext;

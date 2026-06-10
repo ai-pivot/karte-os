@@ -298,5 +298,8 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **Test framework**: `kernel/src/test.rs` — TAP-style `run_test(name, || bool)` API
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`
 - **CI**: GitHub Actions runs build + lint + test + boot-test + smp-test on every push
-- **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), IntSpinLock (5), Mutex (6), Task (6), Syscall (15) = **69 tests**
-- **x86_64**: Tests not yet ported — only RISC-V runs `make test`
+- **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), IntSpinLock (5), Mutex (6), Task (6), Syscall (15) = **69 tests** (RISC-V core)
+- **Architecture tests**: RISC-V (15) + x86_64 (22) = **37 arch-specific tests**
+- **Total**: RISC-V 96/96, x86_64 89/103 (14 network tests fail on x86_64 — no network stack yet)
+- **x86_64**: `make test-x86` runs x86_64 integration tests in QEMU
+- **Both**: `make test-all` runs RISC-V + x86_64 tests sequentially

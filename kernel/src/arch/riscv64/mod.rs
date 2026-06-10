@@ -7,6 +7,9 @@ pub mod sbi;
 pub mod smp;
 pub mod trap;
 
+#[cfg(feature = "test_mode")]
+pub mod test;
+
 // Assembly files are included via global_asm! in the modules that need them:
 // - entry.S: included from main.rs
 // - trap_entry.S: included from trap.rs

@@ -88,6 +88,13 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::sched::task::run_tests();
         crate::syscall::run_tests();
 
+        // Architecture-specific tests
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::test::run_tests();
+
+        #[cfg(target_arch = "riscv64")]
+        crate::arch::test::run_tests();
+
         crate::test::print_summary();
 
         #[cfg(target_arch = "riscv64")]
