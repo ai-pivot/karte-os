@@ -18,18 +18,27 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// Marker trait for types that can be safely accessed through user pointers.
+///
+/// Only `Copy` types without heap indirection should implement this.
+/// Types with `Drop` (String, Vec, Box) must NOT implement `UserSafe`.
+pub trait UserSafe: Copy {}
+
+// Blanket impl: all Copy types are UserSafe.
+impl<T: Copy> UserSafe for T {}
+
 /// A pointer to a single value in user space.
 ///
 /// Cannot be dereferenced directly — must use `.read()` / `.write()`
 /// which handle CR3 switching on x86_64.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
-pub struct UserPtr<T> {
+pub struct UserPtr<T: UserSafe> {
     addr: usize,
     _marker: core::marker::PhantomData<T>,
 }
 
-impl<T: Copy + Default> UserPtr<T> {
+impl<T: UserSafe + Default> UserPtr<T> {
     /// Create a UserPtr from a raw address. Returns None if addr is 0.
     #[inline]
     pub fn new(addr: usize) -> Option<Self> {
@@ -41,6 +50,12 @@ impl<T: Copy + Default> UserPtr<T> {
                 _marker: core::marker::PhantomData,
             })
         }
+    }
+
+    /// Create a UserPtr from a typed UserVirtAddr. Returns None if null.
+    #[inline]
+    pub fn from_user_addr(addr: crate::mm::addr::UserVirtAddr) -> Option<Self> {
+        Self::new(addr.as_usize())
     }
 
     /// Create a UserPtr without checking for null.
@@ -56,6 +71,12 @@ impl<T: Copy + Default> UserPtr<T> {
     #[inline]
     pub fn addr(&self) -> usize {
         self.addr
+    }
+
+    /// Typed user virtual address (if in user range).
+    #[inline]
+    pub fn user_addr(&self) -> Option<crate::mm::addr::UserVirtAddr> {
+        crate::mm::addr::UserVirtAddr::try_new(self.addr)
     }
 
     /// Read a value from user space (with CR3 switch on x86_64).
