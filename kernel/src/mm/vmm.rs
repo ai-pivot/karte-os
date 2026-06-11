@@ -227,6 +227,13 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
             crate::arch::trap::flush_tlb_addr(vaddr);
             // Continue traversal into the new table
             table = unsafe { &mut *((new_ppn << 12) as *mut PageTable) };
+            if sub_page_size == PAGE_SIZE {
+                // Splitting a 2MB PD leaf produces a PT that already contains
+                // 4KB leaf entries. Stop here so the level-0 mapping code below
+                // updates the PT entry instead of treating a data frame as a
+                // lower-level page table.
+                break;
+            }
             continue;
         }
 
@@ -521,6 +528,13 @@ pub fn mprotect_user(root: &mut PageTable, vaddr: usize, flags: PTEFlags) -> boo
         }
         #[cfg(target_arch = "x86_64")]
         {
+            if entry.flags().contains(PTEFlags::PS) {
+                // A huge page here is one of the supervisor-only identity
+                // mappings copied into the user page table. It is not a real
+                // user leaf. Do not add USER or descend into its physical frame
+                // as if it were a lower-level page table.
+                return false;
+            }
             ensure_nonleaf_user_bit(entry, flags);
         }
         let ppn = entry.ppn();

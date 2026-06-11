@@ -1183,34 +1183,43 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 // Protection fault: page exists but wrong permissions.
                 // Check VMA to determine if this is ELF data or anonymous mmap.
                 let vma_prot = crate::syscall::vma_query(fault_addr_val);
-                let vma_allows = vma_prot.map_or(false, |p| p != 0);
-                // ELF segments have prot=1 (RX, read-only text) or prot=5 (RX, read-execute).
-                // Anonymous mmap regions have prot=3 (RW). PROT_NONE (0) means reserved.
-                let vma_is_elf = vma_prot.map_or(false, |p| p == 1 || p == 5);
+                let is_write = error_code & (1 << 1) != 0;
+                let is_exec = error_code & (1 << 4) != 0;
+                let vma_allows = vma_prot.map_or(false, |p| {
+                    p != 0
+                        && if is_exec {
+                            p & 0x4 != 0
+                        } else if is_write {
+                            p & 0x2 != 0
+                        } else {
+                            p & 0x3 != 0
+                        }
+                });
                 let heap_region = fault_addr_val >= crate::process::USER_HEAP_BASE
                     && fault_addr_val < crate::process::USER_HEAP_LIMIT;
                 let stack_region = fault_addr_val >= crate::process::USER_STACK_BASE
                     && fault_addr_val < crate::process::USER_STACK_TOP;
+                let vma_is_elf = crate::syscall::vma_is_elf(fault_addr_val);
 
                 if vma_allows || heap_region || stack_region {
+                    let pte_flags = if let Some(prot) = vma_prot {
+                        crate::syscall::prot_to_pte_flags(prot)
+                    } else {
+                        crate::mm::vmm::PTEFlags::URW
+                    };
                     super::trap::with_kernel_cr3(|| {
                         let user_pt = super::trap::get_user_pt_safe();
                         if let Some(frame) = crate::mm::vmm::translate_user(user_pt, page_addr) {
                             let is_identity = frame == page_addr;
                             if is_identity {
                                 // Identity mapping in user space — this came from copy_kernel_mappings.
-                                // For ELF regions (prot=1 or prot=5), the identity mapping IS the ELF data.
-                                // For other regions (prot=3 RW, prot=0 NONE), allocate fresh zeroed frame.
+                                // For ELF VMAs, the identity mapping IS the ELF data.
+                                // For heap/stack, replace identity mappings with private frames.
                                 if vma_is_elf {
                                     // ELF data: just upgrade permissions, preserve the frame
-                                    crate::mm::vmm::map(
-                                        user_pt,
-                                        page_addr,
-                                        frame,
-                                        crate::mm::vmm::PTEFlags::URW,
-                                    );
+                                    crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
                                 } else {
-                                    // Non-ELF identity mapping: replace with fresh zeroed frame
+                                    // Anonymous mmap/heap/stack identity mapping: replace with a private zeroed frame.
                                     if let Some(new_frame) = crate::mm::pmm::alloc_frame() {
                                         unsafe {
                                             core::ptr::write_bytes(
@@ -1220,23 +1229,16 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                             );
                                         }
                                         crate::mm::vmm::map(
-                                            user_pt,
-                                            page_addr,
-                                            new_frame,
-                                            crate::mm::vmm::PTEFlags::URW,
+                                            user_pt, page_addr, new_frame, pte_flags,
                                         );
                                     }
                                 }
                             } else {
-                                // Non-identity frame: just upgrade permissions
-                                crate::mm::vmm::map(
-                                    user_pt,
-                                    page_addr,
-                                    frame,
-                                    crate::mm::vmm::PTEFlags::URW,
-                                );
+                                // Non-identity frame: restore the permissions allowed by the VMA.
+                                crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
                             }
                         }
+                        super::trap::flush_tlb_addr(page_addr);
                     });
                     break 'handler true;
                 }
@@ -1270,9 +1272,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                 Some(f) => f == page_addr,
                             };
                             if needs_alloc {
-                                // Check if VMA indicates ELF data (prot=1 or prot=5).
-                                // If so, identity mapping IS the ELF data — don't replace.
-                                let vma_is_elf = vma_prot == 1 || vma_prot == 5;
+                                let vma_is_elf = crate::syscall::vma_is_elf(fault_addr_val);
                                 if vma_is_elf && old_frame.is_some() {
                                     // ELF data with identity mapping — just remap with correct perms
                                     crate::mm::vmm::map(

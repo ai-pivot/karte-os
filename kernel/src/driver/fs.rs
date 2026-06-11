@@ -960,7 +960,7 @@ impl FdTable {
             data.resize(end, 0);
         }
         for i in 0..len {
-            data[pos + i] = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+            data[pos + i] = crate::syscall::user_read_u8(buf + i);
         }
         desc.pos = end;
         Some(len as isize)
@@ -995,36 +995,14 @@ impl FdTable {
             let desc = slot.as_ref()?;
             match &desc.fd_type {
                 FdType::FakeFile(data) => {
-                    #[cfg(target_arch = "x86_64")]
-                    crate::arch::trap::with_user_cr3(|| {
-                        for i in 0..to_read {
-                            unsafe {
-                                core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i])
-                            };
-                        }
-                    });
-                    #[cfg(not(target_arch = "x86_64"))]
                     for i in 0..to_read {
-                        unsafe { core::ptr::write_volatile((buf + i) as *mut u8, data[pos + i]) };
+                        crate::syscall::user_write_u8(buf + i, data[pos + i]);
                     }
                 }
                 FdType::Urandom => {
                     // Generate pseudo-random bytes using LCG PRNG
                     static PRNG: core::sync::atomic::AtomicU64 =
                         core::sync::atomic::AtomicU64::new(0xDEADBEEFCAFE1234);
-                    #[cfg(target_arch = "x86_64")]
-                    crate::arch::trap::with_user_cr3(|| {
-                        for i in 0..to_read {
-                            let prev = PRNG.load(core::sync::atomic::Ordering::Relaxed);
-                            let next = prev
-                                .wrapping_mul(6364136223846793005)
-                                .wrapping_add(1442695040888963407);
-                            PRNG.store(next, core::sync::atomic::Ordering::Relaxed);
-                            let byte = ((next >> ((i % 8) * 8)) & 0xFF) as u8;
-                            unsafe { core::ptr::write_volatile((buf + i) as *mut u8, byte) };
-                        }
-                    });
-                    #[cfg(not(target_arch = "x86_64"))]
                     for i in 0..to_read {
                         let prev = PRNG.load(core::sync::atomic::Ordering::Relaxed);
                         let next = prev
@@ -1032,7 +1010,7 @@ impl FdTable {
                             .wrapping_add(1442695040888963407);
                         PRNG.store(next, core::sync::atomic::Ordering::Relaxed);
                         let byte = ((next >> ((i % 8) * 8)) & 0xFF) as u8;
-                        unsafe { core::ptr::write_volatile((buf + i) as *mut u8, byte) };
+                        crate::syscall::user_write_u8(buf + i, byte);
                     }
                 }
                 _ => {}

@@ -371,14 +371,12 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_SCHED_GETAFFINITY => {
             // sched_getaffinity(pid, size, mask) — fake: CPU 0 available
             let size = args[1]; // mask_size in bytes
-            let mask_ptr = args[2] as *mut u8;
-            if mask_ptr as usize != 0 && size > 0 {
-                // Zero-fill the entire mask
-                crate::arch::trap::with_user_cr3(|| unsafe {
-                    core::ptr::write_bytes(mask_ptr, 0, size);
-                    // Set CPU 0 as available (first byte = 0x01)
-                    core::ptr::write_volatile(mask_ptr, 0x01u8);
-                });
+            let mask_ptr = args[2];
+            if mask_ptr != 0 && size > 0 {
+                for i in 0..size {
+                    crate::syscall::user_write_u8(mask_ptr + i, 0);
+                }
+                crate::syscall::user_write_u8(mask_ptr, 0x01);
             }
             Some(Translation::Handled(size as isize))
         }

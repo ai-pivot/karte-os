@@ -12,8 +12,8 @@
 //! If a `Vec::push` triggers alloc/dealloc under user CR3, it may read
 //! corrupted HoleList nodes → GP fault in `linked_list_allocator`.
 //!
-//! All methods below pre-allocate buffers under kernel CR3, then only do
-//! raw `read_volatile`/`write_volatile` inside `with_user_cr3()`.
+//! All methods below keep kernel buffers on the kernel page table and copy
+//! bytes through the syscall user access primitives.
 
 use alloc::string::String;
 use alloc::vec::Vec;

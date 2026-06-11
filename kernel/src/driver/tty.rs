@@ -362,14 +362,9 @@ fn read_available(buf: usize, len: usize) -> isize {
     for i in 0..len {
         match TTY_INPUT.pop() {
             Some(c) => {
-                #[cfg(target_arch = "x86_64")]
-                crate::arch::trap::with_user_cr3(|| {
-                    unsafe { core::ptr::write_volatile((buf + i) as *mut u8, c) };
-                });
-                #[cfg(not(target_arch = "x86_64"))]
                 unsafe {
-                    core::ptr::write_volatile((buf + i) as *mut u8, c)
-                };
+                    core::ptr::write_volatile((buf + i) as *mut u8, c);
+                }
                 count += 1;
             }
             None => break,

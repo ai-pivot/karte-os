@@ -235,6 +235,15 @@ pub fn register_elf_vma(start: usize, end: usize, prot: usize) {
     let _ = vma_add(start, end, prot, false);
 }
 
+/// Return true when `addr` belongs to the ELF PT_LOAD address range.
+///
+/// Anonymous mmap regions can use the same protection bits as ELF segments,
+/// so protection alone cannot distinguish them in the page-fault handler.
+pub fn vma_is_elf(addr: usize) -> bool {
+    let max = MAX_ELF_VADDR.load(core::sync::atomic::Ordering::Relaxed);
+    max != 0 && addr >= 0x400000 && addr < max && vma_query(addr).is_some()
+}
+
 /// Split or remove VMA entries that overlap with [start, end).
 /// For each overlapping VMA:
 /// - If it fully contains [start, end), split into two (tail re-inserted)
@@ -994,7 +1003,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         217 => linux_getdents64(args[0], args[1], args[2]), // getdents64
         218 => linux_set_tid_address(args[0]),         // set_tid_address
         228 => linux_clock_gettime(args[0], args[1]),  // clock_gettime
-        231 => sys_exit(args[0] as i32),               // exit_group
+        231 => linux_exit_group(args[0] as i32),       // exit_group
         234 => linux_tgkill(args[0], args[1], args[2]), // tgkill
         257 => linux_openat(args[0], args[1], args[2], args[3]), // openat
         258 => linux_mkdirat(args[0], args[1], args[2], args[3]), // mkdirat
@@ -1641,17 +1650,12 @@ fn linux_clock_gettime(_clockid: usize, tp: usize) -> isize {
 #[cfg(target_arch = "x86_64")]
 fn linux_sysinfo(info: usize) -> isize {
     if info != 0 {
-        // struct sysinfo is ~80 bytes, zero-fill
-        crate::arch::trap::with_user_cr3(|| {
-            unsafe {
-                core::ptr::write_bytes(info as *mut u8, 0, 80);
-                // Set some reasonable values
-                *(info as *mut u64) = 512 * 1024 / 4; // totalram (in pages, ~512MB)
-                *(info as *mut u64).add(1) = 256 * 1024 / 4; // freeram
-                *(info as *mut u64).add(3) = 1; // procs
-                *(info as *mut u64).add(12) = 4096; // mem_unit
-            }
-        });
+        // Linux x86_64 struct sysinfo is 112 bytes.
+        user_write_bytes(info, &[0u8; 112]);
+        user_write::<u64>(info + 32, 512 * 1024 / 4); // totalram (in pages, ~512MB)
+        user_write::<u64>(info + 40, 256 * 1024 / 4); // freeram
+        user_write::<u16>(info + 80, 1); // procs
+        user_write::<u32>(info + 104, 4096); // mem_unit
     }
     0
 }
@@ -1659,12 +1663,9 @@ fn linux_sysinfo(info: usize) -> isize {
 #[cfg(target_arch = "x86_64")]
 fn linux_sched_getaffinity(_pid: usize, size: usize, mask: usize) -> isize {
     if mask != 0 && size > 0 {
-        crate::arch::trap::with_user_cr3(|| {
-            // Zero-fill the entire mask
-            unsafe {
-                core::ptr::write_bytes(mask as *mut u8, 0, size);
-            }
-        });
+        for i in 0..size {
+            user_write_u8(mask + i, 0);
+        }
         // Set CPU 0 as available (first byte = 0x01)
         user_write::<u8>(mask, 0x01u8);
     }
@@ -1871,6 +1872,81 @@ pub fn sys_exit(code: i32) -> isize {
     0
 }
 
+#[cfg(target_arch = "x86_64")]
+fn linux_exit_group(code: i32) -> isize {
+    unsafe { core::arch::asm!("cli") };
+
+    let my_idx = crate::process::current_index();
+    let my_pid = crate::process::current_pid();
+    let root = crate::process::current_page_table_root();
+    let leader_idx = crate::process::find_group_leader_by_page_table_root(root).unwrap_or(my_idx);
+    let group = crate::process::find_processes_by_page_table_root(root);
+
+    for idx in group {
+        if idx == my_idx {
+            continue;
+        }
+        if let Some(proc) = crate::process::get_process_by_index(idx) {
+            if proc.child_tid_ptr != 0 {
+                user_write::<i32>(proc.child_tid_ptr, 0);
+                linux_futex(proc.child_tid_ptr, 1, 1);
+            }
+        }
+        crate::process::set_exit_code_by_index(idx, code as usize);
+        crate::sched::mark_task_exited_by_proc(idx);
+        if idx != leader_idx {
+            crate::process::free_process_slot(idx);
+        }
+    }
+
+    if leader_idx != my_idx {
+        crate::process::set_exit_code_by_index(leader_idx, code as usize);
+    }
+
+    if let Some(parent_idx) = crate::process::find_waiting_parent(leader_idx) {
+        crate::process::set_wait_child(parent_idx, None);
+        crate::sched::wake_task(parent_idx);
+    }
+
+    crate::sched::mark_current_exited();
+    crate::process::set_exit_code(code as usize);
+
+    if let Some(proc) = crate::process::current() {
+        if proc.child_tid_ptr != 0 {
+            user_write::<i32>(proc.child_tid_ptr, 0);
+            linux_futex(proc.child_tid_ptr, 1, 1);
+        }
+    }
+
+    crate::klog!(
+        INFO,
+        "[process] exit_group pid={} leader_idx={} slot={} code={}",
+        my_pid,
+        leader_idx,
+        crate::sched::current_running_slot(),
+        code
+    );
+
+    if my_pid == 1 {
+        crate::klog!(INFO, "[init] Shell exited, shutting down...");
+        crate::arch::platform::shutdown();
+    }
+
+    let kcr3 = crate::mm::vmm::kernel_cr3();
+    if kcr3 != 0 {
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) kcr3);
+        }
+    }
+
+    if my_idx != leader_idx {
+        crate::process::free_process_slot(my_idx);
+    }
+
+    crate::sched::schedule_exit();
+    0
+}
+
 /// Syscall 2: Write to file descriptor.
 fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
     if buf == 0 || len == 0 || len > 65536 {
@@ -1998,7 +2074,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             // Fall through to file read below
         }
         Some((FdType::FakeFile(_), _, _)) | Some((FdType::Urandom, _, _)) => {
-            // FakeFile/urandom: fake_read writes to user buf via with_user_cr3
+            // FakeFile/urandom: fake_read copies kernel bytes through user_write_u8().
             return crate::process::with_fd_table(|fd_table| {
                 fd_table.fake_read(fd, buf, len).unwrap_or(0)
             }) as isize;
@@ -2759,22 +2835,10 @@ fn linux_rt_sigaction(sig: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
         // We only record the handler; write zeros for the rest.
         let handler_val =
             SIGNAL_STATE.handlers[sig - 1].load(core::sync::atomic::Ordering::Relaxed);
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| unsafe {
-            let oldact = oldact_ptr as *mut [usize; 4];
-            (*oldact)[0] = handler_val;
-            (*oldact)[1] = 0;
-            (*oldact)[2] = 0;
-            (*oldact)[3] = 0;
-        });
-        #[cfg(not(target_arch = "x86_64"))]
-        unsafe {
-            let oldact = oldact_ptr as *mut [usize; 4];
-            (*oldact)[0] = handler_val;
-            (*oldact)[1] = 0;
-            (*oldact)[2] = 0;
-            (*oldact)[3] = 0;
-        }
+        user_write::<usize>(oldact_ptr, handler_val);
+        user_write::<usize>(oldact_ptr + core::mem::size_of::<usize>(), 0);
+        user_write::<usize>(oldact_ptr + 2 * core::mem::size_of::<usize>(), 0);
+        user_write::<usize>(oldact_ptr + 3 * core::mem::size_of::<usize>(), 0);
     }
     // Set new handler if provided
     if act_ptr != 0 {
@@ -2792,14 +2856,7 @@ fn linux_rt_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize 
         let mask_val = SIGNAL_STATE
             .mask
             .load(core::sync::atomic::Ordering::Relaxed);
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| unsafe {
-            *(oldset_ptr as *mut u64) = mask_val;
-        });
-        #[cfg(not(target_arch = "x86_64"))]
-        unsafe {
-            *(oldset_ptr as *mut u64) = mask_val;
-        }
+        user_write::<u64>(oldset_ptr, mask_val);
     }
     // Apply new mask if provided
     if set_ptr != 0 {
@@ -2850,20 +2907,9 @@ fn linux_sigaltstack(ss_ptr: usize, oss_ptr: usize) -> isize {
         let ss_size = SIGNAL_STATE
             .altstack_size
             .load(core::sync::atomic::Ordering::Relaxed);
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| unsafe {
-            let oss = oss_ptr as *mut [usize; 3];
-            (*oss)[0] = ss_sp;
-            (*oss)[1] = ss_flags;
-            (*oss)[2] = ss_size;
-        });
-        #[cfg(not(target_arch = "x86_64"))]
-        unsafe {
-            let oss = oss_ptr as *mut [usize; 3];
-            (*oss)[0] = ss_sp;
-            (*oss)[1] = ss_flags;
-            (*oss)[2] = ss_size;
-        }
+        user_write::<usize>(oss_ptr, ss_sp);
+        user_write::<usize>(oss_ptr + core::mem::size_of::<usize>(), ss_flags);
+        user_write::<usize>(oss_ptr + 2 * core::mem::size_of::<usize>(), ss_size);
     }
     // Set new state if provided
     if ss_ptr != 0 {
@@ -4627,14 +4673,7 @@ pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
                 user_write::<u32>(arg + 8, 0); // c_cflag
                 user_write::<u32>(arg + 12, lflag); // c_lflag
                 user_write::<u8>(arg + 16, 0); // c_line
-                #[cfg(target_arch = "x86_64")]
-                crate::arch::trap::with_user_cr3(|| unsafe {
-                    core::ptr::write_bytes((arg + 17) as *mut u8, 0, 19);
-                });
-                #[cfg(not(target_arch = "x86_64"))]
-                unsafe {
-                    core::ptr::write_bytes((arg + 17) as *mut u8, 0, 19);
-                }
+                user_write_bytes(arg + 17, &[0u8; 19]);
             }
             0
         }

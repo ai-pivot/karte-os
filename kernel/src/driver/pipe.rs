@@ -68,14 +68,7 @@ impl Pipe {
         let to_read = core::cmp::min(len, self.data_len);
         for i in 0..to_read {
             let byte = self.buffer[self.read_pos];
-            #[cfg(target_arch = "x86_64")]
-            crate::arch::trap::with_user_cr3(|| {
-                unsafe { core::ptr::write_volatile((buf + i) as *mut u8, byte) };
-            });
-            #[cfg(not(target_arch = "x86_64"))]
-            unsafe {
-                core::ptr::write_volatile((buf + i) as *mut u8, byte);
-            }
+            crate::syscall::user_write_u8(buf + i, byte);
             self.read_pos = (self.read_pos + 1) % PIPE_BUF_SIZE;
         }
         self.data_len -= to_read;
@@ -110,7 +103,7 @@ impl Pipe {
 
         let to_write = core::cmp::min(len, available);
         for i in 0..to_write {
-            let byte = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+            let byte = crate::syscall::user_read_u8(buf + i);
             self.buffer[self.write_pos] = byte;
             self.write_pos = (self.write_pos + 1) % PIPE_BUF_SIZE;
         }

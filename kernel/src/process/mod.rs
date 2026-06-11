@@ -1268,11 +1268,13 @@ pub fn free_process_slot(idx: usize) {
     table[idx] = None;
 }
 
-/// Set exit code for a process by its table index (used by kill_clone_children).
+/// Set exit code for a process by its table index and mark it exited.
+/// This is what makes a polling parent observe completion via waitpid().
 pub fn set_exit_code_by_index(idx: usize, code: usize) {
     let mut table = PROCESS_TABLE.lock();
     if let Some(p) = table[idx].as_mut() {
         p.exit_code = code;
+        p.state = ProcessState::Exited;
     }
 }
 
@@ -1511,6 +1513,37 @@ pub fn get_process_by_index(idx: usize) -> Option<Process> {
     table[idx].clone()
 }
 
+/// Return all process table indices that share the same page table root.
+pub fn find_processes_by_page_table_root(root: usize) -> alloc::vec::Vec<usize> {
+    let table = PROCESS_TABLE.lock();
+    let mut indices = alloc::vec::Vec::new();
+    for (idx, proc_opt) in table.iter().enumerate() {
+        if let Some(proc) = proc_opt {
+            if proc.page_table_root == root {
+                indices.push(idx);
+            }
+        }
+    }
+    indices
+}
+
+/// Return the process table index for the thread-group leader of an address space.
+pub fn find_group_leader_by_page_table_root(root: usize) -> Option<usize> {
+    let table = PROCESS_TABLE.lock();
+    let mut fallback = None;
+    for (idx, proc_opt) in table.iter().enumerate() {
+        if let Some(proc) = proc_opt {
+            if proc.page_table_root == root {
+                fallback.get_or_insert(idx);
+                if !proc.shared_page_table {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+    fallback
+}
+
 /// Kill all clone child threads of the given PID.
 /// Used when a thread group leader exits (exit_group) to terminate
 /// all CLONE_THREAD children that share the same address space.
@@ -1544,14 +1577,7 @@ pub fn kill_clone_children(parent_pid: usize) {
                 if p.child_tid_ptr != 0 {
                     let tid_ptr = p.child_tid_ptr;
                     drop(table);
-                    #[cfg(target_arch = "x86_64")]
-                    crate::arch::trap::with_user_cr3(|| unsafe {
-                        core::ptr::write_volatile(tid_ptr as *mut i32, 0);
-                    });
-                    #[cfg(not(target_arch = "x86_64"))]
-                    unsafe {
-                        core::ptr::write_volatile(tid_ptr as *mut i32, 0);
-                    }
+                    crate::syscall::user_write::<i32>(tid_ptr, 0);
                     // Wake futex waiters
                     crate::syscall::linux_futex(tid_ptr, 1, 1);
                 }
