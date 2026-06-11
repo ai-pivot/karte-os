@@ -449,6 +449,11 @@ fn walk_to_pt(root: &mut PageTable, vaddr: usize) -> Option<(&mut PageTable, usi
     Some((table, PageTable::vpn(vaddr, 0)))
 }
 
+/// Translate a virtual address to its physical frame.
+///
+/// **Deprecated**: Use `walk_mapping()` instead, which returns `WalkResult`
+/// and forces callers to handle `MappedHuge` explicitly.
+#[deprecated(note = "use walk_mapping() which returns WalkResult")]
 pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
     // Walk intermediate levels, handling huge pages on x86_64
     let mut table = root;
