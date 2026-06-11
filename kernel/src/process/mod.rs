@@ -801,8 +801,9 @@ impl Process {
 
         let initial_rsp = metadata_start;
 
-        // 7. Store page_table_root as PPN
+        // 7. Store page_table_root as PPN and initialize per-root VMA state
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
+        crate::mm::vma::init_root(page_table_ppn);
 
         // 8. Set up initial brk (after loaded segments, aligned to page)
         let initial_brk = (max_vaddr + page_size - 1) & !(page_size - 1);
@@ -1037,14 +1038,20 @@ impl Process {
             verify_streaming_elf_pages(user_pt, &elf_info, &read_fn, page_size)?;
         }
 
+        // 5.05 Register ELF segments as VMA entries. We need page_table_ppn
+        //      which we compute here (before step 8 where it's stored in Process).
+        let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
+
         // 5.1 Register ELF segments as VMA entries to prevent mmap from
         // allocating addresses that overlap with loaded ELF data.
         // Also ensure the mmap bump allocator starts past all ELF segments.
+        // Initialize per-root VMA state first (idempotent if already initialized).
+        crate::mm::vma::init_root(page_table_ppn);
         for &(start, end, prot) in &elf_segments_vma {
-            crate::syscall::register_elf_vma(start, end, prot);
+            crate::mm::vma::register_elf_vma(page_table_ppn, start, end, prot);
         }
         if max_vaddr > 0 {
-            crate::syscall::ensure_mmap_above(max_vaddr);
+            crate::mm::vma::ensure_mmap_above(page_table_ppn, max_vaddr);
         }
 
         // 5.5 Restore CR3 after ELF segment loading.
@@ -1225,6 +1232,7 @@ impl Process {
 
         // 8. Store page_table_root as PPN
         let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
+        // NOTE: init_root was already called in step 5.05 before ELF VMA registration.
 
         // 9. Set up initial brk (after loaded segments, aligned to page)
         let initial_brk = (max_vaddr + page_size - 1) & !(page_size - 1);
@@ -1480,9 +1488,10 @@ pub fn reclaim_process(idx: usize) -> bool {
     };
 
     if let Some(p) = proc {
-        // Free user page table (all user-mapped frames + page table frames)
-        // Skip if page table is shared (CLONE_VM child) — parent owns it
+        // Release VMA state for this address space.
+        // Only when the process owns the page table (not shared via CLONE_VM).
         if p.page_table_root != 0 && !p.shared_page_table {
+            crate::mm::vma::release_root(p.page_table_root);
             crate::mm::vmm::free_user_page_table(p.page_table_root);
         }
         dealloc_kernel_stack(p.kernel_stack_top);

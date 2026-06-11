@@ -57,17 +57,6 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
     crate::console_println!("=== KarteOS v0.2.0 ===");
     crate::console_println!("  Booting on hart {}", hartid);
-    #[cfg(target_arch = "x86_64")]
-    {
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H0","location":"kernel/src/main.rs:kmain","message":"debug image provenance","data":{{"marker":"debug-9230b7","hartid":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            hartid,
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
 
     // Initialize kernel logger before any subsystem that uses `log::`
     crate::kernel_log::init();

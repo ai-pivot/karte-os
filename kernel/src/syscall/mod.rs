@@ -103,193 +103,68 @@ pub const ERR_INTR: isize = -4; // EINTR — Interrupted system call
 
 // ─── VMA (Virtual Memory Area) tracking ────────────────────────────
 //
-// Tracks all mmap'd regions so the PF handler can distinguish valid
-// lazy-allocated pages from illegal accesses, and madvise/mprotect
-// can operate on the correct address ranges.
+// VMA state is now scoped by page_table_root (PPN) in mm::vma module.
+// Each address space has independent VMA entries, mmap bump allocator,
+// and ELF vaddr tracking. See mm::vma for the full implementation.
+//
+// The wrappers below provide convenience access using current_page_table_root().
 
-/// A single VMA region descriptor.
-#[derive(Clone, Copy)]
-struct VmaRegion {
-    start: usize,
-    end: usize,  // exclusive (first byte past the region)
-    prot: usize, // PROT_* bit flags (0 = PROT_NONE)
-    active: bool,
-}
-
-const MAX_VMAS: usize = 1024;
-
-static VMA_TABLE: spin::Mutex<[VmaRegion; MAX_VMAS]> = spin::Mutex::new(
-    [const {
-        VmaRegion {
-            start: 0,
-            end: 0,
-            prot: 0,
-            active: false,
+/// Helper: get current address space root for VMA operations.
+/// Returns a test fallback root when running in test mode with no user process.
+#[inline]
+fn current_root() -> usize {
+    let root = crate::process::current_page_table_root();
+    if root != 0 {
+        root
+    } else {
+        #[cfg(feature = "test_mode")]
+        {
+            // Test mode: use a fixed fallback root for VMA operations
+            const TEST_FALLBACK_ROOT: usize = 0xFFFF_0000;
+            let _ = crate::mm::vma::init_root(TEST_FALLBACK_ROOT);
+            TEST_FALLBACK_ROOT
         }
-    }; MAX_VMAS],
-);
+        #[cfg(not(feature = "test_mode"))]
+        {
+            0 // No fallback outside test mode
+        }
+    }
+}
 
 /// Check if `addr` falls within a VMA that permits access (prot != PROT_NONE).
 /// Returns Some(prot) if valid, None if no VMA covers this address or VMA is PROT_NONE.
 pub fn vma_check(addr: usize) -> Option<usize> {
-    let table = VMA_TABLE.lock();
-    let mut best_prot: Option<usize> = None;
-    let mut best_size: usize = usize::MAX;
-    for vma in table.iter() {
-        if vma.active && addr >= vma.start && addr < vma.end {
-            let size = vma.end - vma.start;
-            let cur_accessible = vma.prot != 0;
-            let best_accessible = best_prot.map_or(false, |p| p != 0);
-            if (cur_accessible && !best_accessible)
-                || (cur_accessible == best_accessible && size < best_size)
-            {
-                best_size = size;
-                best_prot = if vma.prot == 0 { None } else { Some(vma.prot) };
-            }
-        }
-    }
-    best_prot
+    crate::mm::vma::vma_check(current_root(), addr)
 }
 
 /// Query VMA protection for `addr` — distinguishes PROT_NONE from no-VMA.
 /// Returns `Some(prot)` if a VMA covers this address (prot may be 0 for PROT_NONE).
 /// Returns `None` if no VMA covers this address at all.
 pub fn vma_query(addr: usize) -> Option<usize> {
-    let table = VMA_TABLE.lock();
-    for vma in table.iter() {
-        if vma.active && addr >= vma.start && addr < vma.end {
-            return Some(vma.prot);
-        }
-    }
-    None
+    crate::mm::vma::vma_query(current_root(), addr)
 }
 
 /// Dump VMA entries near a given address for debugging.
 pub fn vma_dump_region(addr: usize) {
-    let table = VMA_TABLE.lock();
-    let range = 64 * 1024 * 1024; // ±64MB
-    let mut count = 0;
-    let mut total_active = 0;
-    for vma in table.iter() {
-        if vma.active {
-            total_active += 1;
-            if vma.start < addr + range && vma.end > addr.saturating_sub(range) {
-                let contains = addr >= vma.start && addr < vma.end;
-                crate::console_println!(
-                    "[VMA] {:#x}..{:#x} prot={:#x} {}",
-                    vma.start,
-                    vma.end,
-                    vma.prot,
-                    if contains { "<<< CONTAINS fault" } else { "" }
-                );
-                count += 1;
-                if count >= 20 {
-                    break;
-                }
-            }
-        }
-    }
-    crate::console_println!(
-        "[VMA] total active={}/{} shown={}",
-        total_active,
-        MAX_VMAS,
-        count
-    );
+    crate::mm::vma::vma_dump_region(current_root(), addr)
 }
 
 /// Check if [start, end) overlaps with any active VMA entry.
 pub fn vma_overlaps(start: usize, end: usize) -> bool {
-    let table = VMA_TABLE.lock();
-    for vma in table.iter() {
-        if vma.active && vma.start < end && vma.end > start {
-            return true;
-        }
-    }
-    false
-}
-
-/// Bump allocator for mmap addresses.
-/// Must be past all ELF-loaded segments to avoid overwriting mapped data.
-static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Maximum virtual address of ELF PT_LOAD segments.
-/// Used to prevent MAP_FIXED from overwriting ELF data.
-static MAX_ELF_VADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Flag indicating ELF loading is in progress.
-/// When false, map() operations on ELF range are protected.
-static ELF_LOADING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-#[cfg(target_arch = "x86_64")]
-static DEBUG_SECOND_XBOT_RUN: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-#[cfg(target_arch = "x86_64")]
-pub fn debug_second_xbot_run_active() -> bool {
-    DEBUG_SECOND_XBOT_RUN.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn debug_linux_syscall_boundary(phase: &str, nr: u64, args: [u64; 6], result: i64) {
-    if !debug_second_xbot_run_active() {
-        return;
-    }
-    // #region agent log
-    crate::console_println!(
-        r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H8,H9,H10,H11","location":"kernel/src/syscall/mod.rs:dispatch_syscall_linux","message":"linux syscall {}","data":{{"nr":{},"a0":{},"a1":{},"a2":{},"a3":{},"result":{},"pid":{},"proc":{},"slot":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-        phase,
-        nr,
-        args[0],
-        args[1],
-        args[2],
-        args[3],
-        result,
-        crate::process::current_pid(),
-        crate::process::current_index(),
-        crate::sched::current_sched_slot(),
-        crate::arch::platform::uptime_ms(),
-        crate::arch::platform::uptime_ms(),
-    );
-    // #endregion
-}
-
-#[cfg(target_arch = "x86_64")]
-fn activate_debug_second_xbot_run(my_pid: usize, leader_idx: usize, code: i32) {
-    if DEBUG_SECOND_XBOT_RUN
-        .compare_exchange(
-            false,
-            true,
-            core::sync::atomic::Ordering::Relaxed,
-            core::sync::atomic::Ordering::Relaxed,
-        )
-        .is_ok()
-    {
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H5,H6,H7","location":"kernel/src/syscall/mod.rs:linux_exit_group","message":"debug second xbot run armed","data":{{"pid":{},"leader_idx":{},"code":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            my_pid,
-            leader_idx,
-            code,
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
+    crate::mm::vma::vma_overlaps(current_root(), start, end)
 }
 
 /// Ensure the mmap bump allocator starts at or above `min_addr`.
 /// Called by the ELF loader after loading segments, so that mmap
 /// doesn't allocate addresses that overlap with loaded ELF data.
 pub fn ensure_mmap_above(min_addr: usize) {
-    let aligned = (min_addr + 4095) & !4095;
-    NEXT_MMAP_ADDR.fetch_max(aligned, core::sync::atomic::Ordering::Relaxed);
-    MAX_ELF_VADDR.store(aligned, core::sync::atomic::Ordering::Relaxed);
+    crate::mm::vma::ensure_mmap_above(current_root(), min_addr);
 }
 
 /// Register an ELF PT_LOAD segment as a VMA entry.
 /// This prevents mmap from allocating addresses that overlap with loaded segments.
 pub fn register_elf_vma(start: usize, end: usize, prot: usize) {
-    let _ = vma_add(start, end, prot, false);
+    crate::mm::vma::register_elf_vma(current_root(), start, end, prot);
 }
 
 /// Return true when `addr` belongs to the ELF PT_LOAD address range.
@@ -297,159 +172,30 @@ pub fn register_elf_vma(start: usize, end: usize, prot: usize) {
 /// Anonymous mmap regions can use the same protection bits as ELF segments,
 /// so protection alone cannot distinguish them in the page-fault handler.
 pub fn vma_is_elf(addr: usize) -> bool {
-    let max = MAX_ELF_VADDR.load(core::sync::atomic::Ordering::Relaxed);
-    max != 0 && addr >= 0x400000 && addr < max && vma_query(addr).is_some()
-}
-
-/// Split or remove VMA entries that overlap with [start, end).
-/// For each overlapping VMA:
-/// - If it fully contains [start, end), split into two (tail re-inserted)
-/// - If [start, end) covers its tail, truncate it
-/// - If [start, end) covers its head, move start forward
-/// - If [start, end) fully covers it, deactivate it
-///
-/// Returns up to MAX_VMAS tail splits as (start, end, prot).
-fn split_overlapping_vmas(
-    table: &mut [VmaRegion; MAX_VMAS],
-    start: usize,
-    end: usize,
-) -> [(usize, usize, usize); MAX_VMAS] {
-    let mut tails = [(0usize, 0usize, 0usize); MAX_VMAS];
-    let mut tail_count = 0;
-    for i in 0..MAX_VMAS {
-        let vma = &table[i];
-        if !vma.active || vma.start >= end || vma.end <= start {
-            continue;
-        }
-        // Overlap exists
-        let vma_end = vma.end;
-        let vma_prot = vma.prot;
-
-        if vma.start < start && vma.end > end {
-            // Fully contains: split into [vma_start, start) + [end, vma_end)
-            table[i].end = start;
-            if tail_count < MAX_VMAS {
-                tails[tail_count] = (end, vma_end, vma_prot);
-                tail_count += 1;
-            }
-        } else if vma.start < start {
-            // Overlaps tail: truncate
-            table[i].end = start;
-        } else if vma.end > end {
-            // Overlaps head: move start
-            table[i].start = end;
-        } else {
-            // Fully covered: deactivate
-            table[i].active = false;
-        }
-    }
-    tails
+    crate::mm::vma::vma_is_elf(current_root(), addr)
 }
 
 /// Add or update a VMA entry for [start, end) with the given prot.
 /// For MAP_FIXED, removes any overlapping entries first.
 /// Returns Ok(()) on success, Err(()) if no free VMA slot is available.
 pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result<(), ()> {
-    let mut table = VMA_TABLE.lock();
-    if map_fixed {
-        let tails = split_overlapping_vmas(&mut table, start, end);
-        // Re-insert the tail portions
-        for (s, e, p) in tails.iter() {
-            if *s == 0 && *e == 0 {
-                continue;
-            }
-            for i in 0..MAX_VMAS {
-                if !table[i].active {
-                    table[i] = VmaRegion {
-                        start: *s,
-                        end: *e,
-                        prot: *p,
-                        active: true,
-                    };
-                    break;
-                }
-            }
-        }
-    }
-    // Find a free slot and add the new VMA
-    for i in 0..MAX_VMAS {
-        if !table[i].active {
-            table[i] = VmaRegion {
-                start,
-                end,
-                prot,
-                active: true,
-            };
-            return Ok(());
-        }
-    }
-    Err(())
+    crate::mm::vma::vma_add(current_root(), start, end, prot, map_fixed)
 }
 
 /// Remove all VMA entries overlapping [start, end).
 /// Re-inserts tail fragments (portions of VMAs outside the removed range).
 pub fn vma_remove_range(start: usize, end: usize) {
-    let mut table = VMA_TABLE.lock();
-    let tails = split_overlapping_vmas(&mut table, start, end);
-    for (s, e, p) in tails.iter() {
-        if *s == 0 && *e == 0 {
-            continue;
-        }
-        for i in 0..MAX_VMAS {
-            if !table[i].active {
-                table[i] = VmaRegion {
-                    start: *s,
-                    end: *e,
-                    prot: *p,
-                    active: true,
-                };
-                break;
-            }
-        }
-    }
+    crate::mm::vma::vma_remove_range(current_root(), start, end);
 }
 
 /// Update prot for all VMA entries overlapping [start, end).
 fn vma_update_prot(start: usize, end: usize, new_prot: usize) {
-    let mut table = VMA_TABLE.lock();
-    for vma in table.iter_mut() {
-        if vma.active && vma.start < end && vma.end > start {
-            vma.prot = new_prot;
-        }
-    }
+    crate::mm::vma::vma_update_prot(current_root(), start, end, new_prot);
 }
 
-/// Clear all VMA entries (called on process exit).
+/// Clear all VMA entries for the current address space (called on exec).
 pub fn vma_clear() {
-    #[cfg(target_arch = "x86_64")]
-    let (old_next_mmap, old_max_elf, active_before) = {
-        let table = VMA_TABLE.lock();
-        let active = table.iter().filter(|vma| vma.active).count();
-        (
-            NEXT_MMAP_ADDR.load(core::sync::atomic::Ordering::Relaxed),
-            MAX_ELF_VADDR.load(core::sync::atomic::Ordering::Relaxed),
-            active,
-        )
-    };
-    let mut table = VMA_TABLE.lock();
-    for vma in table.iter_mut() {
-        vma.active = false;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if debug_second_xbot_run_active() {
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H26","location":"kernel/src/syscall/mod.rs:vma_clear","message":"vma clear state","data":{{"old_next_mmap":{},"old_max_elf":{},"active_before":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            old_next_mmap,
-            old_max_elf,
-            active_before,
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
+    crate::mm::vma::vma_clear_root(current_root());
 }
 
 // ─── Global FD table (single-process simplification) ────────────────
@@ -885,15 +631,6 @@ pub fn dispatch_syscall_linux(
         crate::arch::ioapic::unmask_external_irqs();
     }
 
-    // Trace ALL syscalls for debugging — disabled for performance
-    // {
-    //     crate::console_println!(
-    //         "[sys] nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-    //         nr, a1, a2, a3, a4, a5, a6
-    //     );
-    // }
-    let args = [a1, a2, a3, a4, a5, a6];
-    debug_linux_syscall_boundary("begin", nr, args, 0);
     let result = dispatch_linux_raw(
         nr as usize,
         [
@@ -905,8 +642,6 @@ pub fn dispatch_syscall_linux(
             a6 as usize,
         ],
     );
-    debug_linux_syscall_boundary("end", nr, args, result as i64);
-    // crate::console_println!("[sys] nr={} ret={:#x}", nr, result);
     result as u64
 }
 
@@ -924,8 +659,6 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
         1 => {
             let result = sys_write(args[0] as i32, args[1], args[2]);
-            #[cfg(target_arch = "x86_64")]
-            debug_linux_write_result(args[0] as i32, args[1], args[2], result);
             // Validate write return: must be 0..len or negative errno
             let len = args[2];
             if result > 0 && (result as usize) > len {
@@ -1183,31 +916,6 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
             }
         }
     };
-
-    if debug_second_xbot_run_active() {
-        let fd_kind = if result >= 0 {
-            get_fd_info(result as i32)
-                .map(|(fd_type, _, _)| alloc::format!("{:?}", fd_type))
-                .unwrap_or_else(|| alloc::format!("missing"))
-        } else {
-            alloc::format!("none")
-        };
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H17,H18","location":"kernel/src/syscall/mod.rs:linux_openat","message":"linux openat result","data":{{"path":"{}","flags":{},"our_flags":{},"result":{},"fd_kind":"{}","pid":{},"proc":{},"slot":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            path_str,
-            flags,
-            our_flags,
-            result,
-            fd_kind,
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::sched::current_sched_slot(),
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
 
     result
 }
@@ -1575,22 +1283,7 @@ fn linux_readv(_fd: usize, _iov: usize, _iovcnt: usize) -> isize {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn linux_writev(fd: usize, iov: usize, iovcnt: usize) -> isize {
-    if debug_second_xbot_run_active() {
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H21,H22","location":"kernel/src/syscall/mod.rs:linux_writev","message":"linux writev called","data":{{"fd":{},"iov":{},"iovcnt":{},"pid":{},"proc":{},"slot":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            fd,
-            iov,
-            iovcnt,
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::sched::current_sched_slot(),
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
+fn linux_writev(_fd: usize, _iov: usize, _iovcnt: usize) -> isize {
     // Stub: preserve existing behavior while proving whether Bubble Tea writes here.
     0
 }
@@ -1776,23 +1469,6 @@ fn linux_clock_gettime(clockid: usize, tp: usize) -> isize {
             }
             _ => return -22, // EINVAL
         };
-        #[cfg(target_arch = "x86_64")]
-        if debug_second_xbot_run_active() {
-            // #region agent log
-            crate::console_println!(
-                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H12,H13","location":"kernel/src/syscall/mod.rs:linux_clock_gettime","message":"clock_gettime value","data":{{"clockid":{},"tp":{},"sec":{},"nsec":{},"uptime_ms":{},"pid":{},"proc":{},"slot":{}}},"timestamp":{}}}"#,
-                clockid,
-                tp,
-                secs,
-                nsecs,
-                uptime_ms,
-                crate::process::current_pid(),
-                crate::process::current_index(),
-                crate::sched::current_sched_slot(),
-                crate::arch::platform::uptime_ms(),
-            );
-            // #endregion
-        }
         user_write::<i64>(tp, secs);
         user_write::<i64>(tp + 8, nsecs);
     }
@@ -2081,9 +1757,6 @@ fn linux_exit_group(code: i32) -> isize {
     // exit_group tears down the shared file table once for the whole Go
     // thread group before its process-table entries disappear.
     cleanup_current_process_fds();
-    if my_pid != 1 {
-        activate_debug_second_xbot_run(my_pid, leader_idx, code);
-    }
 
     crate::klog!(
         INFO,
@@ -2226,42 +1899,11 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             // Stdio stdin (fd 0 default): blocking read from TTY
             // TTY read needs to write to user memory — use intermediate buffer
             let mut kbuf = alloc::vec![0u8; len];
-            #[cfg(target_arch = "x86_64")]
-            if debug_second_xbot_run_active() {
-                // #region agent log
-                crate::console_println!(
-                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H21,H23","location":"kernel/src/syscall/mod.rs:sys_read","message":"stdio read enter","data":{{"fd":{},"len":{},"has_input":{},"pid":{},"proc":{},"slot":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                    fd,
-                    len,
-                    crate::driver::tty::has_input(),
-                    crate::process::current_pid(),
-                    crate::process::current_index(),
-                    crate::sched::current_sched_slot(),
-                    crate::arch::platform::uptime_ms(),
-                    crate::arch::platform::uptime_ms(),
-                );
-                // #endregion
-            }
             loop {
                 let result = crate::driver::tty::read(kbuf.as_mut_ptr() as usize, len);
                 if result > 0 {
                     let user_buf = UserSliceMut::new(buf, len).unwrap();
                     user_buf.copy_from_slice(&kbuf[..result as usize]);
-                    #[cfg(target_arch = "x86_64")]
-                    if debug_second_xbot_run_active() {
-                        // #region agent log
-                        crate::console_println!(
-                            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H21,H23","location":"kernel/src/syscall/mod.rs:sys_read","message":"stdio read return","data":{{"fd":{},"result":{},"pid":{},"proc":{},"slot":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                            fd,
-                            result,
-                            crate::process::current_pid(),
-                            crate::process::current_index(),
-                            crate::sched::current_sched_slot(),
-                            crate::arch::platform::uptime_ms(),
-                            crate::arch::platform::uptime_ms(),
-                        );
-                        // #endregion
-                    }
                     return result;
                 }
                 crate::driver::tty::poll_uart();
@@ -2490,14 +2132,14 @@ fn linux_mmap_inner(
     let aligned_len = (len + page_size - 1) & !(page_size - 1);
     let map_fixed = (flags & 0x10) != 0;
     let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
+    let root = current_root();
 
     let target_addr = if addr != 0 && map_fixed {
         // MAP_FIXED: exact address required.
         // Reject if target range overlaps ELF segments.
         let aligned = addr & !(page_size - 1);
         let end = aligned + aligned_len;
-        let max_elf = MAX_ELF_VADDR.load(core::sync::atomic::Ordering::Relaxed);
-        if max_elf > 0 && aligned < max_elf && end > 0x400000 {
+        if crate::mm::vma::vma_is_elf(root, aligned) {
             // Overlaps ELF range — reject.
             return aligned as isize;
         }
@@ -2512,7 +2154,8 @@ fn linux_mmap_inner(
         let hint_in_range = aligned_addr >= crate::process::USER_MMAP_BASE
             && hint_end != 0
             && hint_end <= crate::process::USER_MMAP_LIMIT;
-        let hint_overlaps = hint_in_range && vma_overlaps(aligned_addr, hint_end);
+        let hint_overlaps =
+            hint_in_range && crate::mm::vma::vma_overlaps(root, aligned_addr, hint_end);
         if hint_in_range && !hint_overlaps {
             aligned_addr
         } else {
@@ -2525,56 +2168,10 @@ fn linux_mmap_inner(
     let target_addr = if target_addr != 0 {
         target_addr
     } else {
-        // Bump allocator for kernel-chosen addresses.
-        // NOTE: NEXT_MMAP_ADDR may be set past ELF segments by ensure_mmap_above().
-        // If ELF segments extend past USER_MMAP_BASE (e.g., 69MB Go binary),
-        // we must start allocating from the ELF end, not USER_MMAP_BASE.
-        loop {
-            let base = NEXT_MMAP_ADDR.load(core::sync::atomic::Ordering::Relaxed);
-            let candidate = if base > 0 {
-                base // Use ELF-aware address from ensure_mmap_above
-            } else if crate::process::USER_MMAP_BASE > 0 {
-                crate::process::USER_MMAP_BASE
-            } else {
-                base
-            };
-            let end_addr = candidate.checked_add(aligned_len).unwrap_or(0);
-            if end_addr > crate::process::USER_MMAP_LIMIT || end_addr == 0 {
-                return -12; // ENOMEM
-            }
-            let candidate_overlaps = vma_overlaps(candidate, end_addr);
-            #[cfg(target_arch = "x86_64")]
-            if debug_second_xbot_run_active() {
-                // #region agent log
-                crate::console_println!(
-                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H26,H27","location":"kernel/src/syscall/mod.rs:linux_mmap_inner","message":"mmap candidate","data":{{"addr":{},"len":{},"aligned_len":{},"prot":{},"flags":{},"base":{},"candidate":{},"end":{},"overlaps":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                    addr,
-                    len,
-                    aligned_len,
-                    prot,
-                    flags,
-                    base,
-                    candidate,
-                    end_addr,
-                    candidate_overlaps,
-                    crate::process::current_pid(),
-                    crate::process::current_index(),
-                    crate::arch::platform::uptime_ms(),
-                    crate::arch::platform::uptime_ms(),
-                );
-                // #endregion
-            }
-            if NEXT_MMAP_ADDR
-                .compare_exchange(
-                    base,
-                    end_addr,
-                    core::sync::atomic::Ordering::Relaxed,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                break candidate;
-            }
+        // Per-root bump allocator for kernel-chosen addresses.
+        match crate::mm::vma::reserve_mmap_addr(root, aligned_len) {
+            Ok(addr) => addr,
+            Err(()) => return -12, // ENOMEM
         }
     };
 
@@ -3945,9 +3542,9 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
         envp.len()
     );
 
-    // Clear VMA table — exec replaces the entire address space.
-    vma_clear();
-
+    // NOTE: Do NOT clear the global VMA table here! exec creates a new process
+    // with a new page table. The ELF loader will initialize fresh VMA state
+    // for the new root via mm::vma::init_root().
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
     let mut proc = if crate::driver::ext4::has_ext4() {
         let read_opt = crate::driver::ext4::read_file_range(&name);
@@ -4110,6 +3707,29 @@ pub fn run_tests() {
 
     crate::test::run_test("syscall_mmap_zero_len_returns_error", || {
         dispatch(SYS_MMAP, [0, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    crate::test::run_test("linux_arch_prctl_set_fs_updates_return_state", || {
+        use core::sync::atomic::Ordering;
+
+        const ARCH_SET_FS: usize = 0x1002;
+        let slot = crate::sched::current_sched_slot();
+        let orig_msr = unsafe { crate::arch::idt::rdmsr(0xC000_0100) };
+        let orig_task = crate::sched::get_task_fs_base(slot);
+        let orig_pending = crate::arch::trap::PENDING_FS_BASE.load(Ordering::Relaxed);
+        let val = 0x4830_8a8u64;
+
+        let result = linux_arch_prctl(ARCH_SET_FS, val as usize);
+        let msr = unsafe { crate::arch::idt::rdmsr(0xC000_0100) };
+        let task = crate::sched::get_task_fs_base(slot);
+        let pending = crate::arch::trap::PENDING_FS_BASE.load(Ordering::Relaxed);
+
+        unsafe { crate::arch::idt::wrmsr(0xC000_0100, orig_msr) };
+        crate::sched::set_task_fs_base(slot, orig_task);
+        crate::arch::trap::PENDING_FS_BASE.store(orig_pending, Ordering::Relaxed);
+
+        result == 0 && msr == val && task == val && pending == val
     });
 
     // ── File syscall tests ──
@@ -4350,57 +3970,6 @@ fn get_fd_info(fd: i32) -> Option<(FdType, Option<usize>, alloc::string::String)
     })
 }
 
-#[cfg(target_arch = "x86_64")]
-fn debug_linux_write_result(fd: i32, buf: usize, len: usize, result: isize) {
-    if !debug_second_xbot_run_active() {
-        return;
-    }
-
-    let fd_kind = match get_fd_info(fd) {
-        Some((FdType::Stdio, _, _)) => "Stdio",
-        Some((FdType::PipeRead, _, _)) => "PipeRead",
-        Some((FdType::PipeWrite, _, _)) => "PipeWrite",
-        Some((FdType::VfsFile(_), _, _)) => "VfsFile",
-        Some((FdType::FakeFile(_), _, _)) => "FakeFile",
-        Some((FdType::Epoll, _, _)) => "Epoll",
-        Some((FdType::Eventfd, _, _)) => "Eventfd",
-        Some((FdType::Timerfd, _, _)) => "Timerfd",
-        Some((FdType::Urandom, _, _)) => "Urandom",
-        Some((FdType::VirtualFile, _, _)) => "VirtualFile",
-        Some((FdType::Ext4File(_), _, _)) => "Ext4File",
-        Some((FdType::File, _, _)) => "File",
-        None => "Invalid",
-    };
-
-    let preview_len = len.min(64);
-    let mut preview_hex = alloc::string::String::new();
-    if buf != 0 && preview_len != 0 {
-        let preview = user_read_bytes(buf, preview_len);
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for byte in preview {
-            preview_hex.push(HEX[(byte >> 4) as usize] as char);
-            preview_hex.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-    }
-
-    // #region agent log
-    crate::console_println!(
-        r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H14,H15,H16","location":"kernel/src/syscall/mod.rs:debug_linux_write_result","message":"linux write result","data":{{"fd":{},"fd_kind":"{}","len":{},"result":{},"preview_len":{},"preview_hex":"{}","pid":{},"proc":{},"slot":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-        fd,
-        fd_kind,
-        len,
-        result,
-        preview_len,
-        preview_hex,
-        crate::process::current_pid(),
-        crate::process::current_index(),
-        crate::sched::current_sched_slot(),
-        crate::arch::platform::uptime_ms(),
-        crate::arch::platform::uptime_ms(),
-    );
-    // #endregion
-}
-
 /// Blocking read from a pipe. Called from sys_read when fd is a PipeRead.
 fn pipe_read(pipe_id: usize, buf: usize, len: usize) -> isize {
     loop {
@@ -4569,9 +4138,9 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
     };
     let envp = env_to_envp(&proc_env);
 
-    // Clear VMA table — exec replaces the entire address space.
-    vma_clear();
-
+    // NOTE: Do NOT clear the global VMA table here! exec creates a new process
+    // with a new page table. The ELF loader will initialize fresh VMA state
+    // for the new root via mm::vma::init_root().
     // Load ELF from filesystem — try streaming loader from ext4 first
     let mut proc = if crate::driver::ext4::has_ext4() {
         match crate::driver::ext4::read_file_range(&name) {
@@ -4871,6 +4440,12 @@ fn sys_fork() -> isize {
     let page_table_ppn = (user_pt as *const crate::mm::vmm::PageTable as usize) >> 12;
     let child_pid = crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
+    // Clone VMA state from parent to child address space
+    if crate::mm::vma::clone_root_state(parent_ppn, page_table_ppn).is_err() {
+        // VMA clone failed — initialize empty state for child
+        crate::mm::vma::init_root(page_table_ppn).ok();
+    }
+
     // Clone fd table
     // Fork: deep-copy fd table (each process has independent fds)
     let fd_table = {
@@ -5039,35 +4614,6 @@ pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
         }
         _ => ERR_INVAL,
     };
-
-    #[cfg(target_arch = "x86_64")]
-    if debug_second_xbot_run_active() {
-        let tty_mode = match crate::driver::tty::get_mode() {
-            crate::driver::tty::TtyMode::Raw => "raw",
-            crate::driver::tty::TtyMode::Canonical => "canonical",
-        };
-        let lflag = if cmd == TCSETS && arg != 0 {
-            user_read::<u32>(arg + 12)
-        } else {
-            0
-        };
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H21,H23","location":"kernel/src/syscall/mod.rs:sys_ioctl","message":"ioctl result","data":{{"fd":{},"cmd":{},"arg":{},"lflag":{},"tty_mode":"{}","result":{},"pid":{},"proc":{},"slot":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            fd,
-            cmd,
-            arg,
-            lflag,
-            tty_mode,
-            result,
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::sched::current_sched_slot(),
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
 
     result
 }
@@ -5301,56 +4847,6 @@ fn futex_key(uaddr: usize) -> FutexKey {
     (crate::process::current_page_table_root(), uaddr)
 }
 
-fn debug_futex_event(
-    message: &str,
-    uaddr: usize,
-    op: usize,
-    val: usize,
-    queue_len: usize,
-    result: isize,
-) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if !debug_second_xbot_run_active() {
-            return;
-        }
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H9,H10","location":"kernel/src/syscall/mod.rs:linux_futex_impl","message":"{}","data":{{"uaddr":{},"op":{},"val":{},"queue_len":{},"result":{},"root":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            message,
-            uaddr,
-            op,
-            val,
-            queue_len,
-            result,
-            crate::process::current_page_table_root(),
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (message, uaddr, op, val, queue_len, result);
-    }
-}
-
-pub fn debug_futex_summary() {
-    let queues = FUTEX_QUEUES.lock();
-    let waiter_count: usize = queues.values().map(|queue| queue.len()).sum();
-    crate::console_println!("[futex] queues={} waiters={}", queues.len(), waiter_count);
-    for ((root, uaddr), queue) in queues.iter() {
-        crate::console_println!(
-            "[futex] root={:#x} uaddr={:#x} waiters={}",
-            root,
-            uaddr,
-            queue.len()
-        );
-    }
-}
-
 pub fn cleanup_futex_waiters_for_processes(proc_indices: &[usize]) {
     if proc_indices.is_empty() {
         return;
@@ -5392,24 +4888,6 @@ fn futex_wait(uaddr: usize, expected_val: u32, timeout_ms: Option<u64>) -> isize
     // 1. Volatile read of *uaddr from user space.
     //    SSTATUS.SUM is set in trap_handler, allowing S-mode to read U-mode pages.
     let current_val = user_read::<u32>(uaddr);
-    #[cfg(target_arch = "x86_64")]
-    if debug_second_xbot_run_active() {
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H24,H25","location":"kernel/src/syscall/mod.rs:futex_wait","message":"futex wait detail","data":{{"uaddr":{},"expected":{},"current":{},"timeout_ms":{},"pid":{},"proc":{},"slot":{},"root":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            uaddr,
-            expected_val,
-            current_val,
-            timeout_ms.unwrap_or(u64::MAX),
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::sched::current_sched_slot(),
-            crate::process::current_page_table_root(),
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
     if current_val != expected_val {
         return -11; // EAGAIN: value changed, don't block
     }
@@ -5417,7 +4895,6 @@ fn futex_wait(uaddr: usize, expected_val: u32, timeout_ms: Option<u64>) -> isize
     // 2. Register current task in the wait queue.
     let proc_idx = crate::process::current_index();
     let key = futex_key(uaddr);
-    let mut queue_len = 0usize;
     {
         let mut queues = FUTEX_QUEUES.lock();
         let queue = queues.entry(key).or_insert_with(Vec::new);
@@ -5425,16 +4902,7 @@ fn futex_wait(uaddr: usize, expected_val: u32, timeout_ms: Option<u64>) -> isize
             proc_idx,
             woken: false,
         });
-        queue_len = queue.len();
     } // drop lock before blocking — avoids holding spinlock across context switch
-    debug_futex_event(
-        "futex wait queued",
-        uaddr,
-        0,
-        expected_val as usize,
-        queue_len,
-        0,
-    );
 
     // 3. Block current task — switches to another Ready task.
     //    If no other task is Ready, schedule_block() returns immediately
@@ -5468,19 +4936,10 @@ fn futex_wait(uaddr: usize, expected_val: u32, timeout_ms: Option<u64>) -> isize
     }
 
     if timeout_ms.is_some() && still_waiting {
-        debug_futex_event(
-            "futex wait return",
-            uaddr,
-            0,
-            expected_val as usize,
-            0,
-            -110,
-        );
         return -110; // ETIMEDOUT
     }
 
     // 5. Return success for real and spurious wakeups.
-    debug_futex_event("futex wait return", uaddr, 0, expected_val as usize, 0, 0);
     0
 }
 
@@ -5491,7 +4950,6 @@ fn futex_wake(uaddr: usize, max_count: u32) -> isize {
     let mut queues = FUTEX_QUEUES.lock();
     let mut woken = 0u32;
     let key = futex_key(uaddr);
-    let before_len = queues.get(&key).map(|queue| queue.len()).unwrap_or(0);
     if let Some(queue) = queues.get_mut(&key) {
         for waiter in queue.iter_mut() {
             if !waiter.woken && woken < max_count {
@@ -5506,14 +4964,6 @@ fn futex_wake(uaddr: usize, max_count: u32) -> isize {
             queues.remove(&key);
         }
     }
-    debug_futex_event(
-        "futex wake",
-        uaddr,
-        1,
-        max_count as usize,
-        before_len,
-        woken as isize,
-    );
     woken as isize
 }
 
@@ -5578,6 +5028,8 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
             let slot = crate::sched::current_sched_slot();
             unsafe { crate::arch::idt::wrmsr(MSR_FS_BASE, addr as u64) };
             crate::sched::set_task_fs_base(slot, addr as u64);
+            crate::arch::trap::PENDING_FS_BASE
+                .store(addr as u64, core::sync::atomic::Ordering::Relaxed);
             0
         }
         ARCH_GET_FS => {
@@ -5626,24 +5078,6 @@ fn linux_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
     }
 
     let wake_tick = crate::arch::platform::uptime_ms().saturating_add(ms);
-    #[cfg(target_arch = "x86_64")]
-    if debug_second_xbot_run_active() {
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H12,H13","location":"kernel/src/syscall/mod.rs:linux_nanosleep","message":"nanosleep request","data":{{"req_ptr":{},"sec":{},"nsec":{},"ms":{},"wake_tick":{},"uptime_ms":{},"pid":{},"proc":{},"slot":{}}},"timestamp":{}}}"#,
-            req_ptr,
-            sec,
-            nsec,
-            ms,
-            wake_tick,
-            crate::arch::platform::uptime_ms(),
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::sched::current_sched_slot(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
     crate::sched::sleep_until(wake_tick);
     0
 }

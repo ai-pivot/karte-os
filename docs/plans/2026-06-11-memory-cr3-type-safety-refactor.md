@@ -20,9 +20,11 @@ The recent `xbot-cli-static` failures exposed recurring classes of bugs:
 - `mprotect_user()` could descend through a 2MB huge page as if it were a lower-level page table.
 - Page-fault repair mixed three different concepts: ELF file mappings, anonymous mappings, and copied identity mappings.
 - VMA state is global even though VMAs are address-space state.
+- x86_64 user-return architecture state was incomplete: CR3 returned to the user page table, but Linux `SYSCALL` return could leave `FS_BASE` stale or zero. Go immediately reads its g pointer through `%fs:-8`; after `sched_getaffinity(204)`, this produced `PF UNHANDLED addr=0x0 rip=0x44fa78`.
+- Scheduler arch-state restore treated `FS_BASE == 0` as "do nothing". Zero is a valid state and must be written explicitly when switching to tasks that do not use TLS.
 - Logs print many symptoms but not enough typed state at the failing boundary: active CR3, address-space root, PTE chain, VMA owner, leaf kind, and access kind.
 
-The target state is: if code has a `KernelVirtAddr`, it cannot be passed to a function requiring `UserVirtAddr`; if code wants to walk page tables, it must handle `HugePage` explicitly; if code wants to copy user memory, it must hold a `UserAccess` capability; if code wants to switch CR3, the switch is restored by `Drop`.
+The target state is: if code has a `KernelVirtAddr`, it cannot be passed to a function requiring `UserVirtAddr`; if code wants to walk page tables, it must handle `HugePage` explicitly; if code wants to copy user memory, it must hold a `UserAccess` capability; if code wants to switch CR3, the switch is restored by `Drop`; if code returns to user mode, it must restore the full typed `UserReturnState`, not just CR3.
 
 ## Non-Goals
 
@@ -49,7 +51,10 @@ The target state is: if code has a `KernelVirtAddr`, it cannot be passed to a fu
 7. Any function that may switch CR3 returns with the original CR3 restored, including early returns.
 8. ELF PT_LOAD mappings are file-backed private user mappings, never supervisor identity mappings.
 9. Anonymous `mmap` mappings are zero-filled private user mappings, never identity mappings.
-10. Logs identify the failing typed boundary, not just the symptom.
+10. User-return paths restore all per-task x86_64 state: user CR3, kernel RSP0/SYSCALL stack, and `FS_BASE`.
+11. `FS_BASE == 0` is a valid value and must be restored explicitly; no restore API may use zero as "leave unchanged".
+12. Linux `SYSCALL` fast return must not rely on the hardware MSR value that happened to survive kernel execution.
+13. Logs identify the failing typed boundary, not just the symptom.
 
 ---
 
@@ -59,6 +64,9 @@ The target state is: if code has a `KernelVirtAddr`, it cannot be passed to a fu
 - Modify: `kernel/src/mm/vmm.rs`
 - Modify: `kernel/src/syscall/mod.rs`
 - Modify: `kernel/src/process/mod.rs`
+- Modify: `kernel/src/arch/x86_64/idt.rs`
+- Modify: `kernel/src/arch/x86_64/test.rs`
+- Modify: `kernel/src/sched/mod.rs`
 - Test command: `make test-x86`
 
 **Step 1: Add a VMM test for mprotect on copied huge identity mappings**
@@ -120,17 +128,66 @@ crate::test::run_test("process_set_exit_code_by_index_marks_exited", || {
 
 If no test constructor exists, create a minimal `Process::test_dummy(page_table_root)` under `#[cfg(feature = "test_mode")]`.
 
-**Step 4: Run tests and confirm current baseline**
+**Step 4: Add a SYSCALL return FS_BASE regression test**
+
+Add an x86_64 test in `kernel/src/arch/x86_64/test.rs`:
+
+```rust
+crate::test::run_test("x86_64 syscall_fs_restore", || {
+    let slot = crate::sched::current_sched_slot();
+    let orig_msr = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
+    let orig_task = crate::sched::get_task_fs_base(slot);
+    let val = 0x4830_8a8u64;
+
+    crate::sched::set_task_fs_base(slot, val);
+    unsafe { crate::arch::idt::wrmsr(0xC0000100, 0) };
+    crate::arch::idt::restore_current_task_fs_base_for_syscall_return();
+    let restored = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
+
+    unsafe { crate::arch::idt::wrmsr(0xC0000100, orig_msr) };
+    crate::sched::set_task_fs_base(slot, orig_task);
+
+    restored == val
+});
+```
+
+This test captures the xbot failure mode where Go successfully set TLS via `arch_prctl(ARCH_SET_FS)`, then a normal Linux syscall returned with `FS_BASE` lost before Go executed `mov %fs:-8`.
+
+**Step 5: Add a scheduler zero-FS restore regression test**
+
+Add a focused x86_64 test for the opposite leak:
+
+```rust
+crate::test::run_test("x86_64 restore_zero_fs_base", || {
+    let slot = crate::sched::current_sched_slot();
+    let orig_msr = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
+    let orig_task = crate::sched::get_task_fs_base(slot);
+
+    unsafe { crate::arch::idt::wrmsr(0xC0000100, 0xdead_beef) };
+    crate::sched::set_task_fs_base(slot, 0);
+    crate::sched::restore_task_arch_state_for_test(slot);
+    let restored = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
+
+    unsafe { crate::arch::idt::wrmsr(0xC0000100, orig_msr) };
+    crate::sched::set_task_fs_base(slot, orig_task);
+
+    restored == 0
+});
+```
+
+If `restore_task_arch_state()` is private, expose a `#[cfg(feature = "test_mode")]` wrapper only for this test. The invariant is that zero must be written, not skipped.
+
+**Step 6: Run tests and confirm current baseline**
 
 Run: `make test-x86`
 
 Expected before deeper refactor: all existing x86 tests should still pass except any already documented unrelated PMM layout test.
 
-**Step 5: Commit**
+**Step 7: Commit**
 
 ```bash
-git add kernel/src/mm/vmm.rs kernel/src/process/mod.rs kernel/src/syscall/mod.rs
-git commit -m "test(x86_64): cover memory mapping regressions"
+git add kernel/src/mm/vmm.rs kernel/src/process/mod.rs kernel/src/syscall/mod.rs kernel/src/arch/x86_64/idt.rs kernel/src/arch/x86_64/test.rs kernel/src/sched/mod.rs
+git commit -m "test(x86_64): cover memory and user-return regressions"
 ```
 
 ---
@@ -576,7 +633,7 @@ with_kernel_cr3(|| {
 After:
 
 ```rust
-let _cr3 = crate::arch::x86_64::cr3::enter_kernel_cr3();
+let _cr3 = crate::arch::cr3::enter_kernel_cr3();
 // work
 ```
 
@@ -603,6 +660,173 @@ git commit -m "refactor(x86_64): use RAII CR3 guards"
 
 ---
 
+## Task 6A: Type x86_64 User-Return Architecture State
+
+**Files:**
+- Create: `kernel/src/arch/x86_64/user_return.rs`
+- Modify: `kernel/src/arch/x86_64/mod.rs`
+- Modify: `kernel/src/arch/x86_64/idt.rs`
+- Modify: `kernel/src/arch/x86_64/trap.rs`
+- Modify: `kernel/src/sched/mod.rs`
+- Modify: `kernel/src/arch/x86_64/test.rs`
+
+**Step 1: Define typed return-state values**
+
+Create `kernel/src/arch/x86_64/user_return.rs`:
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FsBase(u64);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct UserCr3(u64);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KernelRsp0(u64);
+
+#[derive(Clone, Copy, Debug)]
+pub struct UserReturnState {
+    pub user_cr3: Option<UserCr3>,
+    pub kernel_rsp0: Option<KernelRsp0>,
+    pub fs_base: FsBase,
+}
+
+impl FsBase {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl UserCr3 {
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl KernelRsp0 {
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+```
+
+Do not use `Option<FsBase>` for "no TLS". `FsBase::ZERO` is a real state and must be written to hardware.
+
+**Step 2: Centralize MSR restore**
+
+Add:
+
+```rust
+pub fn restore_fs_base(fs_base: FsBase) {
+    unsafe { crate::arch::idt::wrmsr(0xC0000100, fs_base.raw()) };
+}
+
+pub fn restore_for_user_return(state: UserReturnState) {
+    if let Some(cr3) = state.user_cr3 {
+        unsafe { write_cr3(cr3.raw()) };
+    }
+    if let Some(rsp0) = state.kernel_rsp0 {
+        unsafe { crate::arch::gdt::set_kernel_rsp0_for_cpu(0, rsp0.raw()) };
+    }
+    restore_fs_base(state.fs_base);
+}
+```
+
+Wire the raw CR3 write through the CR3 module from Task 6 once it exists. Until then, keep the unsafe block local to `user_return.rs`.
+
+**Step 3: Replace fast SYSCALL ad hoc restore**
+
+In `kernel/src/arch/x86_64/idt.rs`, replace the direct helper with:
+
+```rust
+let state = crate::sched::current_user_return_state();
+crate::arch::user_return::restore_for_user_return(state);
+```
+
+This must run after every Linux compat syscall, including simple calls such as `sched_getaffinity(204)`. The xbot regression was:
+
+```text
+0x496854 syscall        ; sched_getaffinity
+0x44fa78 mov %fs:-8,%r14
+PF UNHANDLED addr=0x0
+```
+
+**Step 4: Replace scheduler ad hoc arch restore**
+
+In `kernel/src/sched/mod.rs`, store and restore a typed architecture state:
+
+```rust
+#[cfg(target_arch = "x86_64")]
+pub fn current_user_return_state() -> crate::arch::user_return::UserReturnState {
+    let slot = current_sched_slot();
+    user_return_state_for_slot(slot)
+}
+```
+
+`restore_task_arch_state()` must call the same typed restore path and must write `FsBase::ZERO` when that is the slot's stored value.
+
+**Step 5: Update `ARCH_SET_FS`**
+
+In `kernel/src/syscall/mod.rs`, `linux_arch_prctl(ARCH_SET_FS, addr)` should:
+
+```rust
+let fs = crate::arch::user_return::FsBase::new(addr as u64);
+crate::sched::set_task_fs_base(slot, fs);
+crate::arch::user_return::restore_fs_base(fs);
+```
+
+After this task, `set_task_fs_base()` should take `FsBase`, not raw `u64`. Keep a temporary raw wrapper only if migration requires it, and mark it `#[deprecated]`.
+
+**Step 6: Add return-state tests**
+
+Run and keep these tests:
+
+```bash
+make test-x86
+```
+
+Expected:
+
+- `x86_64 syscall_fs_restore` passes.
+- `x86_64 restore_zero_fs_base` passes.
+- Existing `x86_64 fs_base_msr` and `x86_64 task_fs_base` tests still pass after being converted to `FsBase`.
+
+**Step 7: Add xbot smoke gate**
+
+After rebuilding the ISO, run an automated xbot startup smoke test:
+
+```bash
+make build-x86
+LOG=/tmp/karte-os-x86_64-xbot-smoke.log
+timeout 90s bash -lc '(sleep 5; printf "xbot-cli-static\n"; sleep 75; printf "\001x") | qemu-system-x86_64 -machine pc -cpu qemu64 -m 1024M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot -drive file=disk.img,format=raw,if=none,id=hd0 -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0' > "$LOG" 2>&1 || true
+rg "PF\\] UNHANDLED addr=0x0|rip=0x44fa78|mov %fs" "$LOG"
+```
+
+Expected: no matches for the fault signatures. If the command times out because the TUI keeps running, inspect the log and treat "no PF signature" as the pass condition for this smoke gate.
+
+**Step 8: Commit**
+
+```bash
+git add kernel/src/arch/x86_64/user_return.rs kernel/src/arch/x86_64/mod.rs kernel/src/arch/x86_64/idt.rs kernel/src/arch/x86_64/trap.rs kernel/src/sched/mod.rs kernel/src/syscall/mod.rs kernel/src/arch/x86_64/test.rs
+git commit -m "refactor(x86_64): type user return architecture state"
+```
+
+---
+
 ## Task 7: Replace Raw User Pointers with Capability-Based User Access
 
 **Files:**
@@ -617,7 +841,7 @@ git commit -m "refactor(x86_64): use RAII CR3 guards"
 ```rust
 pub struct UserAccess<'a> {
     address_space: &'a AddressSpace,
-    _kernel_cr3: crate::arch::x86_64::cr3::Cr3Guard,
+    _kernel_cr3: crate::arch::cr3::Cr3Guard,
 }
 ```
 
@@ -822,6 +1046,7 @@ pub struct PageFaultEvent {
     pub access: FaultAccess,
     pub active_cr3: Cr3Phys,
     pub expected_root: PageTableRoot,
+    pub fs_base: crate::arch::user_return::FsBase,
 }
 
 pub enum FaultAccess {
@@ -853,7 +1078,11 @@ For any unhandled or repaired PF, log one line with:
 - `vma`
 - `walk_result`
 - `leaf_frame`
+- `fs_base`
+- `user_return_state`
 - first 16 bytes at leaf frame when safe
+
+For faults at low addresses (`0x0..0xfff`) from x86_64 user mode, include the current `FS_BASE` and the previous syscall return path if available. The xbot regression looked like a VMA null fault, but the true failing boundary was an incomplete user-return restore before Go executed `%fs:-8`.
 
 **Step 4: Add mmap/mprotect diagnostics**
 
@@ -906,6 +1135,8 @@ Document x86_64 CR3 rules:
 - User CR3 is installed only at explicit user return paths.
 - `Cr3Guard` is required for temporary switching.
 - User memory copy uses `UserAccess`, not arbitrary `with_user_cr3`.
+- Linux `SYSCALL` fast return restores the full typed `UserReturnState`, including `FS_BASE`.
+- `FS_BASE == 0` is valid and must be written explicitly when restoring a task that has no TLS.
 
 **Step 3: Update AGENTS gotchas**
 
@@ -915,6 +1146,8 @@ Replace scattered CR3/mprotect gotchas with the new invariants:
 - Never expose supervisor identity mappings as user mappings.
 - Never access kernel buffers under user CR3.
 - Never add USER to copied identity leaves.
+- Never return to x86_64 user mode without restoring CR3 and `FS_BASE`.
+- Never treat `FS_BASE == 0` as "do not update the MSR".
 
 **Step 4: Commit**
 
@@ -989,7 +1222,33 @@ Expected:
 - x86_64 tests retain existing pass count or improve if PMM layout test is fixed.
 - x86 ISO is produced.
 
-**Step 5: Commit final cleanup**
+**Step 5: xbot TLS smoke verification**
+
+Run:
+
+```bash
+LOG=/tmp/karte-os-x86_64-xbot-final.log
+timeout 90s bash -lc '(sleep 5; printf "xbot-cli-static\n"; sleep 75; printf "\001x") | qemu-system-x86_64 -machine pc -cpu qemu64 -m 1024M -cdrom target/karte-os-x86_64.iso -serial stdio -display none -no-reboot -drive file=disk.img,format=raw,if=none,id=hd0 -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0' > "$LOG" 2>&1 || true
+rg "PF\\] UNHANDLED addr=0x0|rip=0x44fa78|KERN FATAL|GP FAULT" "$LOG"
+```
+
+Expected: no matches. A timeout is acceptable only if the xbot TUI is still alive and the log has no PF/GP/kernel-fatal signature.
+
+**Step 6: User-return state search gate**
+
+Run:
+
+```bash
+rg "wrmsr\\(0xC0000100|PENDING_FS_BASE|TASK_FS_BASE|restore_user_cr3|iretq|sysret|SYSCALL" kernel/src/arch/x86_64 kernel/src/sched kernel/src/syscall
+```
+
+Expected:
+
+- Raw `FS_BASE` MSR writes are confined to `user_return.rs` or a temporary compatibility shim.
+- Every x86_64 user-return path goes through the typed `UserReturnState` restore helper.
+- No restore function skips writing `FS_BASE` when the stored value is zero.
+
+**Step 7: Commit final cleanup**
 
 ```bash
 git add .
@@ -1003,16 +1262,20 @@ git commit -m "refactor(mm): finish typed memory migration"
 - [ ] No syscall or driver code writes to user buffers through raw pointers.
 - [ ] No arbitrary closure can run under user CR3.
 - [ ] CR3 switches are RAII guarded.
+- [ ] Every x86_64 user-return path restores typed `UserReturnState`.
+- [ ] `FS_BASE == 0` is restored explicitly and is not treated as "no TLS update".
 - [ ] VMA state is address-space local.
 - [ ] Huge page walks are explicit in type signatures or enum results.
 - [ ] ELF mappings cannot be mistaken for anonymous mappings.
 - [ ] Anonymous mappings cannot preserve identity frames.
 - [ ] `mprotect` never descends into a huge page.
 - [ ] PF handler logs typed walk state before repair or termination.
+- [ ] Low-address user PF logs include `FS_BASE` and enough syscall-return context to distinguish TLS loss from a real null pointer.
+- [ ] xbot startup smoke has no `PF UNHANDLED addr=0x0 rip=0x44fa78` regression.
 - [ ] Docs match current x86_64 behavior.
 
 ## Execution Notes
 
-Do this in small commits. The safest order is tests first, then type wrappers, then ownership, then API migration. Avoid changing scheduler behavior while refactoring memory APIs unless a test proves the scheduler is part of the bug.
+Do this in small commits. The safest order is tests first, then type wrappers, then ownership, then API migration. The exception is x86_64 user-return architecture state: CR3 and `FS_BASE` must be treated as one return-to-user boundary, so do not refactor memory return paths while leaving TLS restore as an ad hoc side effect. Avoid changing scheduler policy while refactoring memory APIs unless a test proves scheduler arch-state save/restore is part of the bug.
 
 Plan complete and saved to `docs/plans/2026-06-11-memory-cr3-type-safety-refactor.md`.

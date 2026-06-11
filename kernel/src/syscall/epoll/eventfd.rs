@@ -64,20 +64,6 @@ pub fn eventfd_read(fd: i32, buf: usize, len: usize) -> isize {
     let mut states = EVENTFD_STATES.lock();
     if let Some(counter) = states.get_mut(&fd) {
         let val = *counter;
-        if crate::syscall::debug_second_xbot_run_active() {
-            // #region agent log
-            crate::console_println!(
-                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H21,H22,H25","location":"kernel/src/syscall/epoll/eventfd.rs:eventfd_read","message":"eventfd read","data":{{"fd":{},"counter":{},"len":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                fd,
-                val,
-                len,
-                crate::process::current_pid(),
-                crate::process::current_index(),
-                crate::arch::platform::uptime_ms(),
-                crate::arch::platform::uptime_ms(),
-            );
-            // #endregion
-        }
         if val == 0 {
             return -11; // EAGAIN — non-blocking, nothing to read
         }
@@ -103,21 +89,7 @@ pub fn eventfd_write(fd: i32, buf: usize, len: usize) -> isize {
     {
         let mut states = EVENTFD_STATES.lock();
         if let Some(counter) = states.get_mut(&fd) {
-            let old = *counter;
             *counter = counter.saturating_add(val);
-            // #region agent log
-            crate::console_println!(
-                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H2","location":"kernel/src/syscall/epoll/eventfd.rs:eventfd_write","message":"eventfd write","data":{{"fd":{},"val":{},"old":{},"new":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                fd,
-                val,
-                old,
-                *counter,
-                crate::process::current_pid(),
-                crate::process::current_index(),
-                crate::arch::platform::uptime_ms(),
-                crate::arch::platform::uptime_ms(),
-            );
-            // #endregion
         } else {
             crate::console_println!("[eventfd] write fd={} EBADF!", fd);
             return -9; // EBADF

@@ -71,10 +71,6 @@ impl EpollInstance {
 static EPOLL_INSTANCES: Mutex<BTreeMap<usize, EpollInstance>> = Mutex::new(BTreeMap::new());
 static EPOLL_WAITERS: Mutex<BTreeMap<usize, alloc::vec::Vec<usize>>> = Mutex::new(BTreeMap::new());
 
-fn should_log_wait_debug() -> bool {
-    crate::syscall::debug_second_xbot_run_active()
-}
-
 // epoll constants
 const EPOLL_CTL_ADD: usize = 1;
 const EPOLL_CTL_DEL: usize = 2;
@@ -113,22 +109,12 @@ pub fn close_fd(fd: usize) {
         .remove(&fd)
         .map_or(0, |slots| slots.len());
     let removed_timer = TIMERFD_STATES.lock().remove(&fd).is_some();
-    if removed_instance || removed_entries != 0 || removed_waiters != 0 || removed_timer {
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H7","location":"kernel/src/syscall/epoll/mod.rs:close_fd","message":"epoll close fd cleanup","data":{{"fd":{},"removed_instance":{},"removed_entries":{},"removed_waiters":{},"removed_timer":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            fd,
-            removed_instance,
-            removed_entries,
-            removed_waiters,
-            removed_timer,
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
+    let _ = (
+        removed_instance,
+        removed_entries,
+        removed_waiters,
+        removed_timer,
+    );
 }
 
 /// Wake tasks blocked in epoll_wait for any epoll instance watching `fd`.
@@ -144,34 +130,15 @@ pub fn wake_waiters_for_fd(fd: usize) {
     }
 
     let mut waiters = EPOLL_WAITERS.lock();
-    let mut waiter_count = 0usize;
-    let mut woken_count = 0usize;
     for epfd in epfds {
         if let Some(slots) = waiters.get_mut(&epfd) {
             for &proc_idx in slots.iter() {
-                waiter_count += 1;
-                if crate::sched::wake_task(proc_idx) {
-                    woken_count += 1;
-                }
+                crate::sched::wake_task(proc_idx);
             }
             slots.clear();
         }
     }
     waiters.retain(|_, slots| !slots.is_empty());
-    if waiter_count != 0 {
-        // #region agent log
-        crate::console_println!(
-            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H1,H2,H4","location":"kernel/src/syscall/epoll/mod.rs:wake_waiters_for_fd","message":"epoll wake waiters","data":{{"fd":{},"waiters":{},"woken":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-            fd,
-            waiter_count,
-            woken_count,
-            crate::process::current_pid(),
-            crate::process::current_index(),
-            crate::arch::platform::uptime_ms(),
-            crate::arch::platform::uptime_ms(),
-        );
-        // #endregion
-    }
 }
 
 fn register_waiter(epfd: usize) -> usize {
@@ -226,36 +193,12 @@ fn collect_ready_events(
         }
 
         let is_et = entry.event.events & EPOLLET != 0;
-        let prev_revents = entry.last_revents;
-        if is_et && revents == prev_revents && revents != EPOLLHUP {
+        if is_et && revents == entry.last_revents && revents != EPOLLHUP {
             continue;
         }
         entry.last_revents = revents;
 
         if revents != 0 {
-            if crate::syscall::debug_second_xbot_run_active() {
-                let fd_type = fd_desc
-                    .as_ref()
-                    .map(|desc| alloc::format!("{:?}", desc.fd_type))
-                    .unwrap_or_else(|| alloc::format!("missing"));
-                // #region agent log
-                crate::console_println!(
-                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H17,H18,H19","location":"kernel/src/syscall/epoll/mod.rs:collect_ready_events","message":"epoll ready event","data":{{"epfd":{},"fd":{},"fd_type":"{}","events":{},"revents":{},"last_revents":{},"data":{},"is_et":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                    epfd,
-                    fd,
-                    fd_type,
-                    entry.event.events,
-                    revents,
-                    prev_revents,
-                    entry.event.data,
-                    is_et,
-                    crate::process::current_pid(),
-                    crate::process::current_index(),
-                    crate::arch::platform::uptime_ms(),
-                    crate::arch::platform::uptime_ms(),
-                );
-                // #endregion
-            }
             ready_events.push((revents, entry.event.data));
         }
     }
@@ -289,30 +232,12 @@ fn epoll_target_supported(desc: &crate::driver::fs::FileDescriptor) -> bool {
     }
 }
 
-fn validate_epoll_target(fd: usize) -> Result<(alloc::string::String, bool, bool), isize> {
+fn validate_epoll_target(fd: usize) -> Result<(), isize> {
     let fd_desc = crate::process::with_fd_table(|ft| ft.get(fd).cloned()).ok_or(-9_isize)?;
-    let fd_type = alloc::format!("{:?}", fd_desc.fd_type);
-    let readable = fd_desc.is_readable();
-    let writable = fd_desc.is_writable();
     if !epoll_target_supported(&fd_desc) {
-        if crate::syscall::debug_second_xbot_run_active() {
-            // #region agent log
-            crate::console_println!(
-                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H17,H18,H20","location":"kernel/src/syscall/epoll/mod.rs:validate_epoll_target","message":"epoll ctl reject target","data":{{"fd":{},"fd_type":"{}","readable":{},"writable":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                fd,
-                fd_type,
-                readable,
-                writable,
-                crate::process::current_pid(),
-                crate::process::current_index(),
-                crate::arch::platform::uptime_ms(),
-                crate::arch::platform::uptime_ms(),
-            );
-            // #endregion
-        }
         return Err(-1); // EPERM: regular files and directories are not epollable.
     }
-    Ok((fd_type, readable, writable))
+    Ok(())
 }
 
 /// syscall 233: epoll_ctl(epfd, op, fd, event) — control an epoll instance
@@ -329,10 +254,9 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
                 return -14; // EFAULT
             }
             let event = read_epoll_event(event_ptr);
-            let (fd_type, readable, writable) = match validate_epoll_target(fd) {
-                Ok(info) => info,
-                Err(e) => return e,
-            };
+            if let Err(e) = validate_epoll_target(fd) {
+                return e;
+            }
             instance.entries.insert(
                 fd,
                 EpollEntry {
@@ -340,22 +264,6 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
                     last_revents: 0,
                 },
             );
-            // #region agent log
-            crate::console_println!(
-                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H1,H2","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_ctl","message":"epoll ctl add","data":{{"epfd":{},"fd":{},"events":{},"data":{},"fd_type":"{}","readable":{},"writable":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                epfd,
-                fd,
-                event.events,
-                event.data,
-                fd_type,
-                readable,
-                writable,
-                crate::process::current_pid(),
-                crate::process::current_index(),
-                crate::arch::platform::uptime_ms(),
-                crate::arch::platform::uptime_ms(),
-            );
-            // #endregion
         }
         EPOLL_CTL_MOD => {
             if event_ptr == 0 {
@@ -411,25 +319,6 @@ pub fn sys_epoll_wait(
     }
 
     if timeout_ms == 0 {
-        if should_log_wait_debug() {
-            let entry_count = EPOLL_INSTANCES
-                .lock()
-                .get(&epfd)
-                .map(|instance| instance.entries.len())
-                .unwrap_or(0);
-            // #region agent log
-            crate::console_println!(
-                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H21,H22,H25","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait poll empty","data":{{"epfd":{},"entries":{},"max_events":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                epfd,
-                entry_count,
-                max_events,
-                crate::process::current_pid(),
-                crate::process::current_index(),
-                crate::arch::platform::uptime_ms(),
-                crate::arch::platform::uptime_ms(),
-            );
-            // #endregion
-        }
         return 0;
     }
 
@@ -459,35 +348,8 @@ pub fn sys_epoll_wait(
                 unregister_waiter(epfd, proc_idx);
                 return 0;
             }
-            if should_log_wait_debug() {
-                // #region agent log
-                crate::console_println!(
-                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H6","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait blocking","data":{{"epfd":{},"timeout_ms":{},"wake_tick":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                    epfd,
-                    timeout_ms,
-                    wake_tick,
-                    crate::process::current_pid(),
-                    crate::process::current_index(),
-                    now,
-                    now,
-                );
-                // #endregion
-            }
             crate::sched::sleep_until(wake_tick);
         } else {
-            if should_log_wait_debug() {
-                // #region agent log
-                crate::console_println!(
-                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H6","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait blocking","data":{{"epfd":{},"timeout_ms":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                    epfd,
-                    timeout_ms,
-                    crate::process::current_pid(),
-                    crate::process::current_index(),
-                    crate::arch::platform::uptime_ms(),
-                    crate::arch::platform::uptime_ms(),
-                );
-                // #endregion
-            }
             crate::sched::schedule_block();
         }
 
@@ -500,36 +362,11 @@ pub fn sys_epoll_wait(
         };
         if !ready_events.is_empty() {
             unregister_waiter(epfd, proc_idx);
-            if should_log_wait_debug() {
-                // #region agent log
-                crate::console_println!(
-                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H6","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait woke ready","data":{{"epfd":{},"ready":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                    epfd,
-                    ready_events.len(),
-                    crate::process::current_pid(),
-                    crate::process::current_index(),
-                    crate::arch::platform::uptime_ms(),
-                    crate::arch::platform::uptime_ms(),
-                );
-                // #endregion
-            }
             return write_ready_events(events_ptr, &ready_events);
         }
 
         if deadline.is_some() && crate::arch::platform::uptime_ms() >= deadline.unwrap_or(0) {
             unregister_waiter(epfd, proc_idx);
-            if should_log_wait_debug() {
-                // #region agent log
-                crate::console_println!(
-                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H6","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait woke empty","data":{{"epfd":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
-                    epfd,
-                    crate::process::current_pid(),
-                    crate::process::current_index(),
-                    crate::arch::platform::uptime_ms(),
-                    crate::arch::platform::uptime_ms(),
-                );
-                // #endregion
-            }
             return 0;
         }
     }

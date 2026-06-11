@@ -638,6 +638,19 @@ unsafe extern "C" fn restore_user_cr3() {
     }
 }
 
+/// Restore the current task's user FS_BASE before returning from SYSCALL.
+///
+/// Go reads its g pointer via `%fs:-8` immediately after ordinary syscalls.
+/// Do not rely on whatever FS_BASE happened to survive while Rust kernel code ran.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn restore_current_task_fs_base_for_syscall_return() {
+    const MSR_FS_BASE: u32 = 0xC000_0100;
+    let slot = crate::sched::current_sched_slot();
+    let fs_base = crate::sched::get_task_fs_base(slot);
+    unsafe { wrmsr(MSR_FS_BASE, fs_base) };
+    super::trap::PENDING_FS_BASE.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Handler for SYSCALL fast entry (via MSR LSTAR).
 /// Stack layout at state_ptr (rsp when called):
 /// The push order: r15, r14, r13, r12, rbp, r9, r8, r10, rdx, rsi, rdi,
@@ -707,6 +720,7 @@ unsafe extern "C" fn syscall_fast_handler(state_ptr: *const u64) -> u64 {
         let result = crate::syscall::dispatch_syscall_linux(syscall_nr, a0, a1, a2, a3, a4, a5);
 
         crate::process::set_trap_ctx_ptr(0);
+        restore_current_task_fs_base_for_syscall_return();
 
         result
     }

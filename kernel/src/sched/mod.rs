@@ -225,9 +225,7 @@ fn restore_task_arch_state(slot: usize) {
     // necessarily an immediate user return. User CR3 is installed only at the
     // explicit user-return paths (iretq/trap_return_user/syscall return).
     let fs_base = TASK_FS_BASE[slot].load(Ordering::Relaxed);
-    if fs_base != 0 {
-        unsafe { crate::arch::idt::wrmsr(0xC0000100, fs_base) };
-    }
+    unsafe { crate::arch::idt::wrmsr(0xC0000100, fs_base) };
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -586,6 +584,7 @@ fn allocate_user_slot(
     #[cfg(target_arch = "x86_64")]
     {
         TASK_KSTACK[slot].store(kernel_stack_top as u64, Ordering::Relaxed);
+        TASK_FS_BASE[slot].store(0, Ordering::Relaxed);
     }
 
     Ok(slot)
