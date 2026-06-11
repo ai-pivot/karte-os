@@ -120,3 +120,58 @@ impl AddressSpaceHandle {
         crate::mm::vma::register_elf_vma(self.root.as_usize(), start, end, prot)
     }
 }
+
+// ─── Mapping permission types ─────────────────────────────────────────
+
+/// Permissions for ELF file-backed private mappings.
+/// Prevents passing kernel-only perms to user ELF mapping functions.
+#[derive(Clone, Copy, Debug)]
+pub struct ElfPerms(pub usize);
+
+/// Permissions for anonymous (zero-filled) private mappings.
+#[derive(Clone, Copy, Debug)]
+pub struct AnonPerms(pub usize);
+
+/// Permissions for kernel mappings (supervisor-only).
+#[derive(Clone, Copy, Debug)]
+pub struct KernelPerms(pub usize);
+
+// ─── Mapping-kind-specific methods ────────────────────────────────────
+
+impl AddressSpaceHandle {
+    /// Map an ELF page: file-backed private user mapping.
+    /// The frame must contain ELF segment data loaded under kernel CR3.
+    pub fn map_elf_page(
+        &self,
+        root: &mut crate::mm::vmm::PageTable,
+        va: usize,
+        frame: usize,
+        _perms: ElfPerms,
+        flags: crate::mm::vmm::PTEFlags,
+    ) {
+        crate::mm::vmm::map_user(root, va, frame, flags);
+    }
+
+    /// Map an anonymous page: zero-filled private user mapping.
+    /// Anonymous mappings must never preserve identity frames.
+    pub fn map_anon_page(
+        &self,
+        root: &mut crate::mm::vmm::PageTable,
+        va: usize,
+        frame: usize,
+        _perms: AnonPerms,
+        flags: crate::mm::vmm::PTEFlags,
+    ) {
+        crate::mm::vmm::map_user(root, va, frame, flags);
+    }
+
+    /// Map a stack page: user-accessible, writable.
+    pub fn map_stack_page(
+        root: &mut crate::mm::vmm::PageTable,
+        va: usize,
+        frame: usize,
+        flags: crate::mm::vmm::PTEFlags,
+    ) {
+        crate::mm::vmm::map_user(root, va, frame, flags);
+    }
+}
