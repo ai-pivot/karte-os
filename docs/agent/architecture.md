@@ -87,10 +87,17 @@ driver/fs.rs     → depends on mm/heap (Vec, String via alloc)
 arch/riscv64/trap.rs     → depends on arch::sbi, sched/ (timer → schedule), process/ (satp switch)
 arch/riscv64/plic.rs     → depends on driver/uart (interrupt handler)
 arch/riscv64/smp.rs      → depends on mm/pmm (stack alloc), arch::trap, arch::plic
+arch/x86_64/cr3.rs       → RAII CR3 guards (enter_kernel_cr3 → Cr3Guard auto-restore)
+arch/x86_64/user_return.rs → Typed FsBase, UserReturnState for user-return paths
 
 mm/pmm.rs        → standalone (uses linker symbols _ekernel)
 mm/vmm.rs        → depends on mm/pmm (page table allocation)
 mm/heap.rs       → depends on mm/pmm (heap pages)
+mm/addr.rs       → standalone typed address newtypes (PhysAddr, UserVirtAddr, etc.)
+mm/frame.rs      → depends on mm/pmm (frame alloc/dealloc in Drop)
+mm/page_table.rs → standalone (WalkResult enum, Level markers)
+mm/address_space.rs → depends on mm/vma (VMA operations), mm/addr (PhysAddr)
+mm/diagnostics.rs   → depends on mm/vmm (PageTable walk), mm/addr, mm/page_table
 
 process/         → depends on mm/pmm (page tables + stacks), mm/vmm (user mapping)
 sched/           → depends on mm/pmm (task stacks), process/ (task→process mapping), sync/spinlock

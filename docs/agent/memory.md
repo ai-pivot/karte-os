@@ -105,3 +105,81 @@ RAM origin: 0x80200000, length: 128M
 Sections: .text.entry → .text → .rodata → .data → .bss
 Symbols: _sbss, _ebss, _boot_stack_top, _ekernel
 ```
+
+## Type-Safe Memory Abstractions (2026-06 refactor)
+
+### Module Structure
+
+| Module | File | Purpose |
+|--------|------|---------|
+| `mm::addr` | `mm/addr.rs` | Typed address newtypes (PhysAddr, VirtAddr, UserVirtAddr, KernelVirtAddr) |
+| `mm::frame` | `mm/frame.rs` | Frame ownership types (OwnedFrame, PageTableFrame, BorrowedFrame) |
+| `mm::page_table` | `mm/page_table.rs` | Page-table level markers (L4/L3/L2/L1) and WalkResult enum |
+| `mm::address_space` | `mm/address_space.rs` | Per-process AddressSpaceHandle with PageTableRoot |
+| `mm::diagnostics` | `mm/diagnostics.rs` | Structured PageFaultEvent and PteChain for PF analysis |
+
+### Address Types (`mm::addr`)
+
+```rust
+pub type PhysAddr = Addr<Phys>;          // Physical address
+pub type VirtAddr = Addr<Virt>;          // Virtual address (unspecified space)
+pub type UserVirtAddr = Addr<Virt, User>;   // User-space virtual address
+pub type KernelVirtAddr = Addr<Virt, Kernel>; // Kernel virtual address
+```
+
+- `UserVirtAddr::try_new(raw)` validates user range (< USER_MMAP_LIMIT)
+- `PhysAddr::ppn()` / `PhysAddr::from_ppn()` for page number conversion
+- All types: `is_page_aligned()`, `page_align_down()`, `page_offset()`
+
+### Frame Ownership (`mm::frame`)
+
+```rust
+pub struct OwnedFrame { ... }       // Exclusive frame, freed on Drop
+pub struct PageTableFrame { ... }   // Page table frame, freed on Drop
+pub struct BorrowedFrame { ... }    // Non-owning reference (no Drop)
+```
+
+- `OwnedFrame::into_raw()` transfers ownership (prevents Drop)
+- `PageTableFrame::as_page_table_mut()` provides typed page table access
+- `alloc_owned_frame()` / `alloc_page_table_frame()` wrap PMM allocation
+
+### Page Table Walks (`mm::page_table`)
+
+```rust
+pub enum WalkResult {
+    NotMapped,                                          // Entry not present
+    Mapped4K { frame: PhysAddr, flags: u64 },          // 4KB leaf
+    MappedHuge { frame: PhysAddr, level: usize, size: usize, flags: u64 }, // Huge page
+    Invalid,                                            // Corrupted entry
+}
+```
+
+- `vmm::walk_mapping()` returns `WalkResult` — callers must handle `MappedHuge` explicitly
+- Prevents mprotect/munmap from silently descending into huge pages
+
+### Address Space Handle (`mm::address_space`)
+
+```rust
+pub struct PageTableRoot(PhysAddr);  // Typed CR3/satp value
+pub struct AddressSpaceHandle { root: PageTableRoot }  // Per-process state
+```
+
+- `AddressSpaceHandle::init(root)` — create + init VMA state
+- VMA operations: `vma_check()`, `vma_add()`, `vma_remove_range()`, `vma_update_prot()`
+- Mapping kinds: `map_elf_page()`, `map_anon_page()`, `map_stack_page()`
+- Permission types: `ElfPerms`, `AnonPerms`, `KernelPerms`
+
+### CR3 Guards (x86_64 only)
+
+- **File**: `arch/x86_64/cr3.rs`
+- `enter_kernel_cr3()` returns `Cr3Guard` — auto-restores on drop
+- `enter_cr3(target)` for switching to arbitrary CR3
+- RAII ensures CR3 restore even on early returns
+
+### User-Return State (x86_64 only)
+
+- **File**: `arch/x86_64/user_return.rs`
+- `FsBase` newtype: `FsBase::ZERO` is valid and must be written explicitly
+- `UserReturnState` bundles CR3 + RSP0 + FS_BASE for user return
+- `restore_for_user_return()` restores all state atomically
+- `restore_fs_base()` always writes MSR, even for zero value
