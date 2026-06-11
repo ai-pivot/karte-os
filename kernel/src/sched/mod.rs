@@ -220,17 +220,10 @@ fn restore_task_arch_state(slot: usize) {
             crate::arch::gdt::set_kernel_rsp0_for_cpu(0, kernel_sp);
         }
     }
-    let kind = {
-        let sched = SCHEDULER.lock();
-        sched.kinds[slot]
-    };
-    let task_cr3 = match kind {
-        TaskKind::User { proc_idx } => crate::process::get_page_table_root(proc_idx) << 12,
-        TaskKind::Idle | TaskKind::Empty => crate::mm::vmm::kernel_cr3() as usize,
-    };
-    if task_cr3 != 0 && crate::arch::trap::read_page_table_root() != task_cr3 {
-        crate::arch::trap::activate_page_table(task_cr3);
-    }
+    // Do not switch to a task's user CR3 here. __switch() resumes arbitrary
+    // kernel continuations (syscall handlers, timer handlers, idle paths), not
+    // necessarily an immediate user return. User CR3 is installed only at the
+    // explicit user-return paths (iretq/trap_return_user/syscall return).
     let fs_base = TASK_FS_BASE[slot].load(Ordering::Relaxed);
     if fs_base != 0 {
         unsafe { crate::arch::idt::wrmsr(0xC0000100, fs_base) };
@@ -524,7 +517,6 @@ fn build_clone_stack(init: CloneTaskInit<'_>) -> usize {
         ctx.kernel_sp = init.kernel_stack_top as u64;
         ctx.user_cr3 = init.user_cr3 as u64;
         ctx.trap_from_user = 1;
-        ctx.r15 = init.tls as u64;
         core::ptr::write(trap_ctx_base as *mut crate::arch::trap::TrapContext, ctx);
     }
     switch_sp

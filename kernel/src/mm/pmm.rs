@@ -3,6 +3,8 @@
 use spin::Mutex;
 
 const PAGE_SIZE: usize = 4096;
+#[cfg(target_arch = "x86_64")]
+const WATCH_FRAME: usize = 0x45ff000;
 
 #[cfg(target_arch = "riscv64")]
 const MEMORY_START: usize = 0x8020_0000;
@@ -108,7 +110,12 @@ impl FrameAllocator {
             if self.bitmap[word] & (1u64 << bit) == 0 {
                 self.bitmap[word] |= 1u64 << bit;
                 self.next_free = i + 1;
-                return Some(self.start + i * PAGE_SIZE);
+                let addr = self.start + i * PAGE_SIZE;
+                #[cfg(target_arch = "x86_64")]
+                if addr == WATCH_FRAME {
+                    crate::console_println!("[PMM-WATCH] alloc frame={:#x} idx={}", addr, i);
+                }
+                return Some(addr);
             }
         }
         // Wrap around
@@ -119,6 +126,10 @@ impl FrameAllocator {
                 self.bitmap[word] |= 1u64 << bit;
                 self.next_free = i + 1;
                 let addr = self.start + i * PAGE_SIZE;
+                #[cfg(target_arch = "x86_64")]
+                if addr == WATCH_FRAME {
+                    crate::console_println!("[PMM-WATCH] alloc-wrap frame={:#x} idx={}", addr, i);
+                }
                 return Some(addr);
             }
         }
@@ -150,7 +161,17 @@ impl FrameAllocator {
                         self.bitmap[w] |= 1u64 << b;
                     }
                     self.next_free = run_start + count;
-                    return Some(self.start + run_start * PAGE_SIZE);
+                    let addr = self.start + run_start * PAGE_SIZE;
+                    #[cfg(target_arch = "x86_64")]
+                    if addr <= WATCH_FRAME && WATCH_FRAME < addr + count * PAGE_SIZE {
+                        crate::console_println!(
+                            "[PMM-WATCH] alloc-contig start={:#x} count={} idx={}",
+                            addr,
+                            count,
+                            run_start
+                        );
+                    }
+                    return Some(addr);
                 }
             } else {
                 run_length = 0;
@@ -162,6 +183,10 @@ impl FrameAllocator {
     fn dealloc(&mut self, frame: usize) {
         let idx = (frame - self.start) / PAGE_SIZE;
         if idx < self.total_frames {
+            #[cfg(target_arch = "x86_64")]
+            if frame == WATCH_FRAME {
+                crate::console_println!("[PMM-WATCH] dealloc frame={:#x} idx={}", frame, idx);
+            }
             let word = idx / 64;
             let bit = idx % 64;
             self.bitmap[word] &= !(1u64 << bit);

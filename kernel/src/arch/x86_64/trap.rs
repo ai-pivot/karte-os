@@ -55,6 +55,10 @@ use x86_64::{PhysAddr, VirtAddr};
 #[cfg(target_arch = "x86_64")]
 pub static PENDING_FS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+#[cfg(target_arch = "x86_64")]
+pub static USER_CR3_WINDOW_LINE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// Complete register state saved on trap entry.
 ///
 /// Field ordering is critical: GP regs first, then iretq frame, then
@@ -468,22 +472,41 @@ where
 
 /// Temporarily switch to the user page table to access user-space memory.
 /// Used by syscall handlers that run under kernel CR3 after the entry switch.
-/// MUST be called with interrupts disabled (cli) to prevent Timer ISR from
-/// changing CR3 concurrently.
+/// Disables interrupts for the duration to prevent Timer ISR from accessing
+/// LAPIC MMIO (0xFEE00000) or calling schedule() while user CR3 is active.
+#[track_caller]
 pub fn with_user_cr3<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
+    // Save interrupt flag and disable interrupts
+    let rflags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) rflags) };
+    let was_enabled = (rflags & 0x200) != 0;
+
     let user_root = crate::process::current_page_table_root();
     if user_root == 0 {
         // No user page table — already in the right context
+        if was_enabled {
+            unsafe { core::arch::asm!("sti") };
+        }
         return f();
     }
     let user_cr3 = user_root << 12;
     let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
+    USER_CR3_WINDOW_LINE.store(
+        core::panic::Location::caller().line() as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
     activate_page_table(user_cr3);
     let result = f();
     activate_page_table(kernel_cr3);
+    USER_CR3_WINDOW_LINE.store(0, core::sync::atomic::Ordering::Relaxed);
+
+    // Restore interrupt flag
+    if was_enabled {
+        unsafe { core::arch::asm!("sti") };
+    }
     result
 }
 

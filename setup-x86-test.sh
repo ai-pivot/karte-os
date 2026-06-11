@@ -12,6 +12,26 @@ DISK="${DISK:-disk.img}"
 DISK_SIZE="${DISK_SIZE:-512}"  # 512MB for xbot-cli-static (~69MB)
 MOUNT="/tmp/karteos-mnt"
 
+cleanup_mount() {
+    if mountpoint -q "$MOUNT"; then
+        sudo umount "$MOUNT" 2>/dev/null || true
+    fi
+    rmdir "$MOUNT" 2>/dev/null || true
+}
+
+mount_disk() {
+    local mode="$1"
+    cleanup_mount
+    mkdir -p "$MOUNT"
+    if [ "$mode" = "ro" ]; then
+        sudo mount -o loop,ro "$DISK" "$MOUNT"
+    else
+        sudo mount -o loop "$DISK" "$MOUNT"
+    fi
+}
+
+trap cleanup_mount EXIT INT TERM
+
 echo "════════════════════════════════════════════════"
 echo "  KarteOS x86_64 Test Environment Setup"
 echo "════════════════════════════════════════════════"
@@ -48,6 +68,7 @@ echo "      Done: target/karte-os-x86_64.iso"
 # 3. Create disk image (large enough for xbot)
 echo ""
 echo "[3/5] Creating ${DISK_SIZE}MB ext4 disk image..."
+cleanup_mount
 dd if=/dev/zero of="$DISK" bs=1M count="$DISK_SIZE" status=progress 2>/dev/null
 mkfs.ext4 -O ^64bit -O ^has_journal -O ^metadata_csum -O ^flex_bg -O ^extra_isize \
     -b 4096 -L karteos "$DISK" >/dev/null 2>&1
@@ -56,8 +77,7 @@ echo "      Done: $DISK ($(du -h "$DISK" | cut -f1))"
 # 4. Mount and install programs
 echo ""
 echo "[4/5] Installing programs..."
-mkdir -p "$MOUNT"
-sudo mount -o loop "$DISK" "$MOUNT"
+mount_disk rw
 
 # Install user programs (strip .elf extension)
 count=0
@@ -86,17 +106,15 @@ else
 fi
 
 sudo sync
-sudo umount "$MOUNT"
-rmdir "$MOUNT" 2>/dev/null || true
+cleanup_mount
 
 # 5. Summary
 echo ""
 echo "[5/5] Verifying disk contents..."
-sudo mount -o loop,ro "$DISK" "$MOUNT" 2>/dev/null || mkdir -p "$MOUNT" && sudo mount -o loop,ro "$DISK" "$MOUNT"
+mount_disk ro
 echo "      Files on disk:"
 ls -lh "$MOUNT/" | tail -n +2 | awk '{printf "        %-20s %s\n", $NF, $5}'
-sudo umount "$MOUNT" 2>/dev/null || true
-rmdir "$MOUNT" 2>/dev/null || true
+cleanup_mount
 
 echo ""
 echo "════════════════════════════════════════════════"

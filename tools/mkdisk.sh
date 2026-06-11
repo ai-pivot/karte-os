@@ -23,6 +23,15 @@ MOUNT="/tmp/karteos-mnt"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 
+cleanup_mount() {
+    if mountpoint -q "$MOUNT"; then
+        sudo umount "$MOUNT" 2>/dev/null || true
+    fi
+    rmdir "$MOUNT" 2>/dev/null || true
+}
+
+trap cleanup_mount EXIT INT TERM
+
 # ═══════════════════════════════════════════════════════════════════
 #  Filesystem creation
 # ═══════════════════════════════════════════════════════════════════
@@ -145,12 +154,15 @@ cmd_deploy_x86() {
 
 _mount() {
     mkdir -p "$MOUNT"
+    if mountpoint -q "$MOUNT"; then
+        echo "[disk] Cleaning stale mount at $MOUNT"
+        sudo umount "$MOUNT"
+    fi
     sudo mount -o loop "$DISK" "$MOUNT"
 }
 
 _unmount() {
-    sudo umount "$MOUNT" 2>/dev/null || true
-    rmdir "$MOUNT" 2>/dev/null || true
+    cleanup_mount
 }
 
 _detect_fs() {

@@ -469,6 +469,13 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
     Some((entry.ppn() << 12) | (vaddr & 0xFFF))
 }
 
+/// Return the raw leaf PTE for debugging user mappings.
+#[cfg(target_arch = "x86_64")]
+pub fn debug_pte(root: &mut PageTable, vaddr: usize) -> Option<u64> {
+    let (pt, vpn) = walk_to_pt(root, vaddr)?;
+    Some(pt.entries[vpn].0)
+}
+
 /// Unmap a single page from the user page table (clear PTE present bit).
 /// Returns the physical address that was mapped, or None if not mapped.
 pub fn unmap_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
@@ -603,5 +610,479 @@ pub fn run_tests() {
     crate::test::run_test("vmm_pte_ppn", || {
         let pte = PTE::new(0xABCD, PTEFlags::KRW);
         pte.ppn() == 0xABCD
+    });
+
+    // ── Corruption detection tests ──
+    // These tests simulate the ELF-load-then-map scenario to detect
+    // whether map() overwrites existing code frames with page table data.
+
+    crate::test::run_test("vmm_map_does_not_clobber_code_frame", || {
+        // Simulate ELF loading: allocate a frame, write magic bytes, map it as user code.
+        let code_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        // Write magic pattern to the code frame
+        let magic: u64 = 0xDEADBEEF_CAFEBABE;
+        unsafe {
+            (code_frame as *mut u64).write(magic);
+        }
+
+        // Create a user page table and map the code frame
+        let root = PageTable::zeroed();
+        #[cfg(target_arch = "x86_64")]
+        let code_vaddr = 0x400000usize;
+        #[cfg(target_arch = "riscv64")]
+        let code_vaddr = 0x1000usize;
+        map(root, code_vaddr, code_frame, PTEFlags::URW);
+
+        // Verify the mapping is correct
+        let translated = translate_user(root, code_vaddr);
+        if translated != Some(code_frame) {
+            return false;
+        }
+
+        // Now map a DIFFERENT virtual address that requires new intermediate page tables.
+        // If map() allocates a frame that happens to be code_frame, the magic bytes get zeroed.
+        #[cfg(target_arch = "x86_64")]
+        let far_vaddr = 0x2000_0000usize; // mmap region — different PDP entry
+        #[cfg(target_arch = "riscv64")]
+        let far_vaddr = 0x8000_0000usize;
+        let data_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        map(root, far_vaddr, data_frame, PTEFlags::URW);
+
+        // Check: code frame magic must still be intact
+        let check = unsafe { (code_frame as *const u64).read() };
+        if check != magic {
+            crate::console_println!(
+                "[FAIL] code_frame={:#x} magic={:#x} expected={:#x}",
+                code_frame,
+                check,
+                magic
+            );
+            return false;
+        }
+        true
+    });
+
+    crate::test::run_test("vmm_map_preserves_all_existing_mappings", || {
+        // Map 4 code frames, then map a far address, then check all 4 are intact.
+        let root = PageTable::zeroed();
+        let page_size = pmm::page_size();
+
+        let mut code_frames = [0usize; 4];
+        let mut magics = [0u64; 4];
+        for i in 0..4 {
+            let frame = match pmm::alloc_frame() {
+                Some(f) => f,
+                None => return false,
+            };
+            code_frames[i] = frame;
+            magics[i] = 0xA000_0000_0000_0000 | (i as u64);
+            unsafe {
+                (frame as *mut u64).write(magics[i]);
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            let vaddr = 0x400000 + i * page_size;
+            #[cfg(target_arch = "riscv64")]
+            let vaddr = 0x1000 + i * page_size;
+            map(root, vaddr, frame, PTEFlags::URW);
+        }
+
+        // Map 8 distant pages (exercises intermediate page table allocation heavily)
+        for j in 0..8 {
+            let frame = match pmm::alloc_frame() {
+                Some(f) => f,
+                None => return false,
+            };
+            // Write a different pattern so we can detect swaps
+            unsafe {
+                (frame as *mut u64).write(0xB000_0000_0000_0000 | (j as u64));
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            let vaddr = 0x2000_0000 + j * page_size;
+            #[cfg(target_arch = "riscv64")]
+            let vaddr = 0x8000_0000 + j * page_size;
+            map(root, vaddr, frame, PTEFlags::URW);
+        }
+
+        // Verify ALL 4 code frames are intact
+        for i in 0..4 {
+            let val = unsafe { (code_frames[i] as *const u64).read() };
+            if val != magics[i] {
+                crate::console_println!(
+                    "[FAIL] code_frame[{}]={:#x} val={:#x} expected={:#x}",
+                    i,
+                    code_frames[i],
+                    val,
+                    magics[i]
+                );
+                return false;
+            }
+        }
+        true
+    });
+
+    crate::test::run_test("vmm_unmap_then_remap_no_corruption", || {
+        // Test: unmap a page (dealloc frame), then map a new page.
+        // The deallocated frame should NOT be reused as a page table frame
+        // that clobbers existing data.
+        let root = PageTable::zeroed();
+        let page_size = pmm::page_size();
+
+        // Map code at 0x400000
+        let code_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        let magic: u64 = 0x1234_5678_9ABC_DEF0;
+        unsafe {
+            (code_frame as *mut u64).write(magic);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let code_vaddr = 0x400000usize;
+        #[cfg(target_arch = "riscv64")]
+        let code_vaddr = 0x1000usize;
+        map(root, code_vaddr, code_frame, PTEFlags::URW);
+
+        // Map+unmap a temporary page (simulates madvise DONTNEED cycle)
+        let tmp_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        #[cfg(target_arch = "x86_64")]
+        let tmp_vaddr = 0x2000_0000usize;
+        #[cfg(target_arch = "riscv64")]
+        let tmp_vaddr = 0x8000_0000usize;
+        map(root, tmp_vaddr, tmp_frame, PTEFlags::URW);
+        let freed = unmap_user(root, tmp_vaddr);
+        if freed != Some(tmp_frame) {
+            return false;
+        }
+        pmm::dealloc_frame(tmp_frame);
+
+        // Now map a new page at the same address
+        let new_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        map(root, tmp_vaddr, new_frame, PTEFlags::URW);
+
+        // Code frame must still be intact
+        let check = unsafe { (code_frame as *const u64).read() };
+        if check != magic {
+            crate::console_println!(
+                "[FAIL] code_frame={:#x} val={:#x} expected={:#x}",
+                code_frame,
+                check,
+                magic
+            );
+            return false;
+        }
+        true
+    });
+
+    crate::test::run_test("vmm_map_user_no_identity_clobber", || {
+        // On x86_64, copy_kernel_mappings creates identity mappings.
+        // map_user must NOT skip frame allocation when an identity mapping exists
+        // for the target vaddr — it must allocate a NEW frame.
+        // (This was a previous bug that caused ELF data to be written to wrong pages.)
+        let root = PageTable::zeroed();
+        let page_size = pmm::page_size();
+
+        // Allocate a frame and write magic
+        let code_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        let magic: u64 = 0xCAFE_0000_DEAD_BEEF;
+        unsafe {
+            (code_frame as *mut u64).write(magic);
+        }
+
+        // Map it at a vaddr that happens to equal its physical address (identity-like)
+        let vaddr = code_frame; // vaddr == paddr (identity)
+        map(root, vaddr, code_frame, PTEFlags::URW);
+
+        // translate should return the code_frame
+        match translate_user(root, vaddr) {
+            Some(f) if f == code_frame => {}
+            other => {
+                crate::console_println!(
+                    "[FAIL] translate({:#x}) = {:?}, expected {:#x}",
+                    vaddr,
+                    other,
+                    code_frame
+                );
+                return false;
+            }
+        }
+
+        // Magic must be intact
+        let check = unsafe { (code_frame as *const u64).read() };
+        if check != magic {
+            crate::console_println!(
+                "[FAIL] identity frame={:#x} val={:#x} expected={:#x}",
+                code_frame,
+                check,
+                magic
+            );
+            return false;
+        }
+        true
+    });
+
+    crate::test::run_test("vmm_huge_page_split_preserves_data", || {
+        // Simulate copy_kernel_mappings: set up 2MB huge page identity mapping,
+        // then map code frames on top (splitting the huge page),
+        // then map distant pages, and verify code data is intact.
+        let root = PageTable::zeroed();
+        let page_size = pmm::page_size();
+
+        // Step 1: Create 2MB huge page identity mapping (like copy_kernel_mappings does)
+        // Map first 8MB using 2MB huge pages at PD level (covers 0x400000 comfortably)
+        identity_map_2mb(root, 0, 8 * 1024 * 1024, PTEFlags::KRW);
+
+        // Verify huge page mapping works at 0x400000 (PD index 2)
+        let check_addr = 0x400000usize;
+        match translate_user(root, check_addr) {
+            Some(f) if f == check_addr => {} // identity mapped
+            other => {
+                crate::console_println!(
+                    "[FAIL] huge page translate({:#x}) = {:?}, expected {:#x}",
+                    check_addr,
+                    other,
+                    check_addr
+                );
+                return false;
+            }
+        }
+
+        // Step 2: Allocate a code frame, write magic, map it at an address
+        // within the 2MB range (this triggers huge page split)
+        let code_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        let magic: u64 = 0xFEED_FACE_CAFE_BEEF;
+        unsafe {
+            (code_frame as *mut u64).write(magic);
+        }
+
+        // Map the code frame at a virtual address within the 2MB huge page range
+        // This will split the 2MB huge page into 512 4KB entries
+        let code_vaddr = 0x401000usize; // Within first 2MB range
+        map_user(root, code_vaddr, code_frame, PTEFlags::URW);
+
+        // Verify code data is intact after split
+        let val = unsafe { (code_frame as *const u64).read() };
+        if val != magic {
+            crate::console_println!(
+                "[FAIL] after split: code_frame={:#x} val={:#x} expected={:#x}",
+                code_frame,
+                val,
+                magic
+            );
+            return false;
+        }
+
+        // Step 3: Map more code frames in the same 2MB range
+        let code_frame2 = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        let magic2: u64 = 0x1234_5678_ABCD_EF01;
+        unsafe {
+            (code_frame2 as *mut u64).write(magic2);
+        }
+        map_user(root, 0x402000, code_frame2, PTEFlags::URW);
+
+        // Step 4: Now map a page in a COMPLETELY DIFFERENT 2MB range
+        // (simulating mmap PF at high address like 0x1221949e1000)
+        // This should NOT affect the code frames
+        let far_vaddr = 0x2000_0000usize;
+        let far_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        unsafe {
+            core::ptr::write_bytes(far_frame as *mut u8, 0xAF, page_size);
+        }
+        map_user(root, far_vaddr, far_frame, PTEFlags::URW);
+
+        // Verify ALL code frames are still intact
+        let val1 = unsafe { (code_frame as *const u64).read() };
+        if val1 != magic {
+            crate::console_println!(
+                "[FAIL] code_frame={:#x} val={:#x} expected={:#x}",
+                code_frame,
+                val1,
+                magic
+            );
+            return false;
+        }
+        let val2 = unsafe { (code_frame2 as *const u64).read() };
+        if val2 != magic2 {
+            crate::console_println!(
+                "[FAIL] code_frame2={:#x} val={:#x} expected={:#x}",
+                code_frame2,
+                val2,
+                magic2
+            );
+            return false;
+        }
+        true
+    });
+
+    crate::test::run_test("vmm_split_does_not_clobber_sibling_pages", || {
+        // After a 2MB huge page is split into 4KB entries, verify that
+        // pages we DID NOT explicitly map still have valid identity mappings.
+        // The split must preserve the original physical mappings for all
+        // 512 sub-pages.
+        let root = PageTable::zeroed();
+
+        // Create 2MB huge page covering 0..4MB (PD indices 0 and 1)
+        identity_map_2mb(root, 0, 4 * 1024 * 1024, PTEFlags::KRW);
+
+        // Write magic to physical address 0x200000 (start of the 2MB range)
+        let phys = 0x200000usize;
+        let magic: u64 = 0xABBA_CDEF_1234_5678;
+        unsafe {
+            (phys as *mut u64).write(magic);
+        }
+
+        // Write magic to another physical address in the same 2MB range
+        let phys2 = 0x300000usize; // 3MB — middle of the 2MB range
+        let magic2: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        unsafe {
+            (phys2 as *mut u64).write(magic2);
+        }
+
+        // Now map a specific 4KB page within the range (triggers split)
+        let trigger_vaddr = 0x201000usize; // 2MB + 4KB
+        let trigger_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        unsafe {
+            core::ptr::write_bytes(trigger_frame as *mut u8, 0x42, pmm::page_size());
+        }
+        map_user(root, trigger_vaddr, trigger_frame, PTEFlags::URW);
+
+        // Verify the first page (0x200000) still has its identity mapping and magic
+        match translate_user(root, 0x200000) {
+            Some(f) if f == phys => {
+                let val = unsafe { (phys as *const u64).read() };
+                if val != magic {
+                    crate::console_println!(
+                        "[FAIL] sibling page 0x200000 val={:#x} expected={:#x}",
+                        val,
+                        magic
+                    );
+                    return false;
+                }
+            }
+            other => {
+                crate::console_println!(
+                    "[FAIL] sibling translate(0x200000) = {:?}, expected {:#x}",
+                    other,
+                    phys
+                );
+                return false;
+            }
+        }
+
+        // Verify the middle page (0x300000) still intact
+        match translate_user(root, 0x300000) {
+            Some(f) if f == phys2 => {
+                let val = unsafe { (phys2 as *const u64).read() };
+                if val != magic2 {
+                    crate::console_println!(
+                        "[FAIL] sibling page 0x300000 val={:#x} expected={:#x}",
+                        val,
+                        magic2
+                    );
+                    return false;
+                }
+            }
+            other => {
+                crate::console_println!(
+                    "[FAIL] sibling translate(0x300000) = {:?}, expected {:#x}",
+                    other,
+                    phys2
+                );
+                return false;
+            }
+        }
+        true
+    });
+
+    // ── Runtime corruption detector test ──
+    // Allocate a "canary" frame, fill with magic, track it during
+    // heavy map/unmap operations to detect physical memory corruption.
+    crate::test::run_test("vmm_canary_survives_heavy_map", || {
+        let root = PageTable::zeroed();
+        let page_size = pmm::page_size();
+
+        // Allocate canary frame with magic pattern
+        let canary_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        // Fill with recognizable pattern (not zero, not 0xFF)
+        for i in 0..(page_size / 8) {
+            unsafe {
+                ((canary_frame + i * 8) as *mut u64).write(0xCAFE_0000_BEEF_0000 | (i as u64));
+            }
+        }
+
+        // Map the canary into the page table
+        map(root, 0x400000, canary_frame, PTEFlags::URW);
+
+        // Now perform heavy mapping/unmapping to stress PMM and page table allocation
+        // Map 256 pages in the mmap region (0x2000000..), unmap them, repeat
+        for round in 0..4 {
+            let frames: alloc::vec::Vec<usize> =
+                (0..64).filter_map(|_| pmm::alloc_frame()).collect();
+
+            for (i, &frame) in frames.iter().enumerate() {
+                let vaddr = 0x2000_0000 + (round * 64 + i) * page_size;
+                map(root, vaddr, frame, PTEFlags::URW);
+            }
+
+            // Unmap and free all frames
+            for (i, &frame) in frames.iter().enumerate() {
+                let vaddr = 0x2000_0000 + (round * 64 + i) * page_size;
+                unmap_user(root, vaddr);
+                pmm::dealloc_frame(frame);
+            }
+        }
+
+        // Verify canary frame is intact
+        for i in 0..(page_size / 8) {
+            let expected = 0xCAFE_0000_BEEF_0000 | (i as u64);
+            let actual = unsafe { ((canary_frame + i * 8) as *const u64).read() };
+            if actual != expected {
+                crate::console_println!(
+                    "[FAIL] canary corruption at offset {} (frame={:#x}): {:#x} != {:#x}",
+                    i,
+                    canary_frame,
+                    actual,
+                    expected
+                );
+                return false;
+            }
+        }
+
+        // Clean up
+        unmap_user(root, 0x400000);
+        pmm::dealloc_frame(canary_frame);
+        true
     });
 }

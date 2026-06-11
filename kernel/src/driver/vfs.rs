@@ -323,6 +323,26 @@ pub fn get_inode_for_fd(fd: usize) -> Option<u64> {
     }
 }
 
+/// Get metadata for an open VFS fd.
+pub fn fd_metadata(fd: usize) -> Result<VfsMetadata, VfsError> {
+    let vfs = VFS.lock();
+    let file = vfs.open_files.get(fd).ok_or(VfsError::InvalidParam)?;
+    let mount = vfs.mounts.get(file.mount_id).ok_or(VfsError::NotFound)?;
+    mount.fs.metadata(file.inode)
+}
+
+/// Read the `idx`-th directory entry from an open VFS directory fd.
+pub fn readdir_at(fd: usize, idx: usize) -> Result<Option<VfsDirEntry>, VfsError> {
+    let vfs = VFS.lock();
+    let file = vfs.open_files.get(fd).ok_or(VfsError::InvalidParam)?;
+    let mount = vfs.mounts.get(file.mount_id).ok_or(VfsError::NotFound)?;
+    let meta = mount.fs.metadata(file.inode)?;
+    if !meta.is_dir() {
+        return Err(VfsError::NotADirectory);
+    }
+    mount.fs.readdir(file.inode, idx)
+}
+
 /// Truncate a VFS file to the specified size.
 pub fn truncate(fd: usize, size: usize) -> Result<(), VfsError> {
     let mut vfs = VFS.lock();

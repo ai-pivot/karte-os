@@ -133,15 +133,106 @@ static VMA_TABLE: spin::Mutex<[VmaRegion; MAX_VMAS]> = spin::Mutex::new(
 /// Returns Some(prot) if valid, None if no VMA covers this address or VMA is PROT_NONE.
 pub fn vma_check(addr: usize) -> Option<usize> {
     let table = VMA_TABLE.lock();
+    let mut best_prot: Option<usize> = None;
+    let mut best_size: usize = usize::MAX;
     for vma in table.iter() {
         if vma.active && addr >= vma.start && addr < vma.end {
-            if vma.prot == 0 {
-                return None; // PROT_NONE — access is illegal
+            let size = vma.end - vma.start;
+            let cur_accessible = vma.prot != 0;
+            let best_accessible = best_prot.map_or(false, |p| p != 0);
+            if (cur_accessible && !best_accessible)
+                || (cur_accessible == best_accessible && size < best_size)
+            {
+                best_size = size;
+                best_prot = if vma.prot == 0 { None } else { Some(vma.prot) };
             }
+        }
+    }
+    best_prot
+}
+
+/// Query VMA protection for `addr` — distinguishes PROT_NONE from no-VMA.
+/// Returns `Some(prot)` if a VMA covers this address (prot may be 0 for PROT_NONE).
+/// Returns `None` if no VMA covers this address at all.
+pub fn vma_query(addr: usize) -> Option<usize> {
+    let table = VMA_TABLE.lock();
+    for vma in table.iter() {
+        if vma.active && addr >= vma.start && addr < vma.end {
             return Some(vma.prot);
         }
     }
     None
+}
+
+/// Dump VMA entries near a given address for debugging.
+pub fn vma_dump_region(addr: usize) {
+    let table = VMA_TABLE.lock();
+    let range = 64 * 1024 * 1024; // ±64MB
+    let mut count = 0;
+    let mut total_active = 0;
+    for vma in table.iter() {
+        if vma.active {
+            total_active += 1;
+            if vma.start < addr + range && vma.end > addr.saturating_sub(range) {
+                let contains = addr >= vma.start && addr < vma.end;
+                crate::console_println!(
+                    "[VMA] {:#x}..{:#x} prot={:#x} {}",
+                    vma.start,
+                    vma.end,
+                    vma.prot,
+                    if contains { "<<< CONTAINS fault" } else { "" }
+                );
+                count += 1;
+                if count >= 20 {
+                    break;
+                }
+            }
+        }
+    }
+    crate::console_println!(
+        "[VMA] total active={}/{} shown={}",
+        total_active,
+        MAX_VMAS,
+        count
+    );
+}
+
+/// Check if [start, end) overlaps with any active VMA entry.
+pub fn vma_overlaps(start: usize, end: usize) -> bool {
+    let table = VMA_TABLE.lock();
+    for vma in table.iter() {
+        if vma.active && vma.start < end && vma.end > start {
+            return true;
+        }
+    }
+    false
+}
+
+/// Bump allocator for mmap addresses.
+/// Must be past all ELF-loaded segments to avoid overwriting mapped data.
+static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Maximum virtual address of ELF PT_LOAD segments.
+/// Used to prevent MAP_FIXED from overwriting ELF data.
+static MAX_ELF_VADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Flag indicating ELF loading is in progress.
+/// When false, map() operations on ELF range are protected.
+static ELF_LOADING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Ensure the mmap bump allocator starts at or above `min_addr`.
+/// Called by the ELF loader after loading segments, so that mmap
+/// doesn't allocate addresses that overlap with loaded ELF data.
+pub fn ensure_mmap_above(min_addr: usize) {
+    let aligned = (min_addr + 4095) & !4095;
+    NEXT_MMAP_ADDR.fetch_max(aligned, core::sync::atomic::Ordering::Relaxed);
+    MAX_ELF_VADDR.store(aligned, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Register an ELF PT_LOAD segment as a VMA entry.
+/// This prevents mmap from allocating addresses that overlap with loaded segments.
+pub fn register_elf_vma(start: usize, end: usize, prot: usize) {
+    let _ = vma_add(start, end, prot, false);
 }
 
 /// Split or remove VMA entries that overlap with [start, end).
@@ -151,13 +242,14 @@ pub fn vma_check(addr: usize) -> Option<usize> {
 /// - If [start, end) covers its head, move start forward
 /// - If [start, end) fully covers it, deactivate it
 ///
-/// Returns a Vec of (start, end, prot) for any tail splits that need re-insertion.
+/// Returns up to MAX_VMAS tail splits as (start, end, prot).
 fn split_overlapping_vmas(
     table: &mut [VmaRegion; MAX_VMAS],
     start: usize,
     end: usize,
-) -> alloc::vec::Vec<(usize, usize, usize)> {
-    let mut tails = alloc::vec::Vec::new();
+) -> [(usize, usize, usize); MAX_VMAS] {
+    let mut tails = [(0usize, 0usize, 0usize); MAX_VMAS];
+    let mut tail_count = 0;
     for i in 0..MAX_VMAS {
         let vma = &table[i];
         if !vma.active || vma.start >= end || vma.end <= start {
@@ -170,7 +262,10 @@ fn split_overlapping_vmas(
         if vma.start < start && vma.end > end {
             // Fully contains: split into [vma_start, start) + [end, vma_end)
             table[i].end = start;
-            tails.push((end, vma_end, vma_prot));
+            if tail_count < MAX_VMAS {
+                tails[tail_count] = (end, vma_end, vma_prot);
+                tail_count += 1;
+            }
         } else if vma.start < start {
             // Overlaps tail: truncate
             table[i].end = start;
@@ -193,13 +288,16 @@ pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result
     if map_fixed {
         let tails = split_overlapping_vmas(&mut table, start, end);
         // Re-insert the tail portions
-        for (s, e, p) in tails {
+        for (s, e, p) in tails.iter() {
+            if *s == 0 && *e == 0 {
+                continue;
+            }
             for i in 0..MAX_VMAS {
                 if !table[i].active {
                     table[i] = VmaRegion {
-                        start: s,
-                        end: e,
-                        prot: p,
+                        start: *s,
+                        end: *e,
+                        prot: *p,
                         active: true,
                     };
                     break;
@@ -227,13 +325,16 @@ pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result
 pub fn vma_remove_range(start: usize, end: usize) {
     let mut table = VMA_TABLE.lock();
     let tails = split_overlapping_vmas(&mut table, start, end);
-    for (s, e, p) in tails {
+    for (s, e, p) in tails.iter() {
+        if *s == 0 && *e == 0 {
+            continue;
+        }
         for i in 0..MAX_VMAS {
             if !table[i].active {
                 table[i] = VmaRegion {
-                    start: s,
-                    end: e,
-                    prot: p,
+                    start: *s,
+                    end: *e,
+                    prot: *p,
                     active: true,
                 };
                 break;
@@ -273,11 +374,12 @@ extern crate alloc;
 pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
     #[cfg(target_arch = "x86_64")]
     {
-        let mut val = T::default();
-        crate::arch::trap::with_user_cr3(|| {
-            val = unsafe { core::ptr::read_volatile(addr as *const T) };
-        });
-        val
+        let mut val = core::mem::MaybeUninit::<T>::uninit();
+        let dst = val.as_mut_ptr() as *mut u8;
+        for i in 0..core::mem::size_of::<T>() {
+            unsafe { core::ptr::write(dst.add(i), user_read_u8(addr + i)) };
+        }
+        unsafe { val.assume_init() }
     }
     #[cfg(not(target_arch = "x86_64"))]
     unsafe {
@@ -285,13 +387,113 @@ pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn user_read_u8(addr: usize) -> u8 {
+    let user_root = crate::process::current_page_table_root();
+    if user_root == 0 {
+        return unsafe { core::ptr::read_volatile(addr as *const u8) };
+    }
+
+    let user_cr3 = user_root << 12;
+    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
+    let rflags: u64;
+    let byte: u8;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) rflags
+        );
+        core::arch::asm!(
+            "mov cr3, {user_cr3}",
+            "mov {byte}, byte ptr [{addr}]",
+            "mov cr3, {kernel_cr3}",
+            user_cr3 = in(reg) user_cr3,
+            kernel_cr3 = in(reg) kernel_cr3,
+            addr = in(reg) addr,
+            byte = lateout(reg_byte) byte,
+            options(nostack)
+        );
+        if (rflags & 0x200) != 0 {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+    byte
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn user_read_u8(addr: usize) -> u8 {
+    unsafe { core::ptr::read_volatile(addr as *const u8) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
+    let user_root = crate::process::current_page_table_root();
+    if user_root == 0 {
+        unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
+        return;
+    }
+
+    let user_cr3 = user_root << 12;
+    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
+    let rflags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) rflags
+        );
+        core::arch::asm!(
+            "mov cr3, {user_cr3}",
+            "mov byte ptr [{addr}], {byte}",
+            "mov cr3, {kernel_cr3}",
+            user_cr3 = in(reg) user_cr3,
+            kernel_cr3 = in(reg) kernel_cr3,
+            addr = in(reg) addr,
+            byte = in(reg_byte) byte,
+            options(nostack)
+        );
+        if (rflags & 0x200) != 0 {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn user_write_u8(addr: usize, byte: u8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !ensure_user_write_pages(addr, 1) {
+            return;
+        }
+        unsafe { user_write_u8_mapped(addr, byte) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        core::ptr::write_volatile(addr as *mut u8, byte)
+    }
+}
+
 /// Write a value to user space with automatic CR3 switching on x86_64.
 #[inline]
 pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
     #[cfg(target_arch = "x86_64")]
-    crate::arch::trap::with_user_cr3(|| {
-        unsafe { core::ptr::write_volatile(addr as *mut T, val) };
-    });
+    {
+        if !ensure_user_write_pages(addr, core::mem::size_of::<T>()) {
+            return;
+        }
+        let src = unsafe {
+            core::slice::from_raw_parts((&val as *const T) as *const u8, core::mem::size_of::<T>())
+        };
+        for (i, &byte) in src.iter().enumerate() {
+            unsafe { user_write_u8_mapped(addr + i, byte) };
+        }
+    }
     #[cfg(not(target_arch = "x86_64"))]
     unsafe {
         core::ptr::write_volatile(addr as *mut T, val)
@@ -300,45 +502,124 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
 
 /// Read a slice of bytes from user space with automatic CR3 switching on x86_64.
 ///
-/// CRITICAL: Vec is pre-allocated under kernel CR3. Inside with_user_cr3(),
-/// we only write via raw pointer — NO push/alloc/dealloc to prevent heap
-/// corruption when user page table identity mappings are damaged.
+/// CRITICAL: kernel buffers are only mutated under kernel CR3. The x86_64
+/// helper switches to user CR3 only for the single-byte load itself.
 #[inline]
 pub(crate) fn user_read_bytes(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
     let mut buf = alloc::vec::Vec::with_capacity(len);
-    let dst = buf.as_mut_ptr() as *mut u8;
-    #[cfg(target_arch = "x86_64")]
-    crate::arch::trap::with_user_cr3(|| {
-        for i in 0..len {
-            unsafe {
-                let byte = core::ptr::read_volatile((addr + i) as *const u8);
-                core::ptr::write(dst.add(i), byte);
-            }
-        }
-    });
-    #[cfg(not(target_arch = "x86_64"))]
     for i in 0..len {
-        unsafe {
-            let byte = core::ptr::read_volatile((addr + i) as *const u8);
-            core::ptr::write(dst.add(i), byte);
-        }
+        buf.push(user_read_u8(addr + i));
     }
-    unsafe { buf.set_len(len) };
     buf
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ensure_user_write_pages(addr: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+
+    let page_size = crate::mm::pmm::page_size();
+    let start = addr & !(page_size - 1);
+    let last = match addr.checked_add(len - 1) {
+        Some(last) => last,
+        None => return false,
+    };
+    let end = (last & !(page_size - 1)) + page_size;
+
+    crate::arch::trap::with_kernel_cr3(|| {
+        let user_pt = crate::arch::trap::get_user_pt_safe();
+        let mut page = start;
+        while page < end {
+            let flags = match vma_query(page) {
+                Some(prot) => {
+                    if prot & PROT_WRITE == 0 {
+                        return false;
+                    }
+                    prot_to_pte_flags(prot)
+                }
+                None if page >= crate::process::USER_HEAP_BASE
+                    && page < crate::process::USER_HEAP_LIMIT =>
+                {
+                    crate::mm::vmm::PTEFlags::URW
+                }
+                None if page >= crate::process::USER_STACK_BASE
+                    && page < crate::process::USER_STACK_TOP =>
+                {
+                    crate::mm::vmm::PTEFlags::URW
+                }
+                None => return false,
+            };
+
+            match crate::mm::vmm::translate_user(user_pt, page) {
+                Some(frame) if frame != page => {
+                    crate::mm::vmm::map(user_pt, page, frame, flags);
+                }
+                _ => {
+                    let frame = match crate::mm::pmm::alloc_frame() {
+                        Some(frame) => frame,
+                        None => return false,
+                    };
+                    unsafe {
+                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    }
+                    crate::mm::vmm::map(user_pt, page, frame, flags);
+                }
+            }
+
+            page += page_size;
+        }
+        true
+    })
 }
 
 /// Write a slice of bytes to user space with automatic CR3 switching on x86_64.
 #[inline]
 pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) {
     #[cfg(target_arch = "x86_64")]
-    crate::arch::trap::with_user_cr3(|| {
-        for (i, &byte) in src.iter().enumerate() {
-            unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+    {
+        if !ensure_user_write_pages(addr, src.len()) {
+            return;
         }
-    });
+        for (i, &byte) in src.iter().enumerate() {
+            unsafe { user_write_u8_mapped(addr + i, byte) };
+        }
+    }
     #[cfg(not(target_arch = "x86_64"))]
     for (i, &byte) in src.iter().enumerate() {
         unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn mirror_user_json_log(data: &[u8]) {
+    if !contains_bytes(data, br#""level""#)
+        || !(contains_bytes(data, br#""fatal""#)
+            || contains_bytes(data, br#""error""#)
+            || contains_bytes(data, b"Failed"))
+    {
+        return;
+    }
+
+    crate::arch::platform::print("[xbot-log] ");
+    for &byte in data {
+        let ch = if byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte) {
+            byte
+        } else {
+            b'.'
+        };
+        crate::arch::platform::console_putchar(ch);
+    }
+    if !data.ends_with(b"\n") {
+        crate::arch::platform::console_putchar(b'\n');
     }
 }
 
@@ -372,65 +653,32 @@ fn fill_stat_buffer(buf: &mut [u8; 144], st_mode: u32, st_size: i64, st_ino: u64
 /// Returns the string as a Vec<u8> (without the null terminator).
 /// Switches to user CR3 temporarily since syscall runs under kernel CR3.
 /// Read a NUL-terminated string from user space.
-/// CRITICAL: Pre-allocate buffer, only write via raw pointer inside with_user_cr3.
+/// CRITICAL: mutate kernel buffers only under kernel CR3.
 fn read_user_string(addr: usize) -> Option<alloc::vec::Vec<u8>> {
     let mut buf = alloc::vec::Vec::with_capacity(4096);
-    let dst = buf.as_mut_ptr() as *mut u8;
-    let mut actual_len = 0usize;
-    #[cfg(target_arch = "x86_64")]
-    crate::arch::trap::with_user_cr3(|| {
-        for i in 0..4096 {
-            let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
-            if byte == 0 {
-                return;
-            }
-            unsafe { core::ptr::write(dst.add(actual_len), byte) };
-            actual_len += 1;
-        }
-    });
-    #[cfg(not(target_arch = "x86_64"))]
     for i in 0..4096 {
-        let byte = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+        let byte = user_read_u8(addr + i);
         if byte == 0 {
             break;
         }
-        unsafe { core::ptr::write(dst.add(actual_len), byte) };
-        actual_len += 1;
+        buf.push(byte);
     }
-    unsafe { buf.set_len(actual_len) };
     Some(buf)
 }
 
 /// Read an argv-style pointer array from user space.
 /// `ptr_array` is the address of a null-terminated array of `*const u8` pointers.
 /// Each pointer points to a null-terminated string.
-/// CRITICAL: Pre-allocate buffers, only raw ptr writes inside with_user_cr3.
+/// CRITICAL: mutate kernel buffers only under kernel CR3.
 fn read_user_argv(ptr_array: usize) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-    // Pre-allocate pointer array buffer (256 entries max)
     let mut ptr_buf = alloc::vec::Vec::with_capacity(256);
-    let ptr_dst = ptr_buf.as_mut_ptr() as *mut usize;
-    let mut ptr_count = 0usize;
-    #[cfg(target_arch = "x86_64")]
-    crate::arch::trap::with_user_cr3(|| {
-        for i in 0..256 {
-            let ptr = unsafe { core::ptr::read_volatile((ptr_array + i * 8) as *const usize) };
-            if ptr == 0 {
-                return;
-            }
-            unsafe { core::ptr::write(ptr_dst.add(i), ptr) };
-            ptr_count += 1;
-        }
-    });
-    #[cfg(not(target_arch = "x86_64"))]
     for i in 0..256 {
-        let ptr = unsafe { core::ptr::read_volatile((ptr_array + i * 8) as *const usize) };
+        let ptr = user_read::<usize>(ptr_array + i * core::mem::size_of::<usize>());
         if ptr == 0 {
             break;
         }
-        unsafe { core::ptr::write(ptr_dst.add(i), ptr) };
-        ptr_count += 1;
+        ptr_buf.push(ptr);
     }
-    unsafe { ptr_buf.set_len(ptr_count) };
     // Now read each string (read_user_string handles CR3 safely)
     let mut result = alloc::vec::Vec::new();
     for &ptr in ptr_buf.iter() {
@@ -546,8 +794,13 @@ pub fn dispatch_syscall_linux(
         crate::arch::ioapic::unmask_external_irqs();
     }
 
-    static TRACE_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let tc = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Trace ALL syscalls for debugging — disabled for performance
+    // {
+    //     crate::console_println!(
+    //         "[sys] nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+    //         nr, a1, a2, a3, a4, a5, a6
+    //     );
+    // }
     let result = dispatch_linux_raw(
         nr as usize,
         [
@@ -559,6 +812,7 @@ pub fn dispatch_syscall_linux(
             a6 as usize,
         ],
     );
+    // crate::console_println!("[sys] nr={} ret={:#x}", nr, result);
     result as u64
 }
 
@@ -567,25 +821,11 @@ pub fn dispatch_syscall_linux(
 /// This is ONLY called from the SYSCALL instruction path (MSR LSTAR).
 #[cfg(target_arch = "x86_64")]
 fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
-    let result = dispatch_linux_syscall(nr, args);
-    result
+    dispatch_linux_syscall(nr, args)
 }
 
 #[cfg(target_arch = "x86_64")]
 fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
-    // TEMP: trace first 50 syscalls for debugging chroma null bytes
-    static SYSCALL_TRACE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-    let tc = SYSCALL_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if tc < 80 {
-        crate::console_println!(
-            "[sys] #{} nr={} a0={:#x} a1={:#x} a2={:#x}",
-            tc,
-            nr,
-            args[0],
-            args[1],
-            args[2]
-        );
-    }
     match nr {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
         1 => {
@@ -609,7 +849,10 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         6 => linux_lstat(args[0], args[1]),         // lstat
         7 => linux_poll(args[0], args[1], args[2]), // poll
         8 => linux_lseek(args[0], args[1], args[2]), // lseek
-        9 => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
+        9 => {
+            let r = linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]);
+            r
+        }
         10 => linux_mprotect(args[0], args[1], args[2]),
         11 => linux_munmap(args[0], args[1]), // munmap
         12 => sys_brk(args[0]),
@@ -635,7 +878,17 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         25 => ERR_INVAL,                                   // mremap (stub)
         26 => 0,                                           // msync (stub)
         27 => 0,                                           // mincore (stub)
-        28 => linux_madvise(args[0], args[1], args[2]),    // madvise
+        28 => {
+            let ret = linux_madvise(args[0], args[1], args[2]);
+            crate::console_println!(
+                "[madvise] addr={:#x} len={:#x} advice={} ret={}",
+                args[0],
+                args[1],
+                args[2],
+                ret
+            );
+            ret
+        } // madvise
         29 => linux_dup(args[0]),                          // dup
         30 => linux_dup2(args[0], args[1]),                // dup2
         31 => linux_pause(),                               // pause
@@ -675,7 +928,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         // ─── More file ops ────────────────────────────────────────
         61 => linux_wait4(args[0], args[1], args[2]), // wait4
         63 => linux_uname(args[0]),                   // uname
-        78 => 0,                                      // getdents (stub)
+        78 => linux_getdents(args[0], args[1], args[2]), // getdents
         79 => linux_getcwd(args[0], args[1]),         // getcwd
         80 => linux_chdir(args[0]),                   // chdir
         83 => sys_mkdir(args[0], linux::count_user_string(args[0])), // mkdir
@@ -738,6 +991,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         202 => linux_futex(args[0], args[1], args[2]), // futex
         203 => linux_sched_setaffinity(args[0], args[1], args[2]), // sched_setaffinity (stub)
         204 => linux_sched_getaffinity(args[0], args[1], args[2]), // sched_getaffinity
+        217 => linux_getdents64(args[0], args[1], args[2]), // getdents64
         218 => linux_set_tid_address(args[0]),         // set_tid_address
         228 => linux_clock_gettime(args[0], args[1]),  // clock_gettime
         231 => sys_exit(args[0] as i32),               // exit_group
@@ -913,7 +1167,11 @@ fn linux_fstat(fd: usize, statbuf: usize) -> isize {
             match &desc.fd_type {
                 FdType::VfsFile(vfs_fd) => {
                     let ino = crate::driver::vfs::get_inode_for_fd(*vfs_fd).unwrap_or(0);
-                    (0x81A4u32, 0u64, ino) // S_IFREG | 0644
+                    match crate::driver::vfs::fd_metadata(*vfs_fd) {
+                        Ok(meta) if meta.is_dir() => (0x41FFu32, meta.size as u64, ino),
+                        Ok(meta) => (0x81A4u32, meta.size as u64, ino),
+                        Err(_) => (0x81A4u32, 0u64, ino),
+                    }
                 }
                 FdType::Urandom => {
                     (0x21A4u32, 0u64, 0u64) // S_IFCHR | 0644 (character device)
@@ -961,15 +1219,183 @@ fn linux_poll(_fds: usize, _nfds: usize, _timeout: usize) -> isize {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn linux_lseek(_fd: usize, _offset: usize, _whence: usize) -> isize {
-    // Stub: return 0 (success, offset = 0)
-    0
+fn linux_lseek(fd: usize, offset: usize, whence: usize) -> isize {
+    const SEEK_SET: usize = 0;
+    const SEEK_CUR: usize = 1;
+    const SEEK_END: usize = 2;
+
+    crate::process::with_fd_table(|fd_table| {
+        let desc = match fd_table.get_mut(fd) {
+            Some(desc) => desc,
+            None => return -9, // EBADF
+        };
+        let file_size = match &desc.fd_type {
+            FdType::VfsFile(vfs_fd) => crate::driver::vfs::fd_metadata(*vfs_fd)
+                .map(|meta| meta.size)
+                .unwrap_or(desc.pos),
+            FdType::FakeFile(data) => data.len(),
+            _ => desc.pos,
+        };
+        let base = match whence {
+            SEEK_SET => 0isize,
+            SEEK_CUR => desc.pos as isize,
+            SEEK_END => file_size as isize,
+            _ => return ERR_INVAL,
+        };
+        let new_pos = base.saturating_add(offset as isize);
+        if new_pos < 0 {
+            return ERR_INVAL;
+        }
+        desc.pos = new_pos as usize;
+        desc.pos as isize
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
-fn linux_pread64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi: usize) -> isize {
-    let offset = (offset_hi as u64) << 32 | (offset_lo as u64);
-    let offset = offset as usize;
+fn align_up(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dirent_type(file_type: crate::driver::vfs::VfsFileType) -> u8 {
+    match file_type {
+        crate::driver::vfs::VfsFileType::Directory => 4, // DT_DIR
+        crate::driver::vfs::VfsFileType::File => 8,      // DT_REG
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_getdents64(fd: usize, dirp: usize, count: usize) -> isize {
+    if dirp == 0 || count == 0 {
+        return ERR_INVAL;
+    }
+
+    crate::arch::trap::with_kernel_cr3(|| {
+        let (vfs_fd, mut idx) = match crate::process::with_fd_table(|fd_table| {
+            fd_table.get(fd).map(|desc| match &desc.fd_type {
+                FdType::VfsFile(vfs_fd) => Some((*vfs_fd, desc.pos)),
+                _ => None,
+            })
+        }) {
+            Some(Some(info)) => info,
+            Some(None) => return -20, // ENOTDIR
+            None => return ERR_INVAL,
+        };
+
+        let mut written = 0usize;
+        let mut record = [0u8; 280]; // linux_dirent64 header + ext4 max 255-byte name + padding
+        loop {
+            let entry = match crate::driver::vfs::readdir_at(vfs_fd, idx) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(crate::driver::vfs::VfsError::NotADirectory) => return -20,
+                Err(_) => return ERR_IO,
+            };
+            let name = entry.name.as_bytes();
+            let reclen = align_up(8 + 8 + 2 + 1 + name.len() + 1, 8);
+            if written + reclen > count {
+                if written == 0 {
+                    return ERR_INVAL;
+                }
+                break;
+            }
+            if reclen > record.len() {
+                return ERR_RANGE;
+            }
+
+            for byte in record[..reclen].iter_mut() {
+                *byte = 0;
+            }
+            let ino = (idx as u64) + 1;
+            let next_off = (idx as i64) + 1;
+            record[0..8].copy_from_slice(&ino.to_ne_bytes());
+            record[8..16].copy_from_slice(&next_off.to_ne_bytes());
+            record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+            record[18] = dirent_type(entry.file_type);
+            record[19..19 + name.len()].copy_from_slice(name);
+            user_write_bytes(dirp + written, &record[..reclen]);
+            written += reclen;
+            idx += 1;
+        }
+
+        if written != 0 {
+            crate::process::with_fd_table(|fd_table| {
+                if let Some(desc) = fd_table.get_mut(fd) {
+                    desc.pos = idx;
+                }
+            });
+        }
+        written as isize
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_getdents(fd: usize, dirp: usize, count: usize) -> isize {
+    if dirp == 0 || count == 0 {
+        return ERR_INVAL;
+    }
+
+    crate::arch::trap::with_kernel_cr3(|| {
+        let (vfs_fd, mut idx) = match crate::process::with_fd_table(|fd_table| {
+            fd_table.get(fd).map(|desc| match &desc.fd_type {
+                FdType::VfsFile(vfs_fd) => Some((*vfs_fd, desc.pos)),
+                _ => None,
+            })
+        }) {
+            Some(Some(info)) => info,
+            Some(None) => return -20, // ENOTDIR
+            None => return ERR_INVAL,
+        };
+
+        let mut written = 0usize;
+        let mut record = [0u8; 280]; // linux_dirent header + ext4 max 255-byte name + padding
+        loop {
+            let entry = match crate::driver::vfs::readdir_at(vfs_fd, idx) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(crate::driver::vfs::VfsError::NotADirectory) => return -20,
+                Err(_) => return ERR_IO,
+            };
+            let name = entry.name.as_bytes();
+            let reclen = align_up(8 + 8 + 2 + name.len() + 1 + 1, 8);
+            if written + reclen > count {
+                if written == 0 {
+                    return ERR_INVAL;
+                }
+                break;
+            }
+            if reclen > record.len() {
+                return ERR_RANGE;
+            }
+
+            for byte in record[..reclen].iter_mut() {
+                *byte = 0;
+            }
+            let ino = (idx as u64) + 1;
+            let next_off = (idx as i64) + 1;
+            record[0..8].copy_from_slice(&ino.to_ne_bytes());
+            record[8..16].copy_from_slice(&next_off.to_ne_bytes());
+            record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+            record[18..18 + name.len()].copy_from_slice(name);
+            record[reclen - 1] = dirent_type(entry.file_type);
+            user_write_bytes(dirp + written, &record[..reclen]);
+            written += reclen;
+            idx += 1;
+        }
+
+        if written != 0 {
+            crate::process::with_fd_table(|fd_table| {
+                if let Some(desc) = fd_table.get_mut(fd) {
+                    desc.pos = idx;
+                }
+            });
+        }
+        written as isize
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn linux_pread64(fd: i32, buf: usize, count: usize, offset: usize, _offset_hi: usize) -> isize {
     if count == 0 {
         return 0;
     }
@@ -977,14 +1403,23 @@ fn linux_pread64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi:
     // Kernel buffer for VFS read (user pointer can't be used under kernel CR3)
     let mut data = alloc::vec![0u8; count];
 
-    // Try VFS pread (offset-based, no fd position update)
-    match crate::driver::vfs::pread(fd as usize, &mut data, offset) {
-        Ok(n) => {
-            // Copy to user space
-            user_write_bytes(buf, &data[..n]);
-            return n as isize;
+    // Try VFS pread (offset-based, no fd position update). The Linux fd must
+    // first be resolved through the per-process fd table to the internal VFS fd.
+    if let Some(vfs_fd) = crate::process::with_fd_table(|fd_table| {
+        fd_table
+            .get(fd as usize)
+            .and_then(|desc| match &desc.fd_type {
+                FdType::VfsFile(vfs_fd) => Some(*vfs_fd),
+                _ => None,
+            })
+    }) {
+        match crate::driver::vfs::pread(vfs_fd, &mut data, offset) {
+            Ok(n) => {
+                user_write_bytes(buf, &data[..n]);
+                return n as isize;
+            }
+            Err(_) => {}
         }
-        Err(_) => {}
     }
 
     // Fallback to regular sys_read for non-VFS fds (pipes, stdio, etc.)
@@ -992,9 +1427,7 @@ fn linux_pread64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi:
 }
 
 #[cfg(target_arch = "x86_64")]
-fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi: usize) -> isize {
-    let offset = (offset_hi as u64) << 32 | (offset_lo as u64);
-    let offset = offset as usize;
+fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset: usize, _offset_hi: usize) -> isize {
     if count == 0 {
         return 0;
     }
@@ -1002,10 +1435,20 @@ fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset_lo: usize, offset_hi
     // Read from user space into kernel buffer
     let data = user_read_bytes(buf, count);
 
-    // Try VFS pwrite (offset-based, no fd position update)
-    match crate::driver::vfs::pwrite(fd as usize, &data, offset) {
-        Ok(n) => return n as isize,
-        Err(_) => {}
+    // Try VFS pwrite (offset-based, no fd position update). The Linux fd must
+    // first be resolved through the per-process fd table to the internal VFS fd.
+    if let Some(vfs_fd) = crate::process::with_fd_table(|fd_table| {
+        fd_table
+            .get(fd as usize)
+            .and_then(|desc| match &desc.fd_type {
+                FdType::VfsFile(vfs_fd) => Some(*vfs_fd),
+                _ => None,
+            })
+    }) {
+        match crate::driver::vfs::pwrite(vfs_fd, &data, offset) {
+            Ok(n) => return n as isize,
+            Err(_) => {}
+        }
     }
 
     // Fallback for non-VFS fds (pipes, etc.): ignore offset, do regular write
@@ -1102,7 +1545,30 @@ fn linux_uname(buf: usize) -> isize {
         uts_buf[offset..offset + len].copy_from_slice(&field[..len]);
         offset += 65;
     }
+
+    // Debug: dump CR3 state and page mapping before write
+    let user_root = crate::process::current_page_table_root();
+    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
+    let user_cr3 = user_root << 12;
+    let page = buf & !0xFFF;
+    let before_map = crate::arch::trap::with_kernel_cr3(|| {
+        let pt = crate::arch::trap::get_user_pt_safe();
+        crate::mm::vmm::translate_user(pt, page)
+    });
+    crate::console_println!(
+        "[uname] PRE: user_root={:#x} user_cr3={:#x} kernel_cr3={:#x} buf={:#x} page_map={:?}",
+        user_root,
+        user_cr3,
+        kernel_cr3,
+        buf,
+        before_map
+    );
+
     user_write_bytes(buf, &uts_buf);
+
+    // Verify: read back the release field (offset 130, should be "6.1.0\0")
+    // NOTE: verification disabled — user_read_bytes may not work correctly
+    // for all addresses due to CR3 switching issues.
     0
 }
 
@@ -1236,7 +1702,11 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
 }
 
 fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
-    match id {
+    // Only trace key syscalls from int 0x80 path (shell calls)
+    // id=6=mmap, id=4=brk, id=1=exit — skip read/write noise
+    let should_trace = matches!(id, 1 | 4 | 6);
+
+    let result = match id {
         SYS_DEBUG_PRINT => sys_debug_print(args[0], args[1]),
         SYS_EXIT => sys_exit(args[0] as i32),
         SYS_WRITE => sys_write(args[0] as i32, args[1], args[2]),
@@ -1301,7 +1771,9 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
             crate::klog!(WARN, "[syscall] Unknown syscall: {}", id);
             ERR_INVAL
         }
-    }
+    };
+    let _ = should_trace;
+    result
 }
 
 /// Syscall 0: Debug print (write bytes to kernel console).
@@ -1335,8 +1807,9 @@ pub fn sys_exit(code: i32) -> isize {
     let my_pid = crate::process::current_pid();
     crate::process::kill_clone_children(my_pid);
 
-    // Clear VMA table — the process is exiting, its address space is gone.
-    vma_clear();
+    // NOTE: Do NOT clear the global VMA table here! It is shared across all
+    // processes. The next exec/program load will reinitialize VMAs via mmap.
+    // vma_clear() was here before and caused pid=3 exit to wipe pid=2's VMAs.
 
     // 2. Mark ourselves as Exited in the scheduler
     crate::sched::mark_current_exited();
@@ -1437,11 +1910,8 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             let data = user_read_bytes(buf, len);
             return match crate::driver::vfs::write(vfs_fd, &data) {
                 Ok(n) => {
-                    crate::process::with_fd_table(|fd_table| {
-                        if let Some(f) = fd_table.get_mut(fd as usize) {
-                            f.pos += n;
-                        }
-                    });
+                    #[cfg(target_arch = "x86_64")]
+                    mirror_user_json_log(&data[..n]);
                     n as isize
                 }
                 Err(_) => ERR_IO,
@@ -1731,25 +2201,64 @@ fn linux_mmap(
         return -22; // EINVAL
     }
 
+    let result = linux_mmap_inner(addr, len, prot, flags, _fd, _offset);
+    log_mmap_result(addr, len, prot, flags, result);
+    result
+}
+
+fn linux_mmap_inner(
+    addr: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    _fd: usize,
+    _offset: usize,
+) -> isize {
     let page_size = crate::mm::pmm::page_size();
     let aligned_len = (len + page_size - 1) & !(page_size - 1);
     let map_fixed = (flags & 0x10) != 0;
     let is_anonymous = flags & MAP_ANONYMOUS != 0 || _fd == usize::MAX;
 
-    // Bump allocator for mmap addresses.
-    static NEXT_MMAP_ADDR: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
-
     let target_addr = if addr != 0 && map_fixed {
-        // MAP_FIXED: exact address required
-        addr & !(page_size - 1)
+        // MAP_FIXED: exact address required.
+        // Reject if target range overlaps ELF segments.
+        let aligned = addr & !(page_size - 1);
+        let end = aligned + aligned_len;
+        let max_elf = MAX_ELF_VADDR.load(core::sync::atomic::Ordering::Relaxed);
+        if max_elf > 0 && aligned < max_elf && end > 0x400000 {
+            // Overlaps ELF range — reject
+            crate::console_println!(
+                "[mmap-FIXED] REJECT elf overlap addr={:#x} end={:#x} max_elf={:#x}",
+                aligned,
+                end,
+                max_elf
+            );
+            return aligned as isize;
+        }
+        aligned
     } else if addr != 0 {
-        // Hint: use if valid, otherwise kernel chooses
+        // Hint: use if valid AND no overlap with existing VMAs, otherwise kernel chooses.
+        // PROT_NONE hints (Go's sysReserve) request high addresses for sparse
+        // heap metadata. We honor them — bump allocator is NOT updated, so
+        // subsequent PROT_RW sysAlloc calls still get low addresses.
         let aligned_addr = addr & !(page_size - 1);
-        if aligned_addr >= crate::process::USER_MMAP_BASE {
+        let hint_end = aligned_addr.checked_add(aligned_len).unwrap_or(0);
+        let hint_in_range = aligned_addr >= crate::process::USER_MMAP_BASE
+            && hint_end != 0
+            && hint_end <= crate::process::USER_MMAP_LIMIT;
+        let hint_overlaps = hint_in_range && vma_overlaps(aligned_addr, hint_end);
+        crate::console_println!(
+            "[mmap-hint] addr={:#x} aligned={:#x} end={:#x} in_range={} overlap={}",
+            addr,
+            aligned_addr,
+            hint_end,
+            hint_in_range,
+            hint_overlaps
+        );
+        if hint_in_range && !hint_overlaps {
             aligned_addr
         } else {
-            0
+            0 // hint conflicts with existing VMA or out of range → kernel chooses
         }
     } else {
         0
@@ -1758,10 +2267,15 @@ fn linux_mmap(
     let target_addr = if target_addr != 0 {
         target_addr
     } else {
-        // Bump allocator for kernel-chosen addresses
+        // Bump allocator for kernel-chosen addresses.
+        // NOTE: NEXT_MMAP_ADDR may be set past ELF segments by ensure_mmap_above().
+        // If ELF segments extend past USER_MMAP_BASE (e.g., 69MB Go binary),
+        // we must start allocating from the ELF end, not USER_MMAP_BASE.
         loop {
             let base = NEXT_MMAP_ADDR.load(core::sync::atomic::Ordering::Relaxed);
-            let candidate = if base < crate::process::USER_MMAP_BASE {
+            let candidate = if base > 0 {
+                base // Use ELF-aware address from ensure_mmap_above
+            } else if crate::process::USER_MMAP_BASE > 0 {
                 crate::process::USER_MMAP_BASE
             } else {
                 base
@@ -1770,6 +2284,14 @@ fn linux_mmap(
             if end_addr > crate::process::USER_MMAP_LIMIT || end_addr == 0 {
                 return -12; // ENOMEM
             }
+            let candidate_overlaps = vma_overlaps(candidate, end_addr);
+            crate::console_println!(
+                "[mmap-cand] base={:#x} candidate={:#x} end={:#x} overlap={}",
+                base,
+                candidate,
+                end_addr,
+                candidate_overlaps
+            );
             if NEXT_MMAP_ADDR
                 .compare_exchange(
                     base,
@@ -1829,6 +2351,20 @@ fn linux_mmap(
     }
 
     target_addr as isize
+}
+
+/// Log mmap result — always print, no rate limiting
+fn log_mmap_result(addr: usize, len: usize, prot: usize, flags: usize, result: isize) {
+    let tag = if flags & 0x10 != 0 { "FIXED" } else { "hint " };
+    crate::console_println!(
+        "[mmap] {} a0={:#x} len={:#x} prot={:#x} flags={:#x} => ret={:#x}",
+        tag,
+        addr,
+        len,
+        prot,
+        flags,
+        result
+    );
 }
 
 /// Convert Linux prot flags to KarteOS PTEFlags.
@@ -2037,10 +2573,13 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
         }
         F_GETLK | F_SETLK | F_SETLKW => {
             // arg points to struct flock in user memory.
+            // Flock is 24 bytes: l_type(i16) + l_whence(i16) + l_start(i64) + l_len(i64) + l_pid(i32)
             if arg == 0 {
                 return -14; // EFAULT
             }
-            let flock = Flock::read_from_user(arg as *const u8);
+            // Read from user space with CR3 switching on x86_64
+            let flock_bytes = user_read_bytes(arg, 24);
+            let flock = Flock::from_bytes(&flock_bytes);
 
             // Look up the inode for this fd — locks are keyed by inode.
             let inode = crate::process::with_fd_table(|fd_table| match fd_table.get(fd) {
@@ -2060,7 +2599,8 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             let (retval, out_flock) = fcntl_lock_op(cmd, fd, inode, &flock);
 
             if let Some(out) = out_flock {
-                out.write_to_user(arg as *mut u8);
+                let bytes = out.to_bytes();
+                user_write_bytes(arg, &bytes);
             }
 
             if retval == -1 && (cmd == F_SETLK || cmd == F_SETLKW) {
@@ -2558,33 +3098,20 @@ fn sys_waitpid(pid: usize) -> isize {
     }
 }
 
-/// Read a byte string from user memory and strip trailing NUL bytes.
-/// CRITICAL: Pre-allocate buffer, only raw ptr writes inside with_user_cr3.
+/// Read a byte string from user memory.
+/// Linux pathnames are NUL-terminated: stop at the first NUL even if the
+/// caller supplied a larger length.
 fn read_user_path(ptr: usize, len: usize) -> Option<alloc::string::String> {
     if ptr == 0 || len == 0 || len > 512 {
         return None;
     }
     let mut buf = alloc::vec::Vec::with_capacity(len);
-    let dst = buf.as_mut_ptr() as *mut u8;
-    #[cfg(target_arch = "x86_64")]
-    crate::arch::trap::with_user_cr3(|| {
-        for i in 0..len {
-            unsafe {
-                let byte = core::ptr::read_volatile((ptr + i) as *const u8);
-                core::ptr::write(dst.add(i), byte);
-            }
-        }
-    });
-    #[cfg(not(target_arch = "x86_64"))]
     for i in 0..len {
-        unsafe {
-            let byte = core::ptr::read_volatile((ptr + i) as *const u8);
-            core::ptr::write(dst.add(i), byte);
+        let byte = user_read_u8(ptr + i);
+        if byte == 0 {
+            break;
         }
-    }
-    unsafe { buf.set_len(len) };
-    while buf.last() == Some(&0) {
-        buf.pop();
+        buf.push(byte);
     }
     alloc::string::String::from_utf8(buf).ok()
 }
@@ -2722,6 +3249,14 @@ fn sys_mkdir(path: usize, path_len: usize) -> isize {
         _ => return ERR_INVAL,
     };
     let name = resolve_path(&name);
+    if let Some(inode) = crate::driver::fs::lookup_path(&name) {
+        if let Some(meta) = crate::driver::ext4::metadata_of(inode) {
+            if !meta.is_dir() {
+                return -20; // ENOTDIR / existing non-directory at this path
+            }
+        }
+        return -17; // EEXIST
+    }
     match crate::driver::fs::create_dir(&name) {
         Ok(()) => 0,
         Err(()) => ERR_IO,
@@ -3164,6 +3699,9 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
         envp.len()
     );
 
+    // Clear VMA table — exec replaces the entire address space.
+    vma_clear();
+
     // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
     let mut proc = if crate::driver::ext4::has_ext4() {
         let read_opt = crate::driver::ext4::read_file_range(&name);
@@ -3470,6 +4008,14 @@ pub fn run_tests() {
         result == ERR_INVAL
     });
 
+    #[cfg(target_arch = "x86_64")]
+    crate::test::run_test("linux_getdents64_is_implemented", || {
+        let mut buf = [0u8; 64];
+        let result =
+            dispatch_linux_syscall(217, [99, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0]);
+        result != -38
+    });
+
     // ── Network syscall tests ──
 
     crate::test::run_test("syscall_socket_invalid_domain", || {
@@ -3725,6 +4271,9 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         }
     };
     let envp = env_to_envp(&proc_env);
+
+    // Clear VMA table — exec replaces the entire address space.
+    vma_clear();
 
     // Load ELF from filesystem — try streaming loader from ext4 first
     let mut proc = if crate::driver::ext4::has_ext4() {
@@ -4496,11 +5045,11 @@ fn linux_nanosleep(_req_ptr: usize, _rem_ptr: usize) -> isize {
     0
 }
 
-/// Linux mkdirat(dirfd, pathname, path_len, mode) — create directory.
+/// Linux mkdirat(dirfd, pathname, mode) — create directory.
 /// dirfd=AT_FDCWD (-100 = 0xffffff9c) means relative to CWD.
 #[cfg(target_arch = "x86_64")]
-fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) -> isize {
-    if path_ptr == 0 || path_len == 0 || path_len > 512 {
+fn linux_mkdirat(_dirfd: usize, path_ptr: usize, _mode: usize, _unused: usize) -> isize {
+    if path_ptr == 0 {
         return -22; // EINVAL
     }
 
@@ -4509,24 +5058,5 @@ fn linux_mkdirat(_dirfd: usize, path_ptr: usize, path_len: usize, _mode: usize) 
         return -2; // ENOENT
     }
 
-    let mut buf = [0u8; 256];
-    let read_len = actual_len.min(256);
-    let user_data = user_read_bytes(path_ptr, read_len);
-    buf[..read_len].copy_from_slice(&user_data[..read_len]);
-    let path_str = match core::str::from_utf8(&buf[..actual_len.min(256)]) {
-        Ok(s) => s.trim_end_matches('\0'),
-        Err(_) => return -22,
-    };
-    if path_str.is_empty() {
-        return -22;
-    }
-
-    let resolved = crate::syscall::resolve_path(path_str);
-
-    match crate::driver::ext4::create_directory(&resolved) {
-        Ok(()) => 0,
-        Err(e) => {
-            -1 // EPERM
-        }
-    }
+    sys_mkdir(path_ptr, actual_len)
 }

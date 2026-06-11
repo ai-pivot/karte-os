@@ -286,7 +286,7 @@ impl Ext4 {
     ) -> Result<usize> {
         // required length aligned to 4 bytes
         let required_len = {
-            let mut len = size_of::<Ext4DirEntry>() + name.len();
+            let mut len = size_of::<Ext4FakeDirEntry>() + name.len();
             if len % 4 != 0 {
                 len += 4 - (len % 4);
             }
@@ -359,8 +359,6 @@ impl Ext4 {
         let el = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
         new_entry.write_entry(el as u16, inode, name, de_type);
         new_entry.copy_to_slice(&mut block.data, 0);
-
-        copy_dir_entry_to_array(&new_entry, &mut block.data, 0);
 
         // init tail for new block
         let tail = Ext4DirEntryTail::new();
@@ -498,7 +496,7 @@ pub fn copy_dir_entry_to_array(header: &Ext4DirEntry, array: &mut [u8], offset: 
     unsafe {
         let de_ptr = header as *const Ext4DirEntry as *const u8;
         let array_ptr = array as *mut [u8] as *mut u8;
-        let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
+        let count = header.align_len();
         core::ptr::copy_nonoverlapping(de_ptr, array_ptr.add(offset), count);
     }
 }

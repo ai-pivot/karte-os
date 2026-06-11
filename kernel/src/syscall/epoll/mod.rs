@@ -19,12 +19,29 @@ use spin::Mutex;
 /// epoll_wait reads and clears it.
 static TIMERFD_STATES: Mutex<BTreeMap<usize, bool>> = Mutex::new(BTreeMap::new());
 
-/// epoll_event structure matching Linux ABI
-#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct EpollEvent {
-    pub events: u32, // epoll events (EPOLLIN, EPOLLOUT, etc.)
-    pub data: u64,   // user data
+    pub events: u32,
+    pub data: u64,
+}
+
+const EPOLL_EVENT_SIZE: usize = 12;
+
+fn read_epoll_event(event_ptr: usize) -> EpollEvent {
+    let raw = crate::syscall::user_read_bytes(event_ptr, EPOLL_EVENT_SIZE);
+    EpollEvent {
+        events: u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]),
+        data: u64::from_ne_bytes([
+            raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
+        ]),
+    }
+}
+
+fn write_epoll_event(event_ptr: usize, event: EpollEvent) {
+    let mut raw = [0u8; EPOLL_EVENT_SIZE];
+    raw[0..4].copy_from_slice(&event.events.to_ne_bytes());
+    raw[4..12].copy_from_slice(&event.data.to_ne_bytes());
+    crate::syscall::user_write_bytes(event_ptr, &raw);
 }
 
 const EPOLLET: u32 = 0x80000000;
@@ -86,11 +103,22 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
 
     match op {
         EPOLL_CTL_ADD => {
-            let event = if event_ptr != 0 {
-                unsafe { *(event_ptr as *const EpollEvent) }
-            } else {
+            if event_ptr == 0 {
                 return -14; // EFAULT
-            };
+            }
+            let event = read_epoll_event(event_ptr);
+            let raw_bytes = crate::syscall::user_read_bytes(event_ptr, EPOLL_EVENT_SIZE);
+            let ev_events = event.events;
+            let ev_data = event.data;
+            crate::console_println!(
+                "[epoll_ctl] ADD epfd={:#x} fd={} events={:#x} data={:#x} ptr={:#x} raw={:02x?}",
+                epfd,
+                fd,
+                ev_events,
+                ev_data,
+                event_ptr,
+                &raw_bytes[..EPOLL_EVENT_SIZE]
+            );
             instance.entries.insert(
                 fd,
                 EpollEntry {
@@ -100,11 +128,10 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
             );
         }
         EPOLL_CTL_MOD => {
-            let event = if event_ptr != 0 {
-                unsafe { *(event_ptr as *const EpollEvent) }
-            } else {
+            if event_ptr == 0 {
                 return -14;
-            };
+            }
+            let event = read_epoll_event(event_ptr);
             match instance.entries.get_mut(&fd) {
                 Some(entry) => {
                     entry.event = event;
@@ -201,26 +228,26 @@ pub fn sys_epoll_wait(
 
     let ready_count = ready_events.len();
     if ready_count > 0 {
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| {
-            let output = unsafe {
-                core::slice::from_raw_parts_mut(events_ptr as *mut EpollEvent, max_events)
-            };
-            for (i, &(rev, data)) in ready_events.iter().enumerate() {
-                output[i].events = rev;
-                output[i].data = data;
-            }
-        });
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let output = unsafe {
-                core::slice::from_raw_parts_mut(events_ptr as *mut EpollEvent, max_events)
-            };
-            for (i, &(rev, data)) in ready_events.iter().enumerate() {
-                output[i].events = rev;
-                output[i].data = data;
-            }
+        for (i, &(rev, data)) in ready_events.iter().enumerate() {
+            crate::console_println!(
+                "[epoll_wait] event[{}] events={:#x} data={:#x}",
+                i,
+                rev,
+                data
+            );
         }
+        for (i, &(rev, data)) in ready_events.iter().enumerate() {
+            write_epoll_event(
+                events_ptr + i * EPOLL_EVENT_SIZE,
+                EpollEvent { events: rev, data },
+            );
+        }
+        let verify = crate::syscall::user_read_bytes(events_ptr, EPOLL_EVENT_SIZE);
+        crate::console_println!(
+            "[epoll_wait] wrote to ptr={:#x} verify={:02x?}",
+            events_ptr,
+            &verify[..EPOLL_EVENT_SIZE]
+        );
         return ready_count as isize;
     }
 

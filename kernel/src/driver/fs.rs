@@ -454,6 +454,35 @@ impl Flock {
         }
     }
 
+    /// Construct a Flock from a byte slice (24 bytes).
+    /// Used to safely decode bytes read from user space via user_read_bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Flock {
+            l_type: i16::from_ne_bytes([bytes[0], bytes[1]]),
+            l_whence: i16::from_ne_bytes([bytes[2], bytes[3]]),
+            l_start: i64::from_ne_bytes([
+                bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+            ]),
+            l_len: i64::from_ne_bytes([
+                bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18],
+                bytes[19],
+            ]),
+            l_pid: i32::from_ne_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+        }
+    }
+
+    /// Serialize Flock to a byte array (24 bytes).
+    /// Used to safely write back to user space via user_write_bytes.
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut buf = [0u8; 24];
+        buf[0..2].copy_from_slice(&self.l_type.to_ne_bytes());
+        buf[2..4].copy_from_slice(&self.l_whence.to_ne_bytes());
+        buf[4..12].copy_from_slice(&self.l_start.to_ne_bytes());
+        buf[12..20].copy_from_slice(&self.l_len.to_ne_bytes());
+        buf[20..24].copy_from_slice(&self.l_pid.to_ne_bytes());
+        buf
+    }
+
     pub fn write_to_user(&self, buf: *mut u8) {
         unsafe {
             core::ptr::write_unaligned(buf as *mut i16, self.l_type);

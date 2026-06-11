@@ -128,6 +128,11 @@ impl Ext4BlockDevice for KarteBlockDevice {
                 drop(cache);
                 let mut sector = [0u8; SECTOR_SIZE];
                 if block_read(abs_sector, &mut sector).is_err() {
+                    crate::console_println!(
+                        "[read_offset] DISK READ FAIL sector={} offset={:#x}",
+                        abs_sector,
+                        offset
+                    );
                     break;
                 }
                 buf[buf_pos..buf_pos + copy_len]
@@ -604,7 +609,22 @@ pub fn read_file_range(name: &str) -> Option<impl Fn(usize, &mut [u8]) -> Result
             with_kernel_cr3_ext4(|| {
                 let guard = EXT4_FS.lock();
                 let fs = guard.as_ref().ok_or(())?;
-                fs.read_file(inode, offset, buf).map_err(|_| ())
+                let result = fs.read_file(inode, offset, buf);
+                match &result {
+                    Ok(n) => {
+                        if *n < buf.len() {
+                            crate::console_println!(
+                                "[read_fn] SHORT READ inode={} off={:#x} req={} got={}",
+                                inode,
+                                offset,
+                                buf.len(),
+                                n
+                            );
+                        }
+                    }
+                    Err(_) => {}
+                }
+                result.map_err(|_| ())
             })
         })
     })

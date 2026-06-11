@@ -150,8 +150,12 @@ core::arch::global_asm!(
     "push rcx", // [bottom] user CR3 — restore before iretq
     "mov rcx, [rip + KERNEL_CR3_PHYS]",
     "mov cr3, rcx",
+    // Save FPU/SSE state
+    // CPU pushes 48 (has error_code) + CR3(8) + 9 GPR(72) = 128 → RSP % 16 == 0. sub 512 stays aligned.
+    "sub rsp, 512",
+    "fxsave64 [rsp]",
     // Save registers (9 slots, 72 bytes)
-    // Stack: [0]=rax(nr) [1]=rax(ret) [2]=rdi [3]=rsi [4]=rdx [5]=r8 [6]=r9 [7]=r10 [8]=r11 [9]=user_cr3
+    // Stack: [0]=rax(nr) [1]=rax(ret) [2]=rdi [3]=rsi [4]=rdx [5]=r8 [6]=r9 [7]=r10 [8]=r11
     "push r11",
     "push r10",
     "push r9",
@@ -174,8 +178,10 @@ core::arch::global_asm!(
     "pop r9",     // [6]
     "pop r10",    // [7]
     "pop r11",    // [8]
-    // Restore user CR3 before returning to Ring 3
-    "pop rcx", // [9] user CR3
+    // Restore FPU/SSE
+    "fxrstor64 [rsp]",
+    "add rsp, 512",
+    "pop rcx", // user CR3
     "mov cr3, rcx",
     "iretq",
     // ─── Timer ISR stub ──────────────────────────────────
@@ -198,11 +204,24 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    // Call handler. User page tables have kernel_mappings (copy_kernel_mappings),
-    // so we don't need to switch CR3. The handler's activate_page_table will
-    // install the correct task's page table after schedule().
+    // Timer can interrupt user mode while CR3 is still a user page table.
+    // Switch before calling Rust: the handler may touch kernel heap/logging.
+    // It restores the post-schedule target CR3 before returning.
+    "mov rax, [rip + KERNEL_CR3_PHYS]",
+    "cmp rax, 0",
+    "je 4f",
+    "mov cr3, rax",
+    "4:",
+    // Save FPU/SSE state (timer can interrupt Go's SSE instructions)
+    // CPU pushes 40 (no error_code) + 15 GPR(120) = 160 → RSP % 16 == 0. sub 512 stays aligned.
+    "sub rsp, 512",
+    "fxsave64 [rsp]",
+    // Call handler
     "mov rdi, rsp",
     "call timer_trap_handler",
+    // Restore FPU/SSE
+    "fxrstor64 [rsp]",
+    "add rsp, 512",
     // Pop 15 registers
     "pop r15",
     "pop r14",
@@ -236,6 +255,10 @@ core::arch::global_asm!(
     // by another task's SYSCALL. Using TSS.RSP0 (updated on every context switch)
     // ensures each task has its own kernel stack.
 
+    // 1. Disable interrupts before touching any register or stack state.
+    // SYSCALL does NOT clear IF; while CPL=0 and RSP still points at the user
+    // stack, a timer IRQ would not switch to RSP0 and could corrupt user memory.
+    "cli",
     // 1. Save original rbx (will be clobbered by user RSP), then switch to kernel stack
     "mov [rip + SYSCALL_SAVED_RBX], rbx",
     "mov rbx, rsp",
@@ -244,10 +267,9 @@ core::arch::global_asm!(
     // Double-indirect load: [TSS_RSP0_ADDR] → ptr to RSP0, [ptr] → RSP0 value.
     "mov rsp, [rip + TSS_RSP0_ADDR]",
     "mov rsp, [rsp]",
-    // 2. Disable interrupts — SYSCALL instruction does NOT clear IF,
-    //    and timer ISR uses the same SpinLock (UART) as console_println!
+    // Keep interrupts disabled throughout the syscall handler; timer ISR uses
+    // the same SpinLock (UART) as console_println!
     //    iretq will restore RFLAGS (with IF=1) on return to user mode.
-    "cli",
     // Do NOT switch CR3 here. The user page table has kernel identity mappings
     // (via copy_kernel_mappings). Switching CR3 would break user memory access
     // (syscall handler needs to read user buffers for paths, data, etc.).
@@ -279,19 +301,27 @@ core::arch::global_asm!(
     "push rax", // [0] = user CR3 (saved from hardware)
     "mov rax, [rip + KERNEL_CR3_PHYS]",
     "mov cr3, rax", // Switch to kernel page table
-    // Stack layout now (rsp = state_ptr):
-    //   [0]  user_cr3 (filled by handler)
-    //   [1]  original user RBX
-    //   [2]  rbx (user RSP)
-    //   [3]  rcx (user RIP)
-    //   [4]  r11 (user RFLAGS)
-    //   [5]  rax (syscall_nr)
-    //   [6]  rdi  [7] rsi  [8] rdx  [9] r10  [10] r8  [11] r9
-    //   [12] rbp  [13] r12  [14] r13  [15] r14  [16] r15
+    // Save FPU/SSE state (kernel may use XMM registers in Rust code)
+    // 17 pushes = 136 bytes → RSP % 16 == 8 (misaligned for fxsave64).
+    // Sub 520 (512 + 8 padding) realigns to 16 bytes.
+    "sub rsp, 520",
+    "fxsave64 [rsp]",
+    // Stack layout now (rsp + 520 = state_ptr passed to handler):
+    //   [+0]  user_cr3
+    //   [+1]  original user RBX
+    //   [+2]  rbx (user RSP)
+    //   [+3]  rcx (user RIP)
+    //   [+4]  r11 (user RFLAGS)
+    //   [+5]  rax (syscall_nr)
+    //   [+6]  rdi  [+7] rsi  [+8] rdx  [+9] r10  [+10] r8  [+11] r9
+    //   [+12] rbp  [+13] r12  [+14] r13  [+15] r14  [+16] r15
     // 6. Call handler
-    "mov rdi, rsp",
+    "lea rdi, [rsp + 520]",
     "call syscall_fast_handler",
-    // 7. Restore user state and return via iretq
+    // 7. Restore FPU/SSE before user return
+    "fxrstor64 [rsp]",
+    "add rsp, 520",
+    // Restore user state and return via iretq
     // Save return value (rax) before CR3 restore clobbers it
     "push rax",
     // Read saved CR3 from [rsp+8] (below the push we just did)
@@ -335,52 +365,152 @@ core::arch::global_asm!(
     // ─── Page Fault ISR stub (vector 14) ───────────────────
     // Defined in global_asm! to avoid compiler prologue uncertainty.
     // CPU pushes: error_code, RIP, CS, RFLAGS, RSP, SS (6 items, 48 bytes)
+    //
+    // IMPORTANT: save ALL 15 GPRs + FPU/SSE BEFORE using any register as scratch.
+    // PF is an exception, not a syscall — user code expects ALL state preserved.
+    // The Rust handler may use XMM registers (LLVM optimization), corrupting Go's SSE state.
     ".globl page_fault_isr_stub",
     ".type page_fault_isr_stub, @function",
     "page_fault_isr_stub:",
-    // Switch to kernel CR3 BEFORE touching any register saves.
-    // Use RCX as scratch (saved below). Do NOT use RAX — it holds user value.
-    "mov rcx, cr3",
-    "push rcx",             // save user CR3
-    "mov rcx, [rip + KERNEL_CR3_PHYS]",
-    "cmp rcx, 0",
-    "je 2f",                // skip if not initialized yet
-    "mov cr3, rcx",
-    "2:",
-
-    // Save caller-saved GP registers (9 regs)
-    "push rax",
-    "push rcx",
-    "push rdx",
-    "push rsi",
-    "push rdi",
-    "push r8",
-    "push r9",
-    "push r10",
+    // Save ALL 15 GP registers FIRST — no scratch use before this point.
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
     "push r11",
-    // After 9 pushes, the stack contains:
-    //   [rsp+72] error_code  [rsp+80] RIP  [rsp+88] CS
-    //   [rsp+96] RFLAGS  [rsp+104] RSP  [rsp+112] SS
-    //   [rsp+120] user CR3
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rbx",
+    "push rbp",
+    "push rax",
+    // Save user CR3 (now safe to use rax as scratch)
+    "mov rax, cr3",
+    "push rax",
+    // Switch to kernel CR3
+    "mov rax, [rip + KERNEL_CR3_PHYS]",
+    "cmp rax, 0",
+    "je 2f",
+    "mov cr3, rax",
+    "2:",
+    // Save FPU/SSE state (512 bytes, must be 16-byte aligned).
+    // After 15 pushes (120) + CR3 push (8) = 128 bytes, RSP is 16-byte aligned
+    // (IST top is page-aligned, CPU pushes 48 bytes = 16B aligned, +128 = 16B aligned).
+    // sub 512 keeps 16B alignment.
+    "sub rsp, 512",
+    "fxsave64 [rsp]",
+    // Stack layout (rsp = stack_ptr passed to handler):
+    //   [rsp + 0..512]    = fxsave area (FPU/SSE state)
+    //   [rsp + 512]       = user CR3
+    //   [rsp + 520..640]  = 15 GPR saves (rax,rbp,rbx,rcx,rdx,rsi,rdi,r8..r15)
+    //   [rsp + 640]       = error_code (CPU-pushed)
+    //   [rsp + 648]       = RIP
+    //   [rsp + 656]       = CS
+    //   [rsp + 664]       = RFLAGS
+    //   [rsp + 672]       = RSP
+    //   [rsp + 680]       = SS
     "mov rdi, rsp",
     "call page_fault_handler_raw",
-    // Restore GP registers
-    "pop r11",
-    "pop r10",
-    "pop r9",
-    "pop r8",
-    "pop rdi",
-    "pop rsi",
-    "pop rdx",
-    "pop rcx",
-    "pop rax",
+    // Restore FPU/SSE state
+    "fxrstor64 [rsp]",
+    "add rsp, 512",
     // Restore user CR3
-    "pop rcx",
-    "cmp rcx, 0",
+    "pop rax",
+    "cmp rax, 0",
     "je 3f",
-    "mov cr3, rcx",
+    "mov cr3, rax",
     "3:",
+    // Restore all 15 GP registers (reverse order)
+    "pop rax",
+    "pop rbp",
+    "pop rbx",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
     "add rsp, 8", // skip error_code (CPU-pushed)
+    "iretq",
+    // ─── #DB (Debug Exception) ISR stub — vector 1 ────────
+    // Fires on hardware data watchpoint (DR0-DR3 write breakpoint).
+    // Saves full context (15 GPRs + FPU) and calls debug_handler_raw.
+    ".globl debug_isr_stub",
+    ".type debug_isr_stub, @function",
+    "debug_isr_stub:",
+    // No error code for #DB
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rbx",
+    "push rbp",
+    "push rax",
+    // Save user CR3
+    "mov rax, cr3",
+    "push rax",
+    // Switch to kernel CR3
+    "mov rax, [rip + KERNEL_CR3_PHYS]",
+    "cmp rax, 0",
+    "je 4f",
+    "mov cr3, rax",
+    "4:",
+    // Save FPU/SSE (512 bytes)
+    "sub rsp, 512",
+    "fxsave64 [rsp]",
+    // Stack layout:
+    //   [rsp+0..512]   = fxsave
+    //   [rsp+512]      = user CR3
+    //   [rsp+520..640] = 15 GPRs (rax,rbp,rbx,rcx,rdx,rsi,rdi,r8..r15)
+    //   [rsp+640]      = RIP (no error code for #DB)
+    //   [rsp+648]      = CS
+    //   [rsp+656]      = RFLAGS
+    //   [rsp+664]      = RSP
+    //   [rsp+672]      = SS
+    "mov rdi, rsp",
+    "call debug_handler_raw",
+    // Restore FPU/SSE
+    "fxrstor64 [rsp]",
+    "add rsp, 512",
+    // Restore user CR3
+    "pop rax",
+    "cmp rax, 0",
+    "je 5f",
+    "mov cr3, rax",
+    "5:",
+    "pop rax",
+    "pop rbp",
+    "pop rbx",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
     "iretq",
 );
 
@@ -392,6 +522,7 @@ unsafe extern "C" {
     fn timer_isr_stub();
     fn syscall_entry();
     fn page_fault_isr_stub();
+    fn debug_isr_stub();
 }
 
 // ─── Rust handlers called from assembly ──────────────────────
@@ -429,7 +560,14 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
 /// Handler for timer interrupt.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
-    let _ = ctx;
+    let stack_ptr = ctx as *mut _ as usize;
+    // timer_isr_stub stack layout after fxsave:
+    //   +0..512   = fxsave area
+    //   +512..632 = 15 pushed GPRs
+    //   +632      = interrupted RIP
+    //   +640      = interrupted CS
+    let interrupted_cs = unsafe { *((stack_ptr + 640) as *const u64) };
+    let from_user = interrupted_cs & 0x3 != 0;
     super::lapic::local_eoi();
     crate::driver::tty::poll_uart();
     crate::arch::platform::tick_uptime();
@@ -441,6 +579,14 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     }
 
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if !from_user {
+        // Do not preempt kernel/syscall code. Returning with a user CR3 while
+        // continuing kernel execution corrupts the execution context.
+        let kernel_pt = crate::mm::vmm::get_kernel_page_table();
+        super::trap::activate_page_table(kernel_pt as *const _ as usize);
+        return;
+    }
+
     crate::sched::schedule();
     if let Some(ksp) = crate::sched::current_kernel_stack() {
         unsafe { crate::arch::idt::SYSCALL_KSP = ksp };
@@ -601,6 +747,21 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
     let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
     let rip = frame.instruction_pointer.as_u64();
     let rsp = frame.stack_pointer.as_u64();
+    let rflags = frame.cpu_flags.bits();
+    let cs = frame.code_segment.0 as u64;
+    let ss = frame.stack_segment.0 as u64;
+    let cr2: u64;
+    let ds: u16;
+    let es: u16;
+    let fs: u16;
+    let gs: u16;
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov {0:x}, ds", out(reg) ds, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov {0:x}, es", out(reg) es, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov {0:x}, fs", out(reg) fs, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov {0:x}, gs", out(reg) gs, options(nomem, nostack, preserves_flags));
+    }
     // Print diagnostic for ALL GP faults (user and kernel)
     {
         let mut print_hex = |mut v: u64| {
@@ -628,6 +789,12 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
         print_hex(rsp);
         print_str(b" ERR=");
         print_hex(err);
+        print_str(b" CS=");
+        print_hex(cs);
+        print_str(b" SS=");
+        print_hex(ss);
+        print_str(b" RFLAGS=");
+        print_hex(rflags);
         {
             let rbx: u64;
             unsafe { core::arch::asm!("mov {}, rbx", out(reg) rbx) };
@@ -676,56 +843,287 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
             print_hex(kc3);
         }
         print_str(b"\n");
+        print_str(b"[GP-SEGS] DS=");
+        print_hex(ds as u64);
+        print_str(b" ES=");
+        print_hex(es as u64);
+        print_str(b" FS=");
+        print_hex(fs as u64);
+        print_str(b" GS=");
+        print_hex(gs as u64);
+        print_str(b" CR2=");
+        print_hex(cr2);
+        print_str(b"\n");
     }
-    // Kernel-mode GP fault during syscall handling (e.g., page table traversal OOB).
-    // If CR3 is a user page table, we can recover by terminating the offending process.
-    // If CR3 is the kernel page table, this is a true kernel bug → halt.
+    // Kernel-mode GP fault during syscall handling.
+    // Switch to kernel CR3 first to ensure safe memory access.
     let cr3: usize;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
     let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys() & !0xFFF;
     let current_cr3 = cr3 & !0xFFF;
+    let user_root = crate::process::current_page_table_root();
+
     if current_cr3 != kernel_cr3 {
-        // Running under a user CR3 — syscall context. Terminate the user process.
-        crate::syscall::dispatch(1, [99, 0, 0, 0, 0, 0]); // exit(99)
-    } else {
-        // True kernel-mode fault — unrecoverable
-        loop {}
+        // Switch before any console_println!/formatting: formatting can touch
+        // the kernel heap, which is not safe while still running on user CR3.
+        unsafe { core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3) };
+        unsafe { core::arch::asm!("invlpg [{}]", in(reg) 0usize) };
     }
+
+    crate::console_println!(
+        "[GP] kernel_cr3={:#x} current_cr3={:#x} user_root={:#x}",
+        kernel_cr3,
+        current_cr3,
+        user_root
+    );
+    let user_cr3_window_line =
+        super::trap::USER_CR3_WINDOW_LINE.load(core::sync::atomic::Ordering::Relaxed);
+    if user_cr3_window_line != 0 {
+        crate::console_println!(
+            "[GP-CR3-WINDOW] with_user_cr3 caller line={}",
+            user_cr3_window_line
+        );
+    }
+    if from_user && user_root != 0 {
+        let user_pt = unsafe { &mut *((user_root << 12) as *mut crate::mm::vmm::PageTable) };
+        // Read user stack via translated physical addresses. The GP handler is
+        // running under kernel CR3 here, so direct user virtual reads can fault.
+        for i in 0..8usize {
+            let addr = rsp as usize + i * 8;
+            if let Some(phys) = crate::mm::vmm::translate_user(user_pt, addr) {
+                let val = unsafe { core::ptr::read_volatile(phys as *const usize) };
+                if val > 0x100000 {
+                    crate::console_println!(
+                        "[GP-USTACK] [{:#x}] phys={:#x} = {:#x}",
+                        addr,
+                        phys,
+                        val
+                    );
+                }
+            } else {
+                crate::console_println!("[GP-USTACK] [{:#x}] unmapped", addr);
+            }
+        }
+        let rip_pte = crate::mm::vmm::debug_pte(user_pt, rip as usize);
+        let rip_phys = crate::mm::vmm::translate_user(user_pt, rip as usize);
+        let target = 0x465f142usize;
+        let target_pte = crate::mm::vmm::debug_pte(user_pt, target);
+        let target_phys = crate::mm::vmm::translate_user(user_pt, target);
+        let alias = rip_phys.unwrap_or(0) & !0xfff;
+        let alias_addr = alias | (rip as usize & 0xfff);
+        let alias_pte = crate::mm::vmm::debug_pte(user_pt, alias_addr);
+        let alias_phys = crate::mm::vmm::translate_user(user_pt, alias_addr);
+        crate::console_println!(
+            "[GP-PTE] rip={:#x} pte={:?} phys={:?} target={:#x} pte={:?} phys={:?} alias={:#x} pte={:?} phys={:?}",
+            rip,
+            rip_pte,
+            rip_phys,
+            target,
+            target_pte,
+            target_phys,
+            alias_addr,
+            alias_pte,
+            alias_phys
+        );
+        if let Some(phys) = rip_phys {
+            let bytes = unsafe { core::ptr::read_volatile(phys as *const [u8; 8]) };
+            crate::console_println!(
+                "[GP-BYTES] rip_phys={:#x} bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                phys,
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                bytes[4],
+                bytes[5],
+                bytes[6],
+                bytes[7]
+            );
+        }
+    } else {
+        // Kernel stack addresses are valid under kernel CR3.
+        for i in 0..8usize {
+            let addr = rsp as usize + i * 8;
+            if addr > 0x100000 {
+                let val = unsafe { core::ptr::read_volatile(addr as *const usize) };
+                if val > 0x100000 {
+                    crate::console_println!("[GP-STACK] [{:#x}] = {:#x}", addr, val);
+                }
+            }
+        }
+    }
+    // Terminate the offending process
+    crate::syscall::dispatch(1, [99, 0, 0, 0, 0, 0]); // exit(99)
 }
 
 // Page Fault ISR stub is now defined in global_asm! above (page_fault_isr_stub).
 // This avoids compiler prologue uncertainty with non-naked functions.
 
 /// Raw page fault handler called from global_asm! stub.
-/// `stack_ptr` points to the bottom of our 9 saved registers.
-/// CPU frame layout above our saves:
-///   [stack_ptr + 9*8 + 0] error_code
-///   [stack_ptr + 9*8 + 8] RIP
-///   [stack_ptr + 9*8 + 16] CS
-///   [stack_ptr + 9*8 + 24] RFLAGS
-///   [stack_ptr + 9*8 + 32] RSP
-///   [stack_ptr + 9*8 + 40] SS
+/// `stack_ptr` points to the bottom of our save area.
+/// Stack layout:
+///   [stack_ptr + 0..512]   fxsave area (FPU/SSE)
+///   [stack_ptr + 512]      user CR3
+///   [stack_ptr + 520..640] 15 GPR saves
+///   [stack_ptr + 640]      error_code (CPU-pushed)
+///   [stack_ptr + 648]      RIP
+///   [stack_ptr + 656]      CS
+///   [stack_ptr + 664]      RFLAGS
+///   [stack_ptr + 672]      RSP
+///   [stack_ptr + 680]      SS
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+/// #DB (Debug Exception) handler — fires on hardware write watchpoint (DR0).
+/// Stack layout (from debug_isr_stub):
+///   [rsp+0..512]   = fxsave
+///   [rsp+512]      = user CR3
+///   [rsp+520..640] = 15 GPRs (rax,rbp,rbx,rcx,rdx,rsi,rdi,r8..r15)
+///   [rsp+640]      = RIP (no error code for #DB)
+///   [rsp+648]      = CS
+///   [rsp+656]      = RFLAGS
+///   [rsp+664]      = RSP
+///   [rsp+672]      = SS
+unsafe extern "C" fn debug_handler_raw(stack_ptr: *const u64) {
+    let rsp = stack_ptr as usize;
+    // Read saved registers
+    let rax = *((rsp + 520) as *const u64);
+    let _rbp = *((rsp + 528) as *const u64);
+    let rbx = *((rsp + 536) as *const u64);
+    let rcx = *((rsp + 544) as *const u64);
+    let rdx = *((rsp + 552) as *const u64);
+    let rsi = *((rsp + 560) as *const u64);
+    let rdi = *((rsp + 568) as *const u64);
+    let r8 = *((rsp + 576) as *const u64);
+    let r9 = *((rsp + 584) as *const u64);
+    let r10 = *((rsp + 592) as *const u64);
+    let r11 = *((rsp + 600) as *const u64);
+    let r12 = *((rsp + 608) as *const u64);
+    let r13 = *((rsp + 616) as *const u64);
+    let r14 = *((rsp + 624) as *const u64);
+    let r15 = *((rsp + 632) as *const u64);
+    let rip = *((rsp + 640) as *const u64);
+    let cs = *((rsp + 648) as *const u64);
+    let rflags = *((rsp + 656) as *const u64);
+    let user_rsp = *((rsp + 664) as *const u64);
+    let ss = *((rsp + 672) as *const u64);
+
+    // Read DR6 to identify which breakpoint fired
+    let dr6: u64;
+    core::arch::asm!("mov {}, dr6", out(reg) dr6);
+
+    let from_user = cs & 0x3 != 0;
+
+    crate::console_println!(
+        "[#DB] WRITE WATCHPOINT! rip={:#x} rsp={:#x} cs={:#x} dr6={:#x} user={}",
+        rip,
+        user_rsp,
+        cs,
+        dr6,
+        from_user
+    );
+    crate::console_println!(
+        "[#DB] rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}",
+        rax,
+        rbx,
+        rcx,
+        rdx,
+        rsi,
+        rdi
+    );
+    crate::console_println!(
+        "[#DB] r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+        r8,
+        r9,
+        r10,
+        r11,
+        r12,
+        r13,
+        r14,
+        r15
+    );
+    crate::console_println!("[#DB] rflags={:#x} ss={:#x}", rflags, ss);
+
+    // If DR6 bit 0 is set, DR0 fired
+    if dr6 & 1 != 0 {
+        // Read the current CR3 to identify context
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+        crate::console_println!("[#DB] DR0 fired! CR3={:#x}", cr3);
+
+        // Read the watched address to show what was written
+        let watched_addr = WATCH_ADDR.load(core::sync::atomic::Ordering::Relaxed);
+        if watched_addr != 0 {
+            let val = unsafe { core::ptr::read_volatile(watched_addr as *const u64) };
+            crate::console_println!(
+                "[#DB] watched addr={:#x} new value={:#x}",
+                watched_addr,
+                val
+            );
+        }
+    }
+
+    // Clear DR6 (write 0 to acknowledge)
+    core::arch::asm!("mov dr6, {}", in(reg) 0u64);
+
+    // Halt if this is a kernel-mode write (we want to catch the exact instruction)
+    if !from_user {
+        crate::console_println!(
+            "[#DB] KERNEL-MODE write to watched address! Halting for inspection."
+        );
+        // Don't halt — continue execution so we can see multiple hits
+    }
+}
+
+/// Address being watched by DR0 hardware breakpoint.
+static WATCH_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Set a hardware write watchpoint on `addr` using DR0.
+/// After this, any 1-byte write to `addr` will trigger #DB.
+pub fn set_write_watchpoint(addr: usize) {
+    WATCH_ADDR.store(addr, core::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        // DR0 = linear address to watch
+        core::arch::asm!("mov dr0, {}", in(reg) addr as u64);
+        // DR7 = enable DR0 write breakpoint (local)
+        // Bits: [0] = L0 (local enable for DR0)
+        //       [16..17] = R/W0: 01 = write only
+        //       [18..19] = LEN0: 00 = 1 byte
+        let dr7: u64 = 0x0001_0001; // L0=1, R/W0=write, LEN0=1byte
+        core::arch::asm!("mov dr7, {}", in(reg) dr7);
+    }
+    crate::console_println!("[DR0] Write watchpoint set on addr={:#x}", addr);
+}
+
+/// Disable the DR0 write watchpoint.
+pub fn clear_write_watchpoint() {
+    unsafe {
+        core::arch::asm!("mov dr7, {}", in(reg) 0u64);
+        core::arch::asm!("mov dr0, {}", in(reg) 0u64);
+    }
+    WATCH_ADDR.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
-    // IMMEDIATELY capture CR3 before any function call can change it
-    let raw_cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) raw_cr3) };
+    let sp = stack_ptr as usize;
+    // Read user CR3 from stub save area (at offset 512 — after fxsave, before GPRs).
+    // The PF stub already switched to kernel CR3, so reading CR3 directly would give kernel CR3.
+    let saved_user_cr3 = unsafe { *((sp + 512) as *const u64) };
+    let raw_cr3 = saved_user_cr3;
 
     let fault_addr = x86_64::registers::control::Cr2::read();
     let fault_addr_val = fault_addr.map(|a| a.as_u64()).unwrap_or(0) as usize;
 
     // Read CPU interrupt frame from known stack offsets:
-    // ISR stub pushes: user_cr3, then 9 regs (9×8 = 72 bytes).
+    // Stub pushes: fxsave (512) + user_cr3 (8) + 15 GPRs (120) = 640 bytes.
     // Above that: CPU-pushed error_code + iretq frame.
-    // Total offset from stack_ptr to error_code = 72 (regs) + 8 (user_cr3) = 80.
-    let sp = stack_ptr as usize;
-    let error_code = unsafe { *((sp + 80) as *const u64) };
-    let rip = unsafe { *((sp + 88) as *const u64) };
-    let cs = unsafe { *((sp + 96) as *const u64) };
-    let rflags = unsafe { *((sp + 104) as *const u64) };
-    let rsp_val = unsafe { *((sp + 112) as *const u64) };
-    let ss = unsafe { *((sp + 120) as *const u64) };
+    let error_code = unsafe { *((sp + 640) as *const u64) };
+    let rip = unsafe { *((sp + 648) as *const u64) };
+    let cs = unsafe { *((sp + 656) as *const u64) };
+    let rflags = unsafe { *((sp + 664) as *const u64) };
+    let rsp_val = unsafe { *((sp + 672) as *const u64) };
+    let ss = unsafe { *((sp + 680) as *const u64) };
 
     let from_user = cs & 0x3 != 0;
     let page_size = crate::mm::pmm::page_size();
@@ -758,20 +1156,22 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             );
         }
     } else {
-        // User PF — rate-limit logging. Go's mmap lazy allocation triggers
-        // thousands of PFs; printing each one to UART causes severe slowdown.
-        static PF_LOG_COUNT: core::sync::atomic::AtomicUsize =
-            core::sync::atomic::AtomicUsize::new(0);
-        let n = PF_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 30 {
-            crate::console_println!(
-                "[PF] USER addr={:#x} rip={:#x} pid={} fs_base={:#x}",
-                fault_addr_val,
-                rip,
-                crate::process::current_pid(),
-                fs_base
-            );
-        }
+        // User PF
+        crate::console_println!(
+            "[PF] USER addr={:#x} page={:#x} rip={:#x} rsp={:#x} err={:#x} P={} W={} U={} pid={} fs_base={:#x} cr3={:#x} can_lazy={}",
+            fault_addr_val,
+            page_addr,
+            rip,
+            rsp_val,
+            error_code,
+            error_code & 1,
+            (error_code >> 1) & 1,
+            (error_code >> 2) & 1,
+            crate::process::current_pid(),
+            fs_base,
+            raw_cr3,
+            can_lazy_alloc
+        );
     }
 
     // Handle user-mode page faults
@@ -781,29 +1181,61 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         if error_code & 1 != 0 {
             if can_lazy_alloc && from_user {
                 // Protection fault: page exists but wrong permissions.
-                // This can happen when mprotect changes permissions or when
-                // pages are re-mapped without proper user flags.
-                // Upgrade PTE to URW for any valid user address region.
-                let vma_allows = crate::syscall::vma_check(fault_addr_val).is_some();
-                let elf_region =
-                    fault_addr_val >= 0x400000 && fault_addr_val < crate::process::USER_HEAP_BASE;
+                // Check VMA to determine if this is ELF data or anonymous mmap.
+                let vma_prot = crate::syscall::vma_query(fault_addr_val);
+                let vma_allows = vma_prot.map_or(false, |p| p != 0);
+                // ELF segments have prot=1 (RX, read-only text) or prot=5 (RX, read-execute).
+                // Anonymous mmap regions have prot=3 (RW). PROT_NONE (0) means reserved.
+                let vma_is_elf = vma_prot.map_or(false, |p| p == 1 || p == 5);
                 let heap_region = fault_addr_val >= crate::process::USER_HEAP_BASE
                     && fault_addr_val < crate::process::USER_HEAP_LIMIT;
-                let mmap_region = fault_addr_val >= crate::process::USER_MMAP_BASE
-                    && fault_addr_val < crate::process::USER_MMAP_LIMIT;
                 let stack_region = fault_addr_val >= crate::process::USER_STACK_BASE
                     && fault_addr_val < crate::process::USER_STACK_TOP;
 
-                if vma_allows || elf_region || heap_region || mmap_region || stack_region {
+                if vma_allows || heap_region || stack_region {
                     super::trap::with_kernel_cr3(|| {
                         let user_pt = super::trap::get_user_pt_safe();
                         if let Some(frame) = crate::mm::vmm::translate_user(user_pt, page_addr) {
-                            crate::mm::vmm::map(
-                                user_pt,
-                                page_addr,
-                                frame,
-                                crate::mm::vmm::PTEFlags::URW,
-                            );
+                            let is_identity = frame == page_addr;
+                            if is_identity {
+                                // Identity mapping in user space — this came from copy_kernel_mappings.
+                                // For ELF regions (prot=1 or prot=5), the identity mapping IS the ELF data.
+                                // For other regions (prot=3 RW, prot=0 NONE), allocate fresh zeroed frame.
+                                if vma_is_elf {
+                                    // ELF data: just upgrade permissions, preserve the frame
+                                    crate::mm::vmm::map(
+                                        user_pt,
+                                        page_addr,
+                                        frame,
+                                        crate::mm::vmm::PTEFlags::URW,
+                                    );
+                                } else {
+                                    // Non-ELF identity mapping: replace with fresh zeroed frame
+                                    if let Some(new_frame) = crate::mm::pmm::alloc_frame() {
+                                        unsafe {
+                                            core::ptr::write_bytes(
+                                                new_frame as *mut u8,
+                                                0,
+                                                page_size,
+                                            );
+                                        }
+                                        crate::mm::vmm::map(
+                                            user_pt,
+                                            page_addr,
+                                            new_frame,
+                                            crate::mm::vmm::PTEFlags::URW,
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Non-identity frame: just upgrade permissions
+                                crate::mm::vmm::map(
+                                    user_pt,
+                                    page_addr,
+                                    frame,
+                                    crate::mm::vmm::PTEFlags::URW,
+                                );
+                            }
                         }
                     });
                     break 'handler true;
@@ -812,7 +1244,78 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             break 'handler false;
         }
 
-        // Lazy allocation for heap
+        // ── Not-present fault: lazy allocation ──────────────────────
+        // Priority: VMA > heap > stack > ELF region
+        // VMA check is first because mmap regions have explicit permissions.
+        // PROT_NONE VMAs explicitly refuse allocation (→ segfault).
+
+        // 1. VMA-backed lazy allocation — highest priority, any address
+        if can_lazy_alloc {
+            match crate::syscall::vma_query(fault_addr_val) {
+                Some(vma_prot) => {
+                    if vma_prot != 0 {
+                        // Valid VMA with non-NONE prot → lazy allocate
+                        crate::console_println!(
+                            "[PF-OK] addr={:#x} prot={:#x}",
+                            fault_addr_val,
+                            vma_prot
+                        );
+                        let pte_flags = crate::syscall::prot_to_pte_flags(vma_prot);
+                        super::trap::with_kernel_cr3(|| {
+                            let user_pt = super::trap::get_user_pt_safe();
+                            let old_pte = crate::mm::vmm::debug_pte(user_pt, page_addr);
+                            let old_frame = crate::mm::vmm::translate_user(user_pt, page_addr);
+                            let needs_alloc = match old_frame {
+                                None => true,
+                                Some(f) => f == page_addr,
+                            };
+                            if needs_alloc {
+                                // Check if VMA indicates ELF data (prot=1 or prot=5).
+                                // If so, identity mapping IS the ELF data — don't replace.
+                                let vma_is_elf = vma_prot == 1 || vma_prot == 5;
+                                if vma_is_elf && old_frame.is_some() {
+                                    // ELF data with identity mapping — just remap with correct perms
+                                    crate::mm::vmm::map(
+                                        user_pt,
+                                        page_addr,
+                                        old_frame.unwrap(),
+                                        pte_flags,
+                                    );
+                                } else if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                                    unsafe {
+                                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                                    }
+                                    crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
+                                }
+                            } else {
+                                // Frame already exists (from copy_kernel_mappings identity map
+                                // or previous ELF segment). Remap with correct VMA permissions.
+                                // This fixes the case where a page is mapped read-only (from
+                                // copy_kernel_mappings) but the VMA says PROT_READ|PROT_WRITE.
+                                if let Some(old_frame) = old_frame {
+                                    crate::mm::vmm::map(user_pt, page_addr, old_frame, pte_flags);
+                                    crate::console_println!(
+                                        "[PF-REMAP] vaddr={:#x} frame={:#x} flags={:#x} (permission upgrade)",
+                                        page_addr,
+                                        old_frame,
+                                        pte_flags.bits()
+                                    );
+                                }
+                            }
+                        });
+                        break 'handler true;
+                    } else {
+                        // PROT_NONE — explicitly reserved, refuse to allocate → segfault
+                        break 'handler false;
+                    }
+                }
+                None => {
+                    // No VMA covers this address → fall through to heap/stack/ELF
+                }
+            }
+        }
+
+        // 2. Heap lazy allocation (fallback — no VMA for this address)
         if can_lazy_alloc
             && fault_addr_val >= crate::process::USER_HEAP_BASE
             && fault_addr_val < crate::process::USER_HEAP_LIMIT
@@ -844,7 +1347,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             break 'handler true;
         }
 
-        // Try lazy allocation for stack
+        // 3. Stack lazy allocation
         if can_lazy_alloc
             && fault_addr_val >= crate::process::USER_STACK_BASE
             && fault_addr_val < crate::process::USER_STACK_TOP
@@ -868,37 +1371,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             break 'handler true;
         }
 
-        // Try lazy allocation for mmap region — check VMA validity
-        if can_lazy_alloc
-            && fault_addr_val >= crate::process::USER_MMAP_BASE
-            && fault_addr_val < crate::process::USER_MMAP_LIMIT
-        {
-            // Check if this address is within a valid VMA (not PROT_NONE)
-            if let Some(vma_prot) = crate::syscall::vma_check(fault_addr_val) {
-                let pte_flags = crate::syscall::prot_to_pte_flags(vma_prot);
-                super::trap::with_kernel_cr3(|| {
-                    let user_pt = super::trap::get_user_pt_safe();
-                    // Double-check: only allocate if not already mapped
-                    let needs_alloc = match crate::mm::vmm::translate_user(user_pt, page_addr) {
-                        None => true,
-                        Some(f) => f == page_addr, // stale identity mapping
-                    };
-                    if needs_alloc {
-                        if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                            unsafe {
-                                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                            }
-                            crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
-                        }
-                    }
-                });
-                break 'handler true;
-            }
-            // No valid VMA — fall through to segfault
-        }
-
-        // Try lazy allocation for Go's low-address regions (e.g., Go uses memory near 0x400000+)
-        // This handles any fault in the ELF-loaded region
+        // 4. ELF-loaded region fallback (0x400000..USER_HEAP_BASE)
         if can_lazy_alloc
             && fault_addr_val >= 0x400000
             && fault_addr_val < crate::process::USER_HEAP_BASE
@@ -910,7 +1383,12 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                         unsafe {
                             core::ptr::write_bytes(frame as *mut u8, 0, page_size);
                         }
-                        crate::mm::vmm::map(user_pt, page_addr, frame, crate::mm::vmm::PTEFlags::URW);
+                        crate::mm::vmm::map(
+                            user_pt,
+                            page_addr,
+                            frame,
+                            crate::mm::vmm::PTEFlags::URW,
+                        );
                         super::trap::flush_tlb();
                     }
                 }
@@ -921,6 +1399,9 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         false
     };
 
+    #[cfg(target_arch = "x86_64")]
+    crate::process::check_text_probe("pf", fault_addr_val, rip as usize);
+
     if !handled {
         let cr3: u64;
         unsafe {
@@ -928,6 +1409,21 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         }
         if from_user {
             let pid = crate::process::current_pid();
+            let rax = unsafe { *((sp + 520) as *const u64) };
+            let rbp = unsafe { *((sp + 528) as *const u64) };
+            let rbx = unsafe { *((sp + 536) as *const u64) };
+            let rcx = unsafe { *((sp + 544) as *const u64) };
+            let rdx = unsafe { *((sp + 552) as *const u64) };
+            let rsi = unsafe { *((sp + 560) as *const u64) };
+            let rdi = unsafe { *((sp + 568) as *const u64) };
+            let r8 = unsafe { *((sp + 576) as *const u64) };
+            let r9 = unsafe { *((sp + 584) as *const u64) };
+            let r10 = unsafe { *((sp + 592) as *const u64) };
+            let r11 = unsafe { *((sp + 600) as *const u64) };
+            let r12 = unsafe { *((sp + 608) as *const u64) };
+            let r13 = unsafe { *((sp + 616) as *const u64) };
+            let r14 = unsafe { *((sp + 624) as *const u64) };
+            let r15 = unsafe { *((sp + 632) as *const u64) };
             // User-mode unhandled PF — terminate the process (segfault)
             crate::console_println!(
                 "[PF] UNHANDLED addr={:#x} rip={:#x} pid={} error={:#x}",
@@ -936,6 +1432,37 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 pid,
                 error_code
             );
+            crate::console_println!(
+                "[PF] regs rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rbp={:#x} rsi={:#x} rdi={:#x}",
+                rax,
+                rbx,
+                rcx,
+                rdx,
+                rbp,
+                rsi,
+                rdi
+            );
+            crate::console_println!(
+                "[PF] regs r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                r8,
+                r9,
+                r10,
+                r11,
+                r12,
+                r13,
+                r14,
+                r15
+            );
+            // Dump VMA state for the faulting address region
+            let vma_prot = crate::syscall::vma_query(fault_addr_val);
+            crate::console_println!(
+                "[PF] vma_query({:#x}) = {:?}, can_lazy_alloc={}",
+                fault_addr_val,
+                vma_prot,
+                can_lazy_alloc
+            );
+            // Dump nearby VMAs
+            crate::syscall::vma_dump_region(fault_addr_val);
             crate::syscall::sys_exit(99);
             loop {}
         } else {
@@ -1020,6 +1547,20 @@ unsafe extern "C" fn keyboard_isr_stub() -> ! {
         "push rbp",
         "push rbx",
         "push rax",
+        // IRQs can arrive while user CR3 is active. Switch before calling Rust
+        // handlers, then restore the interrupted CR3 before iretq.
+        "mov rax, cr3",
+        "push rax",
+        "mov rax, [rip + {kernel_cr3}]",
+        "cmp rax, 0",
+        "je 4f",
+        "mov cr3, rax",
+        "4:",
+        // Save FPU/SSE state
+        // CPU pushes 40 + 15 GPR(120) = 160 aligned; CR3 push(8) misaligns,
+        // so reserve 512 bytes plus 8 bytes of padding.
+        "sub rsp, 520",
+        "fxsave64 [rsp]",
         // Read scancode from PS/2 data port
         "xor rax, rax",
         "in al, 0x60",
@@ -1027,7 +1568,11 @@ unsafe extern "C" fn keyboard_isr_stub() -> ! {
         "call {handle}",
         // Send EOI
         "call {eoi}",
-        // Restore and return
+        // Restore FPU/SSE
+        "fxrstor64 [rsp]",
+        "add rsp, 520",
+        "pop rax",
+        "mov cr3, rax",
         "pop rax",
         "pop rbx",
         "pop rbp",
@@ -1046,6 +1591,7 @@ unsafe extern "C" fn keyboard_isr_stub() -> ! {
         "iretq",
         handle = sym crate::driver::keyboard::handle_scancode,
         eoi = sym super::lapic::local_eoi,
+        kernel_cr3 = sym KERNEL_CR3_PHYS,
     );
 }
 
@@ -1070,6 +1616,20 @@ unsafe extern "C" fn com1_isr_stub() -> ! {
         "push rbp",
         "push rbx",
         "push rax",
+        // IRQs can arrive while user CR3 is active. Switch before calling Rust
+        // handlers, then restore the interrupted CR3 before iretq.
+        "mov rax, cr3",
+        "push rax",
+        "mov rax, [rip + {kernel_cr3}]",
+        "cmp rax, 0",
+        "je 4f",
+        "mov cr3, rax",
+        "4:",
+        // Save FPU/SSE state
+        // CPU pushes 40 + 15 GPR(120) = 160 aligned; CR3 push(8) misaligns,
+        // so reserve 512 bytes plus 8 bytes of padding.
+        "sub rsp, 520",
+        "fxsave64 [rsp]",
         // Handle UART: drain ALL interrupt types to prevent interrupt storm.
         // Read IIR to identify interrupt type, then handle accordingly.
         "mov dx, 0x3FA",       // IIR (Interrupt Identification Register)
@@ -1092,6 +1652,11 @@ unsafe extern "C" fn com1_isr_stub() -> ! {
         "5:",
         "3:",
         "call {eoi}",
+        // Restore FPU/SSE
+        "fxrstor64 [rsp]",
+        "add rsp, 520",
+        "pop rax",
+        "mov cr3, rax",
         "pop rax",
         "pop rbx",
         "pop rbp",
@@ -1110,6 +1675,7 @@ unsafe extern "C" fn com1_isr_stub() -> ! {
         "iretq",
         poll = sym crate::driver::tty::poll_uart,
         eoi = sym super::lapic::local_eoi,
+        kernel_cr3 = sym KERNEL_CR3_PHYS,
     );
 }
 
@@ -1207,6 +1773,13 @@ pub fn init() {
         let mut idt = InterruptDescriptorTable::new();
 
         idt.breakpoint.set_handler_fn(breakpoint_handler);
+        // #DB (Debug Exception, vector 1): hardware write watchpoint via DR0
+        set_naked_handler(
+            &mut idt[1], // Vector 1 = #DB
+            debug_isr_stub as *const () as usize,
+            0x8E00, // 64-bit interrupt gate, DPL=0, P=1
+            0,      // No IST — use task kernel stack
+        );
         unsafe {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)

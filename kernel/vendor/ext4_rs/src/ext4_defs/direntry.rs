@@ -217,7 +217,7 @@ impl Ext4DirEntry {
     pub fn copy_to_slice(&self, array: &mut [u8], offset: usize) {
         let de_ptr = self as *const Ext4DirEntry as *const u8;
         let array_ptr = array as *mut [u8] as *mut u8;
-        let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
+        let count = self.align_len();
         unsafe {
             core::ptr::copy_nonoverlapping(de_ptr, array_ptr.add(offset), count);
         }

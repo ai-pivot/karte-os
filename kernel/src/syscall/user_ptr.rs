@@ -62,30 +62,14 @@ impl<T: Copy + Default> UserPtr<T> {
     /// No heap operations inside the CR3 switch.
     #[inline]
     pub fn read(&self) -> T {
-        let mut val = T::default();
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| {
-            val = unsafe { core::ptr::read_volatile(self.addr as *const T) };
-        });
-        #[cfg(not(target_arch = "x86_64"))]
-        unsafe {
-            val = core::ptr::read_volatile(self.addr as *const T);
-        }
-        val
+        super::user_read::<T>(self.addr)
     }
 
     /// Write a value to user space (with CR3 switch on x86_64).
     /// No heap operations inside the CR3 switch.
     #[inline]
     pub fn write(&self, val: T) {
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| {
-            unsafe { core::ptr::write_volatile(self.addr as *mut T, val) };
-        });
-        #[cfg(not(target_arch = "x86_64"))]
-        unsafe {
-            core::ptr::write_volatile(self.addr as *mut T, val)
-        }
+        super::user_write::<T>(self.addr, val);
     }
 
     /// Offset the pointer by `count` elements.
@@ -130,64 +114,28 @@ impl UserSlice {
 
     /// Read all bytes from user space into a Vec.
     ///
-    /// CRITICAL: Vec is pre-allocated under kernel CR3.
-    /// Inside with_user_cr3(), we only write to the Vec's raw buffer
-    /// via pointer — NO push/alloc/dealloc.
+    /// CRITICAL: kernel buffers are only mutated under kernel CR3.
     pub fn read_to_vec(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.len);
-        // SAFETY: with_capacity allocated len bytes. We write exactly len bytes
-        // via raw pointer, then set_len. No alloc/dealloc inside with_user_cr3.
-        let dst = buf.as_mut_ptr() as *mut u8;
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| {
-            for i in 0..self.len {
-                unsafe {
-                    let byte = core::ptr::read_volatile((self.addr + i) as *const u8);
-                    core::ptr::write(dst.add(i), byte);
-                }
-            }
-        });
-        #[cfg(not(target_arch = "x86_64"))]
         for i in 0..self.len {
-            unsafe {
-                let byte = core::ptr::read_volatile((self.addr + i) as *const u8);
-                core::ptr::write(dst.add(i), byte);
-            }
+            buf.push(super::user_read_u8(self.addr + i));
         }
-        unsafe { buf.set_len(self.len) };
         buf
     }
 
     /// Read a NUL-terminated string from user space (max 4096 bytes).
     ///
-    /// CRITICAL: Vec is pre-allocated under kernel CR3.
-    /// Inside with_user_cr3(), we only write via raw pointer.
+    /// CRITICAL: kernel buffers are only mutated under kernel CR3.
     pub fn read_cstring(&self) -> Option<String> {
         let max_len = self.len.min(4096);
         let mut buf = Vec::with_capacity(max_len);
-        let dst = buf.as_mut_ptr() as *mut u8;
-        let mut actual_len = 0usize;
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| {
-            for i in 0..max_len {
-                let byte = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
-                if byte == 0 {
-                    return;
-                }
-                unsafe { core::ptr::write(dst.add(actual_len), byte) };
-                actual_len += 1;
-            }
-        });
-        #[cfg(not(target_arch = "x86_64"))]
         for i in 0..max_len {
-            let byte = unsafe { core::ptr::read_volatile((self.addr + i) as *const u8) };
+            let byte = super::user_read_u8(self.addr + i);
             if byte == 0 {
                 break;
             }
-            unsafe { core::ptr::write(dst.add(actual_len), byte) };
-            actual_len += 1;
+            buf.push(byte);
         }
-        unsafe { buf.set_len(actual_len) };
         String::from_utf8(buf).ok()
     }
 }
@@ -224,62 +172,31 @@ impl UserSliceMut {
 
     /// Read all bytes from user space into a Vec.
     ///
-    /// CRITICAL: Same as UserSlice::read_to_vec — no heap ops inside with_user_cr3.
+    /// CRITICAL: kernel buffers are only mutated under kernel CR3.
     pub fn read_to_vec(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.len);
-        let dst = buf.as_mut_ptr() as *mut u8;
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| {
-            for i in 0..self.len {
-                unsafe {
-                    let byte = core::ptr::read_volatile((self.addr + i) as *const u8);
-                    core::ptr::write(dst.add(i), byte);
-                }
-            }
-        });
-        #[cfg(not(target_arch = "x86_64"))]
         for i in 0..self.len {
-            unsafe {
-                let byte = core::ptr::read_volatile((self.addr + i) as *const u8);
-                core::ptr::write(dst.add(i), byte);
-            }
+            buf.push(super::user_read_u8(self.addr + i));
         }
-        unsafe { buf.set_len(self.len) };
         buf
     }
 
     /// Write bytes to user space from a source slice.
     ///
-    /// CRITICAL: Only write_volatile inside with_user_cr3 — no heap ops.
+    /// CRITICAL: kernel buffers are only read under kernel CR3.
     pub fn copy_from_slice(&self, src: &[u8]) {
         let n = src.len().min(self.len);
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| {
-            for i in 0..n {
-                unsafe { core::ptr::write_volatile((self.addr + i) as *mut u8, src[i]) };
-            }
-        });
-        #[cfg(not(target_arch = "x86_64"))]
-        for i in 0..n {
-            unsafe { core::ptr::write_volatile((self.addr + i) as *mut u8, src[i]) };
-        }
+        super::user_write_bytes(self.addr, &src[..n]);
     }
 
     /// Write a single byte to user space at offset.
     ///
-    /// CRITICAL: Only write_volatile inside with_user_cr3 — no heap ops.
+    /// CRITICAL: kernel values are only read under kernel CR3.
     #[inline]
     pub fn write_byte_at(&self, offset: usize, byte: u8) {
         if offset >= self.len {
             return;
         }
-        #[cfg(target_arch = "x86_64")]
-        crate::arch::trap::with_user_cr3(|| {
-            unsafe { core::ptr::write_volatile((self.addr + offset) as *mut u8, byte) };
-        });
-        #[cfg(not(target_arch = "x86_64"))]
-        unsafe {
-            core::ptr::write_volatile((self.addr + offset) as *mut u8, byte)
-        }
+        super::user_write_u8(self.addr + offset, byte);
     }
 }

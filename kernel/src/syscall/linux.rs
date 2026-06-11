@@ -519,19 +519,8 @@ pub fn count_user_string(ptr: usize) -> usize {
         return 0;
     }
     let mut len = 0usize;
-    #[cfg(target_arch = "x86_64")]
-    crate::arch::trap::with_user_cr3(|| {
-        while len < 256 {
-            let b = unsafe { core::ptr::read_volatile((ptr + len) as *const u8) };
-            if b == 0 {
-                break;
-            }
-            len += 1;
-        }
-    });
-    #[cfg(not(target_arch = "x86_64"))]
     while len < 256 {
-        let b = unsafe { core::ptr::read_volatile((ptr + len) as *const u8) };
+        let b = super::user_read_u8(ptr + len);
         if b == 0 {
             break;
         }

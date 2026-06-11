@@ -11,6 +11,40 @@ use spin::Mutex;
 
 use crate::mm::{pmm, vmm};
 
+#[cfg(target_arch = "x86_64")]
+static TEXT_PROBE_PHYS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
+static TEXT_PROBE_LAST: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_arch = "x86_64")]
+pub fn set_text_probe_phys(phys: usize) {
+    TEXT_PROBE_PHYS.store(phys, Ordering::Relaxed);
+    let value = unsafe { core::ptr::read_volatile(phys as *const u64) as usize };
+    TEXT_PROBE_LAST.store(value, Ordering::Relaxed);
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn check_text_probe(label: &str, a: usize, b: usize) {
+    let phys = TEXT_PROBE_PHYS.load(Ordering::Relaxed);
+    if phys == 0 {
+        return;
+    }
+    let value = unsafe { core::ptr::read_volatile(phys as *const u64) as usize };
+    let last = TEXT_PROBE_LAST.load(Ordering::Relaxed);
+    if value != last {
+        crate::console_println!(
+            "[TEXT-PROBE] {} phys={:#x} old={:#x} new={:#x} a={:#x} b={:#x}",
+            label,
+            phys,
+            last,
+            value,
+            a,
+            b
+        );
+        TEXT_PROBE_LAST.store(value, Ordering::Relaxed);
+    }
+}
+
 /// User address space layout constants.
 ///
 /// x86_64 address space layout:
@@ -25,7 +59,7 @@ pub const USER_CODE_BASE: usize = 0x0000_0000;
 pub const USER_CODE_LIMIT: usize = 0x1000_0000; // 256MB for code+data
 pub const USER_HEAP_BASE: usize = 0x1000_0000;
 pub const USER_HEAP_LIMIT: usize = 0x2000_0000; // 256MB heap (brk)
-pub const USER_MMAP_BASE: usize = 0x1000_0000; // 512MB — above identity map (max 512MB), below stack
+pub const USER_MMAP_BASE: usize = 0x2000_0000; // Above heap (256MB), separate from brk region
 pub const USER_MMAP_LIMIT: usize = 0x0000_7FFF_FFFF_F000; // x86_64 max canonical user address
 pub const USER_STACK_TOP: usize = 0x8000_0000; // 2GB — top of user stack
 pub const USER_STACK_BASE: usize = 0x7F00_0000; // 16MB stack region (address space)
@@ -170,7 +204,15 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
                 for j in 0..512 {
                     let pd_entry = kernel_pd.entries[j];
                     if pd_entry.is_valid() {
-                        new_pd.entries[j] = vmm::PTE(pd_entry.0 | user_flag);
+                        // Leaf kernel/identity mappings must remain supervisor-only.
+                        // Non-leaf entries need USER so Ring 3 page walks can reach
+                        // user leaves that we install later in the same subtree.
+                        let copied = if pd_entry.flags().contains(vmm::PTEFlags::PS) {
+                            pd_entry.0 & !user_flag
+                        } else {
+                            pd_entry.0 | user_flag
+                        };
+                        new_pd.entries[j] = vmm::PTE(copied);
                     }
                 }
                 let pd_flags = vmm::PTEFlags::PRESENT.bits()
@@ -208,6 +250,67 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
             );
         }
     }
+}
+
+fn elf_segment_pte_flags(flags: usize) -> vmm::PTEFlags {
+    let executable = flags & 1 != 0; // PF_X
+    let writable = flags & 2 != 0; // PF_W
+    let readable = flags & 4 != 0; // PF_R
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut pte_flags = vmm::PTEFlags::PRESENT | vmm::PTEFlags::USER;
+        if writable {
+            pte_flags |= vmm::PTEFlags::WRITABLE;
+        }
+        if !executable {
+            pte_flags |= vmm::PTEFlags::NX;
+        }
+        pte_flags
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let mut pte_flags = vmm::PTEFlags::V | vmm::PTEFlags::U;
+        if readable {
+            pte_flags |= vmm::PTEFlags::R;
+        }
+        if writable {
+            pte_flags |= vmm::PTEFlags::W;
+        }
+        if executable {
+            pte_flags |= vmm::PTEFlags::X;
+        }
+        pte_flags
+    }
+}
+
+fn merge_page_flags(
+    user_pt: &mut vmm::PageTable,
+    vaddr: usize,
+    new_flags: vmm::PTEFlags,
+) -> vmm::PTEFlags {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(raw) = vmm::debug_pte(user_pt, vaddr) {
+            let existing = vmm::PTEFlags::from_bits_truncate(raw);
+            let mut merged = existing | new_flags;
+            // NX is a restrictive bit: if any segment sharing this page is
+            // executable, the page must remain executable.
+            if !existing.contains(vmm::PTEFlags::NX) || !new_flags.contains(vmm::PTEFlags::NX) {
+                merged.remove(vmm::PTEFlags::NX);
+            }
+            return merged;
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let _ = user_pt;
+        let _ = vaddr;
+    }
+
+    new_flags
 }
 
 impl Process {
@@ -277,7 +380,7 @@ impl Process {
             let seg_vaddr_end = segment.vaddr + segment.mem_size;
             let page_start = seg_vaddr_start & !(page_size - 1);
             let page_end = (seg_vaddr_end + page_size - 1) & !(page_size - 1);
-            let is_executable = segment.flags & 1 != 0; // PF_X
+            let pte_flags = elf_segment_pte_flags(segment.flags);
 
             for vaddr in (page_start..page_end).step_by(page_size) {
                 // Always allocate a fresh frame for ELF segments.
@@ -286,17 +389,21 @@ impl Process {
                     if f == vaddr {
                         // Identity mapping — allocate new frame instead
                         let new_f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
-                        vmm::map_user(user_pt, vaddr, new_f, vmm::PTEFlags::URWX);
+                        vmm::map_user(user_pt, vaddr, new_f, pte_flags);
                         unsafe {
                             core::ptr::write_bytes(new_f as *mut u8, 0, page_size);
                         }
                         new_f
                     } else {
+                        // Multiple PT_LOAD segments may share one page. Keep
+                        // the physical frame and merge page-level permissions.
+                        let merged_flags = merge_page_flags(user_pt, vaddr, pte_flags);
+                        vmm::map_user(user_pt, vaddr, f, merged_flags);
                         f
                     }
                 } else {
                     let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
-                    vmm::map_user(user_pt, vaddr, f, vmm::PTEFlags::URWX);
+                    vmm::map_user(user_pt, vaddr, f, pte_flags);
                     unsafe {
                         core::ptr::write_bytes(f as *mut u8, 0, page_size);
                     }
@@ -324,7 +431,6 @@ impl Process {
                     // here. This is NO LONGER needed since we now have proper MSR-based
                     // SYSCALL/SYSRET support. The binary's native `syscall` instruction
                     // works correctly via the LSTAR entry point → dispatch_linux_raw().
-                    let _ = is_executable;
                 }
             }
             if segment.vaddr + segment.mem_size > max_vaddr {
@@ -624,14 +730,33 @@ impl Process {
         // pages (PS=1) that overlap with ELF segment addresses.
         let mut max_vaddr = 0usize;
         let mut total_pages: usize = 0;
+        // Collect segment ranges for VMA registration (prevents mmap overlap)
+        let mut elf_segments_vma: alloc::vec::Vec<(usize, usize, usize)> = alloc::vec::Vec::new();
         for seg_idx in 0..elf_info.num_segments {
             let seg = elf_info.segments[seg_idx].as_ref().unwrap();
             let seg_vaddr_start = seg.vaddr;
             let seg_vaddr_end = seg.vaddr + seg.mem_size;
             let page_start = seg_vaddr_start & !(page_size - 1);
             let page_end = (seg_vaddr_end + page_size - 1) & !(page_size - 1);
-            let is_executable = seg.flags & 1 != 0; // PF_X
+            let pte_flags = elf_segment_pte_flags(seg.flags as usize);
             let num_pages = (page_end - page_start) / page_size;
+
+            // Register this segment for VMA tracking (to prevent mmap overlap)
+            // Convert ELF flags to Linux PROT flags for VMA registration
+            let seg_prot = {
+                let mut p = 0usize;
+                if seg.flags & 1 != 0 {
+                    p |= 1;
+                } // PF_X → PROT_EXEC
+                if seg.flags & 2 != 0 {
+                    p |= 2;
+                } // PF_W → PROT_WRITE
+                if seg.flags & 4 != 0 {
+                    p |= 1;
+                } // PF_R → PROT_READ
+                p
+            };
+            elf_segments_vma.push((page_start, page_end, seg_prot));
 
             for vaddr in (page_start..page_end).step_by(page_size) {
                 // Always allocate a fresh frame for ELF segments.
@@ -646,19 +771,21 @@ impl Process {
                     if f == vaddr {
                         // Allocate a new frame and overwrite the identity mapping
                         let new_f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
-                        vmm::map_user(user_pt, vaddr, new_f, vmm::PTEFlags::URWX);
+                        vmm::map_user(user_pt, vaddr, new_f, pte_flags);
                         unsafe {
                             core::ptr::write_bytes(new_f as *mut u8, 0, page_size);
                         }
                         new_f
                     } else {
                         // Non-identity mapping from a previous segment — reuse it
+                        let merged_flags = merge_page_flags(user_pt, vaddr, pte_flags);
+                        vmm::map_user(user_pt, vaddr, f, merged_flags);
                         f
                     }
                 } else {
                     // No mapping exists — allocate a new frame
                     let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
-                    vmm::map_user(user_pt, vaddr, f, vmm::PTEFlags::URWX);
+                    vmm::map_user(user_pt, vaddr, f, pte_flags);
                     // Zero-fill the entire frame
                     unsafe {
                         core::ptr::write_bytes(f as *mut u8, 0, page_size);
@@ -685,6 +812,23 @@ impl Process {
                             core::ptr::write_bytes(tmp_buf[bytes..].as_mut_ptr(), 0, len - bytes);
                         }
                     }
+                    #[cfg(target_arch = "x86_64")]
+                    if vaddr == 0x407000 && dst_offset <= 0x7f4 && 0x7fc <= dst_offset + len {
+                        let probe = 0x7f4 - dst_offset;
+                        crate::console_println!(
+                            "[ELF-PROBE] before copy file_off={:#x} frame={:#x} tmp={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            file_offset,
+                            frame,
+                            tmp_buf[probe],
+                            tmp_buf[probe + 1],
+                            tmp_buf[probe + 2],
+                            tmp_buf[probe + 3],
+                            tmp_buf[probe + 4],
+                            tmp_buf[probe + 5],
+                            tmp_buf[probe + 6],
+                            tmp_buf[probe + 7],
+                        );
+                    }
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             tmp_buf[..len].as_ptr(),
@@ -692,17 +836,114 @@ impl Process {
                             len,
                         );
                     }
+                    #[cfg(target_arch = "x86_64")]
+                    if vaddr == 0x407000 && dst_offset <= 0x7f4 && 0x7fc <= dst_offset + len {
+                        let phys = frame + 0x7f4;
+                        let loaded = unsafe { core::ptr::read_volatile(phys as *const [u8; 8]) };
+                        crate::console_println!(
+                            "[ELF-PROBE] after copy phys={:#x} mem={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            phys,
+                            loaded[0],
+                            loaded[1],
+                            loaded[2],
+                            loaded[3],
+                            loaded[4],
+                            loaded[5],
+                            loaded[6],
+                            loaded[7],
+                        );
+                        set_text_probe_phys(phys);
+                        // DR0 watchpoint disabled — causes GP fault
+                    }
 
                     // NOTE: No longer patching syscall→int 0x80. MSR SYSCALL/SYSRET
                     // is properly configured. The binary's native `syscall` instruction
                     // works via LSTAR → dispatch_linux_raw().
-                    let _ = is_executable;
                 }
             }
             if seg.vaddr + seg.mem_size > max_vaddr {
                 max_vaddr = seg.vaddr + seg.mem_size;
             }
         } // end for seg_idx
+
+        // 5.05 Verify loaded data — probe known bytes in segments.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Probe 1: rodata "<?xml version" at vaddr 0x24b9e22
+            let probe_vaddr = 0x24b9e22usize;
+            if let Some(phys) = vmm::translate_user(user_pt, probe_vaddr) {
+                let bytes = unsafe { core::ptr::read_volatile(phys as *const [u8; 16]) };
+                crate::console_println!(
+                    "[ELF-VERIFY] rodata @{:#x} phys={:#x}: {:02x?} ({})",
+                    probe_vaddr,
+                    phys,
+                    &bytes[..16],
+                    if bytes[0] == b'<' && bytes[1] == b'?' {
+                        "OK"
+                    } else {
+                        "CORRUPT!"
+                    }
+                );
+            }
+            // Probe 2: .data at vaddr 0x47d11c0 — should be [40,3e,7e,04,...]
+            let probe_data = 0x47d11c0usize;
+            if let Some(phys) = vmm::translate_user(user_pt, probe_data) {
+                let bytes = unsafe { core::ptr::read_volatile(phys as *const [u8; 16]) };
+                let is_identity = phys == (probe_data & !0xFFF);
+                crate::console_println!(
+                    "[ELF-VERIFY] .data @{:#x} phys={:#x} identity={} : {:02x?} ({})",
+                    probe_data,
+                    phys,
+                    is_identity,
+                    &bytes[..16],
+                    if bytes[0] == 0x40 && bytes[1] == 0x3e {
+                        "OK"
+                    } else {
+                        "CORRUPT!"
+                    }
+                );
+            } else {
+                crate::console_println!("[ELF-VERIFY] .data @{:#x} NOT MAPPED!", probe_data);
+            }
+            // Probe 4: Verify c.xml data_ptr in embed.FS metadata
+            // c.xml embed.file entry: name_ptr=0x244e7eb, data_ptr at vaddr 0x27ff918
+            let dptr_vaddr = 0x27ff918usize;
+            if let Some(phys) = vmm::translate_user(user_pt, dptr_vaddr) {
+                let stored_ptr = unsafe { core::ptr::read_volatile(phys as *const u64) };
+                crate::console_println!(
+                    "[ELF-VERIFY] c.xml data_ptr vaddr={:#x} phys={:#x} value={:#x} ({})",
+                    dptr_vaddr,
+                    phys,
+                    stored_ptr,
+                    if stored_ptr == 0x26244c0 {
+                        "OK"
+                    } else {
+                        "CORRUPT!"
+                    }
+                );
+                // Also read data at the stored pointer to verify
+                let data_vaddr = stored_ptr as usize;
+                if let Some(data_phys) = vmm::translate_user(user_pt, data_vaddr) {
+                    let bytes = unsafe { core::ptr::read_volatile(data_phys as *const [u8; 8]) };
+                    crate::console_println!(
+                        "[ELF-VERIFY] c.xml data @{:#x} phys={:#x}: {:02x?}",
+                        data_vaddr,
+                        data_phys,
+                        &bytes[..8]
+                    );
+                }
+            }
+        }
+
+        // 5.1 Register ELF segments as VMA entries to prevent mmap from
+        // allocating addresses that overlap with loaded ELF data.
+        // Also ensure the mmap bump allocator starts past all ELF segments.
+        for &(start, end, prot) in &elf_segments_vma {
+            crate::syscall::register_elf_vma(start, end, prot);
+        }
+        if max_vaddr > 0 {
+            crate::syscall::ensure_mmap_above(max_vaddr);
+        }
 
         // 5.5 Restore CR3 after ELF segment loading.
         // All frame writes (via identity-mapped physical addresses) are done.
