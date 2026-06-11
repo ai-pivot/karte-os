@@ -35,6 +35,7 @@ pub fn run_tests() {
     test_vma_mmap_isolation();
     test_vma_fork_clone();
     test_vma_stack_scratch_bound();
+    test_restore_zero_fs_base();
 }
 
 fn test_trap_context_size() {
@@ -527,4 +528,25 @@ fn test_vma_fork_clone() {
         crate::mm::vma::release_root(root_c);
         ok
     })
+}
+
+/// Regression: restore_task_arch_state must write FS_BASE=0 when slot stores zero.
+/// Go's sysUnused→mmap→DONTNEED cycle may set fs_base to 0; the restore path
+/// must actually write 0 to the MSR, not skip it.
+fn test_restore_zero_fs_base() {
+    run_test("x86_64 restore_zero_fs_base", || {
+        let slot = crate::sched::current_sched_slot();
+        let orig_msr = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
+        let orig_task = crate::sched::get_task_fs_base(slot);
+
+        unsafe { crate::arch::idt::wrmsr(0xC0000100, 0xdead_beef) };
+        crate::sched::set_task_fs_base(slot, 0);
+        crate::sched::restore_task_arch_state_for_test(slot);
+        let restored = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
+
+        unsafe { crate::arch::idt::wrmsr(0xC0000100, orig_msr) };
+        crate::sched::set_task_fs_base(slot, orig_task);
+
+        restored == 0
+    });
 }

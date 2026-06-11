@@ -231,6 +231,12 @@ fn restore_task_arch_state(slot: usize) {
 #[cfg(not(target_arch = "x86_64"))]
 fn restore_task_arch_state(_slot: usize) {}
 
+/// Test-only access to restore_task_arch_state for verifying arch-state restore.
+#[cfg(all(target_arch = "x86_64", feature = "test_mode"))]
+pub fn restore_task_arch_state_for_test(slot: usize) {
+    restore_task_arch_state(slot);
+}
+
 fn switch_to(current: usize, next: usize) {
     save_fs_base(current);
     CURRENT_RUNNING.store(next, Ordering::Relaxed);

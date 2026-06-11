@@ -1744,3 +1744,52 @@ pub fn kill_clone_children(parent_pid: usize) {
     #[cfg(target_arch = "x86_64")]
     crate::arch::lapic::broadcast_reschedule();
 }
+
+#[cfg(feature = "test_mode")]
+impl Process {
+    /// Minimal test-only Process constructor.
+    fn test_dummy(page_table_root: usize) -> Self {
+        Process {
+            pid: 0,
+            ppid: 0,
+            page_table_root,
+            kernel_stack_top: 0,
+            fs_base: 0,
+            user_stack_top: 0,
+            brk: USER_HEAP_BASE,
+            initial_brk: USER_HEAP_BASE,
+            entry: 0,
+            state: ProcessState::Ready,
+            exit_code: 0,
+            wait_child_idx: None,
+            fd_table: alloc::sync::Arc::new(spin::Mutex::new(
+                crate::driver::fs::FdTable::new(),
+            )),
+            trap_ctx_ptr: 0,
+            shared_page_table: false,
+            clone_tls: 0,
+            child_tid_ptr: 0,
+            env: BTreeMap::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test_mode")]
+pub fn run_tests() {
+    crate::console_println!("");
+    crate::console_println!("── Process Tests ──");
+
+    crate::test::run_test("process_set_exit_code_by_index_marks_exited", || {
+        let proc = Process::test_dummy(0xDEAD_0000);
+        let idx = match add_process(proc) {
+            Some(i) => i,
+            None => return false,
+        };
+
+        set_exit_code_by_index(idx, 7);
+        let observed = get_exit_code(idx);
+        free_process_slot(idx);
+
+        observed == Some(7)
+    });
+}

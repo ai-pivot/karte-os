@@ -1143,4 +1143,33 @@ pub fn run_tests() {
         pmm::dealloc_frame(canary_frame);
         true
     });
+
+    // ── Task 1 regression tests ──
+
+    #[cfg(target_arch = "x86_64")]
+    crate::test::run_test("vmm_mprotect_does_not_descend_into_huge_page", || {
+        let root = PageTable::zeroed();
+        identity_map_2mb(root, 0, 4 * 1024 * 1024, PTEFlags::KRW);
+
+        let target = 0x401000usize;
+        let before = translate_user(root, target);
+        let changed = mprotect_user(root, target, PTEFlags::UR);
+        let after = translate_user(root, target);
+
+        !changed && before == after
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    crate::test::run_test("vmm_map_split_2mb_stops_at_pt_level", || {
+        let root = PageTable::zeroed();
+        identity_map_2mb(root, 0, 4 * 1024 * 1024, PTEFlags::KRW);
+
+        let frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        map_user(root, 0x401000, frame, PTEFlags::UR);
+
+        translate_user(root, 0x401000) == Some(frame)
+    });
 }
