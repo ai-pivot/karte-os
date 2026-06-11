@@ -478,6 +478,56 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
     Some((entry.ppn() << 12) | (vaddr & 0xFFF))
 }
 
+/// Typed page-table walk returning `WalkResult`.
+///
+/// Unlike `translate_user()` which returns `Option<usize>`, this function
+/// explicitly returns `MappedHuge` when a huge page is encountered, forcing
+/// callers to handle that case rather than silently descending.
+pub fn walk_mapping(root: &mut PageTable, vaddr: usize) -> super::page_table::WalkResult {
+    use super::page_table::WalkResult;
+    use crate::mm::addr::PhysAddr;
+
+    let mut table = root;
+    for level in (1..PT_LEVELS).rev() {
+        let vpn = PageTable::vpn(vaddr, level);
+        let entry = table.entries[vpn];
+        if !entry.is_valid() {
+            return WalkResult::NotMapped;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if entry.flags().contains(PTEFlags::PS) {
+            let page_size = 1 << (12 + 9 * level);
+            let page_offset_mask = page_size - 1;
+            let frame_addr = (entry.ppn() << 12) | (vaddr & page_offset_mask);
+            return WalkResult::MappedHuge {
+                frame: PhysAddr::new(frame_addr),
+                level,
+                size: page_size,
+                flags: entry.flags().bits(),
+            };
+        }
+        let ppn = entry.ppn();
+        if ppn == 0 {
+            return WalkResult::Invalid;
+        }
+        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+    }
+    // Leaf level (PT)
+    let vpn = PageTable::vpn(vaddr, 0);
+    let entry = table.entries[vpn];
+    if !entry.is_valid() {
+        return WalkResult::NotMapped;
+    }
+    let ppn = entry.ppn();
+    if ppn == 0 {
+        return WalkResult::Invalid;
+    }
+    WalkResult::Mapped4K {
+        frame: PhysAddr::new((ppn << 12) | (vaddr & 0xFFF)),
+        flags: entry.flags().bits(),
+    }
+}
+
 /// Return the raw leaf PTE for debugging user mappings.
 #[cfg(target_arch = "x86_64")]
 pub fn debug_pte(root: &mut PageTable, vaddr: usize) -> Option<u64> {
@@ -1149,7 +1199,7 @@ pub fn run_tests() {
     #[cfg(target_arch = "x86_64")]
     crate::test::run_test("vmm_mprotect_does_not_descend_into_huge_page", || {
         let root = PageTable::zeroed();
-        identity_map_2mb(root, 0, 4 * 1024 * 1024, PTEFlags::KRW);
+        identity_map_2mb(root, 0, 8 * 1024 * 1024, PTEFlags::KRW);
 
         let target = 0x401000usize;
         let before = translate_user(root, target);
@@ -1162,7 +1212,7 @@ pub fn run_tests() {
     #[cfg(target_arch = "x86_64")]
     crate::test::run_test("vmm_map_split_2mb_stops_at_pt_level", || {
         let root = PageTable::zeroed();
-        identity_map_2mb(root, 0, 4 * 1024 * 1024, PTEFlags::KRW);
+        identity_map_2mb(root, 0, 8 * 1024 * 1024, PTEFlags::KRW);
 
         let frame = match pmm::alloc_frame() {
             Some(f) => f,
@@ -1209,5 +1259,57 @@ pub fn run_tests() {
         // Manually free the raw frame (simulating page table cleanup)
         crate::mm::pmm::dealloc_frame(raw.as_usize());
         true
+    });
+
+    // ── WalkResult typed walk tests ──
+
+    #[cfg(target_arch = "x86_64")]
+    crate::test::run_test("vmm_walk_mapping_returns_mapped_huge", || {
+        let root = PageTable::zeroed();
+        // Map 0..8MB so 0x401000 falls within the third 2MB page (PD[2])
+        identity_map_2mb(root, 0, 8 * 1024 * 1024, PTEFlags::KRW);
+
+        let result = walk_mapping(root, 0x401000);
+        match result {
+            super::page_table::WalkResult::MappedHuge { size, level, .. } => {
+                if size != 2 * 1024 * 1024 {
+                    crate::console_println!("[FAIL] huge size={} expected={}", size, 2*1024*1024);
+                    false
+                } else if level != 1 {
+                    crate::console_println!("[FAIL] huge level={} expected=1", level);
+                    false
+                } else {
+                    true
+                }
+            }
+            other => {
+                crate::console_println!("[FAIL] expected MappedHuge, got {:?}", other);
+                false
+            }
+        }
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    crate::test::run_test("vmm_walk_mapping_4k_after_split", || {
+        let root = PageTable::zeroed();
+        identity_map_2mb(root, 0, 8 * 1024 * 1024, PTEFlags::KRW);
+        let frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        map_user(root, 0x401000, frame, PTEFlags::UR);
+        let result = walk_mapping(root, 0x401000);
+        if let super::page_table::WalkResult::Mapped4K { frame: f, .. } = result {
+            f.as_usize() == frame
+        } else {
+            crate::console_println!("[FAIL] expected Mapped4K, got {:?}", result);
+            false
+        }
+    });
+
+    crate::test::run_test("vmm_walk_mapping_not_mapped", || {
+        let root = PageTable::zeroed();
+        let result = walk_mapping(root, 0x400000);
+        matches!(result, super::page_table::WalkResult::NotMapped)
     });
 }
