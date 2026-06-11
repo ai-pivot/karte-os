@@ -237,6 +237,37 @@ pub fn restore_task_arch_state_for_test(slot: usize) {
     restore_task_arch_state(slot);
 }
 
+/// Get the typed `UserReturnState` for the currently scheduled task.
+/// Used by syscall return paths to restore all per-task state.
+#[cfg(target_arch = "x86_64")]
+pub fn current_user_return_state() -> crate::arch::user_return::UserReturnState {
+    let slot = current_sched_slot();
+    user_return_state_for_slot(slot)
+}
+
+/// Get the typed `UserReturnState` for a specific scheduler slot.
+#[cfg(target_arch = "x86_64")]
+pub fn user_return_state_for_slot(slot: usize) -> crate::arch::user_return::UserReturnState {
+    use crate::arch::user_return::*;
+
+    let fs_base = FsBase::new(TASK_FS_BASE[slot].load(Ordering::Relaxed));
+    let kernel_sp = TASK_KSTACK[slot].load(Ordering::Relaxed);
+
+    // user_cr3 is not tracked per-slot in the scheduler (it's in Process).
+    // The caller should set user_cr3 separately if needed.
+    let kernel_rsp0 = if kernel_sp != 0 {
+        Some(KernelRsp0::new(kernel_sp))
+    } else {
+        None
+    };
+
+    UserReturnState {
+        user_cr3: None, // Set by caller from Process page_table_root
+        kernel_rsp0,
+        fs_base,
+    }
+}
+
 fn switch_to(current: usize, next: usize) {
     save_fs_base(current);
     CURRENT_RUNNING.store(next, Ordering::Relaxed);
@@ -705,6 +736,20 @@ pub fn set_task_fs_base(slot: usize, val: u64) {
     if slot < MAX_TASKS {
         TASK_FS_BASE[slot].store(val, Ordering::Relaxed);
     }
+}
+
+/// Typed version: set FS_BASE using the FsBase newtype.
+#[cfg(target_arch = "x86_64")]
+pub fn set_task_fs_base_typed(slot: usize, val: crate::arch::user_return::FsBase) {
+    if slot < MAX_TASKS {
+        TASK_FS_BASE[slot].store(val.raw(), Ordering::Relaxed);
+    }
+}
+
+/// Typed version: get FS_BASE as the FsBase newtype.
+#[cfg(target_arch = "x86_64")]
+pub fn get_task_fs_base_typed(slot: usize) -> crate::arch::user_return::FsBase {
+    crate::arch::user_return::FsBase::new(get_task_fs_base(slot))
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -25,6 +25,7 @@ pub mod smp;
 pub mod switch;
 pub mod trap;
 pub mod uart;
+pub mod user_return;
 pub mod virtio_blk;
 pub mod virtio_net;
 
