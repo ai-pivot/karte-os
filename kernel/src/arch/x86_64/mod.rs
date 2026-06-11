@@ -11,6 +11,7 @@
 pub mod boot;
 pub mod cet;
 pub mod console;
+pub mod cr3;
 pub mod emergency_stack;
 pub mod gdt;
 pub mod idt;
