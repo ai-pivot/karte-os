@@ -5,5 +5,6 @@ pub mod frame;
 pub mod heap;
 pub mod page_table;
 pub mod pmm;
+pub mod unsafe_bridge;
 pub mod vma;
 pub mod vmm;
