@@ -231,6 +231,16 @@ pub fn feed_byte(c: u8) {
     on_char(c);
 }
 
+fn wake_input_waiters() {
+    let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
+    if waiting != usize::MAX {
+        crate::sched::wake_task(waiting);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    crate::syscall::epoll::wake_waiters_for_fd(0);
+}
+
 /// Process a single character from input.
 fn on_char(c: u8) {
     let is_raw = TTY_MODE.load(Ordering::Relaxed);
@@ -249,11 +259,7 @@ fn on_char(c: u8) {
 fn on_char_raw(c: u8) {
     // In raw mode, deliver the byte immediately
     if TTY_INPUT.push(c) {
-        // Wake blocked reader
-        let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
-        if waiting != usize::MAX {
-            crate::sched::wake_task(waiting);
-        }
+        wake_input_waiters();
     }
     // No echo in raw mode
 }
@@ -269,10 +275,7 @@ fn on_char_canonical(c: u8) {
             echo(b"^C\r\n");
             line.clear();
             TTY_INPUT.push(b'\n');
-            let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
-            if waiting != usize::MAX {
-                crate::sched::wake_task(waiting);
-            }
+            wake_input_waiters();
         }
         // Backspace (BS) or Delete (DEL)
         0x08 | 0x7F => {
@@ -292,10 +295,7 @@ fn on_char_canonical(c: u8) {
             TTY_INPUT.push(b'\n');
             line.clear();
 
-            let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
-            if waiting != usize::MAX {
-                crate::sched::wake_task(waiting);
-            }
+            wake_input_waiters();
         }
         // Regular printable ASCII
         0x20..=0x7E => {
@@ -307,10 +307,7 @@ fn on_char_canonical(c: u8) {
         0x04 => {
             if line.len == 0 {
                 // Push nothing — sys_read returns 0 (EOF)
-                let waiting = TTY_WAITING.swap(usize::MAX, Ordering::AcqRel);
-                if waiting != usize::MAX {
-                    crate::sched::wake_task(waiting);
-                }
+                wake_input_waiters();
             }
         }
         // Ctrl+L — clear screen (convenience)

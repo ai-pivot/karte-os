@@ -11,40 +11,6 @@ use spin::Mutex;
 
 use crate::mm::{pmm, vmm};
 
-#[cfg(target_arch = "x86_64")]
-static TEXT_PROBE_PHYS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(target_arch = "x86_64")]
-static TEXT_PROBE_LAST: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(target_arch = "x86_64")]
-pub fn set_text_probe_phys(phys: usize) {
-    TEXT_PROBE_PHYS.store(phys, Ordering::Relaxed);
-    let value = unsafe { core::ptr::read_volatile(phys as *const u64) as usize };
-    TEXT_PROBE_LAST.store(value, Ordering::Relaxed);
-}
-
-#[cfg(target_arch = "x86_64")]
-pub fn check_text_probe(label: &str, a: usize, b: usize) {
-    let phys = TEXT_PROBE_PHYS.load(Ordering::Relaxed);
-    if phys == 0 {
-        return;
-    }
-    let value = unsafe { core::ptr::read_volatile(phys as *const u64) as usize };
-    let last = TEXT_PROBE_LAST.load(Ordering::Relaxed);
-    if value != last {
-        crate::console_println!(
-            "[TEXT-PROBE] {} phys={:#x} old={:#x} new={:#x} a={:#x} b={:#x}",
-            label,
-            phys,
-            last,
-            value,
-            a,
-            b
-        );
-        TEXT_PROBE_LAST.store(value, Ordering::Relaxed);
-    }
-}
-
 /// User address space layout constants.
 ///
 /// x86_64 address space layout:
@@ -67,6 +33,82 @@ pub const USER_STACK_PAGES: usize = 512; // 2 MB pre-mapped stack (Go g0 needs ~
 pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack
 #[cfg(target_arch = "x86_64")]
 const CET_TRANSITION_STACK_PAGE: usize = 0xffff_ffff_ffff_f000;
+#[cfg(target_arch = "x86_64")]
+pub const KERNEL_STACK_VIRT_BASE: usize = 0xffff_8000_0000_0000;
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn kernel_stack_top_from_phys_base(phys_base: usize) -> usize {
+    KERNEL_STACK_VIRT_BASE + phys_base + KERNEL_STACK_PAGES * pmm::page_size()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn kernel_stack_phys_base_from_top(kernel_stack_top: usize) -> usize {
+    kernel_stack_top - KERNEL_STACK_VIRT_BASE - KERNEL_STACK_PAGES * pmm::page_size()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn map_kernel_stack_pages_at(
+    page_table: &mut vmm::PageTable,
+    phys_base: usize,
+    kernel_stack_top: usize,
+) {
+    let page_size = pmm::page_size();
+    let virt_base = kernel_stack_top - KERNEL_STACK_PAGES * page_size;
+    for offset in (0..KERNEL_STACK_PAGES * page_size).step_by(page_size) {
+        vmm::map(
+            page_table,
+            virt_base + offset,
+            phys_base + offset,
+            vmm::PTEFlags::KRW,
+        );
+    }
+}
+
+pub(crate) fn map_kernel_stack_pages(user_pt: &mut vmm::PageTable, kernel_stack_top: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let phys_base = kernel_stack_phys_base_from_top(kernel_stack_top);
+        map_kernel_stack_pages_at(user_pt, phys_base, kernel_stack_top);
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let page_size = pmm::page_size();
+        let kstack_base = kernel_stack_top - KERNEL_STACK_PAGES * page_size;
+        for addr in (kstack_base..kernel_stack_top).step_by(page_size) {
+            vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+        }
+    }
+}
+
+pub fn alloc_kernel_stack() -> Option<usize> {
+    let phys_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)?;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let kernel_stack_top = kernel_stack_top_from_phys_base(phys_base);
+        let kernel_pt = vmm::get_kernel_page_table();
+        map_kernel_stack_pages_at(kernel_pt, phys_base, kernel_stack_top);
+        Some(kernel_stack_top)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        Some(phys_base + KERNEL_STACK_PAGES * pmm::page_size())
+    }
+}
+
+fn dealloc_kernel_stack(kernel_stack_top: usize) {
+    #[cfg(target_arch = "x86_64")]
+    let phys_base = kernel_stack_phys_base_from_top(kernel_stack_top);
+
+    #[cfg(not(target_arch = "x86_64"))]
+    let phys_base = kernel_stack_top - KERNEL_STACK_PAGES * pmm::page_size();
+
+    for offset in (0..KERNEL_STACK_PAGES * pmm::page_size()).step_by(pmm::page_size()) {
+        pmm::dealloc_frame(phys_base + offset);
+    }
+}
 
 /// Process identifier allocator
 pub(crate) static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
@@ -229,10 +271,7 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
         // mapped into user page tables. Kernel accesses them via with_kernel_cr3().
 
         // Map kernel stack pages into user page table.
-        let kstack_base = kernel_stack_top - KERNEL_STACK_PAGES * 4096;
-        for addr in (kstack_base..kernel_stack_top).step_by(4096) {
-            vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
-        }
+        map_kernel_stack_pages(user_pt, kernel_stack_top);
 
         // Some x86_64 emulators/CPUs can perform a CET/shadow-stack transition
         // access while the user CR3 is already active but before Ring 3 code
@@ -313,6 +352,169 @@ fn merge_page_flags(
     new_flags
 }
 
+#[cfg(target_arch = "x86_64")]
+fn merge_pte_flags(existing: vmm::PTEFlags, new_flags: vmm::PTEFlags) -> vmm::PTEFlags {
+    let mut merged = existing | new_flags;
+    // NX is restrictive: any executable segment sharing the page must keep it executable.
+    if !existing.contains(vmm::PTEFlags::NX) || !new_flags.contains(vmm::PTEFlags::NX) {
+        merged.remove(vmm::PTEFlags::NX);
+    }
+    merged
+}
+
+#[cfg(target_arch = "x86_64")]
+fn streaming_elf_page_flags(
+    elf_info: &elf::ElfInfo,
+    page_addr: usize,
+    page_size: usize,
+) -> Option<vmm::PTEFlags> {
+    let mut merged: Option<vmm::PTEFlags> = None;
+    for seg_idx in 0..elf_info.num_segments {
+        let seg = elf_info.segments[seg_idx].as_ref().unwrap();
+        let page_start = seg.vaddr & !(page_size - 1);
+        let page_end = (seg.vaddr + seg.mem_size + page_size - 1) & !(page_size - 1);
+        if page_addr < page_start || page_addr >= page_end {
+            continue;
+        }
+
+        let flags = elf_segment_pte_flags(seg.flags as usize);
+        merged = Some(match merged {
+            Some(existing) => merge_pte_flags(existing, flags),
+            None => flags,
+        });
+    }
+    merged
+}
+
+#[cfg(target_arch = "x86_64")]
+fn reload_streaming_elf_page<F>(
+    user_pt: &mut vmm::PageTable,
+    elf_info: &elf::ElfInfo,
+    read_fn: &F,
+    page_addr: usize,
+    page_size: usize,
+) -> Result<(), &'static str>
+where
+    F: Fn(usize, &mut [u8]) -> Result<usize, ()>,
+{
+    let flags = streaming_elf_page_flags(elf_info, page_addr, page_size)
+        .ok_or("ELF: page not in segment")?;
+    let frame = pmm::alloc_frame().ok_or("Out of memory for ELF invariant repair")?;
+    vmm::map_user(user_pt, page_addr, frame, flags);
+    unsafe {
+        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+    }
+
+    for seg_idx in 0..elf_info.num_segments {
+        let seg = elf_info.segments[seg_idx].as_ref().unwrap();
+        let seg_start = seg.vaddr;
+        let seg_file_end = seg.vaddr + seg.file_size;
+        let seg_mem_end = seg.vaddr + seg.mem_size;
+        if page_addr >= seg_mem_end || page_addr + page_size <= seg_start {
+            continue;
+        }
+
+        let copy_start = core::cmp::max(page_addr, seg_start);
+        let copy_end = core::cmp::min(page_addr + page_size, seg_file_end);
+        if copy_start >= copy_end {
+            continue;
+        }
+
+        let file_offset = seg.offset + (copy_start - seg_start);
+        let dst_offset = copy_start & (page_size - 1);
+        let len = copy_end - copy_start;
+        let mut tmp_buf = [0u8; 4096];
+        let bytes = read_fn(file_offset, &mut tmp_buf[..len])
+            .map_err(|_| "ELF: failed to reread invariant page")?;
+        if bytes < len {
+            unsafe {
+                core::ptr::write_bytes(tmp_buf[bytes..].as_mut_ptr(), 0, len - bytes);
+            }
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                tmp_buf[..len].as_ptr(),
+                (frame + dst_offset) as *mut u8,
+                len,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_streaming_elf_pages<F>(
+    user_pt: &mut vmm::PageTable,
+    elf_info: &elf::ElfInfo,
+    read_fn: &F,
+    page_size: usize,
+) -> Result<(), &'static str>
+where
+    F: Fn(usize, &mut [u8]) -> Result<usize, ()>,
+{
+    let mut repaired_count = 0usize;
+    let mut first_vaddr = 0usize;
+    let mut first_old_pte = None;
+    let mut first_old_frame = None;
+
+    for seg_idx in 0..elf_info.num_segments {
+        let seg = elf_info.segments[seg_idx].as_ref().unwrap();
+        let page_start = seg.vaddr & !(page_size - 1);
+        let page_end = (seg.vaddr + seg.mem_size + page_size - 1) & !(page_size - 1);
+
+        for page_addr in (page_start..page_end).step_by(page_size) {
+            let old_pte = vmm::debug_pte(user_pt, page_addr);
+            let old_frame = vmm::translate_user(user_pt, page_addr).map(|p| p & !(page_size - 1));
+            let leaf_user = old_pte
+                .map(|raw| vmm::PTEFlags::from_bits_truncate(raw).contains(vmm::PTEFlags::USER))
+                .unwrap_or(false);
+            let needs_repair = old_frame.map_or(true, |frame| frame == page_addr) || !leaf_user;
+
+            if !needs_repair {
+                continue;
+            }
+
+            if repaired_count == 0 {
+                first_vaddr = page_addr;
+                first_old_pte = old_pte;
+                first_old_frame = old_frame;
+            }
+            reload_streaming_elf_page(user_pt, elf_info, read_fn, page_addr, page_size)?;
+
+            let new_pte = vmm::debug_pte(user_pt, page_addr);
+            let new_frame = vmm::translate_user(user_pt, page_addr).map(|p| p & !(page_size - 1));
+            let repaired_user = new_pte
+                .map(|raw| vmm::PTEFlags::from_bits_truncate(raw).contains(vmm::PTEFlags::USER))
+                .unwrap_or(false);
+            if new_frame.map_or(true, |frame| frame == page_addr) || !repaired_user {
+                crate::console_println!(
+                    "[ELF-INVARIANT] repair failed vaddr={:#x} old_pte={:?} old_frame={:?} new_pte={:?} new_frame={:?}",
+                    page_addr,
+                    old_pte,
+                    old_frame,
+                    new_pte,
+                    new_frame
+                );
+                return Err("ELF: invariant repair failed");
+            }
+            repaired_count += 1;
+        }
+    }
+
+    if repaired_count != 0 {
+        crate::console_println!(
+            "[ELF-INVARIANT] repaired {} PT_LOAD pages first_vaddr={:#x} old_pte={:?} old_frame={:?}",
+            repaired_count,
+            first_vaddr,
+            first_old_pte,
+            first_old_frame
+        );
+    }
+
+    Ok(())
+}
+
 impl Process {
     /// Create a new user process from an ELF binary.
     ///
@@ -336,9 +538,7 @@ impl Process {
         let _guard = pmm::alloc_frame();
 
         // 3. Allocate kernel stack (needed before copy_kernel_mappings)
-        let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
-            .ok_or("Out of memory for kernel stack")?;
-        let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * pmm::page_size();
+        let kernel_stack_top = alloc_kernel_stack().ok_or("Out of memory for kernel stack")?;
 
         // 4. Copy kernel identity map (2MB huge pages) BEFORE loading ELF.
         // This establishes identity-mapped access to physical memory using the
@@ -666,9 +866,7 @@ impl Process {
         let page_size = pmm::page_size();
 
         // 0. Allocate kernel stack (needed before copy_kernel_mappings)
-        let kstack_base = pmm::alloc_contiguous_frames(KERNEL_STACK_PAGES)
-            .ok_or("Out of memory for kernel stack")?;
-        let kernel_stack_top = kstack_base + KERNEL_STACK_PAGES * page_size;
+        let kernel_stack_top = alloc_kernel_stack().ok_or("Out of memory for kernel stack")?;
 
         // 0.5 Allocate a guard frame between stack and page table.
         // Timer ISR's TrapContext (184 bytes) can overflow kernel_stack_top by up to
@@ -746,7 +944,7 @@ impl Process {
             let seg_prot = {
                 let mut p = 0usize;
                 if seg.flags & 1 != 0 {
-                    p |= 1;
+                    p |= 4;
                 } // PF_X → PROT_EXEC
                 if seg.flags & 2 != 0 {
                     p |= 2;
@@ -812,48 +1010,12 @@ impl Process {
                             core::ptr::write_bytes(tmp_buf[bytes..].as_mut_ptr(), 0, len - bytes);
                         }
                     }
-                    #[cfg(target_arch = "x86_64")]
-                    if vaddr == 0x407000 && dst_offset <= 0x7f4 && 0x7fc <= dst_offset + len {
-                        let probe = 0x7f4 - dst_offset;
-                        crate::console_println!(
-                            "[ELF-PROBE] before copy file_off={:#x} frame={:#x} tmp={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                            file_offset,
-                            frame,
-                            tmp_buf[probe],
-                            tmp_buf[probe + 1],
-                            tmp_buf[probe + 2],
-                            tmp_buf[probe + 3],
-                            tmp_buf[probe + 4],
-                            tmp_buf[probe + 5],
-                            tmp_buf[probe + 6],
-                            tmp_buf[probe + 7],
-                        );
-                    }
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             tmp_buf[..len].as_ptr(),
                             (frame + dst_offset) as *mut u8,
                             len,
                         );
-                    }
-                    #[cfg(target_arch = "x86_64")]
-                    if vaddr == 0x407000 && dst_offset <= 0x7f4 && 0x7fc <= dst_offset + len {
-                        let phys = frame + 0x7f4;
-                        let loaded = unsafe { core::ptr::read_volatile(phys as *const [u8; 8]) };
-                        crate::console_println!(
-                            "[ELF-PROBE] after copy phys={:#x} mem={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                            phys,
-                            loaded[0],
-                            loaded[1],
-                            loaded[2],
-                            loaded[3],
-                            loaded[4],
-                            loaded[5],
-                            loaded[6],
-                            loaded[7],
-                        );
-                        set_text_probe_phys(phys);
-                        // DR0 watchpoint disabled — causes GP fault
                     }
 
                     // NOTE: No longer patching syscall→int 0x80. MSR SYSCALL/SYSRET
@@ -866,73 +1028,13 @@ impl Process {
             }
         } // end for seg_idx
 
-        // 5.05 Verify loaded data — probe known bytes in segments.
+        // 5.05 Enforce ELF mapping invariants before any user code can run:
+        // every PT_LOAD page must be user-accessible and backed by a private
+        // non-identity frame. If a copied identity mapping leaked through,
+        // rebuild that page from the ELF file immediately.
         #[cfg(target_arch = "x86_64")]
         {
-            // Probe 1: rodata "<?xml version" at vaddr 0x24b9e22
-            let probe_vaddr = 0x24b9e22usize;
-            if let Some(phys) = vmm::translate_user(user_pt, probe_vaddr) {
-                let bytes = unsafe { core::ptr::read_volatile(phys as *const [u8; 16]) };
-                crate::console_println!(
-                    "[ELF-VERIFY] rodata @{:#x} phys={:#x}: {:02x?} ({})",
-                    probe_vaddr,
-                    phys,
-                    &bytes[..16],
-                    if bytes[0] == b'<' && bytes[1] == b'?' {
-                        "OK"
-                    } else {
-                        "CORRUPT!"
-                    }
-                );
-            }
-            // Probe 2: .data at vaddr 0x47d11c0 — should be [40,3e,7e,04,...]
-            let probe_data = 0x47d11c0usize;
-            if let Some(phys) = vmm::translate_user(user_pt, probe_data) {
-                let bytes = unsafe { core::ptr::read_volatile(phys as *const [u8; 16]) };
-                let is_identity = phys == (probe_data & !0xFFF);
-                crate::console_println!(
-                    "[ELF-VERIFY] .data @{:#x} phys={:#x} identity={} : {:02x?} ({})",
-                    probe_data,
-                    phys,
-                    is_identity,
-                    &bytes[..16],
-                    if bytes[0] == 0x40 && bytes[1] == 0x3e {
-                        "OK"
-                    } else {
-                        "CORRUPT!"
-                    }
-                );
-            } else {
-                crate::console_println!("[ELF-VERIFY] .data @{:#x} NOT MAPPED!", probe_data);
-            }
-            // Probe 4: Verify c.xml data_ptr in embed.FS metadata
-            // c.xml embed.file entry: name_ptr=0x244e7eb, data_ptr at vaddr 0x27ff918
-            let dptr_vaddr = 0x27ff918usize;
-            if let Some(phys) = vmm::translate_user(user_pt, dptr_vaddr) {
-                let stored_ptr = unsafe { core::ptr::read_volatile(phys as *const u64) };
-                crate::console_println!(
-                    "[ELF-VERIFY] c.xml data_ptr vaddr={:#x} phys={:#x} value={:#x} ({})",
-                    dptr_vaddr,
-                    phys,
-                    stored_ptr,
-                    if stored_ptr == 0x26244c0 {
-                        "OK"
-                    } else {
-                        "CORRUPT!"
-                    }
-                );
-                // Also read data at the stored pointer to verify
-                let data_vaddr = stored_ptr as usize;
-                if let Some(data_phys) = vmm::translate_user(user_pt, data_vaddr) {
-                    let bytes = unsafe { core::ptr::read_volatile(data_phys as *const [u8; 8]) };
-                    crate::console_println!(
-                        "[ELF-VERIFY] c.xml data @{:#x} phys={:#x}: {:02x?}",
-                        data_vaddr,
-                        data_phys,
-                        &bytes[..8]
-                    );
-                }
-            }
+            verify_streaming_elf_pages(user_pt, &elf_info, &read_fn, page_size)?;
         }
 
         // 5.1 Register ELF segments as VMA entries to prevent mmap from
@@ -1006,23 +1108,63 @@ impl Process {
             }
         }
 
-        // ── Phase 1: Write string data near the top of the stack ──
-        // We write strings from stack_top - 16 (after 16B random) downward.
-        // Track each string's address for the pointer arrays.
+        // Random bytes pointed to by AT_RANDOM.
+        let random_addr = stack_top - 16;
+        unsafe {
+            write_u64_to_user(user_pt, random_addr, 0x12345678_9ABCDEF0u64);
+            write_u64_to_user(user_pt, random_addr + 8, 0xDEADBEEF_FEEDFACEu64);
+        }
 
-        // Use OLD simple layout: argc=0, no strings. The env/args parameters
-        // are accepted but not written to the initial stack. This avoids the
-        // bug in the string writing code while preserving API compatibility.
-        let random_addr = stack_top - 256; // same as old working code
+        // Build and copy argv/envp strings above the metadata area.  Linux
+        // userspace, including Go, expects argc/argv/envp to be present even
+        // when the binary was loaded through the streaming path.
+        let envp_strs: alloc::vec::Vec<alloc::vec::Vec<u8>> = envp
+            .iter()
+            .map(|(k, v)| {
+                let mut s = alloc::vec::Vec::new();
+                s.extend_from_slice(k);
+                s.push(b'=');
+                s.extend_from_slice(v);
+                s.push(0);
+                s
+            })
+            .collect();
 
-        // Write random bytes (16 bytes)
-        for i in 0..2 {
-            unsafe {
-                write_u64_to_user(
-                    user_pt,
-                    random_addr + i * 8,
-                    0x12345678_9ABCDEF0u64.wrapping_add(i as u64 * 0xDEADBEEF),
-                );
+        let argv_strs: alloc::vec::Vec<alloc::vec::Vec<u8>> = argv
+            .iter()
+            .map(|s| {
+                let mut v = s.clone();
+                if v.last() != Some(&0) {
+                    v.push(0);
+                }
+                v
+            })
+            .collect();
+
+        let strings_size: usize = argv_strs.iter().map(|s| s.len()).sum::<usize>()
+            + envp_strs.iter().map(|s| s.len()).sum::<usize>();
+        let strings_start = random_addr - strings_size;
+
+        let mut argv_ptrs: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut envp_ptrs: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut str_pos = strings_start;
+
+        for s in &argv_strs {
+            argv_ptrs.push(str_pos);
+            for &b in s {
+                unsafe {
+                    write_byte_to_user(user_pt, str_pos, b);
+                }
+                str_pos += 1;
+            }
+        }
+        for s in &envp_strs {
+            envp_ptrs.push(str_pos);
+            for &b in s {
+                unsafe {
+                    write_byte_to_user(user_pt, str_pos, b);
+                }
+                str_pos += 1;
             }
         }
 
@@ -1041,27 +1183,35 @@ impl Process {
             (AT_NULL, 0),
         ];
 
-        let total_size = 8 + 8 + 8 + auxv_data.len() * 16 + 16;
-        let new_rsp = (stack_top - total_size) & !0xF;
+        let argc = argv_ptrs.len();
+        let metadata_size = 8 + (argc + 1) * 8 + (envp_ptrs.len() + 1) * 8 + auxv_data.len() * 16;
+        let initial_rsp = (strings_start - metadata_size) & !0xF;
 
-        let initial_rsp = new_rsp;
-        let mut pos = new_rsp;
-        // argc = 0
+        let mut pos = initial_rsp;
+        unsafe {
+            write_u64_to_user(user_pt, pos, argc as u64);
+        }
+        pos += 8;
+        for &ptr in &argv_ptrs {
+            unsafe {
+                write_u64_to_user(user_pt, pos, ptr as u64);
+            }
+            pos += 8;
+        }
         unsafe {
             write_u64_to_user(user_pt, pos, 0);
         }
         pos += 8;
-        // argv[0] = NULL
+        for &ptr in &envp_ptrs {
+            unsafe {
+                write_u64_to_user(user_pt, pos, ptr as u64);
+            }
+            pos += 8;
+        }
         unsafe {
             write_u64_to_user(user_pt, pos, 0);
         }
         pos += 8;
-        // envp[0] = NULL
-        unsafe {
-            write_u64_to_user(user_pt, pos, 0);
-        }
-        pos += 8;
-        // auxv entries
         for (atype, avalue) in &auxv_data {
             unsafe {
                 write_u64_to_user(user_pt, pos, *atype as u64);
@@ -1091,16 +1241,7 @@ impl Process {
         // frames, not ELF data frames.
         #[cfg(target_arch = "x86_64")]
         {
-            let page_size = pmm::page_size();
-            let kstack_base = kernel_stack_top - 4 * page_size; // 4 pages: guard + 3 stack pages
-            for page_addr in (kstack_base..kernel_stack_top).step_by(page_size) {
-                vmm::map_user(
-                    user_pt,
-                    page_addr,
-                    page_addr,
-                    vmm::PTEFlags::PRESENT | vmm::PTEFlags::WRITABLE,
-                );
-            }
+            map_kernel_stack_pages(user_pt, kernel_stack_top);
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = _kernel_stack_top_hint;
@@ -1344,12 +1485,7 @@ pub fn reclaim_process(idx: usize) -> bool {
         if p.page_table_root != 0 && !p.shared_page_table {
             crate::mm::vmm::free_user_page_table(p.page_table_root);
         }
-        // Free kernel stack frames (KERNEL_STACK_PAGES * PAGE_SIZE)
-        // Kernel stack is allocated from kernel_stack_top down
-        let stack_bottom = p.kernel_stack_top - crate::process::KERNEL_STACK_PAGES * 4096;
-        for offset in (0..crate::process::KERNEL_STACK_PAGES).step_by(4096) {
-            crate::mm::pmm::dealloc_frame(stack_bottom + offset);
-        }
+        dealloc_kernel_stack(p.kernel_stack_top);
         true
     } else {
         false
@@ -1569,6 +1705,8 @@ pub fn kill_clone_children(parent_pid: usize) {
             }
         }
     }
+    crate::syscall::cleanup_futex_waiters_for_processes(&indices_to_kill);
+
     for idx in indices_to_kill {
         // CLONE_CHILD_CLEARTID: notify futex waiters
         {

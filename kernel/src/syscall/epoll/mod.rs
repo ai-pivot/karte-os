@@ -69,7 +69,11 @@ impl EpollInstance {
 
 /// Global epoll state: fd → EpollInstance
 static EPOLL_INSTANCES: Mutex<BTreeMap<usize, EpollInstance>> = Mutex::new(BTreeMap::new());
-static NEXT_EPOLL_FD: Mutex<usize> = Mutex::new(100); // Start from fd 100
+static EPOLL_WAITERS: Mutex<BTreeMap<usize, alloc::vec::Vec<usize>>> = Mutex::new(BTreeMap::new());
+
+fn should_log_wait_debug() -> bool {
+    crate::syscall::debug_second_xbot_run_active()
+}
 
 // epoll constants
 const EPOLL_CTL_ADD: usize = 1;
@@ -83,14 +87,232 @@ const EPOLLHUP: u32 = 0x010;
 
 /// syscall 291: epoll_create1(flags) — create an epoll instance
 pub fn sys_epoll_create1(_flags: usize) -> isize {
-    let mut next = NEXT_EPOLL_FD.lock();
-    let fd = *next;
-    *next += 1;
-    drop(next);
+    let fd = match crate::process::with_fd_table(|ft| {
+        ft.alloc_special_fd(alloc::format!("epoll"), 0, crate::driver::fs::FdType::Epoll)
+    }) {
+        Some(fd) => fd,
+        None => return -24, // EMFILE
+    };
 
     EPOLL_INSTANCES.lock().insert(fd, EpollInstance::new());
-    crate::console_println!("[epoll] create1 → fd={}", fd);
     fd as isize
+}
+
+/// Release epoll/timer state associated with a closing process fd.
+pub fn close_fd(fd: usize) {
+    let mut instances = EPOLL_INSTANCES.lock();
+    let removed_instance = instances.remove(&fd).is_some();
+    let mut removed_entries = 0usize;
+    for instance in instances.values_mut() {
+        if instance.entries.remove(&fd).is_some() {
+            removed_entries += 1;
+        }
+    }
+    let removed_waiters = EPOLL_WAITERS
+        .lock()
+        .remove(&fd)
+        .map_or(0, |slots| slots.len());
+    let removed_timer = TIMERFD_STATES.lock().remove(&fd).is_some();
+    if removed_instance || removed_entries != 0 || removed_waiters != 0 || removed_timer {
+        // #region agent log
+        crate::console_println!(
+            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H7","location":"kernel/src/syscall/epoll/mod.rs:close_fd","message":"epoll close fd cleanup","data":{{"fd":{},"removed_instance":{},"removed_entries":{},"removed_waiters":{},"removed_timer":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+            fd,
+            removed_instance,
+            removed_entries,
+            removed_waiters,
+            removed_timer,
+            crate::process::current_pid(),
+            crate::process::current_index(),
+            crate::arch::platform::uptime_ms(),
+            crate::arch::platform::uptime_ms(),
+        );
+        // #endregion
+    }
+}
+
+/// Wake tasks blocked in epoll_wait for any epoll instance watching `fd`.
+pub fn wake_waiters_for_fd(fd: usize) {
+    let mut epfds = alloc::vec::Vec::new();
+    {
+        let instances = EPOLL_INSTANCES.lock();
+        for (&epfd, instance) in instances.iter() {
+            if instance.entries.contains_key(&fd) {
+                epfds.push(epfd);
+            }
+        }
+    }
+
+    let mut waiters = EPOLL_WAITERS.lock();
+    let mut waiter_count = 0usize;
+    let mut woken_count = 0usize;
+    for epfd in epfds {
+        if let Some(slots) = waiters.get_mut(&epfd) {
+            for &proc_idx in slots.iter() {
+                waiter_count += 1;
+                if crate::sched::wake_task(proc_idx) {
+                    woken_count += 1;
+                }
+            }
+            slots.clear();
+        }
+    }
+    waiters.retain(|_, slots| !slots.is_empty());
+    if waiter_count != 0 {
+        // #region agent log
+        crate::console_println!(
+            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H1,H2,H4","location":"kernel/src/syscall/epoll/mod.rs:wake_waiters_for_fd","message":"epoll wake waiters","data":{{"fd":{},"waiters":{},"woken":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+            fd,
+            waiter_count,
+            woken_count,
+            crate::process::current_pid(),
+            crate::process::current_index(),
+            crate::arch::platform::uptime_ms(),
+            crate::arch::platform::uptime_ms(),
+        );
+        // #endregion
+    }
+}
+
+fn register_waiter(epfd: usize) -> usize {
+    let proc_idx = crate::process::current_index();
+    let mut waiters = EPOLL_WAITERS.lock();
+    let slots = waiters.entry(epfd).or_insert_with(alloc::vec::Vec::new);
+    if !slots.contains(&proc_idx) {
+        slots.push(proc_idx);
+    }
+    proc_idx
+}
+
+fn unregister_waiter(epfd: usize, proc_idx: usize) {
+    let mut waiters = EPOLL_WAITERS.lock();
+    if let Some(slots) = waiters.get_mut(&epfd) {
+        slots.retain(|&slot| slot != proc_idx);
+        if slots.is_empty() {
+            waiters.remove(&epfd);
+        }
+    }
+}
+
+fn collect_ready_events(
+    epfd: usize,
+    max_events: usize,
+) -> Result<alloc::vec::Vec<(u32, u64)>, isize> {
+    let mut ready_events: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
+    let mut instances = EPOLL_INSTANCES.lock();
+    let instance = instances.get_mut(&epfd).ok_or(-9_isize)?; // EBADF
+
+    for (&fd, entry) in &mut instance.entries {
+        if ready_events.len() >= max_events {
+            break;
+        }
+
+        let mut revents = 0u32;
+        let fd_desc = crate::process::with_fd_table(|ft| ft.get(fd).cloned());
+
+        if let Some(ref desc) = fd_desc {
+            if entry.event.events & EPOLLIN != 0 && desc.is_readable() {
+                revents |= EPOLLIN;
+            }
+            if entry.event.events & EPOLLOUT != 0 && desc.is_writable() {
+                revents |= EPOLLOUT;
+            }
+            if matches!(desc.fd_type, crate::driver::fs::FdType::Timerfd) && revents & EPOLLIN != 0
+            {
+                TIMERFD_STATES.lock().insert(fd, false);
+            }
+        } else {
+            revents = EPOLLHUP;
+        }
+
+        let is_et = entry.event.events & EPOLLET != 0;
+        let prev_revents = entry.last_revents;
+        if is_et && revents == prev_revents && revents != EPOLLHUP {
+            continue;
+        }
+        entry.last_revents = revents;
+
+        if revents != 0 {
+            if crate::syscall::debug_second_xbot_run_active() {
+                let fd_type = fd_desc
+                    .as_ref()
+                    .map(|desc| alloc::format!("{:?}", desc.fd_type))
+                    .unwrap_or_else(|| alloc::format!("missing"));
+                // #region agent log
+                crate::console_println!(
+                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H17,H18,H19","location":"kernel/src/syscall/epoll/mod.rs:collect_ready_events","message":"epoll ready event","data":{{"epfd":{},"fd":{},"fd_type":"{}","events":{},"revents":{},"last_revents":{},"data":{},"is_et":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                    epfd,
+                    fd,
+                    fd_type,
+                    entry.event.events,
+                    revents,
+                    prev_revents,
+                    entry.event.data,
+                    is_et,
+                    crate::process::current_pid(),
+                    crate::process::current_index(),
+                    crate::arch::platform::uptime_ms(),
+                    crate::arch::platform::uptime_ms(),
+                );
+                // #endregion
+            }
+            ready_events.push((revents, entry.event.data));
+        }
+    }
+
+    Ok(ready_events)
+}
+
+fn write_ready_events(events_ptr: usize, ready_events: &[(u32, u64)]) -> isize {
+    for (i, &(rev, data)) in ready_events.iter().enumerate() {
+        write_epoll_event(
+            events_ptr + i * EPOLL_EVENT_SIZE,
+            EpollEvent { events: rev, data },
+        );
+    }
+    ready_events.len() as isize
+}
+
+fn epoll_target_supported(desc: &crate::driver::fs::FileDescriptor) -> bool {
+    match &desc.fd_type {
+        crate::driver::fs::FdType::Stdio
+        | crate::driver::fs::FdType::PipeRead
+        | crate::driver::fs::FdType::PipeWrite => true,
+        crate::driver::fs::FdType::Eventfd | crate::driver::fs::FdType::Timerfd => true,
+        crate::driver::fs::FdType::Epoll
+        | crate::driver::fs::FdType::File
+        | crate::driver::fs::FdType::FakeFile(_)
+        | crate::driver::fs::FdType::VirtualFile
+        | crate::driver::fs::FdType::Urandom
+        | crate::driver::fs::FdType::VfsFile(_)
+        | crate::driver::fs::FdType::Ext4File(_) => false,
+    }
+}
+
+fn validate_epoll_target(fd: usize) -> Result<(alloc::string::String, bool, bool), isize> {
+    let fd_desc = crate::process::with_fd_table(|ft| ft.get(fd).cloned()).ok_or(-9_isize)?;
+    let fd_type = alloc::format!("{:?}", fd_desc.fd_type);
+    let readable = fd_desc.is_readable();
+    let writable = fd_desc.is_writable();
+    if !epoll_target_supported(&fd_desc) {
+        if crate::syscall::debug_second_xbot_run_active() {
+            // #region agent log
+            crate::console_println!(
+                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H17,H18,H20","location":"kernel/src/syscall/epoll/mod.rs:validate_epoll_target","message":"epoll ctl reject target","data":{{"fd":{},"fd_type":"{}","readable":{},"writable":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                fd,
+                fd_type,
+                readable,
+                writable,
+                crate::process::current_pid(),
+                crate::process::current_index(),
+                crate::arch::platform::uptime_ms(),
+                crate::arch::platform::uptime_ms(),
+            );
+            // #endregion
+        }
+        return Err(-1); // EPERM: regular files and directories are not epollable.
+    }
+    Ok((fd_type, readable, writable))
 }
 
 /// syscall 233: epoll_ctl(epfd, op, fd, event) — control an epoll instance
@@ -107,18 +329,10 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
                 return -14; // EFAULT
             }
             let event = read_epoll_event(event_ptr);
-            let raw_bytes = crate::syscall::user_read_bytes(event_ptr, EPOLL_EVENT_SIZE);
-            let ev_events = event.events;
-            let ev_data = event.data;
-            crate::console_println!(
-                "[epoll_ctl] ADD epfd={:#x} fd={} events={:#x} data={:#x} ptr={:#x} raw={:02x?}",
-                epfd,
-                fd,
-                ev_events,
-                ev_data,
-                event_ptr,
-                &raw_bytes[..EPOLL_EVENT_SIZE]
-            );
+            let (fd_type, readable, writable) = match validate_epoll_target(fd) {
+                Ok(info) => info,
+                Err(e) => return e,
+            };
             instance.entries.insert(
                 fd,
                 EpollEntry {
@@ -126,12 +340,31 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
                     last_revents: 0,
                 },
             );
+            // #region agent log
+            crate::console_println!(
+                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H1,H2","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_ctl","message":"epoll ctl add","data":{{"epfd":{},"fd":{},"events":{},"data":{},"fd_type":"{}","readable":{},"writable":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                epfd,
+                fd,
+                event.events,
+                event.data,
+                fd_type,
+                readable,
+                writable,
+                crate::process::current_pid(),
+                crate::process::current_index(),
+                crate::arch::platform::uptime_ms(),
+                crate::arch::platform::uptime_ms(),
+            );
+            // #endregion
         }
         EPOLL_CTL_MOD => {
             if event_ptr == 0 {
                 return -14;
             }
             let event = read_epoll_event(event_ptr);
+            if let Err(e) = validate_epoll_target(fd) {
+                return e;
+            }
             match instance.entries.get_mut(&fd) {
                 Some(entry) => {
                     entry.event = event;
@@ -152,10 +385,10 @@ pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isi
 
 /// syscall 232: epoll_wait(epfd, events, maxevents, timeout)
 ///
-/// For Go runtime compatibility:
-/// - Timer fds are always reported as ready (Go uses timerfd for scheduler ticks)
-/// - Stdin is checked via tty buffer
-/// - Other fds are reported as ready if watched for input
+/// Go's netpoller relies on Linux epoll_wait semantics: timeout=0 polls,
+/// timeout>0 blocks until readiness or timeout, and timeout<0 blocks until
+/// readiness. Returning 0 immediately for blocking waits makes Go spin in its
+/// timer loop.
 pub fn sys_epoll_wait(
     epfd: usize,
     events_ptr: usize,
@@ -169,103 +402,135 @@ pub fn sys_epoll_wait(
         return -14; // EFAULT
     }
 
-    // Validate epfd
-    {
-        let instances = EPOLL_INSTANCES.lock();
-        if !instances.contains_key(&epfd) {
-            return -9; // EBADF
-        }
+    let ready_events = match collect_ready_events(epfd, max_events) {
+        Ok(events) => events,
+        Err(e) => return e,
+    };
+    if !ready_events.is_empty() {
+        return write_ready_events(events_ptr, &ready_events);
     }
 
-    // Collect ready events before writing to user memory
-    let mut ready_events: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
-
-    let mut instances = EPOLL_INSTANCES.lock();
-    if let Some(instance) = instances.get_mut(&epfd) {
-        for (&fd, entry) in &mut instance.entries {
-            if ready_events.len() >= max_events {
-                break;
-            }
-
-            let mut revents = 0u32;
-
-            // Unified fd ready check — look up FdTable and dispatch by FdType.
-            let fd_desc = crate::process::with_fd_table(|ft| ft.get(fd).cloned());
-
-            if let Some(desc) = fd_desc {
-                // Readable check
-                if entry.event.events & EPOLLIN != 0 && desc.is_readable() {
-                    revents |= EPOLLIN;
-                }
-                // Writable check
-                if entry.event.events & EPOLLOUT != 0 && desc.is_writable() {
-                    revents |= EPOLLOUT;
-                }
-                // Timerfd edge-triggered: clear trigger flag after reporting
-                if matches!(desc.fd_type, crate::driver::fs::FdType::Timerfd)
-                    && revents & EPOLLIN != 0
-                {
-                    TIMERFD_STATES.lock().insert(fd, false);
-                }
-            } else {
-                // fd closed/invalid — report EPOLLHUP so caller can clean up
-                revents = EPOLLHUP;
-            }
-
-            let is_et = entry.event.events & EPOLLET != 0;
-
-            // EPOLLET: only report when revents changes (edge-triggered semantics)
-            if is_et && revents == entry.last_revents && revents != EPOLLHUP {
-                continue; // no change since last report
-            }
-            entry.last_revents = revents;
-
-            if revents != 0 {
-                ready_events.push((revents, entry.event.data));
-            }
-        }
-    }
-
-    let ready_count = ready_events.len();
-    if ready_count > 0 {
-        for (i, &(rev, data)) in ready_events.iter().enumerate() {
-            crate::console_println!(
-                "[epoll_wait] event[{}] events={:#x} data={:#x}",
-                i,
-                rev,
-                data
-            );
-        }
-        for (i, &(rev, data)) in ready_events.iter().enumerate() {
-            write_epoll_event(
-                events_ptr + i * EPOLL_EVENT_SIZE,
-                EpollEvent { events: rev, data },
-            );
-        }
-        let verify = crate::syscall::user_read_bytes(events_ptr, EPOLL_EVENT_SIZE);
-        crate::console_println!(
-            "[epoll_wait] wrote to ptr={:#x} verify={:02x?}",
-            events_ptr,
-            &verify[..EPOLL_EVENT_SIZE]
-        );
-        return ready_count as isize;
-    }
-
-    // No events ready
     if timeout_ms == 0 {
-        return 0; // Non-blocking
+        if should_log_wait_debug() {
+            let entry_count = EPOLL_INSTANCES
+                .lock()
+                .get(&epfd)
+                .map(|instance| instance.entries.len())
+                .unwrap_or(0);
+            // #region agent log
+            crate::console_println!(
+                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H21,H22,H25","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait poll empty","data":{{"epfd":{},"entries":{},"max_events":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                epfd,
+                entry_count,
+                max_events,
+                crate::process::current_pid(),
+                crate::process::current_index(),
+                crate::arch::platform::uptime_ms(),
+                crate::arch::platform::uptime_ms(),
+            );
+            // #endregion
+        }
+        return 0;
     }
 
-    // Positive timeout or infinite wait: block the task until timeout
-    drop(instances);
-    if timeout_ms > 0 {
-        let target = crate::arch::platform::uptime_ms() + timeout_ms as u64;
-        crate::sched::sleep_until(target);
-    } else {
-        // Infinite wait: block indefinitely until an event triggers
-        // (would need wake from epoll_ctl/add, for now block 100ms and retry)
-        let target = crate::arch::platform::uptime_ms() + 100;
-        crate::sched::sleep_until(target);
+    let proc_idx = register_waiter(epfd);
+    let ready_events = match collect_ready_events(epfd, max_events) {
+        Ok(events) => events,
+        Err(e) => {
+            unregister_waiter(epfd, proc_idx);
+            return e;
+        }
+    };
+    if !ready_events.is_empty() {
+        unregister_waiter(epfd, proc_idx);
+        return write_ready_events(events_ptr, &ready_events);
     }
-    0
+
+    let deadline = if timeout_ms > 0 {
+        Some(crate::arch::platform::uptime_ms().saturating_add(timeout_ms as u64))
+    } else {
+        None
+    };
+
+    loop {
+        if let Some(wake_tick) = deadline {
+            let now = crate::arch::platform::uptime_ms();
+            if now >= wake_tick {
+                unregister_waiter(epfd, proc_idx);
+                return 0;
+            }
+            if should_log_wait_debug() {
+                // #region agent log
+                crate::console_println!(
+                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H6","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait blocking","data":{{"epfd":{},"timeout_ms":{},"wake_tick":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                    epfd,
+                    timeout_ms,
+                    wake_tick,
+                    crate::process::current_pid(),
+                    crate::process::current_index(),
+                    now,
+                    now,
+                );
+                // #endregion
+            }
+            crate::sched::sleep_until(wake_tick);
+        } else {
+            if should_log_wait_debug() {
+                // #region agent log
+                crate::console_println!(
+                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H6","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait blocking","data":{{"epfd":{},"timeout_ms":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                    epfd,
+                    timeout_ms,
+                    crate::process::current_pid(),
+                    crate::process::current_index(),
+                    crate::arch::platform::uptime_ms(),
+                    crate::arch::platform::uptime_ms(),
+                );
+                // #endregion
+            }
+            crate::sched::schedule_block();
+        }
+
+        let ready_events = match collect_ready_events(epfd, max_events) {
+            Ok(events) => events,
+            Err(e) => {
+                unregister_waiter(epfd, proc_idx);
+                return e;
+            }
+        };
+        if !ready_events.is_empty() {
+            unregister_waiter(epfd, proc_idx);
+            if should_log_wait_debug() {
+                // #region agent log
+                crate::console_println!(
+                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H6","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait woke ready","data":{{"epfd":{},"ready":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                    epfd,
+                    ready_events.len(),
+                    crate::process::current_pid(),
+                    crate::process::current_index(),
+                    crate::arch::platform::uptime_ms(),
+                    crate::arch::platform::uptime_ms(),
+                );
+                // #endregion
+            }
+            return write_ready_events(events_ptr, &ready_events);
+        }
+
+        if deadline.is_some() && crate::arch::platform::uptime_ms() >= deadline.unwrap_or(0) {
+            unregister_waiter(epfd, proc_idx);
+            if should_log_wait_debug() {
+                // #region agent log
+                crate::console_println!(
+                    r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H6","location":"kernel/src/syscall/epoll/mod.rs:sys_epoll_wait","message":"epoll wait woke empty","data":{{"epfd":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                    epfd,
+                    crate::process::current_pid(),
+                    crate::process::current_index(),
+                    crate::arch::platform::uptime_ms(),
+                    crate::arch::platform::uptime_ms(),
+                );
+                // #endregion
+            }
+            return 0;
+        }
+    }
 }

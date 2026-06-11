@@ -62,21 +62,11 @@ impl FrameAllocator {
             *word = 0;
         }
 
-        // Mark bitmap region as used
-        let bitmap_frames = (managed_start - start + PAGE_SIZE - 1) / PAGE_SIZE;
-        for i in 0..bitmap_frames {
-            let word = i / 64;
-            let bit = i % 64;
-            if word < bitmap.len() {
-                bitmap[word] |= 1u64 << bit;
-            }
-        }
-
         let allocator = Self {
             start: managed_start,
             bitmap,
             total_frames: managed_frames,
-            next_free: bitmap_frames,
+            next_free: 0,
         };
         allocator.debug_init_info(kernel_end, start, managed_start, end);
         allocator

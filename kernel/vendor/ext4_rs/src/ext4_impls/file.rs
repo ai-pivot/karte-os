@@ -291,13 +291,6 @@ impl Ext4 {
             return Ok(0);
         }
 
-        log::warn!(
-            "[write_at] inode={} offset={} len={}",
-            inode,
-            offset,
-            write_buf_len
-        );
-
         // get the inode reference
         let mut inode_ref = self.get_inode_ref(inode);
 
@@ -313,7 +306,6 @@ impl Ext4 {
             );
         }
 
-        log::warn!("[write_at] file_size={}", file_size);
         log::trace!(
             "[Write] Starting write - inode: {}, offset: {}, size: {}, current file size: {}",
             inode,
@@ -330,6 +322,44 @@ impl Ext4 {
         // start block index
         let mut iblk_idx = iblock_start;
         let ifile_blocks = (file_size + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64;
+
+        let ensure_pblock =
+            |fs: &Ext4, inode_ref: &mut Ext4InodeRef, lblock: u32| -> Result<Ext4Fsblk> {
+                let existing = fs.get_pblock_idx(inode_ref, lblock)?;
+                if existing != 0 {
+                    return Ok(existing);
+                }
+
+                let mut start_bgid = 0;
+                let new_block = fs.balloc_alloc_block_from(inode_ref, &mut start_bgid)?;
+                let mut newex = Ext4Extent::default();
+                newex.first_block = lblock;
+                newex.store_pblock(new_block);
+                newex.block_count = 1;
+                if let Err(e) = fs.insert_extent(inode_ref, &mut newex) {
+                    if e.error() != Errno::ENOENT || lblock != 0 {
+                        return Err(e);
+                    }
+                    inode_ref.inode.extent_tree_init();
+                    inode_ref.inode.set_size(0);
+                    fs.write_back_inode(inode_ref);
+                    fs.insert_extent(inode_ref, &mut newex)?;
+                    log::warn!(
+                    "[EXT4-REPAIR] reset corrupt empty extent tree inode={} lblock={} pblock={}",
+                    inode_ref.inode_num,
+                    lblock,
+                    new_block
+                );
+                }
+                fs.write_back_inode(inode_ref);
+                log::warn!(
+                    "[EXT4-REPAIR] allocated missing extent inode={} lblock={} pblock={}",
+                    inode_ref.inode_num,
+                    lblock,
+                    new_block
+                );
+                Ok(new_block)
+            };
 
         // Calculate the unaligned size
         let unaligned = offset % BLOCK_SIZE;
@@ -356,11 +386,6 @@ impl Ext4 {
         };
 
         if blocks_to_allocate > 0 {
-            log::warn!(
-                "[write_at] blocks_to_allocate={} inode={}",
-                blocks_to_allocate,
-                inode_ref.inode_num
-            );
             log::trace!("[Pre-allocation] Allocating {} blocks", blocks_to_allocate);
 
             // 使用append_inode_pblk_batch进行批量块分配
@@ -436,7 +461,7 @@ impl Ext4 {
             log::trace!("[Unaligned Write] Writing {} bytes", len);
 
             // Get the physical block id
-            let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
+            let pblock_idx = match ensure_pblock(self, &mut inode_ref, iblk_idx as u32) {
                 Ok(idx) => idx,
                 Err(e) => {
                     log::error!(
@@ -480,7 +505,7 @@ impl Ext4 {
 
         // Aligned write
         let mut aligned_blocks = 0;
-        log::info!(
+        log::trace!(
             "[Aligned Write] Starting aligned writes for {} blocks",
             (write_buf_len - written + BLOCK_SIZE - 1) / BLOCK_SIZE
         );
@@ -489,7 +514,7 @@ impl Ext4 {
             aligned_blocks += 1;
 
             // Get the physical block id
-            let pblock_idx = match self.get_pblock_idx(&inode_ref, iblk_idx as u32) {
+            let pblock_idx = match ensure_pblock(self, &mut inode_ref, iblk_idx as u32) {
                 Ok(idx) => idx,
                 Err(e) => {
                     log::error!(
@@ -500,6 +525,14 @@ impl Ext4 {
                     return Err(e);
                 }
             };
+            if pblock_idx == 0 {
+                log::error!(
+                    "[Write] Invalid physical block 0 for inode={} logical block={}",
+                    inode,
+                    iblk_idx
+                );
+                return return_errno_with_message!(Errno::EIO, "Invalid extent mapping");
+            }
             total_blocks += 1;
 
             let block_offset = pblock_idx as usize * BLOCK_SIZE;
@@ -561,16 +594,16 @@ impl Ext4 {
             self.write_back_inode(&mut inode_ref);
         }
 
-        log::info!("=== Write Performance Summary ===");
-        log::info!(
+        log::trace!("=== Write Performance Summary ===");
+        log::trace!(
             "[Blocks] Total blocks: {}, New blocks: {}, Aligned blocks: {}",
             total_blocks,
             new_blocks,
             aligned_blocks
         );
-        log::info!("[Bytes] Total written: {}", written);
-        log::info!("[File] Final size: {}", inode_ref.inode.size());
-        log::info!("=== End of Write Analysis ===");
+        log::trace!("[Bytes] Total written: {}", written);
+        log::trace!("[File] Final size: {}", inode_ref.inode.size());
+        log::trace!("=== End of Write Analysis ===");
 
         Ok(written)
     }
@@ -624,8 +657,10 @@ impl Ext4 {
             return_errno_with_message!(Errno::EINVAL, "truncate_inode cannot grow a file");
         }
 
-        // no-op
-        if old_size == new_size {
+        if new_size == 0 {
+            inode_ref.inode.extent_tree_init();
+            inode_ref.inode.set_size(0);
+            self.write_back_inode(inode_ref);
             return Ok(EOK);
         }
 

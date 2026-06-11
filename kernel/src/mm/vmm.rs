@@ -90,12 +90,19 @@ impl PTE {
 
     #[cfg(target_arch = "x86_64")]
     pub fn new(ppn: usize, flags: PTEFlags) -> Self {
-        // x86_64: PTE = physical_address[51:12] << 12 | flags
-        // For non-leaf entries, WRITABLE should be set so child entries can be modified
-        let mut f = flags;
-        // Ensure non-leaf entries are writable (needed for page table updates)
-        f.insert(PTEFlags::WRITABLE);
-        Self(((ppn as u64) << 12) | f.bits())
+        Self::new_leaf(ppn, flags)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn new_leaf(ppn: usize, flags: PTEFlags) -> Self {
+        // x86_64 leaf PTEs must preserve exact permissions; read-only ELF
+        // pages must not become writable during copy/rebuild paths.
+        Self(((ppn as u64) << 12) | flags.bits())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn new_nonleaf(ppn: usize) -> Self {
+        Self(((ppn as u64) << 12) | NON_LEAF_FLAGS)
     }
 
     pub fn flags(&self) -> PTEFlags {
@@ -123,19 +130,15 @@ impl PTE {
         }
     }
 
+    #[cfg(target_arch = "riscv64")]
     pub fn is_leaf(&self) -> bool {
-        #[cfg(target_arch = "riscv64")]
-        {
-            let f = self.flags();
-            f.contains(PTEFlags::R) || f.contains(PTEFlags::W) || f.contains(PTEFlags::X)
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            // x86_64: leaf if PS bit set, OR if at level 0 (PT level, always leaf)
-            self.flags().contains(PTEFlags::PS) || self.is_valid()
-            // Note: at PT level (level 0), all valid entries are leaf entries
-            // We handle this in map() by not checking is_leaf at level 0
-        }
+        let f = self.flags();
+        f.contains(PTEFlags::R) || f.contains(PTEFlags::W) || f.contains(PTEFlags::X)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn is_leaf_at_level(&self, level: usize) -> bool {
+        self.is_valid() && (level == 0 || self.flags().contains(PTEFlags::PS))
     }
 }
 
@@ -320,29 +323,28 @@ pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: P
     let start_aligned = start & !(HUGE_PAGE_SIZE - 1);
     let end_aligned = (end + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
 
-    let mut table = root;
-    // Walk P4 → P3, creating intermediate tables as needed
-    for level in &[3usize, 2] {
-        // For 0..512GB range, P4[0] covers it all. level=3 is P3.
-        // Use vpn=0 for the low-memory identity map.
-        let vpn = PageTable::vpn(start_aligned, *level);
-        let entry = &mut table.entries[vpn];
-        if !entry.is_valid() {
-            let new_table = PageTable::zeroed();
-            let ppn = (new_table as *const PageTable as usize) >> 12;
-            *entry = PTE(((ppn as u64) << 12) | NON_LEAF_FLAGS);
-        }
-        let ppn = entry.ppn();
-        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
-    }
-
-    // table is now P2. Set 2MB entries directly.
     let mut addr = start_aligned;
     while addr < end_aligned {
-        let vpn = PageTable::vpn(addr, 1); // P2 index
+        let p4_idx = PageTable::vpn(addr, 3);
+        if !root.entries[p4_idx].is_valid() {
+            let new_p3 = PageTable::zeroed();
+            let ppn = (new_p3 as *const PageTable as usize) >> 12;
+            root.entries[p4_idx] = PTE::new_nonleaf(ppn);
+        }
+
+        let p3 = unsafe { &mut *((root.entries[p4_idx].ppn() << 12) as *mut PageTable) };
+        let p3_idx = PageTable::vpn(addr, 2);
+        if !p3.entries[p3_idx].is_valid() {
+            let new_p2 = PageTable::zeroed();
+            let ppn = (new_p2 as *const PageTable as usize) >> 12;
+            p3.entries[p3_idx] = PTE::new_nonleaf(ppn);
+        }
+
+        let p2 = unsafe { &mut *((p3.entries[p3_idx].ppn() << 12) as *mut PageTable) };
+        let vpn = PageTable::vpn(addr, 1);
         let ppn = addr >> 12;
         let huge_flags = flags.bits() | PTEFlags::PS.bits();
-        table.entries[vpn] = PTE(((ppn as u64) << 12) | huge_flags);
+        p2.entries[vpn] = PTE(((ppn as u64) << 12) | huge_flags);
         addr += HUGE_PAGE_SIZE;
     }
 }
@@ -382,8 +384,8 @@ pub fn init() {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Map all physical memory for kernel access using 2MB huge pages.
-        identity_map_2mb(root, 0x0, 0x2000_0000, PTEFlags::KRWX);
+        // Map all PMM-managed physical memory for kernel access.
+        identity_map_2mb(root, 0x0, pmm::total_memory(), PTEFlags::KRWX);
         // Map MMIO regions via 2MB pages (AHCI, LAPIC, IOAPIC, etc.)
         identity_map_2mb(root, 0xFE000000, 0xFF000000, PTEFlags::KRW);
     }
@@ -849,6 +851,48 @@ pub fn run_tests() {
             );
             return false;
         }
+        true
+    });
+
+    #[cfg(target_arch = "x86_64")]
+    crate::test::run_test("vmm_kernel_stack_mapping_preserves_user_elf_page", || {
+        let root = PageTable::zeroed();
+        let page_size = pmm::page_size();
+        let elf_vaddr = 0x0460_3000usize;
+        let elf_frame = match pmm::alloc_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+
+        map(root, elf_vaddr, elf_frame, PTEFlags::UR);
+        if translate_user(root, elf_vaddr) != Some(elf_frame) {
+            return false;
+        }
+
+        let stack_phys_base = elf_vaddr - (crate::process::KERNEL_STACK_PAGES - 1) * page_size;
+        let kernel_stack_top = crate::process::kernel_stack_top_from_phys_base(stack_phys_base);
+        crate::process::map_kernel_stack_pages(root, kernel_stack_top);
+
+        let after = translate_user(root, elf_vaddr);
+        if after != Some(elf_frame) {
+            crate::console_println!(
+                "[FAIL] kernel stack mapping replaced ELF page: before={:#x} after={:?}",
+                elf_frame,
+                after
+            );
+            return false;
+        }
+
+        let stack_last_page = kernel_stack_top - page_size;
+        if translate_user(root, stack_last_page) != Some(elf_vaddr) {
+            crate::console_println!(
+                "[FAIL] high kernel stack alias missing: vaddr={:#x} phys={:?}",
+                stack_last_page,
+                translate_user(root, stack_last_page)
+            );
+            return false;
+        }
+
         true
     });
 

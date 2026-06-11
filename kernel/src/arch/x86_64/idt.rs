@@ -1156,22 +1156,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             );
         }
     } else {
-        // User PF
-        crate::console_println!(
-            "[PF] USER addr={:#x} page={:#x} rip={:#x} rsp={:#x} err={:#x} P={} W={} U={} pid={} fs_base={:#x} cr3={:#x} can_lazy={}",
-            fault_addr_val,
-            page_addr,
-            rip,
-            rsp_val,
-            error_code,
-            error_code & 1,
-            (error_code >> 1) & 1,
-            (error_code >> 2) & 1,
-            crate::process::current_pid(),
-            fs_base,
-            raw_cr3,
-            can_lazy_alloc
-        );
+        let _ = (rsp_val, fs_base, raw_cr3);
     }
 
     // Handle user-mode page faults
@@ -1207,17 +1192,22 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                     } else {
                         crate::mm::vmm::PTEFlags::URW
                     };
+                    let mut updated = false;
+                    let mut rejected_elf_identity = false;
+                    let mut rejected_pte = None;
                     super::trap::with_kernel_cr3(|| {
                         let user_pt = super::trap::get_user_pt_safe();
                         if let Some(frame) = crate::mm::vmm::translate_user(user_pt, page_addr) {
                             let is_identity = frame == page_addr;
                             if is_identity {
                                 // Identity mapping in user space — this came from copy_kernel_mappings.
-                                // For ELF VMAs, the identity mapping IS the ELF data.
-                                // For heap/stack, replace identity mappings with private frames.
                                 if vma_is_elf {
-                                    // ELF data: just upgrade permissions, preserve the frame
-                                    crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
+                                    // ELF PT_LOAD pages must have been loaded into private
+                                    // non-identity frames. Upgrading a supervisor identity
+                                    // mapping would let Go read unrelated physical memory
+                                    // as .gopclntab and hide the real loader corruption.
+                                    rejected_elf_identity = true;
+                                    rejected_pte = crate::mm::vmm::debug_pte(user_pt, page_addr);
                                 } else {
                                     // Anonymous mmap/heap/stack identity mapping: replace with a private zeroed frame.
                                     if let Some(new_frame) = crate::mm::pmm::alloc_frame() {
@@ -1231,16 +1221,29 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                         crate::mm::vmm::map(
                                             user_pt, page_addr, new_frame, pte_flags,
                                         );
+                                        updated = true;
                                     }
                                 }
                             } else {
                                 // Non-identity frame: restore the permissions allowed by the VMA.
                                 crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
+                                updated = true;
                             }
                         }
-                        super::trap::flush_tlb_addr(page_addr);
                     });
-                    break 'handler true;
+                    if rejected_elf_identity {
+                        crate::console_println!(
+                            "[ELF-INVARIANT] PF on identity ELF page addr={:#x} rip={:#x} pte={:?}",
+                            page_addr,
+                            rip,
+                            rejected_pte
+                        );
+                        break 'handler false;
+                    }
+                    if updated {
+                        super::trap::flush_tlb_addr(page_addr);
+                        break 'handler true;
+                    }
                 }
             }
             break 'handler false;
@@ -1257,12 +1260,10 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 Some(vma_prot) => {
                     if vma_prot != 0 {
                         // Valid VMA with non-NONE prot → lazy allocate
-                        crate::console_println!(
-                            "[PF-OK] addr={:#x} prot={:#x}",
-                            fault_addr_val,
-                            vma_prot
-                        );
                         let pte_flags = crate::syscall::prot_to_pte_flags(vma_prot);
+                        let mut mapped = false;
+                        let mut rejected_elf_identity = false;
+                        let mut rejected_pte = None;
                         super::trap::with_kernel_cr3(|| {
                             let user_pt = super::trap::get_user_pt_safe();
                             let old_pte = crate::mm::vmm::debug_pte(user_pt, page_addr);
@@ -1274,18 +1275,14 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                             if needs_alloc {
                                 let vma_is_elf = crate::syscall::vma_is_elf(fault_addr_val);
                                 if vma_is_elf && old_frame.is_some() {
-                                    // ELF data with identity mapping — just remap with correct perms
-                                    crate::mm::vmm::map(
-                                        user_pt,
-                                        page_addr,
-                                        old_frame.unwrap(),
-                                        pte_flags,
-                                    );
+                                    rejected_elf_identity = true;
+                                    rejected_pte = old_pte;
                                 } else if let Some(frame) = crate::mm::pmm::alloc_frame() {
                                     unsafe {
                                         core::ptr::write_bytes(frame as *mut u8, 0, page_size);
                                     }
                                     crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
+                                    mapped = true;
                                 }
                             } else {
                                 // Frame already exists (from copy_kernel_mappings identity map
@@ -1294,16 +1291,23 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                 // copy_kernel_mappings) but the VMA says PROT_READ|PROT_WRITE.
                                 if let Some(old_frame) = old_frame {
                                     crate::mm::vmm::map(user_pt, page_addr, old_frame, pte_flags);
-                                    crate::console_println!(
-                                        "[PF-REMAP] vaddr={:#x} frame={:#x} flags={:#x} (permission upgrade)",
-                                        page_addr,
-                                        old_frame,
-                                        pte_flags.bits()
-                                    );
+                                    mapped = true;
                                 }
                             }
                         });
-                        break 'handler true;
+                        if rejected_elf_identity {
+                            crate::console_println!(
+                                "[ELF-INVARIANT] not-present PF saw identity ELF page addr={:#x} old_pte={:?}",
+                                page_addr,
+                                rejected_pte
+                            );
+                            break 'handler false;
+                        }
+                        if mapped {
+                            super::trap::flush_tlb_addr(page_addr);
+                            break 'handler true;
+                        }
+                        break 'handler false;
                     } else {
                         // PROT_NONE — explicitly reserved, refuse to allocate → segfault
                         break 'handler false;
@@ -1398,9 +1402,6 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
 
         false
     };
-
-    #[cfg(target_arch = "x86_64")]
-    crate::process::check_text_probe("pf", fault_addr_val, rip as usize);
 
     if !handled {
         let cr3: u64;

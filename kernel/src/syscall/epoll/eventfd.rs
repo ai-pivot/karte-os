@@ -22,9 +22,10 @@ static NEXT_EVENTFD: AtomicUsize = AtomicUsize::new(200); // Start from fd=200
 pub fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
     // Allocate fd number from the process's fd table
     let fd = crate::process::with_fd_table(|ft| {
-        ft.alloc(
+        ft.alloc_special_fd(
             alloc::format!("eventfd_{}", NEXT_EVENTFD.load(Ordering::Relaxed)),
             0,
+            crate::driver::fs::FdType::Eventfd,
         )
     });
     let fd = match fd {
@@ -39,14 +40,13 @@ pub fn sys_eventfd2(initval: usize, _flags: usize) -> isize {
         let mut states = EVENTFD_STATES.lock();
         states.insert(fd, initval as u64);
     }
-    // Update FdTable entry's type to Eventfd
-    crate::process::with_fd_table(|ft| {
-        if let Some(desc) = ft.get_mut(fd as usize) {
-            desc.fd_type = crate::driver::fs::FdType::Eventfd;
-            desc.fd_num = fd as usize;
-        }
-    });
     fd as isize
+}
+
+/// Remove eventfd state when the owning file descriptor is closed or the
+/// process exits without explicitly closing it.
+pub fn close_eventfd(fd: i32) {
+    EVENTFD_STATES.lock().remove(&fd);
 }
 
 /// Check if an fd is an eventfd.
@@ -64,6 +64,20 @@ pub fn eventfd_read(fd: i32, buf: usize, len: usize) -> isize {
     let mut states = EVENTFD_STATES.lock();
     if let Some(counter) = states.get_mut(&fd) {
         let val = *counter;
+        if crate::syscall::debug_second_xbot_run_active() {
+            // #region agent log
+            crate::console_println!(
+                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H21,H22,H25","location":"kernel/src/syscall/epoll/eventfd.rs:eventfd_read","message":"eventfd read","data":{{"fd":{},"counter":{},"len":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                fd,
+                val,
+                len,
+                crate::process::current_pid(),
+                crate::process::current_index(),
+                crate::arch::platform::uptime_ms(),
+                crate::arch::platform::uptime_ms(),
+            );
+            // #endregion
+        }
         if val == 0 {
             return -11; // EAGAIN — non-blocking, nothing to read
         }
@@ -86,15 +100,31 @@ pub fn eventfd_write(fd: i32, buf: usize, len: usize) -> isize {
     if val == u64::MAX {
         return -22; // EINVAL
     }
-    let mut states = EVENTFD_STATES.lock();
-    if let Some(counter) = states.get_mut(&fd) {
-        let old = *counter;
-        *counter = counter.saturating_add(val);
-        8
-    } else {
-        crate::console_println!("[eventfd] write fd={} EBADF!", fd);
-        -9 // EBADF
+    {
+        let mut states = EVENTFD_STATES.lock();
+        if let Some(counter) = states.get_mut(&fd) {
+            let old = *counter;
+            *counter = counter.saturating_add(val);
+            // #region agent log
+            crate::console_println!(
+                r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H2","location":"kernel/src/syscall/epoll/eventfd.rs:eventfd_write","message":"eventfd write","data":{{"fd":{},"val":{},"old":{},"new":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+                fd,
+                val,
+                old,
+                *counter,
+                crate::process::current_pid(),
+                crate::process::current_index(),
+                crate::arch::platform::uptime_ms(),
+                crate::arch::platform::uptime_ms(),
+            );
+            // #endregion
+        } else {
+            crate::console_println!("[eventfd] write fd={} EBADF!", fd);
+            return -9; // EBADF
+        }
     }
+    super::wake_waiters_for_fd(fd as usize);
+    8
 }
 
 /// Peek at eventfd counter without consuming it.

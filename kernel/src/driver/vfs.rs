@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use crate::sync::spinlock::SpinLock;
+use crate::sync::mutex::YieldMutex;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -194,7 +194,10 @@ pub struct VfsState {
     open_files: OpenFileTable,
 }
 
-static VFS: SpinLock<VfsState> = SpinLock::new(VfsState::new_internal());
+// VFS operations may call into ext4/AHCI block I/O. A plain SpinLock can
+// deadlock on single-core preemption if another task spins on VFS while the
+// lock holder is waiting in I/O, so contenders must yield to the scheduler.
+static VFS: YieldMutex<VfsState> = YieldMutex::new(VfsState::new_internal());
 
 impl VfsState {
     const fn new_internal() -> Self {
@@ -367,7 +370,47 @@ pub fn read(fd: usize, buf: &mut [u8]) -> Result<usize, VfsError> {
     let inode = of.inode;
     let offset = of.pos;
     let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
+    let log_enabled = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::syscall::debug_second_xbot_run_active()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    if log_enabled {
+        // #region agent log
+        crate::console_println!(
+            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H5","location":"kernel/src/driver/vfs.rs:read","message":"vfs read begin","data":{{"fd":{},"inode":{},"offset":{},"len":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+            fd,
+            inode,
+            offset,
+            buf.len(),
+            crate::process::current_pid(),
+            crate::process::current_index(),
+            crate::arch::platform::uptime_ms(),
+            crate::arch::platform::uptime_ms(),
+        );
+        // #endregion
+    }
     let bytes_read = mount.fs.read_file(inode, offset, buf)?;
+    if log_enabled {
+        // #region agent log
+        crate::console_println!(
+            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H5","location":"kernel/src/driver/vfs.rs:read","message":"vfs read end","data":{{"fd":{},"inode":{},"offset":{},"read":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+            fd,
+            inode,
+            offset,
+            bytes_read,
+            crate::process::current_pid(),
+            crate::process::current_index(),
+            crate::arch::platform::uptime_ms(),
+            crate::arch::platform::uptime_ms(),
+        );
+        // #endregion
+    }
     let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;
     of.pos += bytes_read;
     Ok(bytes_read)
@@ -384,7 +427,47 @@ pub fn write(fd: usize, data: &[u8]) -> Result<usize, VfsError> {
     let inode = of.inode;
     let offset = of.pos;
     let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
+    let log_enabled = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::syscall::debug_second_xbot_run_active()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    if log_enabled {
+        // #region agent log
+        crate::console_println!(
+            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H5","location":"kernel/src/driver/vfs.rs:write","message":"vfs write begin","data":{{"fd":{},"inode":{},"offset":{},"len":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+            fd,
+            inode,
+            offset,
+            data.len(),
+            crate::process::current_pid(),
+            crate::process::current_index(),
+            crate::arch::platform::uptime_ms(),
+            crate::arch::platform::uptime_ms(),
+        );
+        // #endregion
+    }
     let bytes_written = mount.fs.write_file(inode, offset, data)?;
+    if log_enabled {
+        // #region agent log
+        crate::console_println!(
+            r#"{{"sessionId":"9230b7","runId":"pre-fix","hypothesisId":"H5","location":"kernel/src/driver/vfs.rs:write","message":"vfs write end","data":{{"fd":{},"inode":{},"offset":{},"written":{},"pid":{},"proc":{},"uptime_ms":{}}},"timestamp":{}}}"#,
+            fd,
+            inode,
+            offset,
+            bytes_written,
+            crate::process::current_pid(),
+            crate::process::current_index(),
+            crate::arch::platform::uptime_ms(),
+            crate::arch::platform::uptime_ms(),
+        );
+        // #endregion
+    }
     let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;
     of.pos += bytes_written;
     Ok(bytes_written)
@@ -522,7 +605,7 @@ pub fn mkdir(path: &str) -> Result<(), VfsError> {
 }
 
 /// Get a locked reference to the global VFS state
-pub fn global_vfs() -> crate::sync::spinlock::SpinLockGuard<'static, VfsState> {
+pub fn global_vfs() -> crate::sync::mutex::YieldMutexGuard<'static, VfsState> {
     VFS.lock()
 }
 

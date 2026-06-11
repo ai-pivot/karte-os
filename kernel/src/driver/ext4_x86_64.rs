@@ -162,11 +162,13 @@ impl Ext4BlockDevice for KarteBlockDevice {
 
             // For partial writes, read existing sector (try cache first)
             if sector_offset != 0 || bytes_in_sector != SECTOR_SIZE {
-                let cache = SECTOR_CACHE.lock();
-                if let Some(cached) = cache.get(sector_idx) {
-                    sector.copy_from_slice(cached);
+                let cached = {
+                    let cache = SECTOR_CACHE.lock();
+                    cache.get(sector_idx).copied()
+                };
+                if let Some(cached) = cached {
+                    sector.copy_from_slice(&cached);
                 } else {
-                    drop(cache);
                     if block_read(sector_idx, &mut sector).is_err() {
                         return;
                     }
@@ -176,7 +178,13 @@ impl Ext4BlockDevice for KarteBlockDevice {
             sector[sector_offset..sector_offset + bytes_in_sector]
                 .copy_from_slice(&data[data_pos..data_pos + bytes_in_sector]);
 
-            if block_write(sector_idx, &sector).is_err() {
+            if let Err(e) = block_write(sector_idx, &sector) {
+                crate::console_println!(
+                    "[write_offset] DISK WRITE FAIL sector={} offset={:#x} err={}",
+                    sector_idx,
+                    current_offset,
+                    e
+                );
                 return;
             }
 
@@ -340,7 +348,35 @@ impl FileSystem for Ext4Fs {
         }
     }
 
-    fn set_file_size(&mut self, _inode: u64, _size: usize) -> Result<(), VfsError> {
+    fn set_file_size(&mut self, inode: u64, size: usize) -> Result<(), VfsError> {
+        let ext4 = self.ext4.lock();
+        let mut inode_ref = ext4.get_inode_ref(inode as u32);
+        if inode_ref.inode.is_dir() {
+            return Err(VfsError::NotAFile);
+        }
+
+        let old_size = inode_ref.inode.size() as usize;
+        crate::console_println!(
+            "[ext4] truncate inode={} old={} new={}",
+            inode,
+            old_size,
+            size
+        );
+        if size <= old_size {
+            return ext4
+                .truncate_inode(&mut inode_ref, size as u64)
+                .map(|_| ())
+                .map_err(|_| VfsError::IoError);
+        }
+
+        let zeros = alloc::vec![0u8; BLOCK_SIZE];
+        let mut offset = old_size;
+        while offset < size {
+            let chunk_len = core::cmp::min(BLOCK_SIZE, size - offset);
+            ext4.write_at(inode as u32, offset, &zeros[..chunk_len])
+                .map_err(|_| VfsError::IoError)?;
+            offset += chunk_len;
+        }
         Ok(())
     }
 }

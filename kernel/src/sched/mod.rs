@@ -319,6 +319,7 @@ pub fn schedule_block() {
 }
 
 pub fn schedule_exit() {
+    remove_sleep(CURRENT_RUNNING.load(Ordering::Relaxed));
     let (current, next) = {
         let mut sched = SCHEDULER.lock();
         let current = sched.current;
@@ -347,6 +348,7 @@ pub fn is_init_running() -> bool {
 }
 
 pub fn mark_current_exited() {
+    remove_sleep(CURRENT_RUNNING.load(Ordering::Relaxed));
     let mut sched = SCHEDULER.lock();
     let cur = sched.current;
     if let Some(ref mut task) = sched.tasks[cur] {
@@ -359,35 +361,67 @@ pub fn mark_task_exited_by_proc(proc_idx: usize) {
     if slot >= MAX_TASKS {
         return;
     }
+    remove_sleep(slot);
     let mut sched = SCHEDULER.lock();
     sched.tasks[slot] = None;
     sched.kinds[slot] = TaskKind::Empty;
     PROC_TO_SLOT[proc_idx].store(NO_SLOT, Ordering::Relaxed);
 }
 
-pub fn wake_task(proc_idx: usize) {
+pub fn wake_task(proc_idx: usize) -> bool {
     let slot = PROC_TO_SLOT[proc_idx].load(Ordering::Relaxed);
     if slot >= MAX_TASKS {
-        return;
+        return false;
     }
+    remove_sleep(slot);
     let mut sched = SCHEDULER.lock();
     if let Some(ref mut task) = sched.tasks[slot] {
         if task.state == TaskState::Blocked {
             task.state = TaskState::Ready;
+            return true;
         }
     }
+    false
 }
 
 const MAX_SLEEPQ: usize = 32;
 static SLEEPQ: SpinLock<[(usize, u64); MAX_SLEEPQ]> = SpinLock::new([(NO_SLOT, 0u64); MAX_SLEEPQ]);
 static SLEEPQ_LEN: AtomicUsize = AtomicUsize::new(0);
 
-fn queue_sleep(slot: usize, wake_tick: u64) {
+fn remove_sleep(slot: usize) {
     let mut q = SLEEPQ.lock();
     let len = SLEEPQ_LEN.load(Ordering::Relaxed);
+    let mut new_len = 0;
+    for i in 0..len {
+        if q[i].0 == slot {
+            continue;
+        }
+        if new_len != i {
+            q[new_len] = q[i];
+        }
+        new_len += 1;
+    }
+    for i in new_len..len {
+        q[i] = (NO_SLOT, 0);
+    }
+    SLEEPQ_LEN.store(new_len, Ordering::Relaxed);
+}
+
+fn queue_sleep(slot: usize, wake_tick: u64) -> bool {
+    let mut q = SLEEPQ.lock();
+    let len = SLEEPQ_LEN.load(Ordering::Relaxed);
+    for i in 0..len {
+        if q[i].0 == slot {
+            q[i].1 = wake_tick;
+            return true;
+        }
+    }
     if len < MAX_SLEEPQ {
         q[len] = (slot, wake_tick);
         SLEEPQ_LEN.store(len + 1, Ordering::Relaxed);
+        true
+    } else {
+        false
     }
 }
 
@@ -403,8 +437,13 @@ pub fn sleep_until(wake_tick: u64) {
         }
         return;
     }
-    queue_sleep(slot, wake_tick);
-    schedule_block();
+    if queue_sleep(slot, wake_tick) {
+        schedule_block();
+    } else {
+        while crate::arch::platform::uptime_ms() < wake_tick {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 pub fn tick_sleep_queue() {
@@ -629,6 +668,10 @@ pub fn start_first_task() -> ! {
 
 fn idle_loop() -> ! {
     loop {
+        // Timer/IRQ handlers may wake blocked tasks while the BSP is parked in
+        // idle. Re-run the scheduler before halting again so Ready tasks resume.
+        schedule();
+
         #[cfg(target_arch = "x86_64")]
         x86_64::instructions::interrupts::enable_and_hlt();
 

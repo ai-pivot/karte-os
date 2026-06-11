@@ -396,24 +396,71 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             Some(Translation::Handled(0))
         }
         L_CLOCK_GETTIME => {
-            // clock_gettime(clockid, tp) — fake
+            const CLOCK_REALTIME: usize = 0;
+            const CLOCK_MONOTONIC: usize = 1;
+            const CLOCK_PROCESS_CPUTIME_ID: usize = 2;
+            const CLOCK_THREAD_CPUTIME_ID: usize = 3;
+            const CLOCK_MONOTONIC_RAW: usize = 4;
+            const CLOCK_REALTIME_COARSE: usize = 5;
+            const CLOCK_MONOTONIC_COARSE: usize = 6;
+            const CLOCK_BOOTTIME: usize = 7;
+
             if args[1] != 0 {
+                let clockid = args[0];
                 let tp = args[1];
-                crate::syscall::user_write::<u64>(tp, 0);
-                crate::syscall::user_write::<u64>(tp + 8, 0);
+                let uptime_ms = crate::arch::platform::uptime_ms();
+                let (secs, nsecs) = match clockid {
+                    CLOCK_REALTIME | CLOCK_REALTIME_COARSE => (
+                        (super::FAKE_EPOCH + uptime_ms / 1000) as i64,
+                        ((uptime_ms % 1000) * 1_000_000) as i64,
+                    ),
+                    CLOCK_MONOTONIC
+                    | CLOCK_MONOTONIC_RAW
+                    | CLOCK_MONOTONIC_COARSE
+                    | CLOCK_BOOTTIME
+                    | CLOCK_PROCESS_CPUTIME_ID
+                    | CLOCK_THREAD_CPUTIME_ID => {
+                        let secs = (uptime_ms / 1000) as i64;
+                        let mut nsecs = ((uptime_ms % 1000) * 1_000_000) as i64;
+                        if secs == 0 && nsecs == 0 {
+                            nsecs = 1;
+                        }
+                        (secs, nsecs)
+                    }
+                    _ => return Some(Translation::Handled(-22)),
+                };
+                crate::syscall::user_write::<i64>(tp, secs);
+                crate::syscall::user_write::<i64>(tp + 8, nsecs);
             }
             Some(Translation::Handled(0))
         }
         L_NANOSLEEP => {
-            // nanosleep(req, rem) — fake: return immediately
+            let req_ptr = args[0];
+            if req_ptr == 0 {
+                return Some(Translation::Handled(-14)); // EFAULT
+            }
+
+            let sec = crate::syscall::user_read::<i64>(req_ptr);
+            let nsec = crate::syscall::user_read::<i64>(req_ptr + 8);
+            if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                return Some(Translation::Handled(-22)); // EINVAL
+            }
+
+            let ms = (sec as u64)
+                .saturating_mul(1000)
+                .saturating_add(((nsec as u64) + 999_999) / 1_000_000);
+            if ms != 0 {
+                let wake_tick = crate::arch::platform::uptime_ms().saturating_add(ms);
+                crate::sched::sleep_until(wake_tick);
+            }
             Some(Translation::Handled(0))
         }
         L_TIME => {
-            // time(tloc) — return 0
+            let now = (super::FAKE_EPOCH + crate::arch::platform::uptime_ms() / 1000) as i64;
             if args[0] != 0 {
-                crate::syscall::user_write::<u64>(args[0], 0);
+                crate::syscall::user_write::<i64>(args[0], now);
             }
-            Some(Translation::Handled(0))
+            Some(Translation::Handled(now as isize))
         }
 
         // ─── System info ─────────────────────────────────────

@@ -227,7 +227,29 @@ impl FileSystem for Ext4Fs {
         }
     }
 
-    fn set_file_size(&mut self, _inode: u64, _size: usize) -> Result<(), VfsError> {
+    fn set_file_size(&mut self, inode: u64, size: usize) -> Result<(), VfsError> {
+        let ext4 = self.ext4.lock();
+        let mut inode_ref = ext4.get_inode_ref(inode as u32);
+        if inode_ref.inode.is_dir() {
+            return Err(VfsError::NotAFile);
+        }
+
+        let old_size = inode_ref.inode.size() as usize;
+        if size <= old_size {
+            return ext4
+                .truncate_inode(&mut inode_ref, size as u64)
+                .map(|_| ())
+                .map_err(|_| VfsError::IoError);
+        }
+
+        let zeros = alloc::vec![0u8; BLOCK_SIZE];
+        let mut offset = old_size;
+        while offset < size {
+            let chunk_len = core::cmp::min(BLOCK_SIZE, size - offset);
+            ext4.write_at(inode as u32, offset, &zeros[..chunk_len])
+                .map_err(|_| VfsError::IoError)?;
+            offset += chunk_len;
+        }
         Ok(())
     }
 }

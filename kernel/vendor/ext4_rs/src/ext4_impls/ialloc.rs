@@ -11,7 +11,7 @@ impl Ext4 {
         let mut iterations = 0u32;
         let max_iterations = bg_count * 2 + 1;
 
-        log::warn!(
+        log::trace!(
             "[ialloc] bg_count={} desc_size={}",
             bg_count,
             super_block.desc_size
@@ -31,7 +31,7 @@ impl Ext4 {
             let block_bmap = bg.get_block_bitmap_block(&super_block);
             let inode_tbl = bg.get_inode_table_blk_num();
             let flags = bg.flags;
-            log::warn!(
+            log::trace!(
                 "[ialloc] bg[{}] free_inodes={} free_blocks={} flags={:#x} ibmap={} bbmap={} itbl={}",
                 bgid, free_inodes, free_blocks, flags, inode_bmap, block_bmap, inode_tbl
             );

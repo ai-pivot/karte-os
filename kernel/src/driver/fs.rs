@@ -699,6 +699,9 @@ pub enum FdType {
     /// eventfd — for Go runtime polling.
     #[cfg(target_arch = "x86_64")]
     Eventfd,
+    /// epoll instance — for Go runtime netpoll.
+    #[cfg(target_arch = "x86_64")]
+    Epoll,
     /// timerfd — for Go runtime timers.
     #[cfg(target_arch = "x86_64")]
     Timerfd,
@@ -757,6 +760,8 @@ impl FileDescriptor {
             FdType::Eventfd => crate::syscall::epoll::eventfd::eventfd_peek_by_fd(self.fd_num) > 0,
             #[cfg(target_arch = "x86_64")]
             FdType::Timerfd => crate::syscall::epoll::timerfd_peek(self.fd_num),
+            #[cfg(target_arch = "x86_64")]
+            FdType::Epoll => false,
             FdType::PipeWrite
             | FdType::File
             | FdType::FakeFile(_)
@@ -779,7 +784,7 @@ impl FileDescriptor {
         match &self.fd_type {
             FdType::Stdio => self.name != "stdin",
             FdType::PipeWrite => true,
-            FdType::PipeRead | FdType::Eventfd | FdType::Timerfd => false,
+            FdType::PipeRead | FdType::Eventfd | FdType::Epoll | FdType::Timerfd => false,
             FdType::File
             | FdType::FakeFile(_)
             | FdType::VirtualFile
@@ -946,6 +951,26 @@ impl FdTable {
         None
     }
 
+    /// Allocate a special kernel-backed fd (eventfd, epoll, timerfd, etc.).
+    #[cfg(target_arch = "x86_64")]
+    pub fn alloc_special_fd(&mut self, name: String, flags: u32, fd_type: FdType) -> Option<usize> {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = Some(FileDescriptor {
+                    name,
+                    pos: 0,
+                    flags,
+                    valid: true,
+                    fd_type,
+                    pipe_id: None,
+                    fd_num: i,
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Write to a FakeFile fd. Returns bytes written.
     pub fn fake_write(&mut self, fd: i32, buf: usize, len: usize) -> Option<isize> {
         let slot = self.fds.get_mut(fd as usize)?;
@@ -1104,6 +1129,29 @@ impl FdTable {
         self.fds
             .get_mut(fd)
             .and_then(|opt| opt.as_mut().filter(|f| f.valid))
+    }
+
+    /// Remove and return a file descriptor so callers can run type-specific cleanup.
+    pub fn take(&mut self, fd: usize) -> Option<FileDescriptor> {
+        let slot = self.fds.get_mut(fd)?;
+        if slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// Remove all open descriptors. Used by process exit to release kernel state.
+    pub fn drain_open_fds(&mut self) -> Vec<(usize, FileDescriptor)> {
+        let mut drained = Vec::new();
+        for (fd, slot) in self.fds.iter_mut().enumerate() {
+            if slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                if let Some(desc) = slot.take() {
+                    drained.push((fd, desc));
+                }
+            }
+        }
+        drained
     }
 
     /// Close a file descriptor
