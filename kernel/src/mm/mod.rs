@@ -1,5 +1,6 @@
 pub mod addr;
 pub mod address_space;
+pub mod diagnostics;
 pub mod frame;
 pub mod heap;
 pub mod page_table;
