@@ -7,10 +7,9 @@ use sbi::system_reset::{ResetReason, ResetType, system_reset};
 
 /// Write a single byte to UART0 (0x10000000) via MMIO.
 ///
-/// Switches to kernel page table (SATP) before accessing UART MMIO,
-/// then restores the original SATP. This ensures UART is always
-/// accessible via the kernel's identity mapping, regardless of
-/// the current process's page table state.
+/// UART is identity-mapped in ALL page tables (via copy_kernel_mappings),
+/// so no SATP switching is needed. The PF handler's MMIO exclusion ensures
+/// lazy allocation never overwrites the UART PTE.
 pub fn console_putchar(c: u8) {
     const UART0_BASE: usize = 0x1000_0000;
     const UART_LSR: usize = 5;
@@ -18,36 +17,10 @@ pub fn console_putchar(c: u8) {
     const LSR_TX_EMPTY: u8 = 0x20;
 
     unsafe {
-        // Save current satp
-        let saved_satp: usize;
-        core::arch::asm!("csrr {}, satp", out(reg) saved_satp);
-
-        // Switch to kernel page table for reliable UART MMIO access
-        let kernel_satp =
-            crate::mm::vmm::KERNEL_SATP.load(core::sync::atomic::Ordering::Relaxed);
-        let need_switch = kernel_satp != 0 && kernel_satp != saved_satp;
-        if need_switch {
-            core::arch::asm!(
-                "csrw satp, {ks}",
-                "sfence.vma",
-                ks = in(reg) kernel_satp,
-            );
-        }
-
-        // Write to UART
         while core::ptr::read_volatile((UART0_BASE + UART_LSR) as *const u8) & LSR_TX_EMPTY == 0 {
             core::hint::spin_loop();
         }
         core::ptr::write_volatile((UART0_BASE + UART_THR) as *mut u8, c);
-
-        // Restore original satp
-        if need_switch {
-            core::arch::asm!(
-                "csrw satp, {ss}",
-                "sfence.vma",
-                ss = in(reg) saved_satp,
-            );
-        }
     }
 }
 
@@ -102,4 +75,32 @@ macro_rules! console_println {
             let _ = writeln!($crate::arch::sbi::Console, $($arg)*);
         }
     };
+}
+
+/// Trace output - uses console_putchar (with SATP switching) for reliability.
+#[allow(dead_code)]
+pub fn raw_trace(msg: &str) {
+    for &b in msg.as_bytes() {
+        console_putchar(b);
+    }
+}
+
+/// Raw trace with hex value
+#[allow(dead_code)]  
+pub fn raw_trace_hex(prefix: &str, val: usize) {
+    raw_trace(prefix);
+    let mut buf = [0u8; 19];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let mut idx = 2;
+    for shift in (0..64).step_by(4).rev() {
+        let nibble = (val >> shift) & 0xf;
+        if nibble != 0 || idx > 2 || shift == 0 {
+            buf[idx] = if nibble < 10 { b'0' + nibble as u8 } else { b'a' + (nibble - 10) as u8 };
+            idx += 1;
+        }
+    }
+    let s = core::str::from_utf8(&buf[..idx]).unwrap_or("?");
+    raw_trace(s);
+    raw_trace("\n");
 }

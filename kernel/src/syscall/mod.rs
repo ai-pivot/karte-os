@@ -1677,6 +1677,9 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 
 /// Syscall 1: Exit the current process.
 pub fn sys_exit(code: i32) -> isize {
+    #[cfg(target_arch = "riscv64")]
+    {
+    }
     // ═══════════════════════════════════════════════════════════════
     // CRITICAL: cli FIRST. SYSCALL does NOT clear IF, so Timer ISR
     // can preempt us at any point. We must prevent preemption while
@@ -1767,6 +1770,11 @@ pub fn sys_exit(code: i32) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 fn linux_exit_group(code: i32) -> isize {
+    #[cfg(target_arch = "riscv64")]
+    #[cfg(target_arch = "riscv64")]
+    {
+        let code_str = match code { 0 => "0", 1 => "1", 2 => "2", _ => "?" };
+    }
     unsafe { core::arch::asm!("cli") };
 
     let my_idx = crate::process::current_index();
@@ -2887,6 +2895,10 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     if name.is_empty() {
         return ERR_INVAL;
     }
+    // Trace file opens for debugging
+    #[cfg(target_arch = "riscv64")]
+    {
+    }
 
     // Convert flags: Linux x86_64 O_CREAT=0x40, our internal=0x100
     // Go uses O_CREAT=0x40 on ALL architectures (including RISC-V).
@@ -2983,16 +2995,24 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         }
     }
 
+    #[cfg(target_arch = "riscv64")]
+
     // O_CREAT with ext4: create the file if it doesn't exist
         if has_creat && crate::driver::ext4::has_ext4() {
         // Create empty file on ext4
         match crate::driver::ext4::write_file(&name, &[]) {
-            Ok(()) => {}
+            Ok(()) => {
+                #[cfg(target_arch = "riscv64")]
+            }
             Err(e) => {
+                #[cfg(target_arch = "riscv64")]
+                {
+                }
             }
         }
         // Try lookup again after creation
         if let Some(inode) = crate::driver::fs::lookup_path(&name) {
+            #[cfg(target_arch = "riscv64")]
             return crate::process::with_fd_table(|fd_table| {
                 match fd_table.alloc_special_fd(
                     name.clone(),
