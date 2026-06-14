@@ -349,14 +349,11 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                     }
                 }
 
-                crate::console_println!(
-                    "[trap] Page fault (code={}) at sepc={:#x}, stval={:#x}",
-                    code,
-                    ctx.sepc,
-                    stval
-                );
+                // Page fault we couldn't handle — skip instruction silently.
+                // DO NOT use console_println here: it acquires a SpinLock
+                // which deadlocks if the PF happens during a timer ISR
+                // that interrupted a console_putchar call.
                 if from_user {
-                    crate::console_println!("[trap] Killing user process");
                     crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
                 } else {
                     skip_trap_instruction(ctx);

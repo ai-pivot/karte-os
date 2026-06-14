@@ -30,7 +30,7 @@ unsafe impl Hal for VirtIOHal {
         // Allocate contiguous frames for DMA
         let mut frame_list: [Option<usize>; 256] = [None; 256];
         if pages > 256 {
-            crate::console_println!("[virtio] dma_alloc: too many pages requested ({})", pages);
+//
             return (0, NonNull::dangling());
         }
 
@@ -44,7 +44,7 @@ unsafe impl Hal for VirtIOHal {
                             pmm::dealloc_frame(f);
                         }
                     }
-                    crate::console_println!("[virtio] dma_alloc: out of memory");
+//
                     return (0, NonNull::dangling());
                 }
             }

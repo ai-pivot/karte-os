@@ -105,7 +105,6 @@ impl NetStack {
             .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2))
             .unwrap();
 
-        crate::console_println!("[net] Interface configured: ip=10.0.2.15/24, gw=10.0.2.2");
 
         // Create socket storage (cannot use vec![] since SocketStorage doesn't impl Clone)
         let mut socket_storage: Vec<SocketStorage<'static>> = Vec::with_capacity(MAX_SOCKETS);
@@ -122,7 +121,6 @@ impl NetStack {
         };
 
         *NET_STACK.lock() = Some(stack);
-        crate::console_println!("[net] Network stack initialized");
     }
 
     /// Poll the network stack (called from timer interrupt).
@@ -220,12 +218,6 @@ impl NetStack {
             state: SocketState::Created,
         });
 
-        crate::console_println!(
-            "[net] Created {:?} socket: fd={}, handle={:?}",
-            socket_type,
-            fd,
-            handle
-        );
         fd as isize
     }
 
@@ -294,14 +286,6 @@ impl NetStack {
         match sock.connect(cx, (remote_addr, port), 0) {
             Ok(()) => {
                 meta.state = SocketState::Connecting;
-                crate::console_println!(
-                    "[net] TCP connecting to {}.{}.{}.{}:{}",
-                    ip[0],
-                    ip[1],
-                    ip[2],
-                    ip[3],
-                    port
-                );
                 0
             }
             Err(_) => -1,
