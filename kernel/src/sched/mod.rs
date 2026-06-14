@@ -281,13 +281,6 @@ pub fn user_return_state_for_slot(slot: usize) -> crate::arch::user_return::User
 }
 
 fn switch_to(current: usize, next: usize) {
-    // Diagnostic: log first switch to each slot
-    static SWITCHED: [core::sync::atomic::AtomicBool; 64] =
-        [const { core::sync::atomic::AtomicBool::new(false) }; 64];
-    if !SWITCHED[next].swap(true, Ordering::Relaxed) {
-        crate::console_println!("[switch] first time -> slot {}", next);
-    }
-
     save_fs_base(current);
     CURRENT_RUNNING.store(next, Ordering::Relaxed);
     set_current_process_for_slot(next);

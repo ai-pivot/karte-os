@@ -24,8 +24,9 @@
 trap_entry:
     # ── Step 1: Swap sp with sscratch ──
     # After csrrw: sp = old_sscratch, sscratch = old_sp
-    #   S-mode: sp = 0,         sscratch = S-mode sp
-    #   U-mode: sp = kernel_sp,  sscratch = user_sp
+    #   S-mode (1st trap): sp = 0,         sscratch = S-mode sp
+    #   S-mode (nested):    sp = 0,         sscratch = 0 (already cleared!)
+    #   U-mode:             sp = kernel_sp,  sscratch = user_sp
     csrrw   sp, sscratch, sp
 
     # ── Step 2: Check trap source via old sscratch value (now in sp) ──
@@ -33,10 +34,14 @@ trap_entry:
 
     # ═══════════════════════════════════════════════════════════════
     # S-mode trap path
-    # sp = 0 (old sscratch), sscratch = old S-mode sp
+    # sp = 0 (old sscratch was 0 for S-mode)
+    # sscratch = old_sp (1st trap) or old_sp (nested: sscratch was re-saved)
     # ═══════════════════════════════════════════════════════════════
-    csrr    sp, sscratch           # restore S-mode sp
-    csrw    sscratch, zero         # clear sscratch for next trap
+    # For nested S-mode traps: sscratch was cleared by 1st trap, so
+    # csrrw above set sscratch=old_sp and sp=0. We need old_sp back.
+    # sscratch now holds old_sp (from csrrw above). Read it.
+    csrr    sp, sscratch           # sp = old S-mode sp (saved by csrrw)
+    csrw    sscratch, zero         # clear for potential next nested trap
 
     addi    sp, sp, -288
 

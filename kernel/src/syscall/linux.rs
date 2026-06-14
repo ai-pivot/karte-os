@@ -208,6 +208,7 @@ mod riscv_syscalls {
     pub const L_EVENTFD2: usize = 19;
     pub const L_CLONE: usize = 220;
     pub const L_MKDIRAT: usize = 258;
+    pub const L_MKDIRAT_OLD: usize = 34;
 }
 
 // ─── Public API ──────────────────────────────────────────────────
@@ -327,23 +328,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             args,
         }),
 
-        // ─── Signals ─────────────────────────────────────────
-        L_RT_SIGACTION => Some(Translation::Dispatch {
-            karte_nr: 102, // LINUX_RT_SIGACTION
-            args,
-        }),
-        L_RT_SIGPROCMASK => Some(Translation::Dispatch {
-            karte_nr: 103, // LINUX_RT_SIGPROCMASK
-            args,
-        }),
-        L_RT_SIGRETURN => Some(Translation::Dispatch {
-            karte_nr: 104, // LINUX_RT_SIGRETURN
-            args,
-        }),
-        L_SIGALTSTACK => Some(Translation::Dispatch {
-            karte_nr: 105, // LINUX_SIGALTSTACK
-            args,
-        }),
+        // Signal handlers are in translate_riscv_go with correct RISC-V numbers
 
         // ─── File system (Linux-only numbers, no KarteOS conflict) ──
         // Note: L_OPEN(2), L_CLOSE(3), L_READ(0), L_WRITE(1) are
@@ -362,7 +347,25 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
                 args: [path_ptr, path_len, flags, 0, 0, 0],
             })
         }
-        L_NEWFSTATAT => Some(Translation::Handled(0)), // stub
+        L_NEWFSTATAT => {
+            let pl = count_user_string(args[1]);
+            if pl == 0 { return Some(Translation::Handled(super::ERR_NOENT)); }
+            let name = match super::read_user_path(args[1], pl) {
+                Some(n) => n,
+                None => return Some(Translation::Handled(super::ERR_NOENT)),
+            };
+            let name = super::resolve_path(&name);
+            if let Some(inode) = crate::driver::fs::lookup_path(&name) {
+                if args[2] != 0 {
+                    let is_dir = crate::driver::ext4::metadata_of(inode).map(|m| m.is_dir()).unwrap_or(false);
+                    let mode = if is_dir { 0x41EDu32 } else { 0x81A4u32 };
+                    let _ = super::user_write::<u32>(args[2] + 16, mode);
+                }
+                Some(Translation::Handled(0))
+            } else {
+                Some(Translation::Handled(super::ERR_NOENT))
+            }
+        } // stub
         L_FSTAT => {
             // fstat(fd, stat_ptr) — fill x86_64 struct stat (144 bytes)
             let result = sys_fstat(args[0] as i32, args[1]);
@@ -927,22 +930,10 @@ fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::LINUX_CLONE,
             args,
         }),
-        L_RT_SIGACTION => Some(Translation::Dispatch {
-            karte_nr: super::LINUX_RT_SIGACTION,
-            args,
-        }),
-        L_RT_SIGPROCMASK => Some(Translation::Dispatch {
-            karte_nr: super::LINUX_RT_SIGPROCMASK,
-            args,
-        }),
-        L_RT_SIGRETURN => Some(Translation::Dispatch {
-            karte_nr: super::LINUX_RT_SIGRETURN,
-            args,
-        }),
-        L_SIGALTSTACK => Some(Translation::Dispatch {
-            karte_nr: super::LINUX_SIGALTSTACK,
-            args,
-        }),
+        L_RT_SIGACTION => Some(Translation::Handled(0)),
+        L_RT_SIGPROCMASK => Some(Translation::Handled(0)),
+        L_RT_SIGRETURN => Some(Translation::Handled(0)),
+        L_SIGALTSTACK => Some(Translation::Handled(0)),
         L_KILL => Some(Translation::Handled(0)),
         L_GETTID => Some(Translation::Dispatch {
             karte_nr: super::SYS_GETPID,
@@ -950,7 +941,7 @@ fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
         }),
         L_FACCESSAT => Some(Translation::Handled(0)),
         L_FCNTL => Some(Translation::Handled(0)),
-        L_MKDIRAT => {
+        L_MKDIRAT | L_MKDIRAT_OLD => {
             let pl = count_user_string(args[1]);
             if pl == 0 {
                 return Some(Translation::Handled(super::ERR_NOENT));
@@ -960,7 +951,25 @@ fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
                 args: [args[1], pl, 0, 0, 0, 0],
             })
         }
-        L_NEWFSTATAT => Some(Translation::Handled(0)),
+        L_NEWFSTATAT => {
+            let pl = count_user_string(args[1]);
+            if pl == 0 { return Some(Translation::Handled(super::ERR_NOENT)); }
+            let name = match super::read_user_path(args[1], pl) {
+                Some(n) => n,
+                None => return Some(Translation::Handled(super::ERR_NOENT)),
+            };
+            let name = super::resolve_path(&name);
+            if let Some(inode) = crate::driver::fs::lookup_path(&name) {
+                if args[2] != 0 {
+                    let is_dir = crate::driver::ext4::metadata_of(inode).map(|m| m.is_dir()).unwrap_or(false);
+                    let mode = if is_dir { 0x41EDu32 } else { 0x81A4u32 };
+                    let _ = super::user_write::<u32>(args[2] + 16, mode);
+                }
+                Some(Translation::Handled(0))
+            } else {
+                Some(Translation::Handled(super::ERR_NOENT))
+            }
+        }
         L_READLINKAT => Some(Translation::Handled(super::ERR_NOENT)),
         L_GETDENTS64 => Some(Translation::Handled(0)),
         L_GETCWD => {

@@ -1652,8 +1652,11 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
             0 // stub: not needed on non-x86_64
         }
 
+        #[cfg(target_arch = "riscv64")]
+        131 | 133 | 139 => 0,
+
         _ => {
-            crate::klog!(WARN, "[syscall] Unknown syscall: {}", id);
+            let _ = id;
             ERR_INVAL
         }
     };
@@ -3038,7 +3041,7 @@ fn sys_waitpid(pid: usize) -> isize {
 /// Read a byte string from user memory.
 /// Linux pathnames are NUL-terminated: stop at the first NUL even if the
 /// caller supplied a larger length.
-fn read_user_path(ptr: usize, len: usize) -> Option<alloc::string::String> {
+pub(crate) fn read_user_path(ptr: usize, len: usize) -> Option<alloc::string::String> {
     if ptr == 0 || len == 0 || len > 512 {
         return None;
     }
@@ -3057,7 +3060,7 @@ fn read_user_path(ptr: usize, len: usize) -> Option<alloc::string::String> {
 ///
 /// - If `path` starts with '/', it is absolute — just strip the leading '/'.
 /// - If `path` is relative, prepend CWD env var (with '/' separator if needed).
-fn resolve_path(path: &str) -> alloc::string::String {
+pub(crate) fn resolve_path(path: &str) -> alloc::string::String {
     if path.starts_with('/') {
         return alloc::string::String::from(path.strip_prefix('/').unwrap_or(path));
     }
@@ -3186,15 +3189,14 @@ fn sys_mkdir(path: usize, path_len: usize) -> isize {
         _ => return ERR_INVAL,
     };
     let name = resolve_path(&name);
-    if let Some(inode) = crate::driver::fs::lookup_path(&name) {
-        if let Some(meta) = crate::driver::ext4::metadata_of(inode) {
-            if !meta.is_dir() {
-                return -20; // ENOTDIR / existing non-directory at this path
-            }
-        }
+
+    // Check if already exists
+    if crate::driver::fs::lookup_path(&name).is_some() {
         return -17; // EEXIST
     }
-    let _ = name;
+
+    // Create the directory on ext4
+    let _ = crate::driver::ext4::create_directory(&name);
     0
 }
 
@@ -4437,6 +4439,10 @@ fn copy_user_pages_x86(
 }
 
 fn sys_fork() -> isize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        return -38;
+    }
     // Get current process info
     let current = match crate::process::current() {
         Some(p) => p,
@@ -4752,6 +4758,10 @@ fn linux_clone(
             Some(top) => top,
             None => return ERR_NOMEM,
         };
+
+        // Map kernel stack into user page table for clone children
+        let user_pt = crate::process::get_user_page_table(crate::process::current_page_table_root());
+        crate::process::map_kernel_stack_pages(user_pt, kernel_stack_top);
 
         // Write child TID to parent_tid_ptr if CLONE_PARENT_SETTID
         if (flags & 0x100000) != 0 && parent_tid_ptr != 0 {

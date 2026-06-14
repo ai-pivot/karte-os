@@ -1014,7 +1014,6 @@ impl Process {
                 max_vaddr = seg.vaddr + seg.mem_size;
             }
         } // end for seg_idx
-        crate::console_println!("[ELF] loaded {} pages", total_pages);
 
 
         // 5.05 Enforce ELF mapping invariants before any user code can run:

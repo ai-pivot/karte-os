@@ -266,8 +266,11 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                     }
                 }
 
-                // Lazy allocation for unmapped user pages
-                if from_user {
+                // Lazy allocation for unmapped user pages.
+                // Handles BOTH user-mode and kernel-mode PFs.
+                let is_user_addr = fault_addr < crate::process::USER_MMAP_LIMIT
+                    && !(0x8020_0000..0x8220_0000).contains(&fault_addr);
+                if is_user_addr {
                     let user_pt = get_current_user_pt();
                     let heap_base = crate::process::USER_HEAP_BASE;
                     let heap_limit = crate::process::USER_HEAP_LIMIT;
@@ -294,6 +297,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                             return ctx;
                         }
                     }
+                    // VMA-based lazy allocation for mmap'd regions
                     let vma_root =
                         crate::process::get_page_table_root(crate::process::current_index());
                     if let Some(prot) = crate::mm::vma::vma_query(vma_root, page_addr) {
@@ -310,6 +314,37 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                                     crate::mm::vmm::PTEFlags::UR | crate::mm::vmm::PTEFlags::A
                                 };
                                 crate::mm::vmm::map(user_pt, page_addr, frame, flags);
+                                unsafe {
+                                    core::arch::asm!("sfence.vma");
+                                }
+                                return ctx;
+                            }
+                        }
+                    }
+                    // Fallback: S-mode PF on user address without VMA entry.
+                    // This happens when syscall handlers (SUM set) write to Go
+                    // memory that was mmap'd with PROT_NONE then mprotect'd.
+                    // The VMA entry exists but with prot=0 (PROT_NONE).
+                    // We must allocate with RW permissions since the kernel
+                    // is doing the write on behalf of the user.
+                    if !from_user {
+                        // Check if there's a PROT_NONE VMA — that means Go
+                        // reserved this region. mprotect should have updated it,
+                        // but if VMA tracking missed it, allocate anyway.
+                        let vma_exists = crate::mm::vma::vma_query(vma_root, page_addr).is_some();
+                        if vma_exists || true {
+                            if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                                unsafe {
+                                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                                }
+                                crate::mm::vmm::map(
+                                    user_pt,
+                                    page_addr,
+                                    frame,
+                                    crate::mm::vmm::PTEFlags::URW
+                                        | crate::mm::vmm::PTEFlags::A
+                                        | crate::mm::vmm::PTEFlags::D,
+                                );
                                 unsafe {
                                     core::arch::asm!("sfence.vma");
                                 }
