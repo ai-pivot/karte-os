@@ -2864,11 +2864,10 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     }
 
     // Convert flags: Linux x86_64 O_CREAT=0x40, our internal=0x100
-    let linux_o_creat: u32 = if cfg!(target_arch = "x86_64") {
-        0x40
-    } else {
-        0x100
-    };
+    // Go uses O_CREAT=0x40 on ALL architectures (including RISC-V).
+    // Linux RISC-V kernel headers define O_CREAT=0x100 but Go's syscall
+    // package hardcodes 0x40 for all Linux targets. We must accept both.
+    let linux_o_creat: u32 = 0x40;
     let has_creat = (flags & linux_o_creat) != 0 || (flags & crate::driver::fs::O_CREAT) != 0;
     let our_flags = if has_creat {
         crate::driver::fs::O_CREAT
@@ -2938,10 +2937,36 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         });
     }
 
+    // O_CREAT with ext4: create the file if it doesn't exist
+        if has_creat && crate::driver::ext4::has_ext4() {
+        // Create empty file on ext4
+        match crate::driver::ext4::write_file(&name, &[]) {
+            Ok(()) => {}
+            Err(e) => {
+            }
+        }
+        // Try lookup again after creation
+        if let Some(inode) = crate::driver::fs::lookup_path(&name) {
+            return crate::process::with_fd_table(|fd_table| {
+                match fd_table.alloc_special_fd(
+                    name.clone(),
+                    flags,
+                    crate::driver::fs::FdType::Ext4File(
+                        crate::driver::ext4::Ext4FileDesc {
+                            inode_num: inode as u32,
+                            writable: true,
+                        },
+                    ),
+                ) {
+                    Some(fd) => fd as isize,
+                    None => ERR_NOMEM,
+                }
+            });
+        }
+    }
+
     ERR_NOENT
 }
-
-/// Syscall 11: Close a file descriptor.
 fn cleanup_fd_resources(fd: usize, desc: FileDescriptor) {
     // Release all byte-range locks held by this fd.
     crate::driver::fs::release_fd_locks(fd);
@@ -3355,7 +3380,6 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
         proc_idx,
     ) {
         Some(_tid) => {
-            crate::console_println!("[exec] child spawned tid={}", _tid);
             crate::klog!(DEBUG, "[spawn] Spawned process pid={}", child_pid);
             child_pid as isize
         }
@@ -3736,7 +3760,6 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
         proc_idx,
     ) {
         Some(_tid) => {
-            crate::console_println!("[exec] child spawned tid={}", _tid);
             crate::klog!(DEBUG, "[exec] Spawned '{}' pid={}", name, child_pid);
             child_pid as isize
         }
@@ -4318,7 +4341,6 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         proc_idx,
     ) {
         Some(_tid) => {
-            crate::console_println!("[exec] child spawned tid={}", _tid);
             #[cfg(target_arch = "x86_64")]
             crate::console_println!(
                 "[exec] Launched '{}' pid={} entry={:#x} stack={:#x} kstack={:#x} pt_root={:#x} cr3={:#x}",
@@ -4563,7 +4585,6 @@ fn sys_fork() -> isize {
         child_idx,
     ) {
         Some(_tid) => {
-            crate::console_println!("[exec] child spawned tid={}", _tid);
             crate::console_println!(
                 "[fork] Created child pid={} (parent pid={})",
                 child_pid,
