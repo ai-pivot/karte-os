@@ -385,7 +385,7 @@ pub fn init() {
         // RISC-V Sv39 with QEMU -cpu rv64 does NOT auto-set A/D bits.
         // All PTEs must have A|D pre-set to avoid page faults on every access.
         let start = 0x8020_0000;
-        let end = start + 512 * 1024 * 1024;
+        let end = start + 900 * 1024 * 1024;
         identity_map(root, start, end, PTEFlags::KRWX | PTEFlags::A | PTEFlags::D);
         map(root, 0x1000_0000, 0x1000_0000, PTEFlags::KRW | PTEFlags::A | PTEFlags::D);
         for addr in (0x1000_1000..0x1000_9000).step_by(PAGE_SIZE) {
