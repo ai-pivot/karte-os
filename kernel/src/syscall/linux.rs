@@ -747,7 +747,10 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
     use riscv_syscalls::*;
 
     match id {
-        L_IOCTL => Some(Translation::Handled(0)),
+        L_IOCTL => Some(Translation::Dispatch {
+            karte_nr: super::SYS_IOCTL,
+            args,
+        }),
         L_OPENAT => {
             let path_ptr = args[1];
             let flags = args[2]; // Preserve flags! O_CREAT, O_RDWR, etc.
