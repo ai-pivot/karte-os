@@ -210,6 +210,14 @@ mod riscv_syscalls {
     pub const L_MKDIRAT: usize = 258;
     pub const L_MKDIRAT_OLD: usize = 34;
     pub const L_FTRUNCATE: usize = 46;
+    pub const L_PREAD64: usize = 67;
+    pub const L_PWRITE64: usize = 68;
+    pub const L_FSYNC: usize = 82;
+    pub const L_UNLINKAT: usize = 35;
+    pub const L_GETEUID: usize = 175;
+    pub const L_GETUID: usize = 174;
+    pub const L_GETGID: usize = 176;
+    pub const L_GETEGID: usize = 177;
 }
 
 // ─── Public API ──────────────────────────────────────────────────
@@ -850,10 +858,64 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             args,
         }),
         L_FTRUNCATE => {
-            // ftruncate(fd, length) — SQLite WAL needs this to set -shm file size.
-            // We stub it to success; the actual file size is managed by write_file.
             Some(Translation::Handled(0))
         }
+        L_PREAD64 => {
+            // pread64(fd, buf, count, offset) — read at specific offset
+            let fd = args[0] as i32;
+            let buf = args[1];
+            let count = args[2];
+            let offset = args[3];
+            // Look up fd type to find Ext4File inode
+            let ext4_inode = super::get_fd_ext4_inode(fd);
+            if let Some(inode) = ext4_inode {
+                let mut kbuf = alloc::vec![0u8; count];
+                match crate::driver::ext4::read_file_at_offset(inode, offset, &mut kbuf) {
+                    Ok(n) => {
+                        for i in 0..n {
+                            super::user_write_u8(buf + i, kbuf[i]);
+                        }
+                        Some(Translation::Handled(n as isize))
+                    }
+                    Err(_) => Some(Translation::Handled(super::ERR_IO)),
+                }
+            } else {
+                // Fall back to regular read
+                let result = super::dispatch_inner(super::SYS_READ, [fd as usize, buf, count, 0, 0, 0]);
+                Some(Translation::Handled(result))
+            }
+        }
+        L_PWRITE64 => {
+            let fd = args[0] as i32;
+            let buf = args[1];
+            let count = args[2];
+            let offset = args[3];
+            let ext4_inode = super::get_fd_ext4_inode(fd);
+            if let Some(inode) = ext4_inode {
+                let data = super::user_read_bytes(buf, count);
+                match crate::driver::ext4::write_file_at_offset(inode, offset, &data) {
+                    Ok(n) => Some(Translation::Handled(n as isize)),
+                    Err(_) => Some(Translation::Handled(super::ERR_IO)),
+                }
+            } else {
+                let result = super::dispatch_inner(super::SYS_WRITE, [fd as usize, buf, count, 0, 0, 0]);
+                Some(Translation::Handled(result))
+            }
+        }
+        L_FSYNC => Some(Translation::Handled(0)), // success stub
+        L_UNLINKAT => {
+            let pl = count_user_string(args[1]);
+            if pl > 0 {
+                let name = match super::read_user_path(args[1], pl) {
+                    Some(n) => n,
+                    None => return Some(Translation::Handled(0)),
+                };
+                let name = super::resolve_path(&name);
+                let _ = crate::driver::fs::delete_file(&name);
+            }
+            Some(Translation::Handled(0))
+        }
+        L_GETUID | L_GETEUID | L_GETGID | L_GETEGID => Some(Translation::Handled(0)),
         _ => None,
     }
 }

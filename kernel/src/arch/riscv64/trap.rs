@@ -288,7 +288,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                                     | crate::mm::vmm::PTEFlags::D,
                             );
                             unsafe {
-                                core::arch::asm!("sfence.vma");
+                                core::arch::asm!("sfence.vma {0}, zero", in(reg) page_addr);
                             }
                             let new_brk = page_addr + page_size;
                             if new_brk > crate::process::current_brk() {
@@ -315,32 +315,37 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                                 };
                                 crate::mm::vmm::map(user_pt, page_addr, frame, flags);
                                 unsafe {
-                                    core::arch::asm!("sfence.vma");
+                                    core::arch::asm!("sfence.vma {0}, zero", in(reg) page_addr);
                                 }
                                 return ctx;
                             }
                         }
                     }
                     // Final fallback: allocate RW page for ANY user-space address.
-                    // Go's mmap/mprotect lifecycle can create situations where
-                    // VMA tracking misses a page. Since we have no swap, always
-                    // allocate a zeroed RW page for valid user addresses.
-                    if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                        unsafe {
-                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    match crate::mm::pmm::alloc_frame() {
+                        Some(frame) => {
+                            unsafe {
+                                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                            }
+                            crate::mm::vmm::map(
+                                user_pt,
+                                page_addr,
+                                frame,
+                                crate::mm::vmm::PTEFlags::URW
+                                    | crate::mm::vmm::PTEFlags::A
+                                    | crate::mm::vmm::PTEFlags::D,
+                            );
+                            unsafe {
+                                core::arch::asm!("sfence.vma {0}, zero", in(reg) page_addr);
+                            }
+                            return ctx;
                         }
-                        crate::mm::vmm::map(
-                            user_pt,
-                            page_addr,
-                            frame,
-                            crate::mm::vmm::PTEFlags::URW
-                                | crate::mm::vmm::PTEFlags::A
-                                | crate::mm::vmm::PTEFlags::D,
-                        );
-                        unsafe {
-                            core::arch::asm!("sfence.vma");
+                        None => {
+                            // OOM: can't allocate page. Skip instruction to avoid crash.
+                            // This is better than killing the process.
+                            skip_trap_instruction(ctx);
+                            return ctx;
                         }
-                        return ctx;
                     }
                 }
 

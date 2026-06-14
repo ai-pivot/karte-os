@@ -14,7 +14,7 @@ echo "---"
 # 直接运行 QEMU，无管道包装，确保 stdin/stdout 直通
 exec qemu-system-riscv64 \
     -machine virt -cpu rv64 -bios default \
-    -m 1024M -smp 1 \
+    -m 2048M -smp 1 \
     -serial stdio \
     -display none -no-reboot \
     -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \

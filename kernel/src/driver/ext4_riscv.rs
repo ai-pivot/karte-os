@@ -456,3 +456,39 @@ pub fn run_tests() {
         count >= 0
     });
 }
+
+/// Read file data at specific offset (for pread64).
+/// Returns number of bytes read into the provided buffer.
+pub fn read_file_at_offset(inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+    if !has_ext4() {
+        return Err("ext4 not initialized");
+    }
+    let mut guard = EXT4_FS.lock();
+    let fs = guard.as_mut().ok_or("ext4 not initialized")?;
+    fs.read_file(inode as u64, offset, buf)
+        .map_err(|_| "ext4 read_at failed")
+}
+
+/// Write data to file at specific offset (for pwrite64).
+/// Returns number of bytes written.
+pub fn write_file_at_offset(inode: u32, offset: usize, data: &[u8]) -> Result<usize, &'static str> {
+    if !has_ext4() {
+        return Err("ext4 not initialized");
+    }
+    let mut guard = EXT4_FS.lock();
+    let fs = guard.as_mut().ok_or("ext4 not initialized")?;
+    fs.write_file(inode as u64, offset, data)
+        .map_err(|_| "ext4 write_at failed")
+}
+
+/// Get file size by inode number.
+pub fn file_size(inode: u32) -> Result<usize, &'static str> {
+    if !has_ext4() {
+        return Err("ext4 not initialized");
+    }
+    let guard = EXT4_FS.lock();
+    let fs = guard.as_ref().ok_or("ext4 not initialized")?;
+    fs.metadata(inode as u64)
+        .map(|m| m.size)
+        .map_err(|_| "ext4 metadata failed")
+}

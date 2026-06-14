@@ -4135,6 +4135,22 @@ fn get_fd_info(fd: i32) -> Option<(FdType, Option<usize>, alloc::string::String)
     })
 }
 
+/// Get ext4 inode number for a given fd (for pread/pwrite offset operations).
+pub(crate) fn get_fd_ext4_inode(fd: i32) -> Option<u32> {
+    if fd < 0 || fd as usize >= MAX_FDS {
+        return None;
+    }
+    crate::process::with_fd_table(|fd_table| {
+        match fd_table.get(fd as usize) {
+            Some(f) => match &f.fd_type {
+                FdType::Ext4File(ext4_desc) => Some(ext4_desc.inode_num),
+                _ => None,
+            },
+            None => None,
+        }
+    })
+}
+
 /// Blocking read from a pipe. Called from sys_read when fd is a PipeRead.
 fn pipe_read(pipe_id: usize, buf: usize, len: usize) -> isize {
     loop {
@@ -4836,13 +4852,18 @@ fn linux_clone(
             user_write::<u64>(parent_tid_ptr, fake_tid);
         }
 
+        // Only pass tls when CLONE_SETTLS flag is set.
+        // Go's clone on RISC-V may pass garbage in the tls register argument
+        // when CLONE_SETTLS is not in flags. Using garbage as tp crashes Go.
+        let effective_tls = if (flags & 0x80000) != 0 { tls } else { 0 };
+
         let tid = match crate::sched::add_clone_process(
             parent_ctx,
             child_user_sp,
             kernel_stack_top,
             user_pt_root,
             my_proc_idx,
-            tls,
+            effective_tls,
         ) {
             Some(tid) => tid,
             None => return ERR_NOMEM,
