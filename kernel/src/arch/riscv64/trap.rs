@@ -1,8 +1,18 @@
 //! Trap handling: U-mode ↔ S-mode transitions, exception dispatch, timer interrupts.
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use riscv::register::stvec;
+
+/// Pointer to the current trap context (set by trap_handler before dispatch).
+/// Used by clone() to copy the parent's register state to the child thread.
+static CURRENT_TRAP_CTX: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the current trap context pointer (valid during syscall dispatch).
+pub fn current_trap_ctx() -> usize {
+    CURRENT_TRAP_CTX.load(Ordering::Relaxed)
+}
 
 // Embed the trap entry/exit assembly (dual-path: S-mode + U-mode)
 global_asm!(include_str!("trap_entry.S"));
@@ -45,7 +55,8 @@ impl TrapContext {
             user_satp: 0,
         };
         // Set sstatus: SPP=0 (return to U-mode), SPIE=1 (enable interrupts after sret)
-        ctx.sstatus = 0x20; // SPIE bit
+        // FS=Initial (1<<13) to enable FPU for Go runtime
+        ctx.sstatus = 0x20 | (1 << 13); // SPIE + FS=Initial
         ctx.x[2] = kernel_sp; // kernel sp (used during trap handling)
         ctx
     }
@@ -137,6 +148,9 @@ fn handle_timer() {
     // Tick uptime counter
     crate::arch::platform::tick_uptime();
 
+    // Wake up tasks whose sleep/futex timeout has expired.
+    crate::sched::tick_sleep_queue();
+
     // Poll network stack (non-blocking) — only after init is complete
     // to avoid interfering with user program loading.
     if crate::net::iface::NetStack::is_initialized() {
@@ -187,6 +201,8 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 let args = [
                     ctx.x[10], ctx.x[11], ctx.x[12], ctx.x[13], ctx.x[14], ctx.x[15],
                 ];
+                // Store trap context pointer for clone() to access parent registers
+                CURRENT_TRAP_CTX.store(ctx as *const _ as usize, Ordering::Relaxed);
                 let result = crate::syscall::dispatch(syscall_id, args);
                 ctx.x[10] = result as usize; // a0 = return value
                 ctx.sepc += 4; // skip ecall instruction
@@ -205,59 +221,115 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 skip_trap_instruction(ctx);
             }
             12 | 13 | 15 => {
-                // Instruction/Load/Store page fault
                 let fault_addr = stval;
-                let heap_base = crate::process::USER_HEAP_BASE;
-                let heap_limit = crate::process::USER_HEAP_LIMIT;
+                let page_size = crate::mm::pmm::page_size();
+                let page_addr = fault_addr & !(page_size - 1);
 
-                // Check if fault is in user heap area (lazy allocation)
-                if from_user && fault_addr >= heap_base && fault_addr < heap_limit {
-                    // Lazy page allocation: map a new page at the faulting address
-                    let page_size = crate::mm::pmm::page_size();
-                    let page_addr = fault_addr & !(page_size - 1); // Align down
+                // A/D bit fix via direct Sv39 page table walk.
+                // Read satp to get the ACTIVE page table root.
+                let satp_val: usize;
+                unsafe {
+                    core::arch::asm!("csrr {}, satp", out(reg) satp_val);
+                }
+                let satp_ppn = satp_val & ((1usize << 44) - 1);
+                let satp_pa = satp_ppn << 12;
 
-                    let kernel_pt = get_current_user_pt();
+                let vpn2 = (page_addr >> 30) & 0x1FF;
+                let vpn1 = (page_addr >> 21) & 0x1FF;
+                let vpn0 = (page_addr >> 12) & 0x1FF;
 
-                    // Check if already mapped (shouldn't be, but safety check)
-                    if crate::mm::vmm::translate_user(kernel_pt, page_addr).is_none() {
+                let l2_entry =
+                    unsafe { core::ptr::read_volatile((satp_pa + vpn2 * 8) as *const usize) };
+                if l2_entry & 1 != 0 {
+                    let l1_pa = (l2_entry >> 10) << 12;
+                    let l1_entry =
+                        unsafe { core::ptr::read_volatile((l1_pa + vpn1 * 8) as *const usize) };
+                    if l1_entry & 1 != 0 {
+                        let l0_pa = (l1_entry >> 10) << 12;
+                        let l0_entry =
+                            unsafe { core::ptr::read_volatile((l0_pa + vpn0 * 8) as *const usize) };
+                        if l0_entry & 1 != 0 {
+                            let mut new_pte = l0_entry;
+                            new_pte |= 1 << 6; // A bit
+                            if code == 15 {
+                                new_pte |= 1 << 7;
+                            } // D bit
+                            unsafe {
+                                core::ptr::write_volatile(
+                                    (l0_pa + vpn0 * 8) as *mut usize,
+                                    new_pte,
+                                );
+                                core::arch::asm!("sfence.vma {0}, zero", in(reg) page_addr);
+                            }
+                            return ctx;
+                        }
+                    }
+                }
+
+                // Lazy allocation for unmapped user pages
+                if from_user {
+                    let user_pt = get_current_user_pt();
+                    let heap_base = crate::process::USER_HEAP_BASE;
+                    let heap_limit = crate::process::USER_HEAP_LIMIT;
+                    if fault_addr >= heap_base && fault_addr < heap_limit {
                         if let Some(frame) = crate::mm::pmm::alloc_frame() {
                             unsafe {
                                 core::ptr::write_bytes(frame as *mut u8, 0, page_size);
                             }
                             crate::mm::vmm::map(
-                                kernel_pt,
+                                user_pt,
                                 page_addr,
                                 frame,
-                                crate::mm::vmm::PTEFlags::URW,
+                                crate::mm::vmm::PTEFlags::URW
+                                    | crate::mm::vmm::PTEFlags::A
+                                    | crate::mm::vmm::PTEFlags::D,
                             );
                             unsafe {
                                 core::arch::asm!("sfence.vma");
                             }
-                            // Update brk if needed
                             let new_brk = page_addr + page_size;
                             if new_brk > crate::process::current_brk() {
                                 crate::process::set_current_brk(new_brk);
                             }
-                            // Don't advance sepc — retry the faulting instruction
+                            return ctx;
                         }
-                        // else: OOM — fall through to not advancing sepc (still retry)
                     }
-                    // Page already mapped or just allocated — don't advance sepc, retry instruction
-                    // (no ctx.sepc modification)
+                    let vma_root =
+                        crate::process::get_page_table_root(crate::process::current_index());
+                    if let Some(prot) = crate::mm::vma::vma_query(vma_root, page_addr) {
+                        if prot != 0 {
+                            if let Some(frame) = crate::mm::pmm::alloc_frame() {
+                                unsafe {
+                                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                                }
+                                let flags = if prot & 2 != 0 {
+                                    crate::mm::vmm::PTEFlags::URW
+                                        | crate::mm::vmm::PTEFlags::A
+                                        | crate::mm::vmm::PTEFlags::D
+                                } else {
+                                    crate::mm::vmm::PTEFlags::UR | crate::mm::vmm::PTEFlags::A
+                                };
+                                crate::mm::vmm::map(user_pt, page_addr, frame, flags);
+                                unsafe {
+                                    core::arch::asm!("sfence.vma");
+                                }
+                                return ctx;
+                            }
+                        }
+                    }
+                }
+
+                crate::console_println!(
+                    "[trap] Page fault (code={}) at sepc={:#x}, stval={:#x}",
+                    code,
+                    ctx.sepc,
+                    stval
+                );
+                if from_user {
+                    crate::console_println!("[trap] Killing user process");
+                    crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
                 } else {
-                    // Not in heap area — fatal page fault
-                    crate::console_println!(
-                        "[trap] Page fault (code={}) at sepc={:#x}, stval={:#x}",
-                        code,
-                        ctx.sepc,
-                        stval
-                    );
-                    if from_user {
-                        crate::console_println!("[trap] Killing user process");
-                        crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]); // sys_exit(1)
-                    } else {
-                        skip_trap_instruction(ctx);
-                    }
+                    skip_trap_instruction(ctx);
                 }
             }
             _ => {
@@ -274,22 +346,14 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
         unsafe { riscv::register::sstatus::clear_sum() };
     }
 
-    // Restore the correct page table for the current process.
-    // After schedule()/__switch, we may be running on a different process
-    // with a different user page table. CURRENT_PAGE_TABLE_ROOT was updated
-    // by the scheduler before __switch.
+    // Store user page table SATP in TrapContext for trap_return_user to switch.
+    // We do NOT switch satp here because the kernel page table (active since
+    // trap_entry) has correct A/D bits on all kernel pages. trap_return_user
+    // will switch satp to the user page table just before sret.
     if from_user {
         let target_ppn = crate::process::current_page_table_root();
         if target_ppn != 0 {
-            let current_satp = riscv::register::satp::read().bits();
-            let current_ppn = current_satp & ((1usize << 44) - 1);
-            if target_ppn != current_ppn {
-                let new_satp = (8usize << 60) | target_ppn;
-                unsafe {
-                    core::arch::asm!("csrw satp, {}", in(reg) new_satp);
-                    core::arch::asm!("sfence.vma");
-                }
-            }
+            ctx.user_satp = (8usize << 60) | target_ppn;
         }
     }
 

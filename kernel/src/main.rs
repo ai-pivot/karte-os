@@ -310,9 +310,10 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             let proc = init_result;
             {
                 crate::console_println!(
-                    "[init] User process loaded: pid={}, entry={:#x}",
+                    "[init] User process loaded: pid={}, entry={:#x}, sp={:#x}",
                     proc.pid,
-                    proc.entry
+                    proc.entry,
+                    proc.user_stack_top
                 );
                 #[cfg(target_arch = "x86_64")]
                 {

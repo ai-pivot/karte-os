@@ -82,7 +82,10 @@ pub enum WalkResult {
 impl WalkResult {
     /// Whether this result represents a usable mapping (4K or huge).
     pub fn is_mapped(&self) -> bool {
-        matches!(self, WalkResult::Mapped4K { .. } | WalkResult::MappedHuge { .. })
+        matches!(
+            self,
+            WalkResult::Mapped4K { .. } | WalkResult::MappedHuge { .. }
+        )
     }
 
     /// Extract the physical frame address if mapped.

@@ -92,6 +92,13 @@ impl Ext4BlockDevice for KarteBlockDevice {
 unsafe impl Send for KarteBlockDevice {}
 unsafe impl Sync for KarteBlockDevice {}
 
+/// Descriptor for an open ext4 file, stored in FdTable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ext4FileDesc {
+    pub inode_num: u32,
+    pub writable: bool,
+}
+
 pub struct Ext4Fs {
     ext4: spin::Mutex<Ext4>,
 }

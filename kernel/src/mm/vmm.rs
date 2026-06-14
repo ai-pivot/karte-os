@@ -269,7 +269,11 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
     let ppn = paddr >> 12;
     #[cfg(target_arch = "riscv64")]
     {
-        table.entries[vpn] = PTE::new(ppn, flags);
+        // RISC-V Sv39 on QEMU -cpu rv64 does NOT auto-set A/D bits.
+        // Force A|D on ALL leaf PTEs to prevent instruction/load/store
+        // page fault loops. This is the standard OS approach for
+        // implementations without hardware A/D bit support.
+        table.entries[vpn] = PTE::new(ppn, flags | PTEFlags::A | PTEFlags::D);
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -351,6 +355,14 @@ pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: P
 
 static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
 
+/// Kernel SATP value for trap_entry.S to switch to on U-mode traps.
+/// This ensures all S-mode code runs with the kernel page table,
+/// which has correct A/D bits on all kernel pages.
+#[cfg(target_arch = "riscv64")]
+#[unsafe(no_mangle)]
+pub static KERNEL_SATP: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 pub fn get_kernel_page_table() -> &'static mut PageTable {
     unsafe { &mut *KERNEL_PAGE_TABLE }
 }
@@ -370,15 +382,17 @@ pub fn init() {
 
     #[cfg(target_arch = "riscv64")]
     {
+        // RISC-V Sv39 with QEMU -cpu rv64 does NOT auto-set A/D bits.
+        // All PTEs must have A|D pre-set to avoid page faults on every access.
         let start = 0x8020_0000;
-        let end = start + 128 * 1024 * 1024;
-        identity_map(root, start, end, PTEFlags::KRWX);
-        map(root, 0x1000_0000, 0x1000_0000, PTEFlags::KRW);
+        let end = start + 512 * 1024 * 1024;
+        identity_map(root, start, end, PTEFlags::KRWX | PTEFlags::A | PTEFlags::D);
+        map(root, 0x1000_0000, 0x1000_0000, PTEFlags::KRW | PTEFlags::A | PTEFlags::D);
         for addr in (0x1000_1000..0x1000_9000).step_by(PAGE_SIZE) {
-            map(root, addr, addr, PTEFlags::KRW);
+            map(root, addr, addr, PTEFlags::KRW | PTEFlags::A | PTEFlags::D);
         }
         for addr in (0x0C00_0000..0x0C40_0000).step_by(PAGE_SIZE) {
-            map(root, addr, addr, PTEFlags::KRW);
+            map(root, addr, addr, PTEFlags::KRW | PTEFlags::A | PTEFlags::D);
         }
     }
 
@@ -395,6 +409,7 @@ pub fn init() {
     unsafe {
         satp::set(satp::Mode::Sv39, 0, ppn);
         core::arch::asm!("sfence.vma");
+        KERNEL_SATP.store((8usize << 60) | ppn, core::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -609,13 +624,64 @@ pub fn mprotect_user(root: &mut PageTable, vaddr: usize, flags: PTEFlags) -> boo
     let ppn = entry.ppn();
     #[cfg(target_arch = "riscv64")]
     {
-        table.entries[vpn] = PTE::new(ppn, flags);
+        table.entries[vpn] = PTE::new(ppn, flags | PTEFlags::A | PTEFlags::D);
     }
     #[cfg(target_arch = "x86_64")]
     {
         table.entries[vpn] = PTE(((ppn as u64) << 12) | flags.bits());
     }
     true
+}
+
+pub fn or_pte_flags(root: &mut PageTable, vaddr: usize, add_flags: PTEFlags) -> bool {
+    let mut table = root;
+    for level in (1..PT_LEVELS).rev() {
+        let vpn = PageTable::vpn(vaddr, level);
+        let entry = table.entries[vpn];
+        if !entry.is_valid() {
+            return false;
+        }
+        let ppn = entry.ppn();
+        if ppn == 0 {
+            return false;
+        }
+        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+    }
+    let vpn = PageTable::vpn(vaddr, 0);
+    let entry = table.entries[vpn];
+    if !entry.is_valid() {
+        return false;
+    }
+    table.entries[vpn] = PTE::new(entry.ppn(), entry.flags() | add_flags);
+    true
+}
+
+/// Walk all leaf PTEs and set A|D bits. Used to pre-set A|D on kernel
+/// identity mappings so that timer interrupts don't cause page faults.
+pub fn set_all_ad_bits(root: &mut PageTable) {
+    fn walk(table: &mut PageTable, level: usize) {
+        for i in 0..512 {
+            let entry = table.entries[i];
+            if !entry.is_valid() {
+                continue;
+            }
+            let flags = entry.flags();
+            // Check if this is a leaf PTE (has R, W, or X set)
+            if flags.contains(PTEFlags::R) || flags.contains(PTEFlags::X) {
+                // Leaf PTE: set A and D bits
+                let new_flags = flags | PTEFlags::A | PTEFlags::D;
+                table.entries[i] = PTE::new(entry.ppn(), new_flags);
+            } else if level > 0 {
+                // Non-leaf PTE: recurse into next level
+                let ppn = entry.ppn();
+                if ppn != 0 {
+                    let next = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+                    walk(next, level - 1);
+                }
+            }
+        }
+    }
+    walk(root, PT_LEVELS - 1);
 }
 
 pub fn free_user_page_table(root_ppn: usize) {
@@ -1278,7 +1344,11 @@ pub fn run_tests() {
         match result {
             super::page_table::WalkResult::MappedHuge { size, level, .. } => {
                 if size != 2 * 1024 * 1024 {
-                    crate::console_println!("[FAIL] huge size={} expected={}", size, 2*1024*1024);
+                    crate::console_println!(
+                        "[FAIL] huge size={} expected={}",
+                        size,
+                        2 * 1024 * 1024
+                    );
                     false
                 } else if level != 1 {
                     crate::console_println!("[FAIL] huge level={} expected=1", level);

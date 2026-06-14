@@ -5,7 +5,9 @@
 # a1 = next task's stack pointer (restore from this)
 __switch:
     # Save callee-saved registers to current task's stack
-    addi sp, sp, -104    # 13 registers * 8 bytes = 104
+    # 14 registers: ra, s0-s11, tp = 14 * 8 = 112 bytes
+    # tp (x4) MUST be saved — Go runtime stores g pointer in tp
+    addi sp, sp, -112
 
     sd ra, 0(sp)
     sd s0, 8(sp)
@@ -20,6 +22,7 @@ __switch:
     sd s9, 80(sp)
     sd s10, 88(sp)
     sd s11, 96(sp)
+    sd tp, 104(sp)
 
     # Save current sp to *current_sp (a0)
     sd sp, 0(a0)
@@ -41,6 +44,7 @@ __switch:
     ld s9, 80(sp)
     ld s10, 88(sp)
     ld s11, 96(sp)
+    ld tp, 104(sp)
 
-    addi sp, sp, 104
+    addi sp, sp, 112
     ret

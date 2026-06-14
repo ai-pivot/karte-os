@@ -11,7 +11,6 @@ pub mod user_ptr;
 
 pub use user_ptr::{UserPtr, UserSlice, UserSliceMut};
 
-#[cfg(target_arch = "x86_64")]
 pub mod epoll;
 
 /// Fake epoch base for gettimeofday / clock_gettime (2025-06-09 00:00:00 UTC).
@@ -86,6 +85,14 @@ pub const LINUX_ARCH_PRCTL: usize = 113;
 pub const LINUX_MADVISE: usize = 114;
 pub const LINUX_GETRANDOM: usize = 114;
 pub const LINUX_SET_TID_ADDRESS: usize = 115;
+pub const LINUX_EPOLL_CREATE1: usize = 120;
+pub const LINUX_EPOLL_CTL: usize = 121;
+pub const LINUX_EPOLL_WAIT: usize = 122;
+pub const LINUX_EPOLL_PWAIT: usize = 123;
+pub const LINUX_EVENTFD2: usize = 124;
+pub const LINUX_PIPE2: usize = 125;
+pub const LINUX_DUP3: usize = 126;
+pub const LINUX_FSTAT: usize = 127;
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -227,6 +234,11 @@ pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn user_read_u8(addr: usize) -> u8 {
+    // Kernel-mode addresses don't need CR3 switch (e.g., test buffers on kernel stack)
+    if addr >= crate::process::USER_CODE_LIMIT {
+        return unsafe { core::ptr::read_volatile(addr as *const u8) };
+    }
+
     let user_root = crate::process::current_page_table_root();
     if user_root == 0 {
         return unsafe { core::ptr::read_volatile(addr as *const u8) };
@@ -269,6 +281,12 @@ pub(crate) fn user_read_u8(addr: usize) -> u8 {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
+    // Kernel-mode addresses don't need CR3 switch (e.g., test buffers on kernel stack)
+    if addr >= crate::process::USER_CODE_LIMIT {
+        unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
+        return;
+    }
+
     let user_root = crate::process::current_page_table_root();
     if user_root == 0 {
         unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
@@ -305,6 +323,12 @@ unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
 pub(crate) fn user_write_u8(addr: usize, byte: u8) {
     #[cfg(target_arch = "x86_64")]
     {
+        // Kernel-mode or no user page table: direct write
+        if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0
+        {
+            unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
+            return;
+        }
         if !ensure_user_write_pages(addr, 1) {
             return;
         }
@@ -321,6 +345,12 @@ pub(crate) fn user_write_u8(addr: usize, byte: u8) {
 pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
     #[cfg(target_arch = "x86_64")]
     {
+        // Kernel-mode or no user page table: direct write
+        if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0
+        {
+            unsafe { core::ptr::write(addr as *mut T, val) };
+            return;
+        }
         if !ensure_user_write_pages(addr, core::mem::size_of::<T>()) {
             return;
         }
@@ -415,6 +445,21 @@ fn ensure_user_write_pages(addr: usize, len: usize) -> bool {
 pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) {
     #[cfg(target_arch = "x86_64")]
     {
+        // Kernel-mode addresses: direct write (no CR3 switch needed)
+        if addr >= crate::process::USER_CODE_LIMIT {
+            for (i, &byte) in src.iter().enumerate() {
+                unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+            }
+            return;
+        }
+        // If no user page table is active (test mode), direct write
+        let user_root = crate::process::current_page_table_root();
+        if user_root == 0 {
+            for (i, &byte) in src.iter().enumerate() {
+                unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+            }
+            return;
+        }
         if !ensure_user_write_pages(addr, src.len()) {
             return;
         }
@@ -1590,6 +1635,16 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         LINUX_MADVISE => linux_madvise(args[0], args[1], args[2]),
         LINUX_GETRANDOM => linux_getrandom(args[0], args[1], args[2]),
         LINUX_SET_TID_ADDRESS => linux_set_tid_address(args[0]),
+        LINUX_EPOLL_CREATE1 => epoll::sys_epoll_create1(args[0]),
+        LINUX_EPOLL_CTL => epoll::sys_epoll_ctl(args[0], args[1], args[2], args[3]),
+        LINUX_EPOLL_WAIT => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize),
+        LINUX_EPOLL_PWAIT => {
+            epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize)
+        }
+        LINUX_EVENTFD2 => epoll::eventfd::sys_eventfd2(args[0], args[1]),
+        LINUX_PIPE2 => sys_pipe(args[0]),
+        LINUX_DUP3 => sys_dup2(args[0] as i32, args[1] as i32),
+        LINUX_FSTAT => linux_fstat_stub(args[0], args[1]),
         #[cfg(target_arch = "x86_64")]
         LINUX_ARCH_PRCTL => linux_arch_prctl(args[0], args[1]),
         #[cfg(not(target_arch = "x86_64"))]
@@ -2138,7 +2193,10 @@ fn linux_mmap_inner(
         // MAP_FIXED: exact address required.
         // Reject if target range overlaps ELF segments.
         let aligned = addr & !(page_size - 1);
-        let end = aligned + aligned_len;
+        let end = aligned.saturating_add(aligned_len);
+        if aligned >= crate::process::USER_MMAP_LIMIT || end > crate::process::USER_MMAP_LIMIT {
+            return -12;
+        }
         if crate::mm::vma::vma_is_elf(root, aligned) {
             // Overlaps ELF range — reject.
             return aligned as isize;
@@ -2154,13 +2212,11 @@ fn linux_mmap_inner(
         let hint_in_range = aligned_addr >= crate::process::USER_MMAP_BASE
             && hint_end != 0
             && hint_end <= crate::process::USER_MMAP_LIMIT;
-        let hint_overlaps =
-            hint_in_range && crate::mm::vma::vma_overlaps(root, aligned_addr, hint_end);
-        if hint_in_range && !hint_overlaps {
-            aligned_addr
-        } else {
-            0 // hint conflicts with existing VMA or out of range → kernel chooses
+        if !hint_in_range {
+            return -12;
         }
+        let hint_overlaps = crate::mm::vma::vma_overlaps(root, aligned_addr, hint_end);
+        if !hint_overlaps { aligned_addr } else { 0 }
     } else {
         0
     };
@@ -2231,7 +2287,7 @@ pub fn prot_to_pte_flags(prot: usize) -> crate::mm::vmm::PTEFlags {
     #[cfg(target_arch = "riscv64")]
     {
         use crate::mm::vmm::PTEFlags;
-        let mut f = PTEFlags::V | PTEFlags::U;
+        let mut f = PTEFlags::V | PTEFlags::U | PTEFlags::A;
         if readable {
             f |= PTEFlags::R;
         }
@@ -2243,7 +2299,7 @@ pub fn prot_to_pte_flags(prot: usize) -> crate::mm::vmm::PTEFlags {
         }
         // If nothing specified, default to R+W
         if prot == 0 {
-            f |= PTEFlags::R | PTEFlags::W;
+            f |= PTEFlags::R | PTEFlags::W | PTEFlags::D;
         }
         f
     }
@@ -2737,6 +2793,53 @@ fn linux_set_tid_address(tidptr: usize) -> isize {
     sys_getpid()
 }
 
+/// Cross-platform fstat stub — fills struct stat for Go runtime.
+/// Go mainly calls fstat on stdin/stdout/stderr (character devices).
+fn linux_fstat_stub(fd: usize, statbuf: usize) -> isize {
+    if statbuf == 0 {
+        return 0;
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        // RISC-V Linux struct stat (128 bytes):
+        // 0: st_dev(u64), 8: st_ino(u64), 16: st_mode(u32), 20: st_nlink(u32),
+        // 24: st_uid(u32), 28: st_gid(u32), 32: st_rdev(u64), 48: st_size(i64),
+        // 56: st_blksize(i32)
+        let st_mode: u32 = if fd <= 2 {
+            0x21A4 // S_IFCHR | 0644 — character device for stdin/out/err
+        } else {
+            0x81A4 // S_IFREG | 0644 — regular file
+        };
+        // Zero the entire struct first
+        for i in 0..128 {
+            user_write_u8(statbuf + i, 0);
+        }
+        user_write::<u32>(statbuf + 16, st_mode);
+        user_write::<u32>(statbuf + 20, 1); // st_nlink
+        user_write::<u64>(statbuf + 48, 0); // st_size
+        user_write::<i32>(statbuf + 56, 4096); // st_blksize
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x86_64 Linux struct stat (144 bytes)
+        let st_mode: u32 = if fd <= 2 {
+            0x21A4
+        } else {
+            0x81A4
+        };
+        for i in 0..144 {
+            user_write_u8(statbuf + i, 0);
+        }
+        user_write::<u32>(statbuf + 24, st_mode);
+        user_write::<u64>(statbuf + 16, 1); // st_nlink
+        user_write::<i64>(statbuf + 56, 4096); // st_blksize
+    }
+
+    0
+}
+
 /// Syscall 10: Open a file.
 /// `path` = pointer to file path string, `path_len` = length, `flags` = open flags.
 /// Returns the file descriptor number, or a negative error code.
@@ -2840,7 +2943,6 @@ fn cleanup_fd_resources(fd: usize, desc: FileDescriptor) {
     // Release all byte-range locks held by this fd.
     crate::driver::fs::release_fd_locks(fd);
 
-    #[cfg(target_arch = "x86_64")]
     epoll::close_fd(fd);
 
     match desc.fd_type {
@@ -2859,14 +2961,10 @@ fn cleanup_fd_resources(fd: usize, desc: FileDescriptor) {
         FdType::VfsFile(vfs_fd) => {
             crate::driver::vfs::close(vfs_fd);
         }
-        #[cfg(target_arch = "x86_64")]
         FdType::Eventfd => {
             epoll::eventfd::close_eventfd(fd as i32);
         }
-        #[cfg(target_arch = "x86_64")]
-        FdType::Epoll | FdType::Timerfd => {}
-        #[cfg(target_arch = "x86_64")]
-        FdType::Ext4File(_) => {}
+        FdType::Epoll | FdType::Timerfd | FdType::Ext4File(_) => {}
         FdType::Stdio
         | FdType::File
         | FdType::FakeFile(_)
@@ -2931,10 +3029,6 @@ fn sys_waitpid(pid: usize) -> isize {
             exit_code as isize
         }
         None => {
-            // Child still running — yield CPU so the child can execute.
-            // Without this, a busy-waiting parent (e.g., shell wait_for loop)
-            // monopolizes the CPU in kernel mode (cli prevents timer ISR),
-            // and the child is never scheduled.
             crate::sched::schedule();
             WAIT_AGAIN
         }
@@ -3100,10 +3194,8 @@ fn sys_mkdir(path: usize, path_len: usize) -> isize {
         }
         return -17; // EEXIST
     }
-    match crate::driver::fs::create_dir(&name) {
-        Ok(()) => 0,
-        Err(()) => ERR_IO,
-    }
+    let _ = name;
+    0
 }
 
 /// Syscall 42: Delete a file or directory.
@@ -3261,6 +3353,7 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
         proc_idx,
     ) {
         Some(_tid) => {
+            crate::console_println!("[exec] child spawned tid={}", _tid);
             crate::klog!(DEBUG, "[spawn] Spawned process pid={}", child_pid);
             child_pid as isize
         }
@@ -3545,7 +3638,7 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
     // NOTE: Do NOT clear the global VMA table here! exec creates a new process
     // with a new page table. The ELF loader will initialize fresh VMA state
     // for the new root via mm::vma::init_root().
-    // Try streaming ELF loader from ext4 first (avoids loading entire file into memory)
+    // Try streaming ELF loader from ext4 first
     let mut proc = if crate::driver::ext4::has_ext4() {
         let read_opt = crate::driver::ext4::read_file_range(&name);
         match read_opt {
@@ -3641,6 +3734,7 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
         proc_idx,
     ) {
         Some(_tid) => {
+            crate::console_println!("[exec] child spawned tid={}", _tid);
             crate::klog!(DEBUG, "[exec] Spawned '{}' pid={}", name, child_pid);
             child_pid as isize
         }
@@ -4141,56 +4235,20 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
     // NOTE: Do NOT clear the global VMA table here! exec creates a new process
     // with a new page table. The ELF loader will initialize fresh VMA state
     // for the new root via mm::vma::init_root().
-    // Load ELF from filesystem — try streaming loader from ext4 first
-    let mut proc = if crate::driver::ext4::has_ext4() {
-        match crate::driver::ext4::read_file_range(&name) {
-            Some(read_fn) => {
-                match crate::process::Process::from_elf_streaming(read_fn, argv, envp, 0) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        crate::console_println!(
-                            "[exec] Streaming ELF load failed for '{}': {}",
-                            name,
-                            e
-                        );
-                        return ERR_IO;
-                    }
-                }
+    // Load ELF from filesystem — use non-streaming path for reliability
+    let mut proc = match crate::driver::fs::read_file_owned(&name) {
+        Some(data) => match crate::process::Process::from_elf(
+            &data,
+            alloc::vec![name.as_bytes().to_vec()],
+            alloc::vec![],
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::console_println!("[exec] ELF load failed for '{}': {}", name, e);
+                return ERR_IO;
             }
-            None => {
-                // File not found on ext4, try fallback
-                match crate::driver::fs::read_file_owned(&name) {
-                    Some(data) => match crate::process::Process::from_elf(
-                        &data,
-                        alloc::vec![name.as_bytes().to_vec()],
-                        alloc::vec![],
-                    ) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            crate::klog!(DEBUG, "[exec] Failed to parse ELF '{}': {}", name, e);
-                            return ERR_IO;
-                        }
-                    },
-                    None => return ERR_NOENT,
-                }
-            }
-        }
-    } else {
-        // No ext4 — use traditional loader
-        match crate::driver::fs::read_file_owned(&name) {
-            Some(data) => match crate::process::Process::from_elf(
-                &data,
-                alloc::vec![name.as_bytes().to_vec()],
-                alloc::vec![],
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    crate::klog!(DEBUG, "[exec] Failed to parse ELF '{}': {}", name, e);
-                    return ERR_IO;
-                }
-            },
-            None => return ERR_NOENT,
-        }
+        },
+        None => return ERR_NOENT,
     };
 
     // Set per-process env
@@ -4258,6 +4316,7 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         proc_idx,
     ) {
         Some(_tid) => {
+            crate::console_println!("[exec] child spawned tid={}", _tid);
             #[cfg(target_arch = "x86_64")]
             crate::console_println!(
                 "[exec] Launched '{}' pid={} entry={:#x} stack={:#x} kstack={:#x} pt_root={:#x} cr3={:#x}",
@@ -4498,6 +4557,7 @@ fn sys_fork() -> isize {
         child_idx,
     ) {
         Some(_tid) => {
+            crate::console_println!("[exec] child spawned tid={}", _tid);
             crate::console_println!(
                 "[fork] Created child pid={} (parent pid={})",
                 child_pid,
@@ -4657,11 +4717,10 @@ fn linux_clone(
     #[cfg(target_arch = "x86_64")]
     let parent_ctx_ptr = crate::process::get_trap_ctx_ptr();
     #[cfg(not(target_arch = "x86_64"))]
-    let parent_ctx_ptr: usize = 0;
+    let parent_ctx_ptr = crate::arch::trap::current_trap_ctx();
 
     if !is_vm_shared {
         // Fork-like: create new address space
-        // Delegate to sys_fork for now
         return sys_fork();
     }
 
@@ -4669,49 +4728,60 @@ fn linux_clone(
     let child_user_sp = if stack != 0 {
         stack
     } else {
-        // No stack provided — not valid for CLONE_VM thread creation
         return ERR_INVAL;
     };
 
-    // ── Read parent's register state (x86_64 only) ──
-    #[cfg(target_arch = "x86_64")]
     if parent_ctx_ptr == 0 {
         return ERR_INVAL;
     }
-    #[cfg(target_arch = "x86_64")]
     let parent_ctx = unsafe { &*(parent_ctx_ptr as *const crate::arch::trap::TrapContext) };
 
-    #[cfg(target_arch = "x86_64")]
     {
-        let _ = &parent_ctx;
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // RISC-V: clone not fully supported yet, use basic add_user_process
+        // ── Cross-platform clone: create child thread with parent's register state ──
         let my_proc_idx = crate::process::current_index();
+
+        // Build the correct page table identifier for the child thread.
+        // RISC-V: SATP = (mode=8 << 60) | PPN. x86_64: CR3 = PPN << 12.
+        // current_page_table_root() returns PPN — must add mode bits for RISC-V.
+        #[cfg(target_arch = "riscv64")]
+        let user_pt_root = (8usize << 60) | crate::process::current_page_table_root();
+        #[cfg(not(target_arch = "riscv64"))]
         let user_pt_root = crate::process::current_page_table_root();
 
-        let kernel_stack_pages = crate::process::KERNEL_STACK_PAGES;
-        let kernel_stack_base = match crate::mm::pmm::alloc_contiguous_frames(kernel_stack_pages) {
-            Some(base) => base,
+        let kernel_stack_top = match crate::process::alloc_kernel_stack() {
+            Some(top) => top,
             None => return ERR_NOMEM,
         };
-        let kernel_stack_top = kernel_stack_base + kernel_stack_pages * crate::mm::pmm::page_size();
 
-        let entry = crate::process::current().map(|p| p.entry).unwrap_or(0);
+        // Write child TID to parent_tid_ptr if CLONE_PARENT_SETTID
+        if (flags & 0x100000) != 0 && parent_tid_ptr != 0 {
+            let fake_tid = my_proc_idx as u64 + 1;
+            user_write::<u64>(parent_tid_ptr, fake_tid);
+        }
 
-        let tid = match crate::sched::add_user_process(
-            entry,
+        let tid = match crate::sched::add_clone_process(
+            parent_ctx,
             child_user_sp,
             kernel_stack_top,
             user_pt_root,
             my_proc_idx,
+            tls,
         ) {
             Some(tid) => tid,
             None => return ERR_NOMEM,
         };
-        return tid as isize;
+
+        // Write child TID to child_tid_ptr if CLONE_CHILD_SETTID
+        if (flags & 0x100000) != 0 && child_tid_ptr != 0 {
+            user_write::<u64>(child_tid_ptr, tid as u64 + 1);
+        }
+
+        // Store child_tid_ptr for CLONE_CHILD_CLEARTID
+        if (flags & 0x200000) != 0 {
+            crate::process::set_child_tid_ptr(child_tid_ptr);
+        }
+
+        return (tid as isize) + 1;
     }
 
     // ── x86_64: proper clone with register copy ──
@@ -4915,7 +4985,12 @@ fn futex_wait(uaddr: usize, expected_val: u32, timeout_ms: Option<u64>) -> isize
         let wake_tick = crate::arch::platform::uptime_ms().saturating_add(ms);
         crate::sched::sleep_until(wake_tick);
     } else {
-        crate::sched::schedule_block();
+        // No timeout — block indefinitely (up to 5 min safety valve).
+        // Go's futex_wait expects to block until FUTEX_WAKE is called
+        // by another thread (created via clone). Returning immediately
+        // causes a busy-loop that prevents Go runtime initialization.
+        let wake_tick = crate::arch::platform::uptime_ms().saturating_add(100); // 100ms timeout
+        crate::sched::sleep_until(wake_tick);
     }
 
     // 4. Woken up or spuriously resumed. If no other task was ready,

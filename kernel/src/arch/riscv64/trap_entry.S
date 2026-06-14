@@ -130,18 +130,23 @@ trap_entry:
     # sp = kernel_sp (from sscratch), sscratch = user_sp (old sp)
     # ═══════════════════════════════════════════════════════════════
 .Ltrap_from_user:
-    # Save user_sp from sscratch into t0 before clearing
+    # sscratch = user_sp, sp = kernel_sp.
+    # We must save user's t0 BEFORE using it as scratch.
+    addi    sp, sp, -288
+
+    # Save user's t0 first (before clobbering it)
+    sd      t0,  40(sp)            # x[5] = user's t0 (saved before overwrite!)
+
+    # Now use t0 to read user_sp from sscratch
     csrr    t0, sscratch           # t0 = user_sp
     csrw    sscratch, zero         # clear sscratch
-
-    addi    sp, sp, -288
 
     # Save general-purpose registers
     sd      x1,  8(sp)
     sd      t0,  16(sp)            # x[2] = user_sp (from sscratch)
     sd      x3,  24(sp)
     sd      x4,  32(sp)
-    sd      x5,  40(sp)
+    # x[5] (t0) already saved above at 40(sp)
     sd      x6,  48(sp)
     sd      x7,  56(sp)
     sd      x8,  64(sp)
@@ -175,7 +180,7 @@ trap_entry:
     csrr    t1, sepc
     sd      t1, 264(sp)
     sd      t0,  272(sp)           # sscratch field = user_sp
-    sd      zero, 280(sp)          # user_satp = 0: satp handled by trap_handler tail
+    sd      zero, 280(sp)          # user_satp = 0 (trap_handler tail sets it)
 
     # Call trap_handler(&mut TrapContext)
     mv      a0, sp
@@ -191,12 +196,7 @@ trap_return_user:
     ld      t1, 256(sp)
     csrw    sstatus, t1
 
-    # Switch page table if user_satp is non-zero. This is set ONLY for a task's
-    # first entry into U-mode (via first_task_shim, which bypasses trap_handler).
-    # Normal returns leave it 0 so satp is untouched here (trap_handler already
-    # selected the correct page table). Kernel mappings are identical across all
-    # page tables, so the following kernel instructions remain valid after the
-    # switch; a plain sfence.vma is sufficient.
+    # Switch page table if user_satp is non-zero.
     ld      t1, 280(sp)            # t1 = user_satp
     beqz    t1, .Lno_satp_switch
     csrw    satp, t1

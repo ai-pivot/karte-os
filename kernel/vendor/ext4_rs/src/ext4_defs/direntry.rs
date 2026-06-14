@@ -171,9 +171,11 @@ impl Ext4DirEntry {
     pub fn write_entry(&mut self, entry_len: u16, inode: u32, name: &str, de_type: DirEntryType) {
         self.inode = inode;
         self.entry_len = entry_len;
-        self.name_len = name.len() as u8;
+        let name_bytes = name.as_bytes();
+        let len = name_bytes.len().min(255);
+        self.name_len = len as u8;
         self.inner.inode_type = de_type.bits();
-        self.name[..name.len()].copy_from_slice(name.as_bytes());
+        self.name[..len].copy_from_slice(&name_bytes[..len]);
     }
 }
 

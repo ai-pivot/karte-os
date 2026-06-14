@@ -697,16 +697,12 @@ pub enum FdType {
     /// writes are discarded. Required by SQLite WAL mode for nonce generation.
     Urandom,
     /// eventfd — for Go runtime polling.
-    #[cfg(target_arch = "x86_64")]
     Eventfd,
     /// epoll instance — for Go runtime netpoll.
-    #[cfg(target_arch = "x86_64")]
     Epoll,
     /// timerfd — for Go runtime timers.
-    #[cfg(target_arch = "x86_64")]
     Timerfd,
     /// ext4 file descriptor.
-    #[cfg(target_arch = "x86_64")]
     Ext4File(crate::driver::ext4::Ext4FileDesc),
     /// VFS-managed file — routes to the VFS open file table.
     VfsFile(usize),
@@ -804,7 +800,11 @@ impl FileDescriptor {
             | FdType::FakeFile(_)
             | FdType::VirtualFile
             | FdType::Urandom
-            | FdType::VfsFile(_) => true,
+            | FdType::VfsFile(_)
+            | FdType::Ext4File(_)
+            | FdType::Eventfd
+            | FdType::Epoll => true,
+            FdType::Timerfd => false,
         }
     }
 
@@ -952,7 +952,6 @@ impl FdTable {
     }
 
     /// Allocate a special kernel-backed fd (eventfd, epoll, timerfd, etc.).
-    #[cfg(target_arch = "x86_64")]
     pub fn alloc_special_fd(&mut self, name: String, flags: u32, fd_type: FdType) -> Option<usize> {
         for (i, slot) in self.fds.iter_mut().enumerate() {
             if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {

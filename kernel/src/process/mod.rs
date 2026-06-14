@@ -26,6 +26,9 @@ pub const USER_CODE_LIMIT: usize = 0x1000_0000; // 256MB for code+data
 pub const USER_HEAP_BASE: usize = 0x1000_0000;
 pub const USER_HEAP_LIMIT: usize = 0x2000_0000; // 256MB heap (brk)
 pub const USER_MMAP_BASE: usize = 0x2000_0000; // Above heap (256MB), separate from brk region
+#[cfg(target_arch = "riscv64")]
+pub const USER_MMAP_LIMIT: usize = 0x003F_FFFF_FFFF;
+#[cfg(not(target_arch = "riscv64"))]
 pub const USER_MMAP_LIMIT: usize = 0x0000_7FFF_FFFF_F000; // x86_64 max canonical user address
 pub const USER_STACK_TOP: usize = 0x8000_0000; // 2GB — top of user stack
 pub const USER_STACK_BASE: usize = 0x7F00_0000; // 16MB stack region (address space)
@@ -180,21 +183,36 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
         vmm::identity_map(
             user_pt,
             0x8020_0000,
-            0x8020_0000 + 128 * 1024 * 1024,
-            vmm::PTEFlags::KRWX,
+            0x8020_0000 + 512 * 1024 * 1024,
+            vmm::PTEFlags::KRWX | vmm::PTEFlags::A | vmm::PTEFlags::D,
         );
 
-        // Map UART MMIO (0x10000000 - 0x10001000)
-        vmm::map(user_pt, 0x1000_0000, 0x1000_0000, vmm::PTEFlags::KRW);
+        // Map UART MMIO (0x10000000 - 0x10001000) with A|D bits
+        vmm::map(
+            user_pt,
+            0x1000_0000,
+            0x1000_0000,
+            vmm::PTEFlags::KRW | vmm::PTEFlags::A | vmm::PTEFlags::D,
+        );
 
-        // Map VirtIO MMIO devices (0x10001000 - 0x10009000)
+        // Map VirtIO MMIO devices (0x10001000 - 0x10009000) with A|D bits
         for addr in (0x1000_1000..0x1000_9000).step_by(4096) {
-            vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+            vmm::map(
+                user_pt,
+                addr,
+                addr,
+                vmm::PTEFlags::KRW | vmm::PTEFlags::A | vmm::PTEFlags::D,
+            );
         }
 
-        // Map PLIC (0x0C000000 - 0x0C400000)
+        // Map PLIC (0x0C000000 - 0x0C400000) with A|D bits
         for addr in (0x0C00_0000..0x0C40_0000).step_by(4096) {
-            vmm::map(user_pt, addr, addr, vmm::PTEFlags::KRW);
+            vmm::map(
+                user_pt,
+                addr,
+                addr,
+                vmm::PTEFlags::KRW | vmm::PTEFlags::A | vmm::PTEFlags::D,
+            );
         }
     }
 
@@ -310,12 +328,12 @@ fn elf_segment_pte_flags(flags: usize) -> vmm::PTEFlags {
 
     #[cfg(target_arch = "riscv64")]
     {
-        let mut pte_flags = vmm::PTEFlags::V | vmm::PTEFlags::U;
+        let mut pte_flags = vmm::PTEFlags::V | vmm::PTEFlags::U | vmm::PTEFlags::A;
         if readable {
             pte_flags |= vmm::PTEFlags::R;
         }
         if writable {
-            pte_flags |= vmm::PTEFlags::W;
+            pte_flags |= vmm::PTEFlags::W | vmm::PTEFlags::D;
         }
         if executable {
             pte_flags |= vmm::PTEFlags::X;
@@ -545,6 +563,10 @@ impl Process {
         // kernel's existing 2MB huge pages. ELF loading can then split these
         // huge pages as needed for 4KB mappings.
         copy_kernel_mappings(user_pt, kernel_stack_top);
+        // Pre-set A|D bits on ALL kernel identity-mapped pages.
+        // Without this, timer interrupts cause page faults on kernel code
+        // pages, and sfence.vma in the PF handler clears Go's lr/sc reservations.
+        vmm::set_all_ad_bits(user_pt);
 
         // 4.5 Switch to kernel CR3 for ELF loading.
         // The ELF loader writes frame data via identity-mapped physical addresses
@@ -653,7 +675,12 @@ impl Process {
             let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
             // Always map, even if identity_map already covered this address
             // (user stack needs URW flags, not kernel-only KRWX)
-            vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
+            vmm::map_user(
+                user_pt,
+                vaddr,
+                frame,
+                vmm::PTEFlags::URW | vmm::PTEFlags::A | vmm::PTEFlags::D,
+            );
         }
 
         // 6. Build initial stack (same layout as from_elf_streaming)
@@ -670,8 +697,6 @@ impl Process {
                 core::ptr::write_volatile(frame as *mut u8, val);
             }
         }
-
-        // Random bytes at stack_top - 16
         let random_addr = stack_top - 16;
         unsafe {
             write_u64_to_user(user_pt, random_addr, 0x12345678_9ABCDEF0u64);
@@ -859,23 +884,15 @@ impl Process {
     where
         F: Fn(usize, &mut [u8]) -> Result<usize, ()>,
     {
-        // Disable interrupts during ELF loading to prevent timer ISR from
-        // interfering with page table operations.
-        #[cfg(target_arch = "x86_64")]
-        x86_64::instructions::interrupts::disable();
 
         let page_size = pmm::page_size();
 
-        // 0. Allocate kernel stack (needed before copy_kernel_mappings)
+        // 0. Allocate kernel stack
         let kernel_stack_top = alloc_kernel_stack().ok_or("Out of memory for kernel stack")?;
 
-        // 0.5 Allocate a guard frame between stack and page table.
-        // Timer ISR's TrapContext (184 bytes) can overflow kernel_stack_top by up to
-        // 24 bytes. If the page table root frame is adjacent to the stack top,
-        // this corruption destroys PML4 entries. The guard frame prevents this.
         let _guard = pmm::alloc_frame();
 
-        // 1. Read ELF header (first 4096 bytes covers header + program headers)
+        // 1. Read ELF header
         let header_size = 4096usize;
         let mut header_buf = alloc::vec![0u8; header_size];
         let bytes_read = read_fn(0, &mut header_buf).map_err(|_| "ELF: failed to read header")?;
@@ -883,53 +900,23 @@ impl Process {
             return Err("ELF: header too small");
         }
 
-        // 2. Parse header and segment info
+        // 2. Parse header
         let elf_info = elf::ElfInfo::parse_header_only(&header_buf[..bytes_read])?;
 
-        // 3. Create independent user page table
+        // 3. Create user page table
         let user_pt = vmm::create_user_page_table();
-
-        // Guard frame between page table and kernel stack:
-        // Timer ISR's TrapContext (184 bytes) can overflow kernel_stack_top by up to
-        // 24 bytes. Without this guard, the overflow would corrupt the page table root frame.
         let _guard = pmm::alloc_frame();
 
-        // 4. Copy kernel identity map (2MB huge pages) BEFORE loading ELF.
-        // This establishes identity-mapped access to physical memory using the
-        // kernel's existing 2MB huge pages. ELF loading can then split these
-        // huge pages as needed for 4KB mappings.
+        // 4. Copy kernel mappings + set A/D bits
         copy_kernel_mappings(user_pt, kernel_stack_top);
+        vmm::set_all_ad_bits(user_pt);
 
-        // 4.5 Switch to kernel CR3 for ELF loading.
-        // The ELF loader writes frame data via identity-mapped physical addresses
-        // (e.g., `write_bytes(frame as *mut u8, 0, 4096)`). This requires a stable
-        // identity mapping. But as vmm::map() splits 2MB huge pages in the user
-        // page table, the identity mapping can become fragmented/corrupted. Running
-        // on the kernel CR3 (which has a complete, untampered identity mapping)
-        // ensures all physical frame writes go to the correct destination.
         let saved_cr3: u64;
-        #[cfg(target_arch = "x86_64")]
-        {
-            saved_cr3 = {
-                let cr3: u64;
-                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
-                cr3
-            };
-            let kcr3 = crate::mm::vmm::kernel_cr3() as u64;
-            if kcr3 != 0 {
-                unsafe { core::arch::asm!("mov cr3, {}", in(reg) kcr3) };
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            saved_cr3 = 0;
-        }
+        { saved_cr3 = 0; } // RISC-V: no CR3 switch needed
 
-        // 5. Load ELF segments page-by-page. map() will split any 2MB huge
-        // pages (PS=1) that overlap with ELF segment addresses.
+        // 5. Load ELF segments
         let mut max_vaddr = 0usize;
         let mut total_pages: usize = 0;
-        // Collect segment ranges for VMA registration (prevents mmap overlap)
         let mut elf_segments_vma: alloc::vec::Vec<(usize, usize, usize)> = alloc::vec::Vec::new();
         for seg_idx in 0..elf_info.num_segments {
             let seg = elf_info.segments[seg_idx].as_ref().unwrap();
@@ -939,7 +926,6 @@ impl Process {
             let page_end = (seg_vaddr_end + page_size - 1) & !(page_size - 1);
             let pte_flags = elf_segment_pte_flags(seg.flags as usize);
             let num_pages = (page_end - page_start) / page_size;
-
             // Register this segment for VMA tracking (to prevent mmap overlap)
             // Convert ELF flags to Linux PROT flags for VMA registration
             let seg_prot = {
@@ -1028,6 +1014,8 @@ impl Process {
                 max_vaddr = seg.vaddr + seg.mem_size;
             }
         } // end for seg_idx
+        crate::console_println!("[ELF] loaded {} pages", total_pages);
+
 
         // 5.05 Enforce ELF mapping invariants before any user code can run:
         // every PT_LOAD page must be user-accessible and backed by a private
@@ -1062,14 +1050,8 @@ impl Process {
             unsafe { core::arch::asm!("mov cr3, {}", in(reg) saved_cr3) };
         }
 
-        // 6. Map user stack in user page table (URW, no execute)
-        // Map from USER_STACK_TOP downward for USER_STACK_PAGES.
-        // Include the page containing USER_STACK_TOP itself (Go/C reads [rsp] on entry).
-        for i in 0..USER_STACK_PAGES {
-            let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
-            let vaddr = (USER_STACK_TOP - i * pmm::page_size()) & !(pmm::page_size() - 1);
-            vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW);
-        }
+        // 6. Stack mapping is done below (after initial stack data computation)
+        //    to allow direct frame address tracking.
 
         // 7. Set up initial stack with Linux execve layout:
         //
@@ -1101,14 +1083,19 @@ impl Process {
         let stack_top = USER_STACK_TOP;
         let phdr_addr = elf_info.phdr_vaddr;
 
-        // Helper to write u64 to user stack via physical address
+        // 6. Map user stack in user page table (URW, no execute)
+        for i in 0..USER_STACK_PAGES {
+            let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
+            let vaddr = (USER_STACK_TOP - i * pmm::page_size()) & !(pmm::page_size() - 1);
+            vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW | vmm::PTEFlags::A | vmm::PTEFlags::D);
+        }
+
+        // Helper to write u64 to user stack via physical address (translate_user)
         unsafe fn write_u64_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u64) {
             if let Some(frame) = vmm::translate_user(user_pt, addr) {
                 core::ptr::write_volatile(frame as *mut u64, val);
             }
         }
-
-        // Helper to write a byte to user stack
         unsafe fn write_byte_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u8) {
             if let Some(frame) = vmm::translate_user(user_pt, addr) {
                 core::ptr::write_volatile(frame as *mut u8, val);
@@ -1541,7 +1528,15 @@ where
     let fd_arc = {
         let table = PROCESS_TABLE.lock();
         let idx = CURRENT_PROCESS[hartid()].load(Ordering::Relaxed);
-        let proc = table[idx].as_ref().expect("No current process");
+        let proc = match table[idx].as_ref() {
+            Some(p) => p,
+            None => {
+                drop(table);
+                // Process already freed — just switch away without cleanup.
+                crate::sched::schedule_exit();
+                loop {}
+            }
+        };
         proc.fd_table.clone() // Arc::clone — cheap refcount bump
     }; // PROCESS_TABLE dropped here
 
@@ -1762,9 +1757,7 @@ impl Process {
             state: ProcessState::Ready,
             exit_code: 0,
             wait_child_idx: None,
-            fd_table: alloc::sync::Arc::new(spin::Mutex::new(
-                crate::driver::fs::FdTable::new(),
-            )),
+            fd_table: alloc::sync::Arc::new(spin::Mutex::new(crate::driver::fs::FdTable::new())),
             trap_ctx_ptr: 0,
             shared_page_table: false,
             clone_tls: 0,

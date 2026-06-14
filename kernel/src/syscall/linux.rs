@@ -174,6 +174,40 @@ mod riscv_syscalls {
     pub const L_SENDTO: usize = 206;
     pub const L_RECVFROM: usize = 207;
     pub const L_SHUTDOWN: usize = 210;
+    pub const L_SCHED_YIELD: usize = 124;
+    pub const L_SCHED_GETAFFINITY: usize = 123;
+    pub const L_FUTEX: usize = 98;
+    pub const L_NANOSLEEP: usize = 101;
+    pub const L_CLOCK_GETTIME: usize = 113;
+    pub const L_CLOCK_GETRES: usize = 114;
+    pub const L_UNAME: usize = 160;
+    pub const L_GETCWD: usize = 17;
+    pub const L_CHDIR: usize = 49;
+    pub const L_GETTID: usize = 178;
+    pub const L_KILL: usize = 129;
+    pub const L_RT_SIGACTION: usize = 134;
+    pub const L_RT_SIGPROCMASK: usize = 135;
+    pub const L_RT_SIGRETURN: usize = 139;
+    pub const L_SIGALTSTACK: usize = 132;
+    pub const L_GETTIMEOFDAY: usize = 169;
+    pub const L_SYSINFO: usize = 179;
+    pub const L_PRCTL: usize = 167;
+    pub const L_PRLIMIT64: usize = 261;
+    pub const L_GETRANDOM: usize = 278;
+    pub const L_EPOLL_CREATE1: usize = 20;
+    pub const L_EPOLL_CTL: usize = 21;
+    pub const L_EPOLL_PWAIT: usize = 22;
+    pub const L_DUP: usize = 23;
+    pub const L_DUP3: usize = 24;
+    pub const L_FCNTL: usize = 25;
+    pub const L_FACCESSAT: usize = 48;
+    pub const L_PIPE2: usize = 59;
+    pub const L_GETDENTS64: usize = 61;
+    pub const L_READLINKAT: usize = 78;
+    pub const L_NEWFSTATAT: usize = 79;
+    pub const L_EVENTFD2: usize = 19;
+    pub const L_CLONE: usize = 220;
+    pub const L_MKDIRAT: usize = 258;
 }
 
 // ─── Public API ──────────────────────────────────────────────────
@@ -200,7 +234,7 @@ pub fn translate(id: usize, args: [usize; 6]) -> Option<Translation> {
     }
     #[cfg(target_arch = "riscv64")]
     {
-        translate_riscv(id, args)
+        translate_riscv(id, args).or_else(|| translate_riscv_go(id, args))
     }
 }
 
@@ -361,7 +395,10 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         }),
         L_READLINK | L_READLINKAT => Some(Translation::Handled(super::ERR_NOENT)), // ENOENT
         L_ACCESS | L_FACCESSAT | L_FACCESSAT2 => Some(Translation::Handled(0)),    // stub
-        L_IOCTL => Some(Translation::Handled(0)),                                  // stub
+        L_IOCTL => Some(Translation::Dispatch {
+            karte_nr: super::SYS_IOCTL,
+            args,
+        }),                                  // stub
 
         // ─── Scheduling ──────────────────────────────────────
         L_SCHED_YIELD => Some(Translation::Dispatch {
@@ -560,7 +597,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
 /// Count the length of a NUL-terminated string in user memory (max 256 bytes).
 /// Switches to user CR3 temporarily since syscall runs under kernel CR3.
 pub fn count_user_string(ptr: usize) -> usize {
-    if ptr == 0 {
+    if ptr < 0x1000 {
         return 0;
     }
     let mut len = 0usize;
@@ -736,7 +773,10 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_WRITE,
             args,
         }),
-        L_FSTAT => Some(Translation::Handled(0)),
+        L_FSTAT => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_FSTAT,
+            args,
+        }),
         L_EXIT => Some(Translation::Dispatch {
             karte_nr: super::SYS_EXIT,
             args,
@@ -800,6 +840,169 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
         }),
         L_SHUTDOWN => Some(Translation::Dispatch {
             karte_nr: super::SYS_SHUTDOWN,
+            args,
+        }),
+        _ => None,
+    }
+}
+
+// Additional RISC-V translations for Go runtime support
+fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
+    use riscv_syscalls::*;
+    match id {
+        L_SCHED_GETAFFINITY => {
+            let size = core::cmp::min(args[1], 128);
+            if args[2] != 0 && size > 0 {
+                for i in 0..size {
+                    super::user_write_u8(args[2] + i, 0);
+                }
+                super::user_write_u8(args[2], 0x01);
+            }
+            Some(Translation::Handled(size as isize))
+        }
+        L_SCHED_YIELD => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_SCHED_YIELD,
+            args,
+        }),
+        L_FUTEX => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_FUTEX,
+            args,
+        }),
+        L_NANOSLEEP => {
+            let req = args[0];
+            if req < 0x1000 {
+                return Some(Translation::Handled(-14));
+            }
+            let sec = super::user_read::<i64>(req);
+            let nsec = super::user_read::<i64>(req + 8);
+            if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                return Some(Translation::Handled(-22));
+            }
+            let ms = (sec as u64)
+                .saturating_mul(1000)
+                .saturating_add(((nsec as u64) + 999_999) / 1_000_000);
+            if ms != 0 {
+                crate::sched::sleep_until(crate::arch::platform::uptime_ms().saturating_add(ms));
+            }
+            Some(Translation::Handled(0))
+        }
+        L_CLOCK_GETTIME => {
+            if args[1] != 0 {
+                let ms = crate::arch::platform::uptime_ms();
+                super::user_write::<i64>(args[1], (super::FAKE_EPOCH + ms / 1000) as i64);
+                super::user_write::<i64>(args[1] + 8, ((ms % 1000) * 1_000_000) as i64);
+            }
+            Some(Translation::Handled(0))
+        }
+        L_CLOCK_GETRES => {
+            if args[1] != 0 {
+                super::user_write::<i64>(args[1], 0);
+                super::user_write::<i64>(args[1] + 8, 1);
+            }
+            Some(Translation::Handled(0))
+        }
+        L_GETTIMEOFDAY => {
+            if args[0] != 0 {
+                let ms = crate::arch::platform::uptime_ms();
+                super::user_write::<i64>(args[0], (super::FAKE_EPOCH + ms / 1000) as i64);
+                super::user_write::<i64>(args[0] + 8, ((ms % 1000) * 1000) as i64);
+            }
+            Some(Translation::Handled(0))
+        }
+        L_UNAME => {
+            let r = sys_uname(args[0]);
+            Some(Translation::Handled(r))
+        }
+        L_SYSINFO => {
+            let r = sys_sysinfo(args[0]);
+            Some(Translation::Handled(r))
+        }
+        L_PRCTL => Some(Translation::Handled(0)),
+        L_PRLIMIT64 => Some(Translation::Handled(0)),
+        L_GETRANDOM => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_GETRANDOM,
+            args,
+        }),
+        L_CLONE => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_CLONE,
+            args,
+        }),
+        L_RT_SIGACTION => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_RT_SIGACTION,
+            args,
+        }),
+        L_RT_SIGPROCMASK => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_RT_SIGPROCMASK,
+            args,
+        }),
+        L_RT_SIGRETURN => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_RT_SIGRETURN,
+            args,
+        }),
+        L_SIGALTSTACK => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_SIGALTSTACK,
+            args,
+        }),
+        L_KILL => Some(Translation::Handled(0)),
+        L_GETTID => Some(Translation::Dispatch {
+            karte_nr: super::SYS_GETPID,
+            args,
+        }),
+        L_FACCESSAT => Some(Translation::Handled(0)),
+        L_FCNTL => Some(Translation::Handled(0)),
+        L_MKDIRAT => {
+            let pl = count_user_string(args[1]);
+            if pl == 0 {
+                return Some(Translation::Handled(super::ERR_NOENT));
+            }
+            Some(Translation::Dispatch {
+                karte_nr: super::SYS_MKDIR,
+                args: [args[1], pl, 0, 0, 0, 0],
+            })
+        }
+        L_NEWFSTATAT => Some(Translation::Handled(0)),
+        L_READLINKAT => Some(Translation::Handled(super::ERR_NOENT)),
+        L_GETDENTS64 => Some(Translation::Handled(0)),
+        L_GETCWD => {
+            let r = sys_getcwd(args[0], args[1]);
+            Some(Translation::Handled(r))
+        }
+        L_CHDIR => {
+            let pl = count_user_string(args[0]);
+            if pl == 0 {
+                return Some(Translation::Handled(super::ERR_NOENT));
+            }
+            Some(Translation::Dispatch {
+                karte_nr: super::SYS_CHDIR,
+                args: [args[0], pl, 0, 0, 0, 0],
+            })
+        }
+        L_EPOLL_CREATE1 => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_EPOLL_CREATE1,
+            args,
+        }),
+        L_EPOLL_CTL => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_EPOLL_CTL,
+            args,
+        }),
+        L_EPOLL_PWAIT => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_EPOLL_PWAIT,
+            args,
+        }),
+        L_EVENTFD2 => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_EVENTFD2,
+            args,
+        }),
+        L_PIPE2 => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_PIPE2,
+            args,
+        }),
+        L_DUP => Some(Translation::Dispatch {
+            karte_nr: super::SYS_DUP2,
+            args: [args[0], 0, 0, 0, 0, 0], // dup(fd) → dup2(fd, 0) — Go uses fcntl(F_DUPFD) anyway
+        }),
+        L_DUP3 => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_DUP3,
             args,
         }),
         _ => None,

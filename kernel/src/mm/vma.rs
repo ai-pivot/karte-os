@@ -432,47 +432,37 @@ pub fn vma_is_elf(root: usize, addr: usize) -> bool {
 pub fn reserve_mmap_addr(root: usize, len: usize) -> Result<usize, ()> {
     let page_size = crate::mm::pmm::page_size();
     let aligned_len = (len + page_size - 1) & !(page_size - 1);
-
     with_state(root, |state| {
-        let user_mmap_base = crate::process::USER_MMAP_BASE;
-        let user_mmap_limit = crate::process::USER_MMAP_LIMIT;
-
+        let base = crate::process::USER_MMAP_BASE;
+        let limit = crate::process::USER_MMAP_LIMIT;
+        if state.next_mmap_addr == 0 || state.next_mmap_addr < base {
+            state.next_mmap_addr = limit;
+        }
         loop {
-            let base = state.next_mmap_addr;
-            let candidate = if base > 0 {
-                base
-            } else if user_mmap_base > 0 {
-                user_mmap_base
-            } else {
-                base
-            };
-            let end_addr = candidate.checked_add(aligned_len).unwrap_or(0);
-            if end_addr > user_mmap_limit || end_addr == 0 {
+            let candidate = (state.next_mmap_addr.saturating_sub(aligned_len)) & !(page_size - 1);
+            if candidate < base {
                 return Err(());
             }
-            // Check overlap with existing VMAs in this root
             let overlaps = state
                 .vmas
                 .iter()
-                .any(|v| v.active && v.start < end_addr && v.end > candidate);
+                .any(|v| v.active && v.start < state.next_mmap_addr && v.end > candidate);
             if overlaps {
-                // Advance past the conflicting VMA
-                let conflict_end = state
+                let cs = state
                     .vmas
                     .iter()
-                    .filter(|v| v.active && v.start < end_addr && v.end > candidate)
-                    .map(|v| v.end)
-                    .max()
-                    .unwrap_or(candidate + aligned_len);
-                state.next_mmap_addr = (conflict_end + page_size - 1) & !(page_size - 1);
+                    .filter(|v| v.active && v.start < state.next_mmap_addr && v.end > candidate)
+                    .map(|v| v.start)
+                    .min()
+                    .unwrap_or(candidate);
+                state.next_mmap_addr = cs & !(page_size - 1);
                 continue;
             }
-            state.next_mmap_addr = end_addr;
+            state.next_mmap_addr = candidate;
             return Ok(candidate);
         }
     })?
 }
-
 /// Clear all VMA state for a given root (used by exec which replaces address space).
 pub fn vma_clear_root(root: usize) {
     let _ = with_state(root, |state| {

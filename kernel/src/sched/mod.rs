@@ -78,13 +78,12 @@ pub struct UserTaskInit {
     pub user_page_table: usize,
 }
 
-#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct CloneTaskInit<'a> {
     pub parent_ctx: &'a crate::arch::trap::TrapContext,
     pub new_user_sp: usize,
     pub kernel_stack_top: usize,
-    pub user_cr3: usize,
+    pub user_page_table: usize,
     pub tls: usize,
 }
 
@@ -229,7 +228,20 @@ fn restore_task_arch_state(slot: usize) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn restore_task_arch_state(_slot: usize) {}
+fn restore_task_arch_state(slot: usize) {
+    // RISC-V: Update CURRENT_PAGE_TABLE_ROOT so that trap_handler's tail
+    // can restore the correct satp when returning to U-mode.
+    // Without this, the page table root stays stale from the previous task,
+    // causing the resumed task to run with the wrong address space.
+    let proc_idx = match PROC_TO_SLOT[slot].load(Ordering::Relaxed) {
+        NO_SLOT => return,
+        idx => idx,
+    };
+    let root = crate::process::get_page_table_root(proc_idx);
+    if root != 0 {
+        crate::process::set_current_page_table_root(root);
+    }
+}
 
 /// Test-only access to restore_task_arch_state for verifying arch-state restore.
 #[cfg(all(target_arch = "x86_64", feature = "test_mode"))]
@@ -269,6 +281,13 @@ pub fn user_return_state_for_slot(slot: usize) -> crate::arch::user_return::User
 }
 
 fn switch_to(current: usize, next: usize) {
+    // Diagnostic: log first switch to each slot
+    static SWITCHED: [core::sync::atomic::AtomicBool; 64] =
+        [const { core::sync::atomic::AtomicBool::new(false) }; 64];
+    if !SWITCHED[next].swap(true, Ordering::Relaxed) {
+        crate::console_println!("[switch] first time -> slot {}", next);
+    }
+
     save_fs_base(current);
     CURRENT_RUNNING.store(next, Ordering::Relaxed);
     set_current_process_for_slot(next);
@@ -384,10 +403,33 @@ pub fn is_init_running() -> bool {
 
 pub fn mark_current_exited() {
     remove_sleep(CURRENT_RUNNING.load(Ordering::Relaxed));
-    let mut sched = SCHEDULER.lock();
-    let cur = sched.current;
-    if let Some(ref mut task) = sched.tasks[cur] {
-        task.state = TaskState::Exited;
+
+    // Also kill ALL scheduler slots that share the same proc_idx.
+    // clone() children share the parent's proc_idx but have separate
+    // scheduler slots. Without this, orphaned clone threads keep running
+    // after the thread group leader exits, causing page faults on freed memory.
+    let proc_idx = {
+        let sched = SCHEDULER.lock();
+        match sched.kinds[sched.current] {
+            TaskKind::User { proc_idx } => Some(proc_idx),
+            _ => None,
+        }
+    };
+    if let Some(pi) = proc_idx {
+        let mut sched = SCHEDULER.lock();
+        for slot in 0..sched.high_water {
+            if matches!(sched.kinds[slot], TaskKind::User { proc_idx: p } if p == pi) {
+                remove_sleep(slot);
+                sched.tasks[slot] = None;
+                sched.kinds[slot] = TaskKind::Empty;
+            }
+        }
+    } else {
+        let mut sched = SCHEDULER.lock();
+        let cur = sched.current;
+        if let Some(ref mut task) = sched.tasks[cur] {
+            task.state = TaskState::Exited;
+        }
     }
 }
 
@@ -529,14 +571,14 @@ pub fn tick_sleep_queue() {
 fn build_initial_stack(init: UserTaskInit) -> usize {
     let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
     let trap_ctx_base = init.kernel_stack_top - ctx_size;
-    let switch_sp = trap_ctx_base - 104;
+    let switch_sp = trap_ctx_base - 112;
     unsafe {
-        core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + 104);
+        core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + 112);
         let sw = switch_sp as *mut usize;
         *sw.add(0) = first_task_shim as *const () as usize;
         let ctx = trap_ctx_base as *mut usize;
-        *ctx.add(2) = init.kernel_stack_top;
-        *ctx.add(32) = 0x20;
+        *ctx.add(2) = init.user_stack_top;
+        *ctx.add(32) = 0x20 | (1 << 13);
         *ctx.add(33) = init.entry;
         *ctx.add(34) = init.user_stack_top;
         *ctx.add(35) = init.user_page_table;
@@ -589,10 +631,49 @@ fn build_clone_stack(init: CloneTaskInit<'_>) -> usize {
         ctx.rax = 0;
         ctx.rsp = init.new_user_sp as u64;
         ctx.kernel_sp = init.kernel_stack_top as u64;
-        ctx.user_cr3 = init.user_cr3 as u64;
+        ctx.user_cr3 = init.user_page_table as u64;
         ctx.trap_from_user = 1;
         core::ptr::write(trap_ctx_base as *mut crate::arch::trap::TrapContext, ctx);
     }
+    switch_sp
+}
+
+/// Build initial kernel stack for a clone()'d thread (RISC-V).
+/// Copies the parent's TrapContext, then modifies:
+///   a0=0 (child return), sp=child_stack, tp=TLS, sepc+=4 (skip ecall)
+#[cfg(target_arch = "riscv64")]
+fn build_clone_stack(init: CloneTaskInit<'_>) -> usize {
+    let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
+    let trap_ctx_base = init.kernel_stack_top - ctx_size;
+    let switch_sp = trap_ctx_base - 112; // 14 callee-saved regs = 112 bytes
+
+    unsafe {
+        core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + 112);
+
+        // Set up __switch return frame: jump to first_task_shim
+        let sw = switch_sp as *mut usize;
+        *sw.add(0) = first_task_shim as *const () as usize;
+
+        // Copy parent's TrapContext to child's stack
+        let ctx = trap_ctx_base as *mut usize;
+        let parent = init.parent_ctx as *const _ as *const usize;
+        for i in 0..36 {
+            // 36 usize fields: x[0..32], sstatus, sepc, sscratch, user_satp
+            *ctx.add(i) = *parent.add(i);
+        }
+
+        // Modify child's TrapContext for thread entry:
+        *ctx.add(10) = 0; // x[10] (a0) = 0: child clone() returns 0
+        *ctx.add(2) = init.new_user_sp; // x[2] (sp) = child user stack
+        // DO NOT override tp (x4): Go's clone wrapper stores TLS on the child
+        // stack and sets tp itself in the thread entry function. Overriding
+        // tp from args[4] would set garbage (Go doesn't pass TLS via a4).
+        *ctx.add(34) = init.new_user_sp; // sscratch = child user sp
+        let parent_sepc = *ctx.add(33);
+        *ctx.add(33) = parent_sepc + 4; // sepc += 4: skip ecall instruction
+        *ctx.add(35) = init.user_page_table; // user_satp = shared page table
+    }
+
     switch_sp
 }
 
@@ -651,21 +732,23 @@ pub fn add_user_process(
     .ok()
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn spawn_clone_task(proc_idx: usize, init: CloneTaskInit<'_>) -> Result<usize, SchedError> {
     let initial_sp = build_clone_stack(init);
     let slot = allocate_user_slot(proc_idx, init.kernel_stack_top, initial_sp)?;
-    TASK_FS_BASE[slot].store(init.tls as u64, Ordering::Relaxed);
-    PENDING_RSP0.store(init.kernel_stack_top as u64, Ordering::Relaxed);
+    #[cfg(target_arch = "x86_64")]
+    {
+        TASK_FS_BASE[slot].store(init.tls as u64, Ordering::Relaxed);
+        PENDING_RSP0.store(init.kernel_stack_top as u64, Ordering::Relaxed);
+    }
+    let _ = init.tls;
     Ok(slot)
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn add_clone_process(
     parent_ctx: &crate::arch::trap::TrapContext,
     new_user_sp: usize,
     kernel_stack_top: usize,
-    user_cr3: usize,
+    user_page_table: usize,
     proc_idx: usize,
     tls: usize,
 ) -> Option<usize> {
@@ -675,7 +758,7 @@ pub fn add_clone_process(
             parent_ctx,
             new_user_sp,
             kernel_stack_top,
-            user_cr3,
+            user_page_table,
             tls,
         },
     )

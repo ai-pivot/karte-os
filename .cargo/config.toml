@@ -7,6 +7,11 @@ rustflags = [
     "-C", "code-model=kernel",
 ]
 
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tkernel/memory.x",
+]
+
 [alias]
 kbuild = "build --release -p karte-os-kernel"
 krun = "run --release -p karte-os-kernel"

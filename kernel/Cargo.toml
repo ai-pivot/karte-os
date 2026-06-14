@@ -11,6 +11,7 @@ klog_debug = []
 
 [dependencies]
 linked_list_allocator = "0.10"
+buddy_system_allocator = "0.11"
 spin = "0.12"
 bitflags = "2.11"
 starry-fatfs = { version = "0.4.1-preview.2", default-features = false, features = ["alloc", "lfn"] }
