@@ -2999,16 +2999,9 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
 
     // O_CREAT with ext4: create the file if it doesn't exist
         if has_creat && crate::driver::ext4::has_ext4() {
-        // Create empty file on ext4
         match crate::driver::ext4::write_file(&name, &[]) {
-            Ok(()) => {
-                #[cfg(target_arch = "riscv64")]
-            }
-            Err(e) => {
-                #[cfg(target_arch = "riscv64")]
-                {
-                }
-            }
+            Ok(()) => {}
+            Err(_) => {}
         }
         // Try lookup again after creation
         if let Some(inode) = crate::driver::fs::lookup_path(&name) {
