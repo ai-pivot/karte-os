@@ -267,9 +267,15 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 }
 
                 // Lazy allocation for unmapped user pages.
-                // Handles BOTH user-mode and kernel-mode PFs.
-                let is_user_addr = fault_addr < crate::process::USER_MMAP_LIMIT
-                    && !(0x8020_0000..0xA020_0000).contains(&fault_addr);
+                // Only for legitimate user-space addresses, excluding
+                // kernel identity map and MMIO regions.
+                let is_kernel_or_mmio = 
+                    (0x0C00_0000..0x0C40_0000).contains(&fault_addr)  // PLIC
+                    || (0x1000_0000..0x1000_A000).contains(&fault_addr) // UART + VirtIO MMIO
+                    || (0x8020_0000..0xC020_0000).contains(&fault_addr); // Kernel identity map
+                let is_user_addr = !is_kernel_or_mmio
+                    && fault_addr < crate::process::USER_MMAP_LIMIT
+                    && fault_addr >= 0x10000; // Above ELF entry point
                 if is_user_addr {
                     let user_pt = get_current_user_pt();
                     let heap_base = crate::process::USER_HEAP_BASE;
@@ -396,4 +402,64 @@ fn skip_trap_instruction(ctx: &mut TrapContext) {
     // during CSR probing). All our code and the Rust runtime use standard
     // 32-bit instructions for CSR probes, so 4 is always correct.
     ctx.sepc += 4;
+}
+
+/// Print a debug message safely by switching to kernel page table first.
+/// This ensures UART MMIO is accessible regardless of current satp state.
+#[allow(dead_code)]
+pub fn safe_print(msg: &str) {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        // Save current satp
+        let saved_satp: usize;
+        core::arch::asm!("csrr {}, satp", out(reg) saved_satp);
+        
+        // Switch to kernel page table
+        let kernel_satp = crate::mm::vmm::KERNEL_SATP.load(core::sync::atomic::Ordering::Relaxed);
+        if kernel_satp != 0 && kernel_satp != saved_satp {
+            core::arch::asm!(
+                "csrw satp, {satp}",
+                "sfence.vma",
+                satp = in(reg) kernel_satp,
+            );
+        }
+        
+        // Print via UART directly (no locks)
+        let uart = crate::driver::uart::Uart::new(0x1000_0000);
+        for byte in msg.bytes() {
+            if byte == b'\n' {
+                uart.putc(b'\r');
+            }
+            uart.putc(byte);
+        }
+        
+        // Restore satp
+        if kernel_satp != 0 && kernel_satp != saved_satp {
+            core::arch::asm!(
+                "csrw satp, {satp}",
+                "sfence.vma",
+                satp = in(reg) saved_satp,
+            );
+        }
+    }
+}
+
+/// Print a hex value safely.
+#[allow(dead_code)]
+pub fn safe_print_hex(val: usize) {
+    let mut buf = [0u8; 20];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let mut i = 2;
+    let mut started = false;
+    for shift in (0..64).step_by(4).rev() {
+        let nibble = (val >> shift) & 0xf;
+        if nibble != 0 || started || shift == 0 {
+            buf[i] = if nibble < 10 { b'0' + nibble as u8 } else { b'a' + (nibble - 10) as u8 };
+            i += 1;
+            started = true;
+        }
+    }
+    let s = core::str::from_utf8(&buf[..i]).unwrap_or("?");
+    safe_print(s);
 }

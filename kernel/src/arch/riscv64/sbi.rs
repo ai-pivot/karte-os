@@ -7,21 +7,47 @@ use sbi::system_reset::{ResetReason, ResetType, system_reset};
 
 /// Write a single byte to UART0 (0x10000000) via MMIO.
 ///
-/// This bypasses SBI entirely and writes directly to the UART hardware,
-/// ensuring compatibility with all SBI versions (1.0, 2.0, etc.).
+/// Switches to kernel page table (SATP) before accessing UART MMIO,
+/// then restores the original SATP. This ensures UART is always
+/// accessible via the kernel's identity mapping, regardless of
+/// the current process's page table state.
 pub fn console_putchar(c: u8) {
     const UART0_BASE: usize = 0x1000_0000;
     const UART_LSR: usize = 5;
     const UART_THR: usize = 0;
     const LSR_TX_EMPTY: u8 = 0x20;
 
-    let base = UART0_BASE;
-    // Wait until TX buffer is empty
-    while unsafe { core::ptr::read_volatile((base + UART_LSR) as *const u8) } & LSR_TX_EMPTY == 0 {
-        core::hint::spin_loop();
-    }
     unsafe {
-        core::ptr::write_volatile((base + UART_THR) as *mut u8, c);
+        // Save current satp
+        let saved_satp: usize;
+        core::arch::asm!("csrr {}, satp", out(reg) saved_satp);
+
+        // Switch to kernel page table for reliable UART MMIO access
+        let kernel_satp =
+            crate::mm::vmm::KERNEL_SATP.load(core::sync::atomic::Ordering::Relaxed);
+        let need_switch = kernel_satp != 0 && kernel_satp != saved_satp;
+        if need_switch {
+            core::arch::asm!(
+                "csrw satp, {ks}",
+                "sfence.vma",
+                ks = in(reg) kernel_satp,
+            );
+        }
+
+        // Write to UART
+        while core::ptr::read_volatile((UART0_BASE + UART_LSR) as *const u8) & LSR_TX_EMPTY == 0 {
+            core::hint::spin_loop();
+        }
+        core::ptr::write_volatile((UART0_BASE + UART_THR) as *mut u8, c);
+
+        // Restore original satp
+        if need_switch {
+            core::arch::asm!(
+                "csrw satp, {ss}",
+                "sfence.vma",
+                ss = in(reg) saved_satp,
+            );
+        }
     }
 }
 

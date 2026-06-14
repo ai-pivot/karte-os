@@ -270,10 +270,16 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
     #[cfg(target_arch = "riscv64")]
     {
         // RISC-V Sv39 on QEMU -cpu rv64 does NOT auto-set A/D bits.
-        // Force A|D on ALL leaf PTEs to prevent instruction/load/store
-        // page fault loops. This is the standard OS approach for
-        // implementations without hardware A/D bit support.
-        table.entries[vpn] = PTE::new(ppn, flags | PTEFlags::A | PTEFlags::D);
+        // Pre-set A bit on all leaf PTEs to avoid access PF loops.
+        // Only set D bit on WRITABLE pages — D on read-only pages
+        // violates RISC-V semantics and corrupts Go's type system
+        // (itabInit bounds checks fail because D on read-only .data
+        // pages confuses Go's memory model).
+        let mut final_flags = flags | PTEFlags::A;
+        if flags.contains(PTEFlags::W) {
+            final_flags |= PTEFlags::D;
+        }
+        table.entries[vpn] = PTE::new(ppn, final_flags);
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -624,7 +630,11 @@ pub fn mprotect_user(root: &mut PageTable, vaddr: usize, flags: PTEFlags) -> boo
     let ppn = entry.ppn();
     #[cfg(target_arch = "riscv64")]
     {
-        table.entries[vpn] = PTE::new(ppn, flags | PTEFlags::A | PTEFlags::D);
+        let mut final_flags = flags | PTEFlags::A;
+        if flags.contains(PTEFlags::W) {
+            final_flags |= PTEFlags::D;
+        }
+        table.entries[vpn] = PTE::new(ppn, final_flags);
     }
     #[cfg(target_arch = "x86_64")]
     {
