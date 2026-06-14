@@ -206,14 +206,26 @@ pub fn set_echo(enabled: bool) {
     TTY_ECHO.store(enabled, Ordering::Relaxed);
 }
 
+/// Atomic guard to prevent reentrant on_char calls from nested interrupts.
+static IN_ON_CHAR: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Poll UART RX FIFO and feed all available bytes into the TTY.
-/// Called from timer interrupt handler.
+/// Called from timer interrupt handler AND sys_read.
+/// Safe for nested calls: uses atomic guard to skip if already polling.
 pub fn poll_uart() {
+    // Prevent reentrant access: if we're already inside poll_uart/on_char
+    // (e.g., timer fired during sys_read's poll_uart), skip this call.
+    if IN_ON_CHAR.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         while let Some(c) = crate::arch::uart::getchar() {
             on_char(c);
         }
+        IN_ON_CHAR.store(false, core::sync::atomic::Ordering::Release);
         return;
     }
     #[cfg(target_arch = "riscv64")]
@@ -222,6 +234,7 @@ pub fn poll_uart() {
         while let Some(c) = uart.getc() {
             on_char(c);
         }
+        IN_ON_CHAR.store(false, core::sync::atomic::Ordering::Release);
     }
 }
 

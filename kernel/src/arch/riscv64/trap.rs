@@ -142,9 +142,9 @@ pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
 
 /// Handle timer interrupt: poll UART, advance scheduler, tick network.
 fn handle_timer() {
-    // Do NOT poll UART here — polling from timer ISR causes reentrant
-    // access to TTY ring buffer / line editor when sys_read is also polling.
-    // UART polling is done from sys_read (stdin) and sys_write (stdout) instead.
+    // Poll UART RX — safe because on_char uses an atomic guard to prevent
+    // reentrant access from nested timer interrupts.
+    crate::driver::tty::poll_uart();
 
     // Tick uptime counter
     crate::arch::platform::tick_uptime();
