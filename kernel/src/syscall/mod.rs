@@ -1970,17 +1970,20 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             return ERR_INVAL; // can't read from write end
         }
         Some((FdType::Stdio, _, _)) => {
-            // Stdio stdin (fd 0 default): blocking read from TTY
-            // TTY read needs to write to user memory — use intermediate buffer
+            // Stdio stdin (fd 0 default): blocking read from TTY.
+            // We poll UART here (NOT from timer ISR) to avoid reentrant
+            // corruption of the ring buffer / line editor.
             let mut kbuf = alloc::vec![0u8; len];
             loop {
+                // Poll UART for new input
+                crate::driver::tty::poll_uart();
                 let result = crate::driver::tty::read(kbuf.as_mut_ptr() as usize, len);
                 if result > 0 {
                     let user_buf = UserSliceMut::new(buf, len).unwrap();
                     user_buf.copy_from_slice(&kbuf[..result as usize]);
                     return result;
                 }
-                crate::driver::tty::poll_uart();
+                // No data yet — yield CPU to other tasks
                 crate::sched::schedule();
             }
         }
