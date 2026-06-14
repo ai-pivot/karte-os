@@ -27,6 +27,14 @@ pub fn init() {
         key: String::from("USER"),
         val: String::from("root"),
     });
+    env.push(EnvVar {
+        key: String::from("HOME"),
+        val: String::from("/"),
+    });
+    env.push(EnvVar {
+        key: String::from("TERM"),
+        val: String::from("xterm-256color"),
+    });
 }
 
 /// Get an environment variable value.
