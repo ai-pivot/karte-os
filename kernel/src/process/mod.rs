@@ -23,8 +23,8 @@ use crate::mm::{pmm, vmm};
 ///   0xFEC0_0000, 0xFEE0_0000    = IOAPIC, LAPIC (kernel only)
 pub const USER_CODE_BASE: usize = 0x0000_0000;
 pub const USER_CODE_LIMIT: usize = 0x1000_0000; // 256MB for code+data
-pub const USER_HEAP_BASE: usize = 0x1000_0000;
-pub const USER_HEAP_LIMIT: usize = 0x2000_0000; // 256MB heap (brk)
+pub const USER_HEAP_BASE: usize = 0x0600_0000; // After Go's BSS (~0x5FA0000)
+pub const USER_HEAP_LIMIT: usize = 0x1600_0000; // 256MB heap (brk)
 pub const USER_MMAP_BASE: usize = 0x2000_0000; // Above heap (256MB), separate from brk region
 #[cfg(target_arch = "riscv64")]
 pub const USER_MMAP_LIMIT: usize = 0x003F_FFFF_FFFF;

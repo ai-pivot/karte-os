@@ -209,6 +209,7 @@ mod riscv_syscalls {
     pub const L_CLONE: usize = 220;
     pub const L_MKDIRAT: usize = 258;
     pub const L_MKDIRAT_OLD: usize = 34;
+    pub const L_FTRUNCATE: usize = 46;
 }
 
 // ─── Public API ──────────────────────────────────────────────────
@@ -381,7 +382,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_PIPE,
             args,
         }),
-        L_GETDENTS | L_GETDENTS64 => Some(Translation::Handled(0)), // stub: empty dir
+        // getdents handled by translate_riscv_go
         L_GETCWD => {
             let result = sys_getcwd(args[0], args[1]);
             Some(Translation::Handled(result))
@@ -845,6 +846,11 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_SHUTDOWN,
             args,
         }),
+        L_FTRUNCATE => {
+            // ftruncate(fd, length) — SQLite WAL needs this to set -shm file size.
+            // We stub it to success; the actual file size is managed by write_file.
+            Some(Translation::Handled(0))
+        }
         _ => None,
     }
 }
@@ -971,7 +977,7 @@ fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
             }
         }
         L_READLINKAT => Some(Translation::Handled(super::ERR_NOENT)),
-        L_GETDENTS64 => Some(Translation::Handled(0)),
+        L_GETDENTS64 => Some(Translation::Handled(0)), // stub: empty dir listing
         L_GETCWD => {
             let r = sys_getcwd(args[0], args[1]);
             Some(Translation::Handled(r))

@@ -1891,8 +1891,16 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
                 Err(_) => ERR_IO,
             };
         }
+        Some((FdType::Ext4File(_), _, _)) => {
+            let data = user_read_bytes(buf, len);
+            let name = crate::process::with_fd_table(|fdt|
+                fdt.get(fd as usize).map(|d| d.name.clone()).unwrap_or_default());
+            if !name.is_empty() {
+                let _ = crate::driver::ext4::write_file(&name, &data);
+            }
+            return len as isize;
+        }
         Some((FdType::File, _, _)) => {
-            // Fall through to file write below
         }
         _ => {
             // Unknown fd — still try to write to console instead of failing
@@ -1968,8 +1976,25 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 crate::sched::schedule();
             }
         }
+        Some((FdType::Ext4File(_), _, _)) => {
+            let name = crate::process::with_fd_table(|fdt|
+                fdt.get(fd as usize).map(|d| d.name.clone()).unwrap_or_default());
+            if !name.is_empty() {
+                if let Some(data) = crate::driver::ext4::read_file(&name) {
+                    let pos = crate::process::with_fd_table(|fdt|
+                        fdt.get(fd as usize).map(|d| d.pos).unwrap_or(0));
+                    let avail = if pos < data.len() { data.len() - pos } else { 0 };
+                    let n = core::cmp::min(avail, len);
+                    for i in 0..n { user_write_u8(buf + i, data[pos + i]); }
+                    crate::process::with_fd_table(|fdt| {
+                        if let Some(f) = fdt.get_mut(fd as usize) { f.pos += n; }
+                    });
+                    return n as isize;
+                }
+            }
+            return 0;
+        }
         Some((FdType::File, _, _)) => {
-            // Fall through to file read below
         }
         Some((FdType::FakeFile(_), _, _)) | Some((FdType::Urandom, _, _)) => {
             // FakeFile/urandom: fake_read copies kernel bytes through user_write_u8().
