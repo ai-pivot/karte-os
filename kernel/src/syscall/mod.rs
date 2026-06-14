@@ -2962,6 +2962,27 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
         });
     }
 
+    // Check ext4 for existing files (open for read/write without O_CREAT)
+    if crate::driver::ext4::has_ext4() {
+        if let Some(inode) = crate::driver::fs::lookup_path(&name) {
+            return crate::process::with_fd_table(|fd_table| {
+                match fd_table.alloc_special_fd(
+                    name.clone(),
+                    flags,
+                    crate::driver::fs::FdType::Ext4File(
+                        crate::driver::ext4::Ext4FileDesc {
+                            inode_num: inode as u32,
+                            writable: has_creat || (flags & 0x3) != 0,
+                        },
+                    ),
+                ) {
+                    Some(fd) => fd as isize,
+                    None => ERR_NOMEM,
+                }
+            });
+        }
+    }
+
     // O_CREAT with ext4: create the file if it doesn't exist
         if has_creat && crate::driver::ext4::has_ext4() {
         // Create empty file on ext4
