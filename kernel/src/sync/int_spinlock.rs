@@ -62,6 +62,25 @@ impl<T> IntSpinLock<T> {
     fn unlock(&self) {
         self.locked.store(false, Ordering::Release);
     }
+
+    /// Try to acquire the lock without waiting. Returns None if already locked.
+    pub fn try_lock(&self) -> Option<IntSpinLockGuard<'_, T>> {
+        let sie_enabled = read_sie();
+        disable_interrupts();
+        if self.locked.swap(true, Ordering::Acquire) {
+            // Already locked — restore interrupts and return None
+            if sie_enabled {
+                enable_interrupts();
+            }
+            None
+        } else {
+            core::sync::atomic::fence(Ordering::SeqCst);
+            Some(IntSpinLockGuard {
+                lock: self,
+                sie_enabled,
+            })
+        }
+    }
 }
 
 pub struct IntSpinLockGuard<'a, T> {

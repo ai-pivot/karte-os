@@ -159,7 +159,14 @@ fn handle_timer() {
     }
 
     set_next_timer();
-    crate::sched::schedule();
+
+    // Set NEED_RESCHED flag instead of calling schedule() directly.
+    // The actual schedule() call happens in the code-5 handler below (when
+    // from_user) or in the ecall handler (when timer fired during a syscall).
+    // This prevents lock-holder preemption deadlocks: if the timer interrupts
+    // a syscall that holds a spinlock (e.g. EXT4_FS), calling schedule() here
+    // would switch to another task that spins on the same lock forever.
+    crate::sched::NEED_RESCHED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Trap handler — called from assembly trap_entry.
@@ -181,7 +188,20 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
 
     if is_interrupt {
         match code {
-            5 => handle_timer(),
+            5 => {
+                handle_timer();
+                // If the timer fired during USER mode (not inside a syscall),
+                // it's safe to schedule immediately — no kernel locks are held.
+                // If it fired during kernel mode (inside a syscall), we skip
+                // here and let the ecall handler check NEED_RESCHED when the
+                // syscall completes.
+                if from_user
+                    && crate::sched::NEED_RESCHED
+                        .swap(false, core::sync::atomic::Ordering::Relaxed)
+                {
+                    crate::sched::schedule();
+                }
+            }
             9 => {
                 // Supervisor External (PLIC)
                 crate::arch::plic::handle_interrupt(0);
@@ -196,8 +216,6 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
         match code {
             8 => {
                 // User Environment Call (ecall from U-mode)
-                // a7 = syscall number (x[17])
-                // a0-a5 = args (x[10]-x[15])
                 let syscall_id = ctx.x[17];
                 let args = [
                     ctx.x[10], ctx.x[11], ctx.x[12], ctx.x[13], ctx.x[14], ctx.x[15],
@@ -207,6 +225,14 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 let result = crate::syscall::dispatch(syscall_id, args);
                 ctx.x[10] = result as usize; // a0 = return value
                 ctx.sepc += 4; // skip ecall instruction
+
+                // Check if timer requested a reschedule.
+                // We do this ONLY on ecall return (user → kernel → user),
+                // never during timer ISR. This ensures schedule() is called
+                // when no spinlocks are held (user mode has no kernel locks).
+                if crate::sched::NEED_RESCHED.swap(false, core::sync::atomic::Ordering::Relaxed) {
+                    crate::sched::schedule();
+                }
             }
             2 => {
                 // Illegal instruction — silently skip.
@@ -302,10 +328,24 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                     // On x86_64, unhandled user PFs kill the process.
                 }
 
-                // Page fault we couldn't handle.
+                // Page fault we couldn't handle through lazy allocation.
                 if from_user {
+                    crate::console_println!(
+                        "[PF-FATAL] sepc={:#x} stval={:#x} code={} pid={}",
+                        ctx.sepc,
+                        stval,
+                        code,
+                        crate::process::current_pid()
+                    );
                     crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
                 } else {
+                    // S-mode page fault on a user address: this happens when
+                    // the kernel (running during a syscall) accesses a user
+                    // buffer whose page hasn't been lazy-allocated yet.
+                    // The lazy allocation above should have handled it, but if
+                    // we get here, the page wasn't in a known VMA/heap region.
+                    // Skip the instruction to avoid infinite loops.
+                    crate::klog!(INFO, "[PF-SMODE] sepc={:#x} stval={:#x} code={} — user addr in S-mode, skipping", ctx.sepc, stval, code);
                     skip_trap_instruction(ctx);
                 }
             }

@@ -212,7 +212,12 @@ mod riscv_syscalls {
     pub const L_FTRUNCATE: usize = 46;
     pub const L_PREAD64: usize = 67;
     pub const L_PWRITE64: usize = 68;
+    pub const L_READV: usize = 65;
+    pub const L_WRITEV: usize = 66;
+    pub const L_PREADV: usize = 69;
+    pub const L_PWRITEV: usize = 70;
     pub const L_FSYNC: usize = 82;
+    pub const L_FALLOCATE: usize = 47;
     pub const L_UNLINKAT: usize = 35;
     pub const L_GETEUID: usize = 175;
     pub const L_GETUID: usize = 174;
@@ -358,9 +363,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         }
         L_NEWFSTATAT => {
             let pl = count_user_string(args[1]);
-            if pl == 0 {
-                return Some(Translation::Handled(super::ERR_NOENT));
-            }
+            if pl == 0 { return Some(Translation::Handled(super::ERR_NOENT)); }
             let name = match super::read_user_path(args[1], pl) {
                 Some(n) => n,
                 None => return Some(Translation::Handled(super::ERR_NOENT)),
@@ -368,11 +371,15 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             let name = super::resolve_path(&name);
             if let Some(inode) = crate::driver::fs::lookup_path(&name) {
                 if args[2] != 0 {
-                    let is_dir = crate::driver::ext4::metadata_of(inode)
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false);
+                    let meta = crate::driver::ext4::metadata_of(inode);
+                    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                    let fsize = meta.as_ref().map(|m| m.size as u64).unwrap_or(0);
                     let mode = if is_dir { 0x41EDu32 } else { 0x81A4u32 };
-                    let _ = super::user_write::<u32>(args[2] + 16, mode);
+                    for i in 0..128usize { super::user_write_u8(args[2] + i, 0); }
+                    super::user_write::<u32>(args[2] + 16, mode);
+                    super::user_write::<u32>(args[2] + 20, 1);
+                    super::user_write::<u64>(args[2] + 48, fsize);
+                    super::user_write::<u32>(args[2] + 56, 4096);
                 }
                 Some(Translation::Handled(0))
             } else {
@@ -783,7 +790,23 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_CLOSE,
             args,
         }),
-        L_LSEEK => Some(Translation::Handled(0)),
+        L_LSEEK => {
+            let fd = args[0] as i32;
+            let offset = args[1] as i64;
+            let whence = args[2] as i32;
+            let ext4_inode = super::get_fd_ext4_inode(fd);
+            if let Some(inode) = ext4_inode {
+                let file_size = crate::driver::ext4::file_size(inode).unwrap_or(0) as i64;
+                let cur_pos = super::get_fd_pos(fd) as i64;
+                let new_pos = match whence {
+                    0 => offset, 1 => cur_pos + offset, 2 => file_size + offset,
+                    _ => return Some(Translation::Handled(super::ERR_INVAL)),
+                };
+                if new_pos < 0 { return Some(Translation::Handled(super::ERR_INVAL)); }
+                super::set_fd_pos(fd, new_pos as usize);
+                Some(Translation::Handled(new_pos as isize))
+            } else { Some(Translation::Handled(0)) }
+        }
         L_READ => Some(Translation::Dispatch {
             karte_nr: super::SYS_READ,
             args,
@@ -906,7 +929,44 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                 Some(Translation::Handled(result))
             }
         }
-        L_FSYNC => Some(Translation::Handled(0)), // success stub
+        L_FSYNC => Some(Translation::Handled(0)),
+        L_FALLOCATE => Some(Translation::Handled(0)),
+        L_WRITEV | L_PWRITEV => {
+            let fd = args[0] as i32; let iov = args[1]; let iovcnt = args[2];
+            let offset = if matches!(id, L_PWRITEV) { args[3] } else { super::get_fd_pos(fd) };
+            let inode = match super::get_fd_ext4_inode(fd) { Some(i) => i, None => return Some(Translation::Handled(0)) };
+            let mut pos = offset; let mut total = 0usize;
+            for i in 0..iovcnt {
+                let base = super::user_read::<usize>(iov + i*16);
+                let len = super::user_read::<usize>(iov + i*16 + 8);
+                if len == 0 { continue; }
+                let data = super::user_read_bytes(base, len);
+                match crate::driver::ext4::write_file_at_offset(inode, pos, &data) {
+                    Ok(n) => { pos += n; total += n; }
+                    Err(_) => break,
+                }
+            }
+            if !matches!(id, L_PWRITEV) { super::set_fd_pos(fd, pos); }
+            Some(Translation::Handled(total as isize))
+        }
+        L_READV | L_PREADV => {
+            let fd = args[0] as i32; let iov = args[1]; let iovcnt = args[2];
+            let offset = if matches!(id, L_PREADV) { args[3] } else { super::get_fd_pos(fd) };
+            let inode = match super::get_fd_ext4_inode(fd) { Some(i) => i, None => return Some(Translation::Handled(0)) };
+            let mut pos = offset; let mut total = 0usize;
+            for i in 0..iovcnt {
+                let base = super::user_read::<usize>(iov + i*16);
+                let len = super::user_read::<usize>(iov + i*16 + 8);
+                if len == 0 { continue; }
+                let mut kbuf = alloc::vec![0u8; len];
+                match crate::driver::ext4::read_file_at_offset(inode, pos, &mut kbuf) {
+                    Ok(n) => { for j in 0..n { super::user_write_u8(base + j, kbuf[j]); } pos += n; total += n; if n < len { break; } }
+                    Err(_) => break,
+                }
+            }
+            if !matches!(id, L_PREADV) { super::set_fd_pos(fd, pos); }
+            Some(Translation::Handled(total as isize))
+        }
         L_UNLINKAT => {
             let pl = count_user_string(args[1]);
             if pl > 0 {

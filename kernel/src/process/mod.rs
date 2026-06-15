@@ -7,6 +7,7 @@ use alloc::string::String;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::sync::spinlock::SpinLock;
 use spin::Mutex;
 
 use crate::mm::{pmm, vmm};
@@ -1312,8 +1313,8 @@ pub fn get_user_page_table(ppn: usize) -> &'static mut vmm::PageTable {
 // ─── Global process table ─────────────────────────────────────────
 
 /// Global process list (simplified for Phase 2)
-static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> =
-    Mutex::new([const { None }; MAX_PROCESSES]);
+static PROCESS_TABLE: SpinLock<[Option<Process>; MAX_PROCESSES]> =
+    SpinLock::new([const { None }; MAX_PROCESSES]);
 
 /// Current running process index — per-hart array for SMP
 static CURRENT_PROCESS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];

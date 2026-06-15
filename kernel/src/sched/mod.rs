@@ -8,7 +8,7 @@
 pub mod task;
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::sync::spinlock::SpinLock;
 use task::{TaskControlBlock, TaskState};
@@ -93,6 +93,13 @@ static PROC_TO_SLOT: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(NO_SLO
 
 /// Currently running scheduler slot. Slot 0 is the typed Idle task, not init.
 pub static CURRENT_RUNNING: AtomicUsize = AtomicUsize::new(IDLE_SLOT);
+
+/// Flag set by timer ISR when a schedule is needed.
+/// Checked and acted upon in the ecall return path.
+/// This prevents reentrant schedule() from timer ISR, which causes
+/// lock-holder preemption deadlocks (task A holds spinlock,
+/// timer switches to task B, task B spins on same lock forever).
+pub static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 
 static LAST_SCHEDULED: AtomicUsize = AtomicUsize::new(IDLE_SLOT);
 

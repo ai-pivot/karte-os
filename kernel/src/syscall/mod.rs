@@ -228,8 +228,14 @@ pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
         unsafe { val.assume_init() }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    unsafe {
-        core::ptr::read_volatile(addr as *const T)
+    {
+        // Delegate to byte-by-byte user_read_u8 which handles satp switching
+        let mut val = core::mem::MaybeUninit::<T>::zeroed();
+        let dst = val.as_mut_ptr() as *mut u8;
+        for i in 0..core::mem::size_of::<T>() {
+            unsafe { core::ptr::write(dst.add(i), user_read_u8(addr + i)) };
+        }
+        unsafe { val.assume_init() }
     }
 }
 
@@ -277,7 +283,17 @@ pub(crate) fn user_read_u8(addr: usize) -> u8 {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 pub(crate) fn user_read_u8(addr: usize) -> u8 {
+    // On RISC-V, trap_entry does NOT switch satp. The kernel runs under
+    // the user's page table during syscall handling. Direct read_volatile
+    // accesses the correct user physical page. If the page is not yet
+    // mapped, the nested PF handler performs lazy allocation automatically.
     unsafe { core::ptr::read_volatile(addr as *const u8) }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn user_write_u8(addr: usize, byte: u8) {
+    unsafe { core::ptr::write_volatile(addr as *mut u8, byte) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -321,26 +337,21 @@ unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn user_write_u8(addr: usize, byte: u8) {
-    #[cfg(target_arch = "x86_64")]
+    // Kernel-mode or no user page table: direct write
+    if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0
     {
-        // Kernel-mode or no user page table: direct write
-        if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0
-        {
-            unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
-            return;
-        }
-        if !ensure_user_write_pages(addr, 1) {
-            return;
-        }
-        unsafe { user_write_u8_mapped(addr, byte) };
+        unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
+        return;
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    unsafe {
-        core::ptr::write_volatile(addr as *mut u8, byte)
+    if !ensure_user_write_pages(addr, 1) {
+        return;
     }
+    unsafe { user_write_u8_mapped(addr, byte) };
 }
+// RISC-V version is implemented as a standalone function above.
 
 /// Write a value to user space with automatic CR3 switching on x86_64.
 #[inline]
@@ -364,8 +375,14 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    unsafe {
-        core::ptr::write_volatile(addr as *mut T, val)
+    {
+        // Delegate to byte-by-byte user_write_u8 which handles satp switching
+        let src = unsafe {
+            core::slice::from_raw_parts(&val as *const T as *const u8, core::mem::size_of::<T>())
+        };
+        for (i, &byte) in src.iter().enumerate() {
+            user_write_u8(addr + i, byte);
+        }
     }
 }
 
@@ -1930,17 +1947,38 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
                 Err(_) => ERR_IO,
             };
         }
-        Some((FdType::Ext4File(_), _, _)) => {
+        Some((FdType::Ext4File(ext4_desc), _, _)) => {
             let data = user_read_bytes(buf, len);
-            let name = crate::process::with_fd_table(|fdt| {
+
+            // Get current seek position and flags
+            let (pos, flags) = crate::process::with_fd_table(|fdt| {
                 fdt.get(fd as usize)
-                    .map(|d| d.name.clone())
-                    .unwrap_or_default()
+                    .map(|d| (d.pos, d.flags))
+                    .unwrap_or((0, 0))
             });
-            if !name.is_empty() {
-                let _ = crate::driver::ext4::write_file(&name, &data);
+
+            // O_APPEND: always write at end of file
+            const O_APPEND_FLAG: u32 = 0x400;
+            let write_offset = if flags & O_APPEND_FLAG != 0 {
+                crate::driver::ext4::file_size(ext4_desc.inode_num).unwrap_or(0)
+            } else {
+                pos
+            };
+
+            match crate::driver::ext4::write_file_at_offset(ext4_desc.inode_num, write_offset, &data) {
+                Ok(_) => {
+                    // Update seek position
+                    crate::process::with_fd_table(|fdt| {
+                        if let Some(f) = fdt.get_mut(fd as usize) {
+                            f.pos = write_offset + len;
+                        }
+                    });
+                    return len as isize;
+                }
+                Err(_) => {
+                    return ERR_IO;
+                }
             }
-            return len as isize;
         }
         Some((FdType::File, _, _)) => {}
         _ => {
@@ -2028,25 +2066,19 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 crate::sched::schedule();
             }
         }
-        Some((FdType::Ext4File(_), _, _)) => {
-            let name = crate::process::with_fd_table(|fdt| {
-                fdt.get(fd as usize)
-                    .map(|d| d.name.clone())
-                    .unwrap_or_default()
+        Some((FdType::Ext4File(ext4_desc), _, _)) => {
+            let pos = crate::process::with_fd_table(|fdt| {
+                fdt.get(fd as usize).map(|d| d.pos).unwrap_or(0)
             });
-            if !name.is_empty() {
-                if let Some(data) = crate::driver::ext4::read_file(&name) {
-                    let pos = crate::process::with_fd_table(|fdt| {
-                        fdt.get(fd as usize).map(|d| d.pos).unwrap_or(0)
-                    });
-                    let avail = if pos < data.len() {
-                        data.len() - pos
-                    } else {
-                        0
-                    };
-                    let n = core::cmp::min(avail, len);
+
+            // Read directly from inode at current seek position (like pread64).
+            // Do NOT read the entire file into a Vec — that wastes memory and
+            // can cause inconsistent results with the write path.
+            let mut kbuf = alloc::vec![0u8; len];
+            match crate::driver::ext4::read_file_at_offset(ext4_desc.inode_num, pos, &mut kbuf) {
+                Ok(n) => {
                     for i in 0..n {
-                        user_write_u8(buf + i, data[pos + i]);
+                        user_write_u8(buf + i, kbuf[i]);
                     }
                     crate::process::with_fd_table(|fdt| {
                         if let Some(f) = fdt.get_mut(fd as usize) {
@@ -2055,8 +2087,8 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     });
                     return n as isize;
                 }
+                Err(_) => return ERR_IO,
             }
-            return 0;
         }
         Some((FdType::File, _, _)) => {}
         Some((FdType::FakeFile(_), _, _)) | Some((FdType::Urandom, _, _)) => {
@@ -2896,25 +2928,35 @@ fn linux_fstat_stub(fd: usize, statbuf: usize) -> isize {
         return 0;
     }
 
+    // For ext4 files, query actual file size from inode
+    let ext4_inode = get_fd_ext4_inode(fd as i32);
+    let file_size: u64 = if let Some(inode) = ext4_inode {
+        crate::driver::ext4::file_size(inode).unwrap_or(0) as u64
+    } else {
+        0
+    };
+
     #[cfg(target_arch = "riscv64")]
     {
-        // RISC-V 64 Linux struct stat (136 bytes):
+        // RISC-V 64 Linux struct stat (128 bytes):
         // 0:  st_dev(u64), 8: st_ino(u64), 16: st_mode(u32), 20: st_nlink(u32),
         // 24: st_uid(u32), 28: st_gid(u32), 32: st_rdev(u64),
-        // 40: st_size(i64), 48: st_blksize(i64), 56: st_blocks(i64)
+        // 40: __pad1(u64), 48: st_size(i64), 56: st_blksize(i32), 60: __pad2(i32),
+        // 64: st_blocks(i64)
+        // NOTE: RISC-V has __pad1 between st_rdev and st_size!
         let st_mode: u32 = if fd <= 2 {
             0x21A4 // S_IFCHR | 0644 — character device for stdin/out/err
         } else {
             0x81A4 // S_IFREG | 0644 — regular file
         };
         // Zero the entire struct first
-        for i in 0..136 {
+        for i in 0..128 {
             user_write_u8(statbuf + i, 0);
         }
         user_write::<u32>(statbuf + 16, st_mode);
         user_write::<u32>(statbuf + 20, 1); // st_nlink
-        user_write::<u64>(statbuf + 40, 0); // st_size
-        user_write::<u64>(statbuf + 48, 4096); // st_blksize
+        user_write::<u64>(statbuf + 48, file_size); // st_size — at offset 48 (after __pad1)!
+        user_write::<u32>(statbuf + 56, 4096); // st_blksize (i32 on riscv64)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2926,6 +2968,7 @@ fn linux_fstat_stub(fd: usize, statbuf: usize) -> isize {
         }
         user_write::<u32>(statbuf + 24, st_mode);
         user_write::<u64>(statbuf + 16, 1); // st_nlink
+        user_write::<u64>(statbuf + 48, file_size); // st_size — actual file size for ext4
         user_write::<i64>(statbuf + 56, 4096); // st_blksize
     }
 
@@ -3032,6 +3075,10 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     // Check ext4 for existing files (open for read/write without O_CREAT)
     if crate::driver::ext4::has_ext4() {
         if let Some(inode) = crate::driver::fs::lookup_path(&name) {
+            // Handle O_TRUNC: truncate file to 0 bytes
+            if our_flags & crate::driver::fs::O_TRUNC != 0 {
+                let _ = crate::driver::ext4::truncate_file(inode as u32);
+            }
             return crate::process::with_fd_table(|fd_table| {
                 match fd_table.alloc_special_fd(
                     name.clone(),
@@ -4210,6 +4257,22 @@ pub(crate) fn get_fd_ext4_inode(fd: i32) -> Option<u32> {
         },
         None => None,
     })
+}
+
+/// Get the current seek position for an fd (for lseek).
+pub(crate) fn get_fd_pos(fd: i32) -> usize {
+    crate::process::with_fd_table(|fdt| {
+        fdt.get(fd as usize).map(|d| d.pos).unwrap_or(0)
+    })
+}
+
+/// Set the seek position for an fd (for lseek).
+pub(crate) fn set_fd_pos(fd: i32, pos: usize) {
+    crate::process::with_fd_table(|fdt| {
+        if let Some(f) = fdt.get_mut(fd as usize) {
+            f.pos = pos;
+        }
+    });
 }
 
 /// Blocking read from a pipe. Called from sys_read when fd is a PipeRead.

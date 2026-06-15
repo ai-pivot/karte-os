@@ -486,6 +486,17 @@ pub fn write_file_at_offset(inode: u32, offset: usize, data: &[u8]) -> Result<us
 }
 
 /// Get file size by inode number.
+/// Truncate file to 0 bytes (for O_TRUNC).
+pub fn truncate_file(inode: u32) -> Result<(), &'static str> {
+    if !has_ext4() {
+        return Err("ext4 not initialized");
+    }
+    let mut guard = EXT4_FS.lock();
+    let fs = guard.as_mut().ok_or("ext4 not initialized")?;
+    fs.set_file_size(inode as u64, 0)
+        .map_err(|_| "ext4 truncate failed")
+}
+
 pub fn file_size(inode: u32) -> Result<usize, &'static str> {
     if !has_ext4() {
         return Err("ext4 not initialized");

@@ -124,7 +124,12 @@ impl NetStack {
 
     /// Poll the network stack (called from timer interrupt).
     pub fn poll() {
-        let mut guard = NET_STACK.lock();
+        // Use try_lock: this is called from timer ISR.
+        // If a syscall holds the lock, skip this tick.
+        let mut guard = match NET_STACK.try_lock() {
+            Some(g) => g,
+            None => return,
+        };
         let stack = match guard.as_mut() {
             Some(s) => s,
             None => return,

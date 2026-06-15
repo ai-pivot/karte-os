@@ -118,10 +118,16 @@ pub fn close_fd(fd: usize) {
 }
 
 /// Wake tasks blocked in epoll_wait for any epoll instance watching `fd`.
+/// Called from timer interrupt context — must use try_lock to avoid deadlock.
 pub fn wake_waiters_for_fd(fd: usize) {
     let mut epfds = alloc::vec::Vec::new();
     {
-        let instances = EPOLL_INSTANCES.lock();
+        // Use try_lock: this is called from timer ISR. If a syscall holds
+        // the lock, skip this tick — the next one will pick it up.
+        let instances = match EPOLL_INSTANCES.try_lock() {
+            Some(g) => g,
+            None => return, // Lock contention — skip
+        };
         for (&epfd, instance) in instances.iter() {
             if instance.entries.contains_key(&fd) {
                 epfds.push(epfd);
@@ -129,7 +135,10 @@ pub fn wake_waiters_for_fd(fd: usize) {
         }
     }
 
-    let mut waiters = EPOLL_WAITERS.lock();
+    let mut waiters = match EPOLL_WAITERS.try_lock() {
+        Some(g) => g,
+        None => return,
+    };
     for epfd in epfds {
         if let Some(slots) = waiters.get_mut(&epfd) {
             for &proc_idx in slots.iter() {
