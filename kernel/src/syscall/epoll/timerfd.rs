@@ -173,25 +173,28 @@ pub fn tick_timerfds() {
     let mut expired_fds: Vec<usize> = Vec::new();
 
     {
-        let mut state = TIMERFDS.lock();
-        for (&fd, tfd) in state.iter_mut() {
+        let state = TIMERFDS.lock();
+        for (&fd, tfd) in state.iter() {
             if tfd.next_expiry != 0 && now >= tfd.next_expiry {
-                tfd.expiry_count = tfd.expiry_count.saturating_add(1);
-
-                if tfd.interval_ms > 0 {
-                    // Repeating timer: schedule next expiry
-                    tfd.next_expiry = now + tfd.interval_ms;
-                } else {
-                    // One-shot: disarm
-                    tfd.next_expiry = 0;
-                }
-
                 expired_fds.push(fd);
             }
         }
     }
 
-    // Wake epoll waiters for each expired timerfd
+    if !expired_fds.is_empty() {
+        let mut state = TIMERFDS.lock();
+        for &fd in &expired_fds {
+            if let Some(tfd) = state.get_mut(&fd) {
+                tfd.expiry_count = tfd.expiry_count.saturating_add(1);
+                if tfd.interval_ms > 0 {
+                    tfd.next_expiry = now + tfd.interval_ms;
+                } else {
+                    tfd.next_expiry = 0;
+                }
+            }
+        }
+    }
+
     for fd in expired_fds {
         super::set_timerfd_triggered(fd, true);
         super::wake_waiters_for_fd(fd);

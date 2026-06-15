@@ -328,7 +328,7 @@ pub fn schedule() {
         let current = sched.current;
         let next = match find_next_ready_user(&sched, current) {
             Some(slot) => slot,
-            None => return,
+            None => return, // No Ready task — caller continues running
         };
 
         if matches!(sched.kinds[current], TaskKind::User { .. }) {

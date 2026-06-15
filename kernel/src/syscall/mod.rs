@@ -3226,11 +3226,8 @@ fn sys_waitpid(pid: usize) -> isize {
             exit_code as isize
         }
         None => {
-            // Yield CPU to let the child process run.
-            // We can't use schedule_block() because nothing wakes us when
-            // the child exits. Use schedule() (cooperative yield) which
-            // keeps us Ready for round-robin. The shell's wait_for loop
-            // has a spin_hint(1000) between retries to reduce CPU waste.
+            // Yield to let child run. If schedule() returns immediately
+            // (no other Ready task), briefly sleep to avoid 100% CPU.
             crate::sched::schedule();
             WAIT_AGAIN
         }
