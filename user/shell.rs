@@ -160,7 +160,11 @@ fn wait_for(pid: isize) -> i32 {
     loop {
         let code = unsafe { syscall1(SYS_WAITPID, pid as usize) };
         if code == WAIT_AGAIN {
-            for _ in 0..1000 { core::hint::spin_loop(); }
+            // Nanosleep 10ms to avoid CPU 100% busy-loop.
+            // RISC-V Linux nanosleep = syscall 101, translated by kernel
+            // to sleep_until which properly blocks (schedule_block → Idle wfi).
+            let ts: [i64; 2] = [0, 10_000_000]; // 0s, 10ms
+            unsafe { syscall2(101, ts.as_ptr() as usize, 0); }
             continue;
         }
         return code as i32;
