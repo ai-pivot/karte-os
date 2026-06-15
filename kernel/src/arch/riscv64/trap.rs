@@ -356,6 +356,12 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
 
                 // Page fault we couldn't handle.
                 if from_user {
+                    crate::console_println!(
+                        "[pf-fatal] sepc={:#x} stval={:#x} code={}",
+                        ctx.sepc,
+                        stval,
+                        code
+                    );
                     crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
                 } else {
                     skip_trap_instruction(ctx);
