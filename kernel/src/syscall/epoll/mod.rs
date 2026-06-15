@@ -139,11 +139,9 @@ pub fn close_fd(fd: usize) {
 pub fn wake_waiters_for_fd(fd: usize) {
     let mut epfds = alloc::vec::Vec::new();
     {
-        // Use try_lock: this is called from timer ISR. If a syscall holds
-        // the lock, skip this tick — the next one will pick it up.
         let instances = match EPOLL_INSTANCES.try_lock() {
             Some(g) => g,
-            None => return, // Lock contention — skip
+            None => return,
         };
         for (&epfd, instance) in instances.iter() {
             if instance.entries.contains_key(&fd) {

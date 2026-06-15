@@ -465,6 +465,23 @@ pub fn dump_task_states() {
     crate::klog!(INFO, "[diag] cur={}{}", current, states);
 }
 
+/// Wake a task directly by scheduler slot (bypasses PROC_TO_SLOT).
+/// Needed for clone threads that share proc_idx but have unique slots.
+pub fn wake_task_by_slot(slot: usize) -> bool {
+    if slot >= MAX_TASKS {
+        return false;
+    }
+    remove_sleep(slot);
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut task) = sched.tasks[slot] {
+        if task.state == TaskState::Blocked {
+            task.state = TaskState::Ready;
+            return true;
+        }
+    }
+    false
+}
+
 pub fn wake_task(proc_idx: usize) -> bool {
     let slot = PROC_TO_SLOT[proc_idx].load(Ordering::Relaxed);
     if slot >= MAX_TASKS {
