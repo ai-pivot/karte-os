@@ -94,6 +94,8 @@ pub const LINUX_PIPE2: usize = 125;
 pub const LINUX_DUP3: usize = 126;
 pub const LINUX_FSTAT: usize = 127;
 pub const LINUX_FCNTL: usize = 128;
+pub const LINUX_TIMERFD_CREATE: usize = 129;
+pub const LINUX_TIMERFD_SETTIME: usize = 130;
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -1679,6 +1681,11 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         LINUX_DUP3 => sys_dup2(args[0] as i32, args[1] as i32),
         LINUX_FSTAT => linux_fstat_stub(args[0], args[1]),
         LINUX_FCNTL => linux_fcntl(args[0], args[1], args[2]),
+        LINUX_TIMERFD_CREATE => epoll::timerfd::sys_timerfd_create(args[0], args[1]),
+        LINUX_TIMERFD_SETTIME => {
+            // timerfd_settime(fd, flags, new_value, old_value)
+            epoll::timerfd::sys_timerfd_settime(args[0], args[1], args[2], args[3])
+        }
         #[cfg(target_arch = "x86_64")]
         LINUX_ARCH_PRCTL => linux_arch_prctl(args[0], args[1]),
         #[cfg(not(target_arch = "x86_64"))]
@@ -1979,6 +1986,9 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
                     return ERR_IO;
                 }
             }
+        }
+        Some((FdType::Timerfd, _, _)) => {
+            return epoll::timerfd::timerfd_read(fd as usize, buf, len);
         }
         Some((FdType::File, _, _)) => {}
         _ => {
@@ -3148,7 +3158,10 @@ fn cleanup_fd_resources(fd: usize, desc: FileDescriptor) {
         FdType::Eventfd => {
             epoll::eventfd::close_eventfd(fd as i32);
         }
-        FdType::Epoll | FdType::Timerfd | FdType::Ext4File(_) => {}
+        FdType::Timerfd => {
+            epoll::timerfd::close_timerfd(fd);
+        }
+        FdType::Epoll | FdType::Ext4File(_) => {}
         FdType::Stdio
         | FdType::File
         | FdType::FakeFile(_)
@@ -3213,6 +3226,11 @@ fn sys_waitpid(pid: usize) -> isize {
             exit_code as isize
         }
         None => {
+            // Yield CPU to let the child process run.
+            // We can't use schedule_block() because nothing wakes us when
+            // the child exits. Use schedule() (cooperative yield) which
+            // keeps us Ready for round-robin. The shell's wait_for loop
+            // has a spin_hint(1000) between retries to reduce CPU waste.
             crate::sched::schedule();
             WAIT_AGAIN
         }

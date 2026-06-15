@@ -4,6 +4,7 @@
 //! Used by Go runtime for netpoll (timer-driven goroutine scheduling).
 
 pub mod eventfd;
+pub mod timerfd;
 
 /// Check if a timerfd has been triggered (for FdType is_readable dispatch).
 pub fn timerfd_peek(fd: usize) -> bool {
@@ -14,10 +15,26 @@ pub fn timerfd_peek(fd: usize) -> bool {
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 
-/// Tracks whether timerfd/eventfd fds have been triggered (edge-triggered semantics).
-/// When timerfd_settime is called or a timer fires, the flag is set to true.
-/// epoll_wait reads and clears it.
+/// Tracks whether timerfd fds have been triggered.
+/// Set to true by `tick_timerfds()` when the timer fires.
+/// Cleared to false by `epoll_wait` (when the event is consumed) and by
+/// `timerfd_read` (when the expiration count is read).
 static TIMERFD_STATES: Mutex<BTreeMap<usize, bool>> = Mutex::new(BTreeMap::new());
+
+/// Register a timerfd in the triggered-state map.
+pub fn register_timerfd(fd: usize) {
+    TIMERFD_STATES.lock().insert(fd, false);
+}
+
+/// Remove a timerfd from the triggered-state map.
+pub fn unregister_timerfd(fd: usize) {
+    TIMERFD_STATES.lock().remove(&fd);
+}
+
+/// Set the triggered flag for a timerfd (called by tick_timerfds).
+pub fn set_timerfd_triggered(fd: usize, triggered: bool) {
+    TIMERFD_STATES.lock().insert(fd, triggered);
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct EpollEvent {

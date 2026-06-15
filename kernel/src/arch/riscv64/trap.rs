@@ -152,6 +152,9 @@ fn handle_timer() {
     // Wake up tasks whose sleep/futex timeout has expired.
     crate::sched::tick_sleep_queue();
 
+    // Check timerfd expiries and wake epoll waiters.
+    crate::syscall::epoll::timerfd::tick_timerfds();
+
     // Poll network stack (non-blocking) — only after init is complete
     // to avoid interfering with user program loading.
     if crate::net::iface::NetStack::is_initialized() {

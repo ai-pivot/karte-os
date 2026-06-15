@@ -206,6 +206,8 @@ mod riscv_syscalls {
     pub const L_READLINKAT: usize = 78;
     pub const L_NEWFSTATAT: usize = 79;
     pub const L_EVENTFD2: usize = 19;
+    pub const L_TIMERFD_CREATE: usize = 85;
+    pub const L_TIMERFD_SETTIME: usize = 86;
     pub const L_CLONE: usize = 220;
     pub const L_MKDIRAT: usize = 258;
     pub const L_MKDIRAT_OLD: usize = 34;
@@ -1142,6 +1144,14 @@ fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
         }),
         L_EVENTFD2 => Some(Translation::Dispatch {
             karte_nr: super::LINUX_EVENTFD2,
+            args,
+        }),
+        L_TIMERFD_CREATE => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_TIMERFD_CREATE,
+            args,
+        }),
+        L_TIMERFD_SETTIME => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_TIMERFD_SETTIME,
             args,
         }),
         L_PIPE2 => Some(Translation::Dispatch {

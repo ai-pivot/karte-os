@@ -445,6 +445,26 @@ pub fn mark_task_exited_by_proc(proc_idx: usize) {
     PROC_TO_SLOT[proc_idx].store(NO_SLOT, Ordering::Relaxed);
 }
 
+/// Diagnostic: dump all task states (called periodically from timer ISR).
+pub fn dump_task_states() {
+    let sched = SCHEDULER.lock();
+    let current = CURRENT_RUNNING.load(Ordering::Relaxed);
+    let mut states = alloc::string::String::new();
+    for i in 0..sched.high_water {
+        if let Some(ref task) = sched.tasks[i] {
+            let state_str = match task.state {
+                TaskState::Ready => "R",
+                TaskState::Running => "*",
+                TaskState::Blocked => "B",
+                TaskState::Exited => "X",
+            };
+            let _ = core::fmt::write(&mut states, format_args!(" s{}={} ", i, state_str));
+        }
+    }
+    drop(sched);
+    crate::klog!(INFO, "[diag] cur={}{}", current, states);
+}
+
 pub fn wake_task(proc_idx: usize) -> bool {
     let slot = PROC_TO_SLOT[proc_idx].load(Ordering::Relaxed);
     if slot >= MAX_TASKS {
