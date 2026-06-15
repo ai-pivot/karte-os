@@ -998,6 +998,8 @@ impl Process {
                             core::ptr::write_bytes(tmp_buf[bytes..].as_mut_ptr(), 0, len - bytes);
                         }
                     }
+                    // Verify: read back from frame and compare first 8 bytes
+                    // to detect ext4 read corruption
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             tmp_buf[..len].as_ptr(),
