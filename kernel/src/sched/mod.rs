@@ -328,7 +328,7 @@ pub fn schedule() {
         let current = sched.current;
         let next = match find_next_ready_user(&sched, current) {
             Some(slot) => slot,
-            None => return, // No Ready task — caller continues running
+            None => return, // No Ready task — caller continues
         };
 
         if matches!(sched.kinds[current], TaskKind::User { .. }) {
@@ -810,8 +810,6 @@ pub fn start_first_task() -> ! {
 
 fn idle_loop() -> ! {
     loop {
-        // Timer/IRQ handlers may wake blocked tasks while the BSP is parked in
-        // idle. Re-run the scheduler before halting again so Ready tasks resume.
         schedule();
 
         #[cfg(target_arch = "x86_64")]

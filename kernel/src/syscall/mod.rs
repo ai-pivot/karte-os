@@ -3226,8 +3226,6 @@ fn sys_waitpid(pid: usize) -> isize {
             exit_code as isize
         }
         None => {
-            // Yield to let child run. If schedule() returns immediately
-            // (no other Ready task), briefly sleep to avoid 100% CPU.
             crate::sched::schedule();
             WAIT_AGAIN
         }
