@@ -304,36 +304,6 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
 
                 // Page fault we couldn't handle.
                 if from_user {
-                    crate::console_println!(
-                        "[pf-kill] sepc={:#x} stval={:#x} code={}",
-                        ctx.sepc,
-                        stval,
-                        code
-                    );
-                    // Map zero page for low-address faults so Go's nil
-                    // dereference reads 0 instead of crashing.
-                    if stval < 4096 {
-                        let user_pt = get_current_user_pt();
-                        let ps = crate::mm::pmm::page_size();
-                        let pa = stval & !(ps - 1);
-                        if crate::mm::vmm::translate_user(user_pt, pa).is_none() {
-                            if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                                unsafe {
-                                    core::ptr::write_bytes(frame as *mut u8, 0, ps);
-                                }
-                                crate::mm::vmm::map(
-                                    user_pt,
-                                    pa,
-                                    frame,
-                                    crate::mm::vmm::PTEFlags::UR | crate::mm::vmm::PTEFlags::A,
-                                );
-                                unsafe {
-                                    core::arch::asm!("sfence.vma {0}, zero", in(reg) pa);
-                                }
-                                return ctx;
-                            }
-                        }
-                    }
                     crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
                 } else {
                     skip_trap_instruction(ctx);

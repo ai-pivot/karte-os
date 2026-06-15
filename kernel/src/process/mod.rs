@@ -183,7 +183,7 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
         vmm::identity_map(
             user_pt,
             0x8020_0000,
-            0x8020_0000 + 4096 * 1024 * 1024,
+            0x8020_0000 + 2048 * 1024 * 1024,
             vmm::PTEFlags::KRWX | vmm::PTEFlags::A | vmm::PTEFlags::D,
         );
 

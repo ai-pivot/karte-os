@@ -13,7 +13,7 @@ const MEMORY_START: usize = 0x8020_0000;
 const MEMORY_START: usize = 0x0020_0000; // 2MB — typical x86_64 kernel load address
 
 #[cfg(target_arch = "riscv64")]
-const MEMORY_SIZE: usize = 4096 * 1024 * 1024; // Up to 4GB QEMU memory
+const MEMORY_SIZE: usize = 2048 * 1024 * 1024;
 
 // On x86_64, MEMORY_SIZE is set dynamically from multiboot2 info.
 // See `init_with_size()` below. This constant is only a fallback.
