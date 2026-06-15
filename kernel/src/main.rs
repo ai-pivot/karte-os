@@ -367,7 +367,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
                     satp
                 } else {
-                    (8usize << 60) | proc.page_table_root
+                    (9usize << 60) | proc.page_table_root
                 };
 
                 #[cfg(target_arch = "x86_64")]

@@ -268,7 +268,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
             let current_satp = riscv::register::satp::read().bits();
             let current_ppn = current_satp & ((1usize << 44) - 1);
             if target_ppn != current_ppn {
-                let new_satp = (8usize << 60) | target_ppn;
+                let new_satp = (9usize << 60) | target_ppn;
                 unsafe {
                     core::arch::asm!("csrw satp, {}", in(reg) new_satp);
                     core::arch::asm!("sfence.vma");

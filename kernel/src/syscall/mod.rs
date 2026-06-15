@@ -3461,7 +3461,7 @@ fn sys_spawn(prog_id: usize, _arg: usize) -> isize {
         unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
         satp
     } else {
-        (8usize << 60) | proc.page_table_root
+        (9usize << 60) | proc.page_table_root
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -3844,7 +3844,7 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
         unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
         satp
     } else {
-        (8usize << 60) | proc.page_table_root
+        (9usize << 60) | proc.page_table_root
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -4452,7 +4452,7 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         crate::process::get_process_by_index(proc_idx).expect("Process disappeared after add");
 
     #[cfg(target_arch = "riscv64")]
-    let user_satp = (8usize << 60) | proc.page_table_root;
+    let user_satp = (9usize << 60) | proc.page_table_root;
     #[cfg(target_arch = "x86_64")]
     let user_satp = proc.page_table_root << 12; // CR3 = physical address of PML4
 
@@ -4696,7 +4696,7 @@ fn sys_fork() -> isize {
         crate::process::get_process_by_index(child_idx).expect("Child disappeared after add");
 
     #[cfg(target_arch = "riscv64")]
-    let user_satp = (8usize << 60) | child_proc.page_table_root;
+    let user_satp = (9usize << 60) | child_proc.page_table_root;
     #[cfg(target_arch = "x86_64")]
     let user_satp = child_proc.page_table_root << 12;
 
@@ -4894,7 +4894,7 @@ fn linux_clone(
         // RISC-V: SATP = (mode=8 << 60) | PPN. x86_64: CR3 = PPN << 12.
         // current_page_table_root() returns PPN — must add mode bits for RISC-V.
         #[cfg(target_arch = "riscv64")]
-        let user_pt_root = (8usize << 60) | crate::process::current_page_table_root();
+        let user_pt_root = (9usize << 60) | crate::process::current_page_table_root();
         #[cfg(not(target_arch = "riscv64"))]
         let user_pt_root = crate::process::current_page_table_root();
 

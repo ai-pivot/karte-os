@@ -435,12 +435,13 @@ pub fn reserve_mmap_addr(root: usize, len: usize) -> Result<usize, ()> {
     with_state(root, |state| {
         let base = crate::process::USER_MMAP_BASE;
         if state.next_mmap_addr == 0 || state.next_mmap_addr < base {
-            // Start from a reasonable address, not the full Sv48 user limit.
-            // Go's mmap hints at specific high addresses are honored directly
-            // (not via this bump allocator). This handles non-hint allocations.
+            // Use a low mmap region right after ELF+BSS+stack.
+            // High addresses (near USER_MMAP_LIMIT) cause slow page table
+            // walks in QEMU TCG and potential Sv39 truncation issues.
+            // USER_STACK_TOP is 0x80000000 (2GB); start mmap just above it.
             #[cfg(target_arch = "riscv64")]
             {
-                state.next_mmap_addr = crate::process::USER_MMAP_LIMIT;
+                state.next_mmap_addr = 0x10_0000_0000; // 64GB — well above stack, below kernel
             }
             #[cfg(not(target_arch = "riscv64"))]
             {

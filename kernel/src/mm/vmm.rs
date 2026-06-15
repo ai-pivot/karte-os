@@ -72,7 +72,7 @@ const NON_LEAF_FLAGS: u64 =
 const PTE_COUNT: usize = 512;
 
 #[cfg(target_arch = "riscv64")]
-const PT_LEVELS: usize = 3; // Sv39
+const PT_LEVELS: usize = 4; // Sv48
 #[cfg(target_arch = "x86_64")]
 const PT_LEVELS: usize = 4;
 
@@ -417,9 +417,9 @@ pub fn init() {
     let ppn = root_addr >> 12;
     #[cfg(target_arch = "riscv64")]
     unsafe {
-        satp::set(satp::Mode::Sv39, 0, ppn);
+        satp::set(satp::Mode::Sv48, 0, ppn);
         core::arch::asm!("sfence.vma");
-        KERNEL_SATP.store((8usize << 60) | ppn, core::sync::atomic::Ordering::Relaxed);
+        KERNEL_SATP.store((9usize << 60) | ppn, core::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(target_arch = "x86_64")]

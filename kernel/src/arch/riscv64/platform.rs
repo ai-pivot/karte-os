@@ -71,7 +71,7 @@ pub fn flush_tlb_addr(_addr: usize) {
 /// Activate page table (write satp + sfence.vma).
 pub fn activate_page_table(root_paddr: usize) {
     let ppn = root_paddr >> 12;
-    let satp_val = (8usize << 60) | ppn; // Sv39 mode
+    let satp_val = (9usize << 60) | ppn; // Sv48 mode
     unsafe {
         core::arch::asm!("csrw satp, {}", in(reg) satp_val);
         core::arch::asm!("sfence.vma");

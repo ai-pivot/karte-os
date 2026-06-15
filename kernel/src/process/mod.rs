@@ -27,10 +27,10 @@ pub const USER_HEAP_BASE: usize = 0x0600_0000; // After Go's BSS (~0x5FA0000)
 pub const USER_HEAP_LIMIT: usize = 0x1600_0000; // 256MB heap (brk)
 pub const USER_MMAP_BASE: usize = 0x2000_0000; // Above heap (256MB), separate from brk region
 #[cfg(target_arch = "riscv64")]
-pub const USER_MMAP_LIMIT: usize = 0x003F_FFFF_FFFF; // Sv39: 256GB user VA
+pub const USER_MMAP_LIMIT: usize = 0x0000_FFFF_FFFF_FFFF; // Sv48: 256TB user VA
 #[cfg(not(target_arch = "riscv64"))]
 pub const USER_MMAP_LIMIT: usize = 0x0000_7FFF_FFFF_F000; // x86_64 max canonical user address
-pub const USER_STACK_TOP: usize = 0x8000_0000; // 2GB — top of user stack
+pub const USER_STACK_TOP: usize = 0x1_0000_0000; // 4GB (above 3GB identity map) — top of user stack
 pub const USER_STACK_BASE: usize = 0x7F00_0000; // 16MB stack region (address space)
 pub const USER_STACK_PAGES: usize = 512; // 2 MB pre-mapped stack (Go g0 needs ~1MB+)
 pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack
@@ -1168,12 +1168,24 @@ impl Process {
             }
         }
 
-        let auxv_data: [(usize, usize); 12] = [
+        const AT_HWCAP: usize = 16;
+        const AT_CLKTCK: usize = 17;
+
+        // RISC-V Linux hwcap bits for RV64GC (IMAFDC):
+        // I=bit0, M=bit1, A=bit2, F=bit3, D=bit4, C=bit5
+        #[cfg(target_arch = "riscv64")]
+        let hwcap_val: usize = 0x3F;
+        #[cfg(not(target_arch = "riscv64"))]
+        let hwcap_val: usize = 0;
+
+        let auxv_data: [(usize, usize); 14] = [
             (AT_SYSINFO_EHDR, 0),
+            (AT_HWCAP, hwcap_val),
+            (AT_PAGESZ, page_size),
+            (AT_CLKTCK, 100),
             (AT_PHDR, phdr_addr),
             (AT_PHENT, elf_info.phent),
             (AT_PHNUM, elf_info.phnum as usize),
-            (AT_PAGESZ, page_size),
             (AT_ENTRY, elf_info.entry),
             (AT_UID, 0),
             (AT_EUID, 0),
