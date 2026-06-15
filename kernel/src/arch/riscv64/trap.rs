@@ -298,32 +298,8 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                             }
                         }
                     }
-                    // Final fallback: allocate RW page for ANY user-space address.
-                    match crate::mm::pmm::alloc_frame() {
-                        Some(frame) => {
-                            unsafe {
-                                core::ptr::write_bytes(frame as *mut u8, 0, page_size);
-                            }
-                            crate::mm::vmm::map(
-                                user_pt,
-                                page_addr,
-                                frame,
-                                crate::mm::vmm::PTEFlags::URW
-                                    | crate::mm::vmm::PTEFlags::A
-                                    | crate::mm::vmm::PTEFlags::D,
-                            );
-                            unsafe {
-                                core::arch::asm!("sfence.vma {0}, zero", in(reg) page_addr);
-                            }
-                            return ctx;
-                        }
-                        None => {
-                            // OOM: can't allocate page. Skip instruction to avoid crash.
-                            // This is better than killing the process.
-                            skip_trap_instruction(ctx);
-                            return ctx;
-                        }
-                    }
+                    // No final fallback — matching x86_64 behavior.
+                    // On x86_64, unhandled user PFs kill the process.
                 }
 
                 // Page fault we couldn't handle.
