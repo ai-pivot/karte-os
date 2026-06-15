@@ -1624,7 +1624,20 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_SYSLOG => sys_syslog(args[0], args[1], args[2]),
 
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
-        LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
+        LINUX_CLONE => {
+            // RISC-V clone ABI: clone(flags, stack, parent_tid, child_tls, child_tid)
+            // a0=flags, a1=stack, a2=parent_tid, a3=child_tls, a4=child_tid
+            // x86_64 clone ABI: clone(flags, stack, parent_tid, child_tid, tls)
+            // RDI=flags, RSI=stack, RDX=parent_tid, R10=child_tid, R8=tls
+            #[cfg(target_arch = "riscv64")]
+            {
+                linux_clone(args[0], args[1], args[2], args[4], args[3])
+            }
+            #[cfg(not(target_arch = "riscv64"))]
+            {
+                linux_clone(args[0], args[1], args[2], args[3], args[4])
+            }
+        }
         LINUX_FUTEX => linux_futex_impl(args[0], args[1], args[2], args[3]),
         LINUX_RT_SIGACTION => linux_rt_sigaction(args[0], args[1], args[2]),
         LINUX_RT_SIGPROCMASK => linux_rt_sigprocmask(args[0], args[1], args[2]),
