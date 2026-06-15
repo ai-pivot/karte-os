@@ -226,52 +226,17 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 let page_size = crate::mm::pmm::page_size();
                 let page_addr = fault_addr & !(page_size - 1);
 
-                // A/D bit fix via direct Sv39 page table walk (3 levels).
-                let satp_val: usize;
-                unsafe {
-                    core::arch::asm!("csrr {}, satp", out(reg) satp_val);
-                }
-                let satp_ppn = satp_val & ((1usize << 44) - 1);
-                let satp_pa = satp_ppn << 12;
-
-                let vpn3 = (page_addr >> 39) & 0x1FF;
-                let vpn2 = (page_addr >> 30) & 0x1FF;
-                let vpn1 = (page_addr >> 21) & 0x1FF;
-                let vpn0 = (page_addr >> 12) & 0x1FF;
-
-                let l3_entry =
-                    unsafe { core::ptr::read_volatile((satp_pa + vpn3 * 8) as *const usize) };
-                if l3_entry & 1 != 0 {
-                    let l2_pa = (l3_entry >> 10) << 12;
-                    let l2_entry =
-                        unsafe { core::ptr::read_volatile((l2_pa + vpn2 * 8) as *const usize) };
-                    if l2_entry & 1 != 0 {
-                        let l1_pa = (l2_entry >> 10) << 12;
-                        let l1_entry =
-                            unsafe { core::ptr::read_volatile((l1_pa + vpn1 * 8) as *const usize) };
-                        if l1_entry & 1 != 0 {
-                            let l0_pa = (l1_entry >> 10) << 12;
-                            let l0_entry = unsafe {
-                                core::ptr::read_volatile((l0_pa + vpn0 * 8) as *const usize)
-                            };
-                            if l0_entry & 1 != 0 {
-                                let mut new_pte = l0_entry;
-                                new_pte |= 1 << 6; // A bit
-                                if code == 15 {
-                                    new_pte |= 1 << 7;
-                                } // D bit
-                                unsafe {
-                                    core::ptr::write_volatile(
-                                        (l0_pa + vpn0 * 8) as *mut usize,
-                                        new_pte,
-                                    );
-                                    core::arch::asm!("sfence.vma {0}, zero", in(reg) page_addr);
-                                }
-                                return ctx;
-                            }
-                        }
-                    }
-                }
+                // A/D bit fix: DISABLED. The vmm::map() function already
+                // pre-sets A|D bits on all leaf PTEs at creation time.
+                // This software walk was needed for Sv39 compatibility but
+                // causes PTE corruption on Sv48 (shared L2 tables between
+                // kernel identity map and user pages lead to wrong PTE
+                // being modified). x86_64 doesn't need this at all because
+                // hardware auto-sets A/D bits.
+                //
+                // If a page fault reaches here despite having A|D bits set,
+                // it means the page is genuinely not mapped → fall through
+                // to lazy allocation below.
 
                 // Lazy allocation for unmapped user pages.
                 // Only for legitimate user-space addresses, excluding
