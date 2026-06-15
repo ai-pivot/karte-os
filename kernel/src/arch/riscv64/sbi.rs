@@ -86,7 +86,7 @@ pub fn raw_trace(msg: &str) {
 }
 
 /// Raw trace with hex value
-#[allow(dead_code)]  
+#[allow(dead_code)]
 pub fn raw_trace_hex(prefix: &str, val: usize) {
     raw_trace(prefix);
     let mut buf = [0u8; 19];
@@ -96,7 +96,11 @@ pub fn raw_trace_hex(prefix: &str, val: usize) {
     for shift in (0..64).step_by(4).rev() {
         let nibble = (val >> shift) & 0xf;
         if nibble != 0 || idx > 2 || shift == 0 {
-            buf[idx] = if nibble < 10 { b'0' + nibble as u8 } else { b'a' + (nibble - 10) as u8 };
+            buf[idx] = if nibble < 10 {
+                b'0' + nibble as u8
+            } else {
+                b'a' + (nibble - 10) as u8
+            };
             idx += 1;
         }
     }

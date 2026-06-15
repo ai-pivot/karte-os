@@ -459,7 +459,11 @@ pub fn run_tests() {
 
 /// Read file data at specific offset (for pread64).
 /// Returns number of bytes read into the provided buffer.
-pub fn read_file_at_offset(inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+pub fn read_file_at_offset(
+    inode: u32,
+    offset: usize,
+    buf: &mut [u8],
+) -> Result<usize, &'static str> {
     if !has_ext4() {
         return Err("ext4 not initialized");
     }

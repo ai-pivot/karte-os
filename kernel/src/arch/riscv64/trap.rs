@@ -226,8 +226,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 let page_size = crate::mm::pmm::page_size();
                 let page_addr = fault_addr & !(page_size - 1);
 
-                // A/D bit fix via direct Sv39 page table walk.
-                // Read satp to get the ACTIVE page table root.
+                // A/D bit fix via direct Sv39 page table walk (3 levels).
                 let satp_val: usize;
                 unsafe {
                     core::arch::asm!("csrr {}, satp", out(reg) satp_val);
@@ -270,8 +269,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 // Lazy allocation for unmapped user pages.
                 // Only for legitimate user-space addresses, excluding
                 // kernel identity map and MMIO regions.
-                let is_kernel_or_mmio = 
-                    (0x0C00_0000..0x0C40_0000).contains(&fault_addr)  // PLIC
+                let is_kernel_or_mmio = (0x0C00_0000..0x0C40_0000).contains(&fault_addr)  // PLIC
                     || (0x1000_0000..0x1000_A000).contains(&fault_addr) // UART + VirtIO MMIO
                     || (0x8020_0000..0xC020_0000).contains(&fault_addr); // Kernel identity map
                 let is_user_addr = !is_kernel_or_mmio
@@ -356,10 +354,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                     }
                 }
 
-                // Page fault we couldn't handle — skip instruction silently.
-                // DO NOT use console_println here: it acquires a SpinLock
-                // which deadlocks if the PF happens during a timer ISR
-                // that interrupted a console_putchar call.
+                // Page fault we couldn't handle.
                 if from_user {
                     crate::syscall::dispatch(1, [1, 0, 0, 0, 0, 0]);
                 } else {
@@ -368,8 +363,6 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
             }
             _ => {
                 // Unknown exception — silently skip.
-                // This handles CSR probing and other spurious exceptions
-                // that may occur during runtime initialization.
                 skip_trap_instruction(ctx);
             }
         }
@@ -414,7 +407,7 @@ pub fn safe_print(msg: &str) {
         // Save current satp
         let saved_satp: usize;
         core::arch::asm!("csrr {}, satp", out(reg) saved_satp);
-        
+
         // Switch to kernel page table
         let kernel_satp = crate::mm::vmm::KERNEL_SATP.load(core::sync::atomic::Ordering::Relaxed);
         if kernel_satp != 0 && kernel_satp != saved_satp {
@@ -424,7 +417,7 @@ pub fn safe_print(msg: &str) {
                 satp = in(reg) kernel_satp,
             );
         }
-        
+
         // Print via UART directly (no locks)
         let uart = crate::driver::uart::Uart::new(0x1000_0000);
         for byte in msg.bytes() {
@@ -433,7 +426,7 @@ pub fn safe_print(msg: &str) {
             }
             uart.putc(byte);
         }
-        
+
         // Restore satp
         if kernel_satp != 0 && kernel_satp != saved_satp {
             core::arch::asm!(
@@ -456,7 +449,11 @@ pub fn safe_print_hex(val: usize) {
     for shift in (0..64).step_by(4).rev() {
         let nibble = (val >> shift) & 0xf;
         if nibble != 0 || started || shift == 0 {
-            buf[i] = if nibble < 10 { b'0' + nibble as u8 } else { b'a' + (nibble - 10) as u8 };
+            buf[i] = if nibble < 10 {
+                b'0' + nibble as u8
+            } else {
+                b'a' + (nibble - 10) as u8
+            };
             i += 1;
             started = true;
         }

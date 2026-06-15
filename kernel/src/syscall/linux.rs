@@ -358,7 +358,9 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         }
         L_NEWFSTATAT => {
             let pl = count_user_string(args[1]);
-            if pl == 0 { return Some(Translation::Handled(super::ERR_NOENT)); }
+            if pl == 0 {
+                return Some(Translation::Handled(super::ERR_NOENT));
+            }
             let name = match super::read_user_path(args[1], pl) {
                 Some(n) => n,
                 None => return Some(Translation::Handled(super::ERR_NOENT)),
@@ -366,7 +368,9 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             let name = super::resolve_path(&name);
             if let Some(inode) = crate::driver::fs::lookup_path(&name) {
                 if args[2] != 0 {
-                    let is_dir = crate::driver::ext4::metadata_of(inode).map(|m| m.is_dir()).unwrap_or(false);
+                    let is_dir = crate::driver::ext4::metadata_of(inode)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
                     let mode = if is_dir { 0x41EDu32 } else { 0x81A4u32 };
                     let _ = super::user_write::<u32>(args[2] + 16, mode);
                 }
@@ -410,7 +414,7 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         L_IOCTL => Some(Translation::Dispatch {
             karte_nr: super::SYS_IOCTL,
             args,
-        }),                                  // stub
+        }), // stub
 
         // ─── Scheduling ──────────────────────────────────────
         L_SCHED_YIELD => Some(Translation::Dispatch {
@@ -857,9 +861,7 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_SHUTDOWN,
             args,
         }),
-        L_FTRUNCATE => {
-            Some(Translation::Handled(0))
-        }
+        L_FTRUNCATE => Some(Translation::Handled(0)),
         L_PREAD64 => {
             // pread64(fd, buf, count, offset) — read at specific offset
             let fd = args[0] as i32;
@@ -881,7 +883,8 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                 }
             } else {
                 // Fall back to regular read
-                let result = super::dispatch_inner(super::SYS_READ, [fd as usize, buf, count, 0, 0, 0]);
+                let result =
+                    super::dispatch_inner(super::SYS_READ, [fd as usize, buf, count, 0, 0, 0]);
                 Some(Translation::Handled(result))
             }
         }
@@ -898,7 +901,8 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                     Err(_) => Some(Translation::Handled(super::ERR_IO)),
                 }
             } else {
-                let result = super::dispatch_inner(super::SYS_WRITE, [fd as usize, buf, count, 0, 0, 0]);
+                let result =
+                    super::dispatch_inner(super::SYS_WRITE, [fd as usize, buf, count, 0, 0, 0]);
                 Some(Translation::Handled(result))
             }
         }
@@ -1011,7 +1015,10 @@ fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
             args,
         }),
         L_FACCESSAT => Some(Translation::Handled(0)),
-        L_FCNTL => Some(Translation::Handled(0)),
+        L_FCNTL => Some(Translation::Dispatch {
+            karte_nr: super::LINUX_FCNTL,
+            args: [args[0], args[1], args[2], 0, 0, 0],
+        }),
         L_MKDIRAT | L_MKDIRAT_OLD => {
             let pl = count_user_string(args[1]);
             if pl == 0 {
@@ -1024,7 +1031,9 @@ fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
         }
         L_NEWFSTATAT => {
             let pl = count_user_string(args[1]);
-            if pl == 0 { return Some(Translation::Handled(super::ERR_NOENT)); }
+            if pl == 0 {
+                return Some(Translation::Handled(super::ERR_NOENT));
+            }
             let name = match super::read_user_path(args[1], pl) {
                 Some(n) => n,
                 None => return Some(Translation::Handled(super::ERR_NOENT)),
@@ -1032,7 +1041,9 @@ fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
             let name = super::resolve_path(&name);
             if let Some(inode) = crate::driver::fs::lookup_path(&name) {
                 if args[2] != 0 {
-                    let is_dir = crate::driver::ext4::metadata_of(inode).map(|m| m.is_dir()).unwrap_or(false);
+                    let is_dir = crate::driver::ext4::metadata_of(inode)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
                     let mode = if is_dir { 0x41EDu32 } else { 0x81A4u32 };
                     let _ = super::user_write::<u32>(args[2] + 16, mode);
                 }

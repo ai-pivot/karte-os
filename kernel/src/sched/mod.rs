@@ -658,9 +658,12 @@ fn build_clone_stack(init: CloneTaskInit<'_>) -> usize {
         // Modify child's TrapContext for thread entry:
         *ctx.add(10) = 0; // x[10] (a0) = 0: child clone() returns 0
         *ctx.add(2) = init.new_user_sp; // x[2] (sp) = child user stack
-        // DO NOT override tp (x4): Go's clone wrapper stores TLS on the child
-        // stack and sets tp itself in the thread entry function. Overriding
-        // tp from args[4] would set garbage (Go doesn't pass TLS via a4).
+        // Set tp (x[4]) from TLS when CLONE_SETTLS was specified.
+        // On Linux RISC-V, clone passes tls in a4 and the kernel must set tp.
+        // Go runtime relies on tp pointing to its TLS block (which contains g).
+        if init.tls != 0 {
+            *ctx.add(4) = init.tls; // x[4] (tp) = TLS pointer
+        }
         *ctx.add(34) = init.new_user_sp; // sscratch = child user sp
         let parent_sepc = *ctx.add(33);
         *ctx.add(33) = parent_sepc + 4; // sepc += 4: skip ecall instruction

@@ -72,7 +72,7 @@ const NON_LEAF_FLAGS: u64 =
 const PTE_COUNT: usize = 512;
 
 #[cfg(target_arch = "riscv64")]
-const PT_LEVELS: usize = 3;
+const PT_LEVELS: usize = 3; // Sv39
 #[cfg(target_arch = "x86_64")]
 const PT_LEVELS: usize = 4;
 
@@ -366,8 +366,7 @@ static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
 /// which has correct A/D bits on all kernel pages.
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
-pub static KERNEL_SATP: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+pub static KERNEL_SATP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 pub fn get_kernel_page_table() -> &'static mut PageTable {
     unsafe { &mut *KERNEL_PAGE_TABLE }
@@ -393,7 +392,12 @@ pub fn init() {
         let start = 0x8020_0000;
         let end = start + 1800 * 1024 * 1024;
         identity_map(root, start, end, PTEFlags::KRWX | PTEFlags::A | PTEFlags::D);
-        map(root, 0x1000_0000, 0x1000_0000, PTEFlags::KRW | PTEFlags::A | PTEFlags::D);
+        map(
+            root,
+            0x1000_0000,
+            0x1000_0000,
+            PTEFlags::KRW | PTEFlags::A | PTEFlags::D,
+        );
         for addr in (0x1000_1000..0x1000_9000).step_by(PAGE_SIZE) {
             map(root, addr, addr, PTEFlags::KRW | PTEFlags::A | PTEFlags::D);
         }

@@ -235,6 +235,13 @@ fn epoll_target_supported(desc: &crate::driver::fs::FileDescriptor) -> bool {
 fn validate_epoll_target(fd: usize) -> Result<(), isize> {
     let fd_desc = crate::process::with_fd_table(|ft| ft.get(fd).cloned()).ok_or(-9_isize)?;
     if !epoll_target_supported(&fd_desc) {
+        crate::klog!(
+            INFO,
+            "[epoll] fd={} type={:?} name={} not epollable",
+            fd,
+            fd_desc.fd_type,
+            fd_desc.name
+        );
         return Err(-1); // EPERM: regular files and directories are not epollable.
     }
     Ok(())

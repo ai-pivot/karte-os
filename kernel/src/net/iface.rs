@@ -105,7 +105,6 @@ impl NetStack {
             .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2))
             .unwrap();
 
-
         // Create socket storage (cannot use vec![] since SocketStorage doesn't impl Clone)
         let mut socket_storage: Vec<SocketStorage<'static>> = Vec::with_capacity(MAX_SOCKETS);
         for _ in 0..MAX_SOCKETS {

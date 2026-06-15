@@ -27,7 +27,7 @@ pub const USER_HEAP_BASE: usize = 0x0600_0000; // After Go's BSS (~0x5FA0000)
 pub const USER_HEAP_LIMIT: usize = 0x1600_0000; // 256MB heap (brk)
 pub const USER_MMAP_BASE: usize = 0x2000_0000; // Above heap (256MB), separate from brk region
 #[cfg(target_arch = "riscv64")]
-pub const USER_MMAP_LIMIT: usize = 0x003F_FFFF_FFFF;
+pub const USER_MMAP_LIMIT: usize = 0x003F_FFFF_FFFF; // Sv39: 256GB user VA
 #[cfg(not(target_arch = "riscv64"))]
 pub const USER_MMAP_LIMIT: usize = 0x0000_7FFF_FFFF_F000; // x86_64 max canonical user address
 pub const USER_STACK_TOP: usize = 0x8000_0000; // 2GB — top of user stack
@@ -884,7 +884,6 @@ impl Process {
     where
         F: Fn(usize, &mut [u8]) -> Result<usize, ()>,
     {
-
         let page_size = pmm::page_size();
 
         // 0. Allocate kernel stack
@@ -912,7 +911,9 @@ impl Process {
         vmm::set_all_ad_bits(user_pt);
 
         let saved_cr3: u64;
-        { saved_cr3 = 0; } // RISC-V: no CR3 switch needed
+        {
+            saved_cr3 = 0;
+        } // RISC-V: no CR3 switch needed
 
         // 5. Load ELF segments
         let mut max_vaddr = 0usize;
@@ -1015,7 +1016,6 @@ impl Process {
             }
         } // end for seg_idx
 
-
         // 5.05 Enforce ELF mapping invariants before any user code can run:
         // every PT_LOAD page must be user-accessible and backed by a private
         // non-identity frame. If a copied identity mapping leaked through,
@@ -1086,7 +1086,12 @@ impl Process {
         for i in 0..USER_STACK_PAGES {
             let frame = pmm::alloc_frame().ok_or("Out of memory for user stack")?;
             let vaddr = (USER_STACK_TOP - i * pmm::page_size()) & !(pmm::page_size() - 1);
-            vmm::map_user(user_pt, vaddr, frame, vmm::PTEFlags::URW | vmm::PTEFlags::A | vmm::PTEFlags::D);
+            vmm::map_user(
+                user_pt,
+                vaddr,
+                frame,
+                vmm::PTEFlags::URW | vmm::PTEFlags::A | vmm::PTEFlags::D,
+            );
         }
 
         // Helper to write u64 to user stack via physical address (translate_user)

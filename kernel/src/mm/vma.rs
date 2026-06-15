@@ -434,9 +434,18 @@ pub fn reserve_mmap_addr(root: usize, len: usize) -> Result<usize, ()> {
     let aligned_len = (len + page_size - 1) & !(page_size - 1);
     with_state(root, |state| {
         let base = crate::process::USER_MMAP_BASE;
-        let limit = crate::process::USER_MMAP_LIMIT;
         if state.next_mmap_addr == 0 || state.next_mmap_addr < base {
-            state.next_mmap_addr = limit;
+            // Start from a reasonable address, not the full Sv48 user limit.
+            // Go's mmap hints at specific high addresses are honored directly
+            // (not via this bump allocator). This handles non-hint allocations.
+            #[cfg(target_arch = "riscv64")]
+            {
+                state.next_mmap_addr = crate::process::USER_MMAP_LIMIT;
+            }
+            #[cfg(not(target_arch = "riscv64"))]
+            {
+                state.next_mmap_addr = crate::process::USER_MMAP_LIMIT;
+            }
         }
         loop {
             let candidate = (state.next_mmap_addr.saturating_sub(aligned_len)) & !(page_size - 1);

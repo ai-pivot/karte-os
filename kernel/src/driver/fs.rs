@@ -396,6 +396,7 @@ pub const O_RDWR: u32 = 2;
 pub const O_CREAT: u32 = 0x100;
 pub const O_TRUNC: u32 = 0x200;
 pub const O_APPEND: u32 = 0x400;
+pub const O_NONBLOCK: u32 = 0x800;
 
 // ─── POSIX Byte-Range File Locking ────────────────────────────────────
 // Required for SQLite WAL mode, which uses fcntl(F_SETLK/F_GETLK) for
@@ -771,7 +772,32 @@ impl FileDescriptor {
 
     #[cfg(not(target_arch = "x86_64"))]
     pub fn is_readable(&self) -> bool {
-        false
+        match &self.fd_type {
+            FdType::Stdio => {
+                if self.name == "stdin" {
+                    crate::driver::tty::has_input()
+                } else {
+                    false
+                }
+            }
+            FdType::PipeRead => {
+                if let Some(pipe_id) = self.pipe_id {
+                    crate::driver::pipe::pipe_available(pipe_id) > 0
+                } else {
+                    false
+                }
+            }
+            FdType::Eventfd => crate::syscall::epoll::eventfd::eventfd_peek_by_fd(self.fd_num) > 0,
+            FdType::Timerfd => crate::syscall::epoll::timerfd_peek(self.fd_num),
+            FdType::Epoll => false,
+            FdType::PipeWrite
+            | FdType::File
+            | FdType::FakeFile(_)
+            | FdType::VirtualFile
+            | FdType::VfsFile(_)
+            | FdType::Urandom => false,
+            FdType::Ext4File(_) => false,
+        }
     }
 
     /// Check if this fd is ready for writing.

@@ -83,7 +83,7 @@ pub const LINUX_MPROTECT: usize = 111;
 pub const LINUX_MUNMAP: usize = 112;
 pub const LINUX_ARCH_PRCTL: usize = 113;
 pub const LINUX_MADVISE: usize = 114;
-pub const LINUX_GETRANDOM: usize = 114;
+pub const LINUX_GETRANDOM: usize = 116;
 pub const LINUX_SET_TID_ADDRESS: usize = 115;
 pub const LINUX_EPOLL_CREATE1: usize = 120;
 pub const LINUX_EPOLL_CTL: usize = 121;
@@ -93,6 +93,7 @@ pub const LINUX_EVENTFD2: usize = 124;
 pub const LINUX_PIPE2: usize = 125;
 pub const LINUX_DUP3: usize = 126;
 pub const LINUX_FSTAT: usize = 127;
+pub const LINUX_FCNTL: usize = 128;
 
 // ─── Error codes ──────────────────────────────────────────────────
 
@@ -104,6 +105,7 @@ pub const ERR_INVAL: isize = -22; // EINVAL — Invalid argument
 pub const ERR_NOMEM: isize = -12; // ENOMEM — Out of memory
 pub const ERR_NOENT: isize = -2; // ENOENT — No such file or directory
 pub const ERR_IO: isize = -5; // EIO — I/O error
+pub const ERR_AGAIN: isize = -11; // EAGAIN — Resource temporarily unavailable
 pub const ERR_ACCES: isize = -13; // EACCES — Permission denied
 pub const ERR_RANGE: isize = -34; // ERANGE — Result too large
 pub const ERR_INTR: isize = -4; // EINTR — Interrupted system call
@@ -1564,14 +1566,17 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
     }
 
     // Try Linux compat layer first.
-    let result = if let Some(translation) = linux::translate(id, args) {
+    let (effective_id, effective_args) = if let Some(translation) = linux::translate(id, args) {
         match translation {
-            linux::Translation::Dispatch { karte_nr, args } => dispatch_inner(karte_nr, args),
-            linux::Translation::Handled(retval) => retval,
+            linux::Translation::Dispatch { karte_nr, args } => (karte_nr, args),
+            linux::Translation::Handled(retval) => {
+                return retval;
+            }
         }
     } else {
-        dispatch_inner(id, args)
+        (id, args)
     };
+    let result = dispatch_inner(effective_id, effective_args);
 
     result
 }
@@ -1638,13 +1643,12 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         LINUX_EPOLL_CREATE1 => epoll::sys_epoll_create1(args[0]),
         LINUX_EPOLL_CTL => epoll::sys_epoll_ctl(args[0], args[1], args[2], args[3]),
         LINUX_EPOLL_WAIT => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize),
-        LINUX_EPOLL_PWAIT => {
-            epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize)
-        }
+        LINUX_EPOLL_PWAIT => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize),
         LINUX_EVENTFD2 => epoll::eventfd::sys_eventfd2(args[0], args[1]),
         LINUX_PIPE2 => sys_pipe(args[0]),
         LINUX_DUP3 => sys_dup2(args[0] as i32, args[1] as i32),
         LINUX_FSTAT => linux_fstat_stub(args[0], args[1]),
+        LINUX_FCNTL => linux_fcntl(args[0], args[1], args[2]),
         #[cfg(target_arch = "x86_64")]
         LINUX_ARCH_PRCTL => linux_arch_prctl(args[0], args[1]),
         #[cfg(not(target_arch = "x86_64"))]
@@ -1655,9 +1659,19 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         #[cfg(target_arch = "riscv64")]
         131 | 133 | 139 => 0,
 
+        // clone3 (Linux generic 435) — return ENOSYS to force Go fallback to clone(220)
+        435 => -38,
+
+        // rseq (Linux generic 293) — return ENOSYS, Go has fallback
+        #[cfg(target_arch = "riscv64")]
+        293 | 168 => -38, // rseq, getcpu → ENOSYS
+
         _ => {
             let _ = id;
-            ERR_INVAL
+            // Return -ENOSYS for unrecognized syscalls. Go runtime expects
+            // ENOSYS (not EINVAL) for unsupported syscalls — it falls back
+            // gracefully to ENOSYS but may abort on EINVAL.
+            -38 // ENOSYS
         }
     };
     let _ = should_trace;
@@ -1678,8 +1692,7 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 /// Syscall 1: Exit the current process.
 pub fn sys_exit(code: i32) -> isize {
     #[cfg(target_arch = "riscv64")]
-    {
-    }
+    {}
     // ═══════════════════════════════════════════════════════════════
     // CRITICAL: cli FIRST. SYSCALL does NOT clear IF, so Timer ISR
     // can preempt us at any point. We must prevent preemption while
@@ -1773,7 +1786,12 @@ fn linux_exit_group(code: i32) -> isize {
     #[cfg(target_arch = "riscv64")]
     #[cfg(target_arch = "riscv64")]
     {
-        let code_str = match code { 0 => "0", 1 => "1", 2 => "2", _ => "?" };
+        let code_str = match code {
+            0 => "0",
+            1 => "1",
+            2 => "2",
+            _ => "?",
+        };
     }
     unsafe { core::arch::asm!("cli") };
 
@@ -1855,7 +1873,7 @@ fn linux_exit_group(code: i32) -> isize {
 
 /// Syscall 2: Write to file descriptor.
 fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
-    if buf == 0 || len == 0 || len > 65536 {
+    if buf == 0 || len == 0 || len > 1048576 {
         return ERR_INVAL;
     }
 
@@ -1901,15 +1919,17 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         }
         Some((FdType::Ext4File(_), _, _)) => {
             let data = user_read_bytes(buf, len);
-            let name = crate::process::with_fd_table(|fdt|
-                fdt.get(fd as usize).map(|d| d.name.clone()).unwrap_or_default());
+            let name = crate::process::with_fd_table(|fdt| {
+                fdt.get(fd as usize)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_default()
+            });
             if !name.is_empty() {
                 let _ = crate::driver::ext4::write_file(&name, &data);
             }
             return len as isize;
         }
-        Some((FdType::File, _, _)) => {
-        }
+        Some((FdType::File, _, _)) => {}
         _ => {
             // Unknown fd — still try to write to console instead of failing
             for i in 0..len {
@@ -1956,7 +1976,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
 
 /// Syscall 3: Read from file descriptor.
 fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
-    if buf == 0 || len == 0 || len > 65536 {
+    if buf == 0 || len == 0 || len > 1048576 {
         return ERR_INVAL;
     }
 
@@ -1971,8 +1991,13 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
         }
         Some((FdType::Stdio, _, _)) => {
             // Stdio stdin (fd 0 default): blocking read from TTY.
-            // Timer ISR also polls UART — poll_uart has an atomic guard
-            // to prevent reentrant corruption.
+            // Check O_NONBLOCK flag — Go's netpoller requires -EAGAIN when
+            // no data is available, otherwise the entire Go runtime deadlocks.
+            let nonblock = crate::process::with_fd_table(|fdt| {
+                fdt.get(fd as usize)
+                    .map(|d| (d.flags & O_NONBLOCK) != 0)
+                    .unwrap_or(false)
+            });
             let mut kbuf = alloc::vec![0u8; len];
             loop {
                 let result = crate::driver::tty::read(kbuf.as_mut_ptr() as usize, len);
@@ -1981,31 +2006,46 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                     user_buf.copy_from_slice(&kbuf[..result as usize]);
                     return result;
                 }
-                // No data — poll UART and yield to other tasks
+                // No data available
+                if nonblock {
+                    return ERR_AGAIN; // -EAGAIN
+                }
+                // Blocking mode: poll UART and yield to other tasks
                 crate::driver::tty::poll_uart();
                 crate::sched::schedule();
             }
         }
         Some((FdType::Ext4File(_), _, _)) => {
-            let name = crate::process::with_fd_table(|fdt|
-                fdt.get(fd as usize).map(|d| d.name.clone()).unwrap_or_default());
+            let name = crate::process::with_fd_table(|fdt| {
+                fdt.get(fd as usize)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_default()
+            });
             if !name.is_empty() {
                 if let Some(data) = crate::driver::ext4::read_file(&name) {
-                    let pos = crate::process::with_fd_table(|fdt|
-                        fdt.get(fd as usize).map(|d| d.pos).unwrap_or(0));
-                    let avail = if pos < data.len() { data.len() - pos } else { 0 };
+                    let pos = crate::process::with_fd_table(|fdt| {
+                        fdt.get(fd as usize).map(|d| d.pos).unwrap_or(0)
+                    });
+                    let avail = if pos < data.len() {
+                        data.len() - pos
+                    } else {
+                        0
+                    };
                     let n = core::cmp::min(avail, len);
-                    for i in 0..n { user_write_u8(buf + i, data[pos + i]); }
+                    for i in 0..n {
+                        user_write_u8(buf + i, data[pos + i]);
+                    }
                     crate::process::with_fd_table(|fdt| {
-                        if let Some(f) = fdt.get_mut(fd as usize) { f.pos += n; }
+                        if let Some(f) = fdt.get_mut(fd as usize) {
+                            f.pos += n;
+                        }
                     });
                     return n as isize;
                 }
             }
             return 0;
         }
-        Some((FdType::File, _, _)) => {
-        }
+        Some((FdType::File, _, _)) => {}
         Some((FdType::FakeFile(_), _, _)) | Some((FdType::Urandom, _, _)) => {
             // FakeFile/urandom: fake_read copies kernel bytes through user_write_u8().
             return crate::process::with_fd_table(|fd_table| {
@@ -2242,19 +2282,24 @@ fn linux_mmap_inner(
         aligned
     } else if addr != 0 {
         // Hint: use if valid AND no overlap with existing VMAs, otherwise kernel chooses.
-        // PROT_NONE hints (Go's sysReserve) request high addresses for sparse
-        // heap metadata. We honor them — bump allocator is NOT updated, so
-        // subsequent PROT_RW sysAlloc calls still get low addresses.
+        // On Sv39 (256GB user VA), Go may request high addresses valid only on Sv48.
+        // Per POSIX, when a hint cannot be honored, the kernel MAY return a different
+        // address. We silently fall back to the bump allocator instead of failing.
         let aligned_addr = addr & !(page_size - 1);
         let hint_end = aligned_addr.checked_add(aligned_len).unwrap_or(0);
         let hint_in_range = aligned_addr >= crate::process::USER_MMAP_BASE
             && hint_end != 0
             && hint_end <= crate::process::USER_MMAP_LIMIT;
-        if !hint_in_range {
-            return -12;
+        if hint_in_range {
+            let hint_overlaps = crate::mm::vma::vma_overlaps(root, aligned_addr, hint_end);
+            if !hint_overlaps {
+                aligned_addr
+            } else {
+                0 // hint overlaps — kernel chooses
+            }
+        } else {
+            0 // hint out of range (e.g. Sv39 limit) — kernel chooses
         }
-        let hint_overlaps = crate::mm::vma::vma_overlaps(root, aligned_addr, hint_end);
-        if !hint_overlaps { aligned_addr } else { 0 }
     } else {
         0
     };
@@ -2840,33 +2885,29 @@ fn linux_fstat_stub(fd: usize, statbuf: usize) -> isize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        // RISC-V Linux struct stat (128 bytes):
-        // 0: st_dev(u64), 8: st_ino(u64), 16: st_mode(u32), 20: st_nlink(u32),
-        // 24: st_uid(u32), 28: st_gid(u32), 32: st_rdev(u64), 48: st_size(i64),
-        // 56: st_blksize(i32)
+        // RISC-V 64 Linux struct stat (136 bytes):
+        // 0:  st_dev(u64), 8: st_ino(u64), 16: st_mode(u32), 20: st_nlink(u32),
+        // 24: st_uid(u32), 28: st_gid(u32), 32: st_rdev(u64),
+        // 40: st_size(i64), 48: st_blksize(i64), 56: st_blocks(i64)
         let st_mode: u32 = if fd <= 2 {
             0x21A4 // S_IFCHR | 0644 — character device for stdin/out/err
         } else {
             0x81A4 // S_IFREG | 0644 — regular file
         };
         // Zero the entire struct first
-        for i in 0..128 {
+        for i in 0..136 {
             user_write_u8(statbuf + i, 0);
         }
         user_write::<u32>(statbuf + 16, st_mode);
         user_write::<u32>(statbuf + 20, 1); // st_nlink
-        user_write::<u64>(statbuf + 48, 0); // st_size
-        user_write::<i32>(statbuf + 56, 4096); // st_blksize
+        user_write::<u64>(statbuf + 40, 0); // st_size
+        user_write::<u64>(statbuf + 48, 4096); // st_blksize
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         // x86_64 Linux struct stat (144 bytes)
-        let st_mode: u32 = if fd <= 2 {
-            0x21A4
-        } else {
-            0x81A4
-        };
+        let st_mode: u32 = if fd <= 2 { 0x21A4 } else { 0x81A4 };
         for i in 0..144 {
             user_write_u8(statbuf + i, 0);
         }
@@ -2899,8 +2940,7 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     }
     // Trace file opens for debugging
     #[cfg(target_arch = "riscv64")]
-    {
-    }
+    {}
 
     // Convert flags: Linux x86_64 O_CREAT=0x40, our internal=0x100
     // Go uses O_CREAT=0x40 on ALL architectures (including RISC-V).
@@ -2983,12 +3023,10 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
                 match fd_table.alloc_special_fd(
                     name.clone(),
                     flags,
-                    crate::driver::fs::FdType::Ext4File(
-                        crate::driver::ext4::Ext4FileDesc {
-                            inode_num: inode as u32,
-                            writable: has_creat || (flags & 0x3) != 0,
-                        },
-                    ),
+                    crate::driver::fs::FdType::Ext4File(crate::driver::ext4::Ext4FileDesc {
+                        inode_num: inode as u32,
+                        writable: has_creat || (flags & 0x3) != 0,
+                    }),
                 ) {
                     Some(fd) => fd as isize,
                     None => ERR_NOMEM,
@@ -2998,9 +3036,8 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     }
 
     #[cfg(target_arch = "riscv64")]
-
     // O_CREAT with ext4: create the file if it doesn't exist
-        if has_creat && crate::driver::ext4::has_ext4() {
+    if has_creat && crate::driver::ext4::has_ext4() {
         match crate::driver::ext4::write_file(&name, &[]) {
             Ok(()) => {}
             Err(_) => {}
@@ -3012,12 +3049,10 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
                 match fd_table.alloc_special_fd(
                     name.clone(),
                     flags,
-                    crate::driver::fs::FdType::Ext4File(
-                        crate::driver::ext4::Ext4FileDesc {
-                            inode_num: inode as u32,
-                            writable: true,
-                        },
-                    ),
+                    crate::driver::fs::FdType::Ext4File(crate::driver::ext4::Ext4FileDesc {
+                        inode_num: inode as u32,
+                        writable: true,
+                    }),
                 ) {
                     Some(fd) => fd as isize,
                     None => ERR_NOMEM,
@@ -4135,7 +4170,7 @@ pub fn run_tests() {
 
 // ─── Pipe / Dup2 / Redirect helpers ──────────────────────────────────
 
-use crate::driver::fs::{FdType, O_APPEND};
+use crate::driver::fs::{FdType, O_APPEND, O_NONBLOCK};
 
 /// Get fd type, pipe_id, and name for a given fd number.
 /// Returns None if fd is invalid or not a pipe.
@@ -4155,14 +4190,12 @@ pub(crate) fn get_fd_ext4_inode(fd: i32) -> Option<u32> {
     if fd < 0 || fd as usize >= MAX_FDS {
         return None;
     }
-    crate::process::with_fd_table(|fd_table| {
-        match fd_table.get(fd as usize) {
-            Some(f) => match &f.fd_type {
-                FdType::Ext4File(ext4_desc) => Some(ext4_desc.inode_num),
-                _ => None,
-            },
-            None => None,
-        }
+    crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
+        Some(f) => match &f.fd_type {
+            FdType::Ext4File(ext4_desc) => Some(ext4_desc.inode_num),
+            _ => None,
+        },
+        None => None,
     })
 }
 
@@ -4858,7 +4891,8 @@ fn linux_clone(
         };
 
         // Map kernel stack into user page table for clone children
-        let user_pt = crate::process::get_user_page_table(crate::process::current_page_table_root());
+        let user_pt =
+            crate::process::get_user_page_table(crate::process::current_page_table_root());
         crate::process::map_kernel_stack_pages(user_pt, kernel_stack_top);
 
         // Write child TID to parent_tid_ptr if CLONE_PARENT_SETTID

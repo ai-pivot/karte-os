@@ -26,7 +26,7 @@ TARGET_RV  := riscv64gc-unknown-none-elf
 KERNEL_RV  := target/$(TARGET_RV)/release/karte-os-kernel
 QEMU_RV_FLAGS := \
   -machine virt -cpu rv64 -bios default -nographic \
-  -m 128M -smp 1 \
+  -m 256M -smp 1 \
   -drive id=blk0,file=disk.img,format=raw,if=none \
   -device virtio-blk-device,drive=blk0 \
   -netdev user,id=net0,hostfwd=tcp::2323-:23,hostfwd=udp::2323-:23 \

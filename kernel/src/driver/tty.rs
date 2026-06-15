@@ -207,8 +207,7 @@ pub fn set_echo(enabled: bool) {
 }
 
 /// Atomic guard to prevent reentrant on_char calls from nested interrupts.
-static IN_ON_CHAR: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static IN_ON_CHAR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Poll UART RX FIFO and feed all available bytes into the TTY.
 /// Called from timer interrupt handler AND sys_read.
@@ -250,7 +249,6 @@ fn wake_input_waiters() {
         crate::sched::wake_task(waiting);
     }
 
-    #[cfg(target_arch = "x86_64")]
     crate::syscall::epoll::wake_waiters_for_fd(0);
 }
 
