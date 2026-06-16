@@ -167,6 +167,9 @@ impl Ext4BlockDevice for KarteBlockDevice {
                 }
                 buf[buf_pos..buf_pos + copy_len]
                     .copy_from_slice(&sector[src_start..src_start + copy_len]);
+                // Populate cache on disk read miss so subsequent writes see
+                // the latest data without a redundant disk read.
+                SECTOR_CACHE.lock().insert(abs_sector, sector);
             }
             buf_pos += copy_len;
             sector_idx += 1;

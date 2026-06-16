@@ -419,6 +419,30 @@ pub fn pread(fd: usize, buf: &mut [u8], offset: usize) -> Result<usize, VfsError
     mount.fs.read_file(inode, offset, buf)
 }
 
+/// Seek to a position in an open file (for lseek).
+/// Updates the VFS open file's position.
+pub fn seek(fd: usize, offset: i64, whence: i32) -> Result<usize, VfsError> {
+    let mut vfs = VFS.lock();
+    let (mount_id, inode, cur_pos) = {
+        let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;
+        (of.mount_id, of.inode, of.pos)
+    };
+    let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
+    let file_size = mount.fs.metadata(inode)?.size as i64;
+    let new_pos = match whence {
+        0 => offset,                  // SEEK_SET
+        1 => cur_pos as i64 + offset, // SEEK_CUR
+        2 => file_size + offset,      // SEEK_END
+        _ => return Err(VfsError::InvalidParam),
+    };
+    if new_pos < 0 {
+        return Err(VfsError::InvalidParam);
+    }
+    let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;
+    of.pos = new_pos as usize;
+    Ok(new_pos as usize)
+}
+
 /// Close an open file
 pub fn close(fd: usize) -> bool {
     let mut vfs = VFS.lock();

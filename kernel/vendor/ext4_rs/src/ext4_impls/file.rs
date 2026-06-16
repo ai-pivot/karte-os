@@ -215,23 +215,26 @@ impl Ext4 {
                 }
             };
 
-            // read data
-            let data = self
-                .block_device
-                .read_offset(pblock_idx as usize * BLOCK_SIZE);
-
-            // copy data to read buffer
-            read_buf[cursor..cursor + adjust_read_size].copy_from_slice(
-                &data[unaligned_start_offset..unaligned_start_offset + adjust_read_size],
-            );
-
-            // update cursor and total bytes read
-            cursor += adjust_read_size;
-            total_bytes_read += adjust_read_size;
-            iblock += 1;
+            // Hole: logical block has no physical mapping (sparse file).
+            // Zero-fill instead of reading ext4 metadata at physical block 0.
+            if pblock_idx == 0 {
+                read_buf[cursor..cursor + adjust_read_size].fill(0);
+                cursor += adjust_read_size;
+                total_bytes_read += adjust_read_size;
+                iblock += 1;
+            } else {
+                // read data
+                let data = self
+                    .block_device
+                    .read_offset(pblock_idx as usize * BLOCK_SIZE);
+                read_buf[cursor..cursor + adjust_read_size].copy_from_slice(
+                    &data[unaligned_start_offset..unaligned_start_offset + adjust_read_size],
+                );
+                cursor += adjust_read_size;
+                total_bytes_read += adjust_read_size;
+                iblock += 1;
+            }
         }
-
-        // Continue with full block reads
         while total_bytes_read < read_buf_len && iblock < iblock_last {
             let mut read_length = min(BLOCK_SIZE, read_buf_len - total_bytes_read);
 
@@ -255,6 +258,16 @@ impl Ext4 {
                     );
                 }
             };
+
+            // Hole: logical block has no physical mapping (sparse file).
+            // Zero-fill instead of reading ext4 metadata at physical block 0.
+            if pblock_idx == 0 {
+                read_buf[cursor..cursor + read_length].fill(0);
+                cursor += read_length;
+                total_bytes_read += read_length;
+                iblock += 1;
+                continue;
+            }
 
             // read data
             let data = self

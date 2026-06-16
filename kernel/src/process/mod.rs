@@ -911,10 +911,28 @@ impl Process {
         copy_kernel_mappings(user_pt, kernel_stack_top);
         vmm::set_all_ad_bits(user_pt);
 
+        // Switch to kernel CR3 for ELF loading. The user page table's identity
+        // mapping (from copy_kernel_mappings) gets overwritten as ELF segments
+        // are loaded. Running map()/translate_user() under user CR3 causes
+        // physical frame writes to go to wrong addresses. Kernel CR3 has a
+        // complete, untampered identity mapping that ensures correct operation.
         let saved_cr3: u64;
+        #[cfg(target_arch = "x86_64")]
+        {
+            saved_cr3 = {
+                let cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+                cr3
+            };
+            let kcr3 = crate::mm::vmm::kernel_cr3() as u64;
+            if kcr3 != 0 {
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) kcr3) };
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         {
             saved_cr3 = 0;
-        } // RISC-V: no CR3 switch needed
+        }
 
         // 5. Load ELF segments
         let mut max_vaddr = 0usize;

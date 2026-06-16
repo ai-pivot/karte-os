@@ -989,7 +989,6 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
 }
 
 // ─── Linux-specific syscall implementations ──────────────────────────
-// These handle Linux ABI differences from KarteOS's native syscalls.
 
 #[cfg(target_arch = "x86_64")]
 /// Linux open(path, flags, mode) — translate to KarteOS sys_open
@@ -1016,7 +1015,8 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
     let has_creat = (flags & linux_creat) != 0;
 
     // Try VFS open with converted flags
-    let our_flags = if has_creat { 0x100 } else { 0 } | (flags & 0x600); // keep O_TRUNC/O_APPEND
+    // Preserve access mode bits (O_RDONLY=0, O_WRONLY=0x1, O_RDWR=0x2)
+    let our_flags = (flags & 0x3) | (if has_creat { 0x100 } else { 0 }) | (flags & 0x600);
     let result = match crate::driver::vfs::open(&path_str, our_flags as u32) {
         Ok(vfs_fd) => {
             // Register the VFS fd in the process FdTable
@@ -2017,6 +2017,9 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             let data = user_read_bytes(buf, len);
             return match crate::driver::vfs::write(vfs_fd, &data) {
                 Ok(n) => {
+                    // Keep fd table position in sync with VFS position
+                    let cur = get_fd_pos(fd);
+                    set_fd_pos(fd, cur + n);
                     #[cfg(target_arch = "x86_64")]
                     mirror_user_json_log(&data[..n]);
                     n as isize
@@ -3120,11 +3123,12 @@ pub(crate) fn sys_open(path: usize, path_len: usize, flags: u32) -> isize {
     // package hardcodes 0x40 for all Linux targets. We must accept both.
     let linux_o_creat: u32 = 0x40;
     let has_creat = (flags & linux_o_creat) != 0 || (flags & crate::driver::fs::O_CREAT) != 0;
-    let our_flags = if has_creat {
+    let our_flags = (if has_creat {
         crate::driver::fs::O_CREAT
     } else {
         0
-    } | (flags & (crate::driver::fs::O_TRUNC | crate::driver::fs::O_APPEND));
+    }) | (flags & 0x3) // Preserve access mode (O_RDONLY=0, O_WRONLY=1, O_RDWR=2)
+      | (flags & (crate::driver::fs::O_TRUNC | crate::driver::fs::O_APPEND));
 
     if name.contains("xbot")
         || name.contains("session")
@@ -4395,6 +4399,22 @@ pub(crate) fn get_fd_ext4_inode(fd: i32) -> Option<u32> {
     crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
         Some(f) => match &f.fd_type {
             FdType::Ext4File(ext4_desc) => Some(ext4_desc.inode_num),
+            _ => None,
+        },
+        None => None,
+    })
+}
+
+/// Get VFS fd number for a given process fd (for pread/pwrite offset operations).
+/// Returns the inner VFS fd index so callers can use vfs::pread / vfs::pwrite
+/// which respect the specified offset instead of the sequential file position.
+pub(crate) fn get_fd_vfs_fd(fd: i32) -> Option<usize> {
+    if fd < 0 || fd as usize >= MAX_FDS {
+        return None;
+    }
+    crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
+        Some(f) => match &f.fd_type {
+            FdType::VfsFile(vfs_fd) => Some(*vfs_fd),
             _ => None,
         },
         None => None,

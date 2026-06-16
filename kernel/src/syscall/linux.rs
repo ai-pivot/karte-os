@@ -815,6 +815,15 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                 }
                 super::set_fd_pos(fd, new_pos as usize);
                 Some(Translation::Handled(new_pos as isize))
+            } else if let Some(vfs_fd) = super::get_fd_vfs_fd(fd) {
+                // VFS file: use vfs::seek which updates the VFS open file position
+                match crate::driver::vfs::seek(vfs_fd, offset, whence) {
+                    Ok(new_pos) => {
+                        super::set_fd_pos(fd, new_pos);
+                        Some(Translation::Handled(new_pos as isize))
+                    }
+                    Err(_) => Some(Translation::Handled(super::ERR_INVAL)),
+                }
             } else {
                 Some(Translation::Handled(0))
             }
@@ -916,6 +925,18 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                     }
                     Err(_) => Some(Translation::Handled(super::ERR_IO)),
                 }
+            } else if let Some(vfs_fd) = super::get_fd_vfs_fd(fd) {
+                // VFS file: use vfs::pread which respects the specified offset
+                let mut kbuf = alloc::vec![0u8; count];
+                match crate::driver::vfs::pread(vfs_fd, &mut kbuf, offset) {
+                    Ok(n) => {
+                        for i in 0..n {
+                            super::user_write_u8(buf + i, kbuf[i]);
+                        }
+                        Some(Translation::Handled(n as isize))
+                    }
+                    Err(_) => Some(Translation::Handled(super::ERR_IO)),
+                }
             } else {
                 // Fall back to regular read
                 let result =
@@ -935,6 +956,13 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                     Ok(n) => Some(Translation::Handled(n as isize)),
                     Err(_) => Some(Translation::Handled(super::ERR_IO)),
                 }
+            } else if let Some(vfs_fd) = super::get_fd_vfs_fd(fd) {
+                // VFS file: use vfs::pwrite which respects the specified offset
+                let data = super::user_read_bytes(buf, count);
+                match crate::driver::vfs::pwrite(vfs_fd, &data, offset) {
+                    Ok(n) => Some(Translation::Handled(n as isize)),
+                    Err(_) => Some(Translation::Handled(super::ERR_IO)),
+                }
             } else {
                 let result =
                     super::dispatch_inner(super::SYS_WRITE, [fd as usize, buf, count, 0, 0, 0]);
@@ -950,15 +978,17 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             let fd = args[0] as i32;
             let iov = args[1];
             let iovcnt = args[2];
-            let offset = if matches!(id, L_PWRITEV) {
+            let is_pwritev = matches!(id, L_PWRITEV);
+            let offset = if is_pwritev {
                 args[3]
             } else {
                 super::get_fd_pos(fd)
             };
-            let inode = match super::get_fd_ext4_inode(fd) {
-                Some(i) => i,
-                None => return Some(Translation::Handled(0)),
-            };
+            let ext4_inode = super::get_fd_ext4_inode(fd);
+            let vfs_fd = super::get_fd_vfs_fd(fd);
+            if ext4_inode.is_none() && vfs_fd.is_none() {
+                return Some(Translation::Handled(0));
+            }
             let mut pos = offset;
             let mut total = 0usize;
             for i in 0..iovcnt {
@@ -968,7 +998,13 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                     continue;
                 }
                 let data = super::user_read_bytes(base, len);
-                match crate::driver::ext4::write_file_at_offset(inode, pos, &data) {
+                let result = if let Some(inode) = ext4_inode {
+                    crate::driver::ext4::write_file_at_offset(inode, pos, &data)
+                } else {
+                    let vfd = vfs_fd.unwrap();
+                    crate::driver::vfs::pwrite(vfd, &data, pos).map_err(|_| "vfs pwrite failed")
+                };
+                match result {
                     Ok(n) => {
                         pos += n;
                         total += n;
@@ -976,7 +1012,7 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                     Err(_) => break,
                 }
             }
-            if !matches!(id, L_PWRITEV) {
+            if !is_pwritev {
                 super::set_fd_pos(fd, pos);
             }
             Some(Translation::Handled(total as isize))
@@ -985,15 +1021,17 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
             let fd = args[0] as i32;
             let iov = args[1];
             let iovcnt = args[2];
-            let offset = if matches!(id, L_PREADV) {
+            let is_preadv = matches!(id, L_PREADV);
+            let offset = if is_preadv {
                 args[3]
             } else {
                 super::get_fd_pos(fd)
             };
-            let inode = match super::get_fd_ext4_inode(fd) {
-                Some(i) => i,
-                None => return Some(Translation::Handled(0)),
-            };
+            let ext4_inode = super::get_fd_ext4_inode(fd);
+            let vfs_fd = super::get_fd_vfs_fd(fd);
+            if ext4_inode.is_none() && vfs_fd.is_none() {
+                return Some(Translation::Handled(0));
+            }
             let mut pos = offset;
             let mut total = 0usize;
             for i in 0..iovcnt {
@@ -1003,7 +1041,13 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                     continue;
                 }
                 let mut kbuf = alloc::vec![0u8; len];
-                match crate::driver::ext4::read_file_at_offset(inode, pos, &mut kbuf) {
+                let result = if let Some(inode) = ext4_inode {
+                    crate::driver::ext4::read_file_at_offset(inode, pos, &mut kbuf)
+                } else {
+                    let vfd = vfs_fd.unwrap();
+                    crate::driver::vfs::pread(vfd, &mut kbuf, pos).map_err(|_| "vfs pread failed")
+                };
+                match result {
                     Ok(n) => {
                         for j in 0..n {
                             super::user_write_u8(base + j, kbuf[j]);
@@ -1017,7 +1061,7 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
                     Err(_) => break,
                 }
             }
-            if !matches!(id, L_PREADV) {
+            if !is_preadv {
                 super::set_fd_pos(fd, pos);
             }
             Some(Translation::Handled(total as isize))
