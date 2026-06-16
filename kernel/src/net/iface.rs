@@ -353,6 +353,17 @@ impl NetStack {
                     },
                 };
                 let sock = stack.socket_set.get_mut::<udp::Socket>(meta.handle);
+                // smoltcp requires UDP sockets to be bound before sending.
+                // Auto-bind to ephemeral port if not already open.
+                if !sock.is_open() {
+                    let endpoint = IpListenEndpoint {
+                        addr: None,
+                        port: 0,
+                    };
+                    if sock.bind(endpoint).is_err() {
+                        return -1;
+                    }
+                }
                 match sock.send_slice(data, (ip_addr, dst_port)) {
                     Ok(()) => data.len() as isize,
                     Err(_) => -1,
