@@ -217,6 +217,17 @@ pub fn write_block(block_id: usize, buf: &[u8]) -> Result<(), &'static str> {
         .map_err(|_| "write failed")
 }
 
+/// Flush pending writes to the physical storage.
+///
+/// Sends a VIRTIO_BLK_T_FLUSH request to the device, ensuring all
+/// previously written blocks are persisted. This is critical for
+/// SQLite's durability guarantees (fsync/fdatasync).
+pub fn flush_block_device() -> Result<(), &'static str> {
+    let mut guard = BLK_DEVICE.lock();
+    let blk_device = guard.as_mut().ok_or("no block device")?;
+    blk_device.flush().map_err(|_| "flush failed")
+}
+
 /// Get the capacity of the block device in sectors, if available.
 pub fn capacity() -> Option<u64> {
     let guard = BLK_DEVICE.lock();

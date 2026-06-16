@@ -343,8 +343,7 @@ unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
 #[inline]
 pub(crate) fn user_write_u8(addr: usize, byte: u8) {
     // Kernel-mode or no user page table: direct write
-    if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0
-    {
+    if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0 {
         unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
         return;
     }
@@ -1972,7 +1971,11 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
                 pos
             };
 
-            match crate::driver::ext4::write_file_at_offset(ext4_desc.inode_num, write_offset, &data) {
+            match crate::driver::ext4::write_file_at_offset(
+                ext4_desc.inode_num,
+                write_offset,
+                &data,
+            ) {
                 Ok(_) => {
                     // Update seek position
                     crate::process::with_fd_table(|fdt| {
@@ -2065,15 +2068,28 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 if result > 0 {
                     let user_buf = UserSliceMut::new(buf, len).unwrap();
                     user_buf.copy_from_slice(&kbuf[..result as usize]);
+                    crate::driver::tty::clear_input_waiter();
                     return result;
                 }
                 // No data available
                 if nonblock {
                     return ERR_AGAIN; // -EAGAIN
                 }
-                // Blocking mode: poll UART and yield to other tasks
+                // Blocking mode: register as stdin waiter, poll UART, then block.
+                // wake_input_waiters() (called from on_char) will wake us via
+                // wake_task() when keyboard input arrives.
+                let proc_idx = crate::process::current_index();
+                crate::driver::tty::set_input_waiter(proc_idx);
                 crate::driver::tty::poll_uart();
-                crate::sched::schedule();
+                // Check again after poll — poll_uart may have delivered data
+                let result2 = crate::driver::tty::read(kbuf.as_mut_ptr() as usize, len);
+                if result2 > 0 {
+                    let user_buf = UserSliceMut::new(buf, len).unwrap();
+                    user_buf.copy_from_slice(&kbuf[..result2 as usize]);
+                    crate::driver::tty::clear_input_waiter();
+                    return result2;
+                }
+                crate::sched::schedule_block();
             }
         }
         Some((FdType::Ext4File(ext4_desc), _, _)) => {
@@ -2567,18 +2583,37 @@ fn flush_tlb_all() {
 ///   - F_GETLK / F_SETLK / F_SETLKW: POSIX advisory byte-range locking
 ///
 /// Linux fsync(fd) — flush file data to disk.
-/// For VFS/ext4 files, issues ATA FLUSH CACHE via AHCI to ensure data is on disk.
-#[cfg(target_arch = "x86_64")]
+/// On x86_64: issues ATA FLUSH CACHE via AHCI.
+/// On RISC-V: sends VIRTIO_BLK_T_FLUSH to the VirtIO block device.
+/// This is critical for SQLite WAL mode durability guarantees.
 fn linux_fsync(fd: usize) -> isize {
     if fd >= crate::driver::fs::MAX_FDS {
         return -9; // EBADF
     }
-    // Issue ATA FLUSH CACHE to ensure all pending writes reach the physical disk.
-    // This is critical for SQLite WAL mode durability guarantees.
-    if crate::driver::ahci::is_available() {
-        if let Err(e) = crate::driver::ahci::flush_cache() {
-            crate::console_println!("[fsync] AHCI flush failed: {}", e);
-            return -5; // EIO
+    // Flush pending writes to ensure data reaches physical disk.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::driver::ahci::is_available() {
+            if let Err(e) = crate::driver::ahci::flush_cache() {
+                crate::console_println!("[fsync] AHCI flush failed: {}", e);
+                return -5; // EIO
+            }
+        }
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        // VirtIO block flush: sends VIRTIO_BLK_T_FLUSH to ensure all pending
+        // writes reach the physical disk. This is critical for SQLite's
+        // durability guarantees.
+        //
+        // The EXT4_FS spin::Mutex serializes all ext4 operations, so no other
+        // thread is doing block I/O when fsync is called. The BLK_DEVICE lock
+        // is held only during the flush request (a few microseconds).
+        match crate::driver::virtio::flush_block_device() {
+            Ok(()) => {}
+            Err(e) => {
+                crate::klog!(INFO, "[fsync] VirtIO flush failed (fd={}): {}", fd, e);
+            }
         }
     }
     0
@@ -3203,9 +3238,13 @@ pub const WAIT_ERR: isize = -2;
 
 /// Syscall 31: Wait for a child process to exit.
 ///
-/// Non-blocking. Returns the exit code (>= 0) when the child has exited (and
-/// reaps it), `WAIT_AGAIN` while it is still running (caller should poll), or
-/// `WAIT_ERR` when the pid is not a child of the caller (or already reaped).
+/// Blocks the caller until the child exits (or returns immediately if the
+/// child has already exited). The child's `sys_exit` handler calls
+/// `wake_task(parent_idx)` to unblock us.
+///
+/// Returns the exit code (>= 0) when the child has exited (and reaps it),
+/// `WAIT_AGAIN` on spurious wake (caller should re-invoke), or `WAIT_ERR`
+/// when the pid is not a child of the caller (or already reaped).
 fn sys_waitpid(pid: usize) -> isize {
     let my_pid = crate::process::current_pid();
 
@@ -3226,8 +3265,27 @@ fn sys_waitpid(pid: usize) -> isize {
             exit_code as isize
         }
         None => {
-            crate::sched::schedule();
-            WAIT_AGAIN
+            // Mark ourselves as waiting for this child, then block.
+            // sys_exit will find us via find_waiting_parent() and call
+            // wake_task() to set us back to Ready.
+            crate::process::set_wait_child(crate::process::current_index(), Some(child_idx));
+            crate::sched::schedule_block();
+
+            // After waking, the child should have exited. Re-check.
+            match crate::process::get_exit_code(child_idx) {
+                Some(exit_code) => {
+                    crate::process::set_wait_child(crate::process::current_index(), None);
+                    crate::process::reclaim_process(child_idx);
+                    crate::sched::remove_task(child_idx);
+                    exit_code as isize
+                }
+                None => {
+                    // Spurious wake — clear wait state and return WAIT_AGAIN
+                    // so the caller can re-invoke.
+                    crate::process::set_wait_child(crate::process::current_index(), None);
+                    WAIT_AGAIN
+                }
+            }
         }
     }
 }
@@ -4274,9 +4332,7 @@ pub(crate) fn get_fd_ext4_inode(fd: i32) -> Option<u32> {
 
 /// Get the current seek position for an fd (for lseek).
 pub(crate) fn get_fd_pos(fd: i32) -> usize {
-    crate::process::with_fd_table(|fdt| {
-        fdt.get(fd as usize).map(|d| d.pos).unwrap_or(0)
-    })
+    crate::process::with_fd_table(|fdt| fdt.get(fd as usize).map(|d| d.pos).unwrap_or(0))
 }
 
 /// Set the seek position for an fd (for lseek).

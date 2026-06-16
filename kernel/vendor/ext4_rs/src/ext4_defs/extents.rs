@@ -352,18 +352,23 @@ impl ExtentNode {
             return None;
         }
 
+        // Single-index tree: return the only entry immediately.
+        // The Linux kernel does the same in ext4_binsearch_idx:
+        //   if (unlikely(l > r)) { path->p_idx = EXT_FIRST_INDEX(eh); return; }
+        if self.header.entries_count == 1 {
+            return Some(0);
+        }
+
         match &self.data {
             NodeData::Root(root_data) => {
                 // Root node handling
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let indexes = &root_data[start..];
 
-                let mut l = 1; // Skip the first index
+                let mut l = 1; // Skip the first index (it's the implicit fallback)
                 let mut r = self.header.entries_count as usize - 1;
 
                 // Clamp r based on actual available data to prevent out-of-bounds access.
-                // The header.entries_count may contain stale/invalid values for newly
-                // created inodes whose extent tree hasn't been fully initialized.
                 let entry_size = size_of::<Ext4ExtentIndex>() / 4;
                 let max_entries = if entry_size > 0 {
                     indexes.len() / entry_size
@@ -371,15 +376,11 @@ impl ExtentNode {
                     0
                 };
                 if r >= max_entries {
-                    r = if max_entries > 1 {
-                        max_entries - 1
-                    } else {
-                        return None;
-                    };
+                    r = max_entries.saturating_sub(1);
                 }
-                // Also ensure l is valid
+                // If only one valid entry, return it
                 if l > r {
-                    return None;
+                    return Some(0);
                 }
 
                 while l <= r {
@@ -397,8 +398,10 @@ impl ExtentNode {
                     }
                 }
 
+                // After binary search, l is the insertion point.
+                // If l == 0, no entry was >= lblock, so use entry 0 as fallback.
                 if l == 0 {
-                    return None;
+                    return Some(0);
                 }
 
                 Some(l - 1)

@@ -160,7 +160,7 @@ fn wait_for(pid: isize) -> i32 {
     loop {
         let code = unsafe { syscall1(SYS_WAITPID, pid as usize) };
         if code == WAIT_AGAIN {
-            for _ in 0..1000 { core::hint::spin_loop(); }
+            // Spurious wake — sys_waitpid will block again on next call.
             continue;
         }
         return code as i32;

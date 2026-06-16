@@ -79,7 +79,12 @@ pub fn sys_timerfd_create(clockid: usize, _flags: usize) -> isize {
 ///   it_value:    { tv_sec(i64)@16, tv_nsec(i64)@24 }
 ///
 /// When `flags & TFD_TIMER_ABSTIME` (1), it_value is absolute (we treat as relative).
-pub fn sys_timerfd_settime(fd: usize, _flags: usize, new_value_ptr: usize, _old_value_ptr: usize) -> isize {
+pub fn sys_timerfd_settime(
+    fd: usize,
+    _flags: usize,
+    new_value_ptr: usize,
+    _old_value_ptr: usize,
+) -> isize {
     if new_value_ptr == 0 {
         return -14; // EFAULT
     }

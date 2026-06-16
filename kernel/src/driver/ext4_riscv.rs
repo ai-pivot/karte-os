@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -12,6 +14,51 @@ use ext4_rs::{BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_INODE_MODE_FILE, 
 use crate::driver::vfs::{FileSystem, VfsDirEntry, VfsError, VfsFileType, VfsMetadata};
 
 const SECTOR_SIZE: usize = 512;
+
+// ─── Sector write-through cache ────────────────────────────────────
+// ext4_rs has no in-memory block cache. Every write goes directly to
+// disk via write_offset's read-modify-write at sector granularity.
+// When multiple metadata updates (bitmap, inode, bgdt) share the same
+// physical sector, the second write's read phase picks up stale data,
+// silently discarding the first write (e.g. bitmap update lost → block
+// double-allocated → directory data overwritten).
+//
+// Fix: cache every sector we write. Subsequent reads hit the cache
+// first, ensuring write-after-write consistency without requiring a
+// full block layer in ext4_rs.
+
+const CACHE_CAPACITY: usize = 2048;
+
+struct SectorCache {
+    map: BTreeMap<usize, [u8; SECTOR_SIZE]>,
+    order: VecDeque<usize>,
+}
+
+impl SectorCache {
+    const fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, sector: usize) -> Option<&[u8; SECTOR_SIZE]> {
+        self.map.get(&sector)
+    }
+
+    fn insert(&mut self, sector: usize, data: [u8; SECTOR_SIZE]) {
+        if self.map.insert(sector, data).is_none() {
+            self.order.push_back(sector);
+            while self.order.len() > CACHE_CAPACITY {
+                if let Some(evict) = self.order.pop_front() {
+                    self.map.remove(&evict);
+                }
+            }
+        }
+    }
+}
+
+static SECTOR_CACHE: spin::Mutex<SectorCache> = spin::Mutex::new(SectorCache::new());
 
 static READ_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -43,19 +90,27 @@ impl Ext4BlockDevice for KarteBlockDevice {
         let mut buf_pos = 0;
         let mut sector_idx = 0;
         while buf_pos < BLOCK_SIZE {
-            let mut sector = [0u8; SECTOR_SIZE];
-            match block_read(base_sector + sector_idx, &mut sector) {
-                Ok(()) => {
-                    let src_start = if sector_idx == 0 { skip } else { 0 };
-                    let src_end = SECTOR_SIZE;
-                    let remaining = BLOCK_SIZE - buf_pos;
-                    let copy_len = core::cmp::min(src_end - src_start, remaining);
-                    buf[buf_pos..buf_pos + copy_len]
-                        .copy_from_slice(&sector[src_start..src_start + copy_len]);
-                    buf_pos += copy_len;
+            let abs_sector = base_sector + sector_idx;
+            let src_start = if sector_idx == 0 { skip } else { 0 };
+            let remaining = BLOCK_SIZE - buf_pos;
+            let copy_len = core::cmp::min(SECTOR_SIZE - src_start, remaining);
+
+            // Try cache first
+            let cache = SECTOR_CACHE.lock();
+            if let Some(cached) = cache.get(abs_sector) {
+                buf[buf_pos..buf_pos + copy_len]
+                    .copy_from_slice(&cached[src_start..src_start + copy_len]);
+                drop(cache);
+            } else {
+                drop(cache);
+                let mut sector = [0u8; SECTOR_SIZE];
+                if block_read(abs_sector, &mut sector).is_err() {
+                    break;
                 }
-                Err(_) => break,
+                buf[buf_pos..buf_pos + copy_len]
+                    .copy_from_slice(&sector[src_start..src_start + copy_len]);
             }
+            buf_pos += copy_len;
             sector_idx += 1;
         }
         buf
@@ -72,8 +127,20 @@ impl Ext4BlockDevice for KarteBlockDevice {
                 core::cmp::min(SECTOR_SIZE - sector_offset, data.len() - data_pos);
 
             let mut sector = [0u8; SECTOR_SIZE];
-            if block_read(sector_idx, &mut sector).is_err() {
-                return;
+
+            // For partial writes, read existing sector (try cache first)
+            if sector_offset != 0 || bytes_in_sector != SECTOR_SIZE {
+                let cached = {
+                    let cache = SECTOR_CACHE.lock();
+                    cache.get(sector_idx).copied()
+                };
+                if let Some(cached) = cached {
+                    sector.copy_from_slice(&cached);
+                } else {
+                    if block_read(sector_idx, &mut sector).is_err() {
+                        return;
+                    }
+                }
             }
 
             sector[sector_offset..sector_offset + bytes_in_sector]
@@ -82,6 +149,9 @@ impl Ext4BlockDevice for KarteBlockDevice {
             if block_write(sector_idx, &sector).is_err() {
                 return;
             }
+
+            // Update cache (write-through)
+            SECTOR_CACHE.lock().insert(sector_idx, sector);
 
             data_pos += bytes_in_sector;
             current_offset += bytes_in_sector;

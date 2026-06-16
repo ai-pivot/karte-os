@@ -146,6 +146,17 @@ pub fn has_input() -> bool {
     TTY_INPUT.len() > 0
 }
 
+/// Mark the current process as the stdin reader that should be woken
+/// when input arrives. Used by sys_read(fd=0) before blocking.
+pub fn set_input_waiter(proc_idx: usize) {
+    TTY_WAITING.store(proc_idx, Ordering::Release);
+}
+
+/// Clear the stdin reader waiter (after a successful read).
+pub fn clear_input_waiter() {
+    TTY_WAITING.store(usize::MAX, Ordering::Release);
+}
+
 /// Line editor (only used in canonical mode)
 static TTY_LINE: LineEditorData = LineEditorData {
     inner: UnsafeCell::new(LineEditor::new()),

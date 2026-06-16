@@ -834,7 +834,19 @@ fn idle_loop() -> ! {
 
         #[cfg(target_arch = "riscv64")]
         unsafe {
+            // Enable S-mode interrupts so the timer can wake us from wfi.
+            //
+            // When schedule_block() switches to IDLE, we arrive here with
+            // SIE=0 (trap entry cleared it). Without setting SIE, wfi never
+            // wakes because there is no pending *enabled* interrupt, causing
+            // a system-wide deadlock when all user tasks are blocked.
+            //
+            // This is safe: schedule() has returned (no SCHEDULER lock held),
+            // and the timer ISR uses try_lock for all kernel locks, so even
+            // if it fires between set_sie and wfi there is no deadlock.
+            riscv::register::sstatus::set_sie();
             core::arch::asm!("wfi");
+            riscv::register::sstatus::clear_sie();
         }
     }
 }

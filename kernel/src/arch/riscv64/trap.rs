@@ -199,8 +199,7 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 // here and let the ecall handler check NEED_RESCHED when the
                 // syscall completes.
                 if from_user
-                    && crate::sched::NEED_RESCHED
-                        .swap(false, core::sync::atomic::Ordering::Relaxed)
+                    && crate::sched::NEED_RESCHED.swap(false, core::sync::atomic::Ordering::Relaxed)
                 {
                     crate::sched::schedule();
                 }
@@ -348,7 +347,13 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                     // The lazy allocation above should have handled it, but if
                     // we get here, the page wasn't in a known VMA/heap region.
                     // Skip the instruction to avoid infinite loops.
-                    crate::klog!(INFO, "[PF-SMODE] sepc={:#x} stval={:#x} code={} — user addr in S-mode, skipping", ctx.sepc, stval, code);
+                    crate::klog!(
+                        INFO,
+                        "[PF-SMODE] sepc={:#x} stval={:#x} code={} — user addr in S-mode, skipping",
+                        ctx.sepc,
+                        stval,
+                        code
+                    );
                     skip_trap_instruction(ctx);
                 }
             }
