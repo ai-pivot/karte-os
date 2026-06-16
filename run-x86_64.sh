@@ -32,5 +32,5 @@ exec script -q -f -c \
     -device ich9-ahci,id=ahci \
     -device ide-hd,drive=hd0,bus=ahci.0 \
     -netdev user,id=net0 \
-    -device virtio-net-pci,netdev=net0,msix=off,disable-modern=on" \
+    -device virtio-net-pci,netdev=net0" \
   "$LOG"
