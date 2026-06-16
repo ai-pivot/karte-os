@@ -941,6 +941,16 @@ impl FdTable {
 
     /// Allocate a fake fd with in-memory buffer for virtual files (.xbot/*).
     pub fn alloc_fake_fd(&mut self, name: String, flags: u32) -> Option<usize> {
+        self.alloc_fake_fd_with_content(name, flags, alloc::vec![])
+    }
+
+    /// Allocate a FakeFile fd with pre-populated content (e.g. /etc/resolv.conf).
+    pub fn alloc_fake_fd_with_content(
+        &mut self,
+        name: String,
+        flags: u32,
+        content: alloc::vec::Vec<u8>,
+    ) -> Option<usize> {
         for (i, slot) in self.fds.iter_mut().enumerate() {
             if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
                 *slot = Some(FileDescriptor {
@@ -948,7 +958,7 @@ impl FdTable {
                     pos: 0,
                     flags,
                     valid: true,
-                    fd_type: FdType::FakeFile(alloc::vec![]),
+                    fd_type: FdType::FakeFile(content),
                     pipe_id: None,
                     fd_num: 0,
                 });

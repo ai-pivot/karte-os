@@ -1052,8 +1052,23 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                     }
                 })
             } else if is_pseudo || is_etc {
+                // Return correct content for known /etc files
+                let content = if path_str.ends_with("resolv.conf") {
+                    // QEMU user-mode DNS proxy is at 10.0.2.3
+                    b"nameserver 10.0.2.3\n".to_vec()
+                } else if path_str.ends_with("hosts") {
+                    b"127.0.0.1 localhost\n".to_vec()
+                } else if path_str.ends_with("hostname") {
+                    b"karteos\n".to_vec()
+                } else {
+                    alloc::vec![]
+                };
                 crate::process::with_fd_table(|fd_table| {
-                    match fd_table.alloc_fake_fd(alloc::format!("{}", path_str), our_flags as u32) {
+                    match fd_table.alloc_fake_fd_with_content(
+                        alloc::format!("{}", path_str),
+                        our_flags as u32,
+                        content,
+                    ) {
                         Some(fd) => fd as isize,
                         None => ERR_NOENT,
                     }
@@ -1480,9 +1495,8 @@ fn linux_getppid() -> isize {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn linux_socket(_domain: usize, _socket_type: usize, _protocol: usize) -> isize {
-    // Network not available on x86_64 yet
-    ERR_IO
+fn linux_socket(domain: usize, socket_type: usize, protocol: usize) -> isize {
+    sys_socket(domain, socket_type, protocol)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3726,7 +3740,10 @@ fn sys_socket(domain: usize, socket_type: usize, _protocol: usize) -> isize {
         return ERR_INVAL;
     }
 
-    let stype = match socket_type {
+    // Mask off Linux socket flags: SOCK_NONBLOCK=0x800, SOCK_CLOEXEC=0x80000
+    let base_type = socket_type & 0xff;
+
+    let stype = match base_type {
         1 => crate::net::iface::SocketType::Tcp,
         2 => crate::net::iface::SocketType::Udp,
         3 => crate::net::iface::SocketType::Icmp,
