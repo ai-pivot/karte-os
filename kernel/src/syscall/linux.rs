@@ -1040,6 +1040,7 @@ fn translate_riscv(id: usize, args: [usize; 6]) -> Option<Translation> {
 }
 
 // Additional RISC-V translations for Go runtime support
+#[cfg(target_arch = "riscv64")]
 fn translate_riscv_go(id: usize, args: [usize; 6]) -> Option<Translation> {
     use riscv_syscalls::*;
     match id {

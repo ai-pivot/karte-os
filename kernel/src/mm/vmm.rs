@@ -59,6 +59,15 @@ bitflags! {
         const URW  = Self::PRESENT.bits() | Self::WRITABLE.bits() | Self::USER.bits();
         const UR   = Self::PRESENT.bits() | Self::USER.bits(); // read-only user
         const UX   = Self::PRESENT.bits() | Self::USER.bits(); // execute only user (no NX)
+
+        // Aliases for architecture-agnostic code
+        const R = Self::PRESENT.bits();       // Readable = Present
+        const X = Self::PRESENT.bits();       // Executable (no NX set)
+        const A = Self::ACCESSED.bits();      // Accessed
+        const D = Self::DIRTY.bits();         // Dirty
+        const V = Self::PRESENT.bits();       // Valid
+        const W = Self::WRITABLE.bits();      // Writable
+        const G = Self::GLOBAL.bits();        // Global
     }
 }
 

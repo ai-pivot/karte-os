@@ -250,17 +250,34 @@ pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn user_read_u8(addr: usize) -> u8 {
-    // Kernel-mode addresses don't need CR3 switch (e.g., test buffers on kernel stack)
-    if addr >= crate::process::USER_CODE_LIMIT {
+    // True kernel addresses (high canonical range) — always direct read
+    if addr >= 0xFFFF_8000_0000_0000 {
         return unsafe { core::ptr::read_volatile(addr as *const u8) };
     }
 
     let user_root = crate::process::current_page_table_root();
     if user_root == 0 {
+        // No user page table active (test mode or boot)
         return unsafe { core::ptr::read_volatile(addr as *const u8) };
     }
 
-    let user_cr3 = user_root << 12;
+    // If already running with user CR3 (SYSCALL path), direct read is safe
+    let user_cr3_phys = user_root << 12;
+    let current_cr3: usize;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) current_cr3) };
+    if current_cr3 == user_cr3_phys {
+        return unsafe { core::ptr::read_volatile(addr as *const u8) };
+    }
+
+    // Kernel CR3 active (int 0x80 path) and addr is in low identity-mapped range
+    // (e.g., test buffers on kernel stack). Direct read works.
+    if addr < crate::process::USER_CODE_LIMIT {
+        // Fall through to CR3 switch below for user addresses < USER_CODE_LIMIT
+        // that are NOT identity mapped under kernel CR3
+    }
+
+    // Kernel CR3 active (int 0x80 path): switch to user CR3, read, switch back
+    let user_cr3 = user_cr3_phys;
     let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
     let rflags: u64;
     let byte: u8;
@@ -308,8 +325,8 @@ pub(crate) fn user_write_u8(addr: usize, byte: u8) -> bool {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
-    // Kernel-mode addresses don't need CR3 switch (e.g., test buffers on kernel stack)
-    if addr >= crate::process::USER_CODE_LIMIT {
+    // True kernel addresses (high canonical range) — always direct write
+    if addr >= 0xFFFF_8000_0000_0000 {
         unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
         return;
     }
@@ -320,7 +337,17 @@ unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
         return;
     }
 
-    let user_cr3 = user_root << 12;
+    // If already running with user CR3 (SYSCALL path), direct write is safe
+    let user_cr3_phys = user_root << 12;
+    let current_cr3: usize;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) current_cr3) };
+    if current_cr3 == user_cr3_phys {
+        unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
+        return;
+    }
+
+    // Kernel CR3 active (int 0x80 path): switch to user CR3, write, switch back
+    let user_cr3 = user_cr3_phys;
     let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
     let rflags: u64;
     unsafe {
@@ -349,11 +376,20 @@ unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn user_write_u8(addr: usize, byte: u8) -> bool {
-    // Kernel-mode or no user page table: direct write
-    if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0 {
+    // True kernel addresses or no user PT: direct write
+    if addr >= 0xFFFF_8000_0000_0000 || crate::process::current_page_table_root() == 0 {
         unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
         return true;
     }
+    // If already on user CR3 (SYSCALL path), write directly
+    let user_cr3_val = crate::process::current_page_table_root() << 12;
+    let cur_cr3: usize;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cur_cr3) };
+    if cur_cr3 == user_cr3_val {
+        unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
+        return true;
+    }
+    // Kernel CR3 active (int 0x80 path): use CR3 switching
     if !ensure_user_write_pages(addr, 1) {
         crate::klog!(
             WARN,
@@ -373,9 +409,16 @@ pub(crate) fn user_write_u8(addr: usize, byte: u8) -> bool {
 pub(crate) fn user_write<T: Copy>(addr: usize, val: T) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        // Kernel-mode or no user page table: direct write
-        if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0
-        {
+        // True kernel addresses or no user PT: direct write
+        if addr >= 0xFFFF_8000_0000_0000 || crate::process::current_page_table_root() == 0 {
+            unsafe { core::ptr::write(addr as *mut T, val) };
+            return true;
+        }
+        // If already on user CR3 (SYSCALL path), delegate to user_write_u8
+        let user_cr3 = crate::process::current_page_table_root() << 12;
+        let current_cr3: usize;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) current_cr3) };
+        if current_cr3 == user_cr3 {
             unsafe { core::ptr::write(addr as *mut T, val) };
             return true;
         }
@@ -487,16 +530,25 @@ fn ensure_user_write_pages(addr: usize, len: usize) -> bool {
 pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        // Kernel-mode addresses: direct write (no CR3 switch needed)
-        if addr >= crate::process::USER_CODE_LIMIT {
+        // True kernel addresses or no user PT: direct write
+        if addr >= 0xFFFF_8000_0000_0000 {
             for (i, &byte) in src.iter().enumerate() {
                 unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
             }
             return true;
         }
-        // If no user page table is active (test mode), direct write
         let user_root = crate::process::current_page_table_root();
         if user_root == 0 {
+            for (i, &byte) in src.iter().enumerate() {
+                unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+            }
+            return true;
+        }
+        // If already on user CR3 (SYSCALL path), direct write
+        let user_cr3 = user_root << 12;
+        let current_cr3: usize;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) current_cr3) };
+        if current_cr3 == user_cr3 {
             for (i, &byte) in src.iter().enumerate() {
                 unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
             }
@@ -932,9 +984,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
         334 => ERR_NOSYS, // rseq → ENOSYS (Go gracefully degrades)
         435 => ERR_NOSYS, // clone3: ENOSYS
-        _ => {
-            -38 // ENOSYS
-        }
+        _ => ERR_NOSYS,
     }
 }
 
@@ -1632,7 +1682,6 @@ pub fn dispatch(id: usize, args: [usize; 6]) -> isize {
 }
 
 fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
-    // Only trace key syscalls from int 0x80 path (shell calls)
     // id=6=mmap, id=4=brk, id=1=exit — skip read/write noise
     let should_trace = matches!(id, 1 | 4 | 6);
 
@@ -5048,8 +5097,10 @@ fn linux_clone(
         // current_page_table_root() returns PPN — must add mode bits for RISC-V.
         #[cfg(target_arch = "riscv64")]
         let user_pt_root = (9usize << 60) | crate::process::current_page_table_root();
-        #[cfg(not(target_arch = "riscv64"))]
-        let user_pt_root = crate::process::current_page_table_root();
+        #[cfg(target_arch = "x86_64")]
+        let user_pt_root = crate::process::current_page_table_root() << 12; // PPN → physical address for CR3
+        #[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64")))]
+        let user_pt_root = crate::process::current_page_table_root(); // non-RISC-V non-x86_64: raw PPN
 
         let kernel_stack_top = match crate::process::alloc_kernel_stack() {
             Some(top) => top,
@@ -5102,7 +5153,8 @@ fn linux_clone(
     {
         let my_pid = crate::process::current_pid();
         let my_proc_idx = crate::process::current_index();
-        let user_pt_root = crate::process::current_page_table_root();
+        let user_pt_ppn = crate::process::current_page_table_root();
+        let user_pt_root = user_pt_ppn << 12; // physical address for CR3
 
         // Allocate kernel stack for child thread
         let kernel_stack_top = match crate::process::alloc_kernel_stack() {
@@ -5110,7 +5162,7 @@ fn linux_clone(
             None => return ERR_NOMEM,
         };
 
-        let user_pt = crate::process::get_user_page_table(user_pt_root);
+        let user_pt = crate::process::get_user_page_table(user_pt_ppn);
         crate::process::map_kernel_stack_pages(user_pt, kernel_stack_top);
 
         // Get parent process info
