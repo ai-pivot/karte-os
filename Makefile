@@ -2,7 +2,8 @@
         deploy deploy-riscv deploy-x86 user-build user-clean \
         run-riscv run-x86 build-riscv build-x86 shell-riscv shell-x86 \
         iso-riscv iso-x86 setup-riscv setup-x86 \
-        share-riscv share-x86 usb-image usb-write
+        share-riscv share-x86 usb-image usb-write \
+        release release-riscv release-x86 release-all
 
 # ═══════════════════════════════════════════════════════════════
 #  KarteOS — Dual-Architecture Makefile
@@ -278,6 +279,25 @@ usb-write: _build-x86-iso disk.img
 	sudo tools/mkusb.sh $(USB_DEV)
 
 # ═══════════════════════════════════════════════════════════════
+#  Release — Build distributable image packages
+# ═══════════════════════════════════════════════════════════════
+
+## Build RISC-V distributable release (kernel + disk + run script)
+release-riscv:
+	@bash tools/mkrelease.sh riscv64 $(DISK_SIZE)
+
+## Build x86_64 distributable release (ISO + disk + run script)
+release-x86:
+	@bash tools/mkrelease.sh x86_64 $(DISK_SIZE)
+
+## Build both architecture releases
+release-all:
+	@bash tools/mkrelease.sh both $(DISK_SIZE)
+
+## Build default release (RISC-V)
+release: release-riscv
+
+# ═══════════════════════════════════════════════════════════════
 #  Help
 # ═══════════════════════════════════════════════════════════════
 
@@ -326,6 +346,13 @@ help:
 	@echo "  Setup (Ubuntu/Debian):"
 	@echo "    make setup-riscv    Install RISC-V toolchain"
 	@echo "    make setup-x86      Install x86_64 toolchain"
+	@echo ""
+	@echo ""
+	@echo "  Release (distributable packages):"
+	@echo "    make release       Build RISC-V release tarball (kernel+disk+run.sh)"
+	@echo "    make release-riscv Same as above, explicit"
+	@echo "    make release-x86   Build x86_64 release tarball (ISO+disk+run.sh)"
+	@echo "    make release-all   Build both architectures"
 	@echo ""
 	@echo "  QEMU exit: Ctrl+A then X"
 	@echo ""

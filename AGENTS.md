@@ -12,11 +12,16 @@ make deploy         # Create disk.img + deploy all user programs
 make test           # Build test kernel + run tests in QEMU
 make clean          # Clean all artifacts
 
-# Disk image management:
+# Disk image management (no sudo required!):
 tools/mkdisk.sh deploy          # Create disk + install all programs
 tools/mkdisk.sh put <file>      # Copy host file to disk
 tools/mkdisk.sh get <file>      # Copy file from disk to host
 tools/mkdisk.sh list            # List files on disk
+
+# Distributable release packages:
+make release-riscv              # Build RISC-V tarball (kernel+disk+run.sh)
+make release-x86                # Build x86_64 tarball (ISO+disk+run.sh)
+make release-all                # Both architectures
 
 # Host shared folder:
 make share-riscv HOST_DIR=/tmp/share

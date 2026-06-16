@@ -1,9 +1,11 @@
 #!/bin/bash
 # tools/mkdisk.sh — Manage the KarteOS disk image (ext4 or FAT32)
 #
+# No sudo required! Uses debugfs for ext4 and mtools for FAT32.
+#
 # Usage:
-#   ./tools/mkdisk.sh init          # Create a new 64MB ext4 disk.img
-#   ./tools/mkdisk.sh init-fat32    # Create a new 64MB FAT32 disk.img
+#   ./tools/mkdisk.sh init          # Create a new ext4 disk.img
+#   ./tools/mkdisk.sh init-fat32    # Create a new FAT32 disk.img
 #   ./tools/mkdisk.sh deploy        # Create disk + deploy ALL user programs
 #   ./tools/mkdisk.sh deploy-riscv  # Deploy RISC-V user programs to disk
 #   ./tools/mkdisk.sh deploy-x86    # Deploy x86_64 user programs to disk
@@ -14,23 +16,17 @@
 #   ./tools/mkdisk.sh get <src> [dst]  # Copy file from disk image to host
 #   ./tools/mkdisk.sh rm <file>     # Delete file from disk image
 #   ./tools/mkdisk.sh info          # Show disk image info
+#
+# Environment:
+#   DISK=disk.img    Path to disk image (default: disk.img)
+#   SIZE=64          Size in MB for 'init' (default: 64)
 
 set -e
 
 DISK="${DISK:-disk.img}"
 SIZE="${SIZE:-64}"  # MB
-MOUNT="/tmp/karteos-mnt"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJ_DIR="$(dirname "$SCRIPT_DIR")"
-
-cleanup_mount() {
-    if mountpoint -q "$MOUNT"; then
-        sudo umount "$MOUNT" 2>/dev/null || true
-    fi
-    rmdir "$MOUNT" 2>/dev/null || true
-}
-
-trap cleanup_mount EXIT INT TERM
 
 # ═══════════════════════════════════════════════════════════════════
 #  Filesystem creation
@@ -39,15 +35,14 @@ trap cleanup_mount EXIT INT TERM
 cmd_init() {
     echo "[disk] Creating ${SIZE}MB ext4 disk image: $DISK"
     dd if=/dev/zero of="$DISK" bs=1M count="$SIZE" status=progress 2>/dev/null
-    mkfs.ext4 -O ^64bit -O ^has_journal -O ^metadata_csum -O ^flex_bg -O ^extra_isize \
-        -b 4096 -L karteos "$DISK" >/dev/null 2>&1
+    _mkfs_ext4 "$DISK"
     echo "[disk] Done."
 }
 
 cmd_format() {
     [ -f "$DISK" ] || { echo "Error: $DISK not found."; exit 1; }
     echo "[disk] Formatting $DISK as ext4..."
-    mkfs.ext4 -b 4096 -L karteos "$DISK" >/dev/null 2>&1
+    _mkfs_ext4 "$DISK"
     echo "[disk] Done."
 }
 
@@ -63,6 +58,95 @@ cmd_format_fat32() {
     echo "[disk] Formatting $DISK as FAT32..."
     mkfs.vfat -F 32 "$DISK" >/dev/null 2>&1
     echo "[disk] Done."
+}
+
+# Create ext4 filesystem with options compatible with the kernel's ext4_rs:
+# - Disable 64bit, journal, metadata_csum, flex_bg, extra_isize for simplicity
+_mkfs_ext4() {
+    local img="$1"
+    mkfs.ext4 -F -O ^64bit -O ^has_journal -O ^metadata_csum -O ^flex_bg -O ^extra_isize \
+        -b 4096 -L karteos "$img" >/dev/null 2>&1
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ext4 operations — uses debugfs (no sudo/root required)
+# ═══════════════════════════════════════════════════════════════════
+
+# Check that debugfs is available
+_require_debugfs() {
+    if ! command -v debugfs &>/dev/null; then
+        echo "Error: debugfs not found. Install e2fsprogs: sudo apt install e2fsprogs"
+        exit 1
+    fi
+}
+
+# Write a file into ext4 image via debugfs
+_ext4_put() {
+    local src="$1" dst="$2" img="$3"
+    _require_debugfs
+    # Remove existing file first (ignore error if not found)
+    debugfs -w -R "rm $dst" "$img" 2>/dev/null || true
+    debugfs -w -R "write $src $dst" "$img" 2>/dev/null
+    # Set executable permissions for binaries
+    debugfs -w -R "set_inode_field $dst mode 0100755" "$img" 2>/dev/null || true
+}
+
+# Read a file from ext4 image via debugfs
+_ext4_get() {
+    local src="$1" dst="$2" img="$3"
+    _require_debugfs
+    debugfs -R "dump $src $dst" "$img" 2>/dev/null
+}
+
+# Delete a file from ext4 image via debugfs
+_ext4_rm() {
+    local file="$1" img="$2"
+    _require_debugfs
+    debugfs -w -R "rm $file" "$img" 2>/dev/null
+}
+
+# List files in ext4 image via debugfs
+_ext4_list() {
+    local img="$1"
+    _require_debugfs
+    # debugfs "ls -l" format:
+    #   inode  mode_octal  (type)  uid  gid  size  date  time  name
+    # Example: "    12  100755 (1)      0      0   713760 16-Jun-2026 10:51 shell"
+    debugfs -R "ls -l" "$img" 2>/dev/null | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^debugfs: ]] && continue
+        # Parse: skip inode, mode, (type), uid, gid → grab size → rest is date+name
+        local inode mode mode_type uid gid size rest
+        read -r inode mode mode_type uid gid size rest <<< "$line"
+        [[ -z "$rest" ]] && continue
+        # rest = "date time name", extract last word as name
+        local name="${rest##* }"
+        name="${name//\//}"
+        [[ "$name" == "." || "$name" == ".." || -z "$name" ]] && continue
+        # Format size
+        if [ "${size:-0}" -gt 1048576 ] 2>/dev/null; then
+            printf "%-32s %dMB\n" "$name" $((size / 1048576))
+        elif [ "${size:-0}" -gt 1024 ] 2>/dev/null; then
+            printf "%-32s %dKB\n" "$name" $((size / 1024))
+        else
+            printf "%-32s %dB\n" "$name" "${size:-0}"
+        fi
+    done
+}
+
+# Create directory in ext4 image
+_ext4_mkdir() {
+    local dir="$1" img="$2"
+    _require_debugfs
+    debugfs -w -R "mkdir $dir" "$img" 2>/dev/null
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  Filesystem detection
+# ═══════════════════════════════════════════════════════════════════
+
+_detect_fs() {
+    file "$DISK" | grep -o 'ext[234]\|FAT\|data' | head -1
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -85,26 +169,22 @@ _deploy_arch() {
     local fs_type=$(_detect_fs)
     case "$fs_type" in
         ext*)
-            _mount
             for elf in "$user_dir"/*.elf; do
                 [ -f "$elf" ] || continue
                 local base="$(basename "$elf" .elf)"
-                # Skip RISC-V assembly programs on x86_64 (they're empty stubs)
+                # Skip RISC-V assembly stubs on x86_64
                 if [ "$arch" = "x86_64" ]; then
                     case "$base" in
                         hello|heap_test|file_test|spawn_test)
-                            # Check if it's a real binary (not an empty stub)
                             local size
                             size=$(stat -c%s "$elf" 2>/dev/null || echo "0")
                             [ "$size" -lt 100 ] && continue
                             ;;
                     esac
                 fi
-                sudo cp "$elf" "$MOUNT/$base"
+                _ext4_put "$elf" "$base" "$DISK"
                 count=$((count + 1))
             done
-            sudo sync
-            _unmount
             ;;
         FAT*)
             for elf in "$user_dir"/*.elf; do
@@ -132,9 +212,7 @@ _deploy_arch() {
 }
 
 cmd_deploy() {
-    # Create disk if it doesn't exist
     [ -f "$DISK" ] || cmd_init
-    # Deploy RISC-V by default (primary architecture)
     _deploy_arch riscv64
 }
 
@@ -149,25 +227,8 @@ cmd_deploy_x86() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#  File operations (mount-based, works for both ext4 and FAT32)
+#  File operations (no sudo — debugfs for ext4, mtools for FAT32)
 # ═══════════════════════════════════════════════════════════════════
-
-_mount() {
-    mkdir -p "$MOUNT"
-    if mountpoint -q "$MOUNT"; then
-        echo "[disk] Cleaning stale mount at $MOUNT"
-        sudo umount "$MOUNT"
-    fi
-    sudo mount -o loop "$DISK" "$MOUNT"
-}
-
-_unmount() {
-    cleanup_mount
-}
-
-_detect_fs() {
-    file "$DISK" | grep -o 'ext[234]\|FAT\|data' | head -1
-}
 
 cmd_list() {
     [ -f "$DISK" ] || { echo "Error: $DISK not found."; exit 1; }
@@ -175,20 +236,14 @@ cmd_list() {
     case "$fs_type" in
         ext*)
             echo "Files on $DISK (ext4):"
-            _mount
-            find "$MOUNT" -maxdepth 1 -type f -printf "%f %s\n" 2>/dev/null || echo "(empty)"
-            find "$MOUNT" -maxdepth 1 -type d -not -path "$MOUNT" -printf "%f/ -\n" 2>/dev/null || true
-            _unmount
+            _ext4_list "$DISK" || echo "(empty)"
             ;;
         FAT*)
             echo "Files on $DISK (FAT32):"
             mdir -i "$DISK" :: 2>/dev/null || echo "(empty)"
             ;;
         *)
-            _mount 2>/dev/null && {
-                ls -la "$MOUNT" 2>/dev/null || echo "(empty)"
-                _unmount
-            } || echo "(unable to read — format disk first)"
+            echo "(unknown filesystem — run 'init' to format)"
             ;;
     esac
 }
@@ -203,10 +258,7 @@ cmd_put() {
     case "$fs_type" in
         ext*)
             echo "[disk] $src -> $DISK::$dst (ext4)"
-            _mount
-            sudo cp "$src" "$MOUNT/$dst"
-            sudo sync
-            _unmount
+            _ext4_put "$src" "$dst" "$DISK"
             ;;
         FAT*)
             echo "[disk] $src -> $DISK::$dst (FAT32)"
@@ -228,9 +280,7 @@ cmd_get() {
     case "$fs_type" in
         ext*)
             echo "[disk] $DISK::$src -> $dst (ext4)"
-            _mount
-            cp "$MOUNT/$src" "$dst"
-            _unmount
+            _ext4_get "$src" "$dst" "$DISK"
             ;;
         FAT*)
             echo "[disk] $DISK::$src -> $dst (FAT32)"
@@ -250,10 +300,7 @@ cmd_rm() {
     case "$fs_type" in
         ext*)
             echo "[disk] Deleting $file from $DISK (ext4)"
-            _mount
-            sudo rm "$MOUNT/$file"
-            sudo sync
-            _unmount
+            _ext4_rm "$file" "$DISK"
             ;;
         FAT*)
             echo "[disk] Deleting $file from $DISK (FAT32)"
@@ -306,7 +353,7 @@ case "${1:-help}" in
     rm|del)       shift; cmd_rm "$@" ;;
     info)         cmd_info ;;
     help|*)
-        echo "KarteOS Disk Image Manager"
+        echo "KarteOS Disk Image Manager (no-sudo)"
         echo ""
         echo "Usage: $0 <command> [args...]"
         echo ""
@@ -321,7 +368,7 @@ case "${1:-help}" in
         echo "  deploy-riscv         Install RISC-V user programs into disk"
         echo "  deploy-x86           Install x86_64 user programs into disk"
         echo ""
-        echo "File operations:"
+        echo "File operations (no sudo required!):"
         echo "  list                 List files on disk"
         echo "  put <src> [dst]      Copy host file to disk"
         echo "  get <src> [dst]      Copy file from disk to host"
