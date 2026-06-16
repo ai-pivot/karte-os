@@ -707,6 +707,8 @@ pub enum FdType {
     Ext4File(crate::driver::ext4::Ext4FileDesc),
     /// VFS-managed file — routes to the VFS open file table.
     VfsFile(usize),
+    /// Network socket — inner value is the NetStack socket index.
+    Socket(usize),
 }
 
 /// A file descriptor entry — wraps an in-memory file with seek position
@@ -765,6 +767,7 @@ impl FileDescriptor {
             | FdType::VirtualFile
             | FdType::VfsFile(_)
             | FdType::Urandom => false,
+            FdType::Socket(sock_idx) => crate::net::iface::NetStack::can_recv(*sock_idx),
             #[cfg(target_arch = "x86_64")]
             FdType::Ext4File(_) => false,
         }
@@ -795,6 +798,7 @@ impl FileDescriptor {
             | FdType::FakeFile(_)
             | FdType::VirtualFile
             | FdType::VfsFile(_)
+            | FdType::Socket(_)
             | FdType::Urandom => false,
             FdType::Ext4File(_) => false,
         }
@@ -812,6 +816,7 @@ impl FileDescriptor {
             | FdType::VirtualFile
             | FdType::VfsFile(_)
             | FdType::Urandom => true,
+            FdType::Socket(sock_idx) => crate::net::iface::NetStack::can_send(*sock_idx),
             FdType::Ext4File(desc) => desc.writable,
         }
     }
@@ -827,6 +832,7 @@ impl FileDescriptor {
             | FdType::VirtualFile
             | FdType::Urandom
             | FdType::VfsFile(_)
+            | FdType::Socket(_)
             | FdType::Ext4File(_)
             | FdType::Eventfd
             | FdType::Epoll => true,
@@ -999,6 +1005,25 @@ impl FdTable {
                     fd_type,
                     pipe_id: None,
                     fd_num: i,
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Allocate a fd for a network socket.
+    pub fn alloc_socket(&mut self, sock_idx: usize) -> Option<usize> {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() || !slot.as_ref().map(|f| f.valid).unwrap_or(false) {
+                *slot = Some(FileDescriptor {
+                    name: alloc::format!("socket[{}]", sock_idx),
+                    pos: 0,
+                    flags: 0,
+                    valid: true,
+                    fd_type: FdType::Socket(sock_idx),
+                    pipe_id: None,
+                    fd_num: 0,
                 });
                 return Some(i);
             }

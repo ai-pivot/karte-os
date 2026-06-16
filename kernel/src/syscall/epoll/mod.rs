@@ -253,12 +253,14 @@ fn epoll_target_supported(desc: &crate::driver::fs::FileDescriptor) -> bool {
         | crate::driver::fs::FdType::PipeRead
         | crate::driver::fs::FdType::PipeWrite => true,
         crate::driver::fs::FdType::Eventfd | crate::driver::fs::FdType::Timerfd => true,
+        crate::driver::fs::FdType::Socket(_) => true,
         crate::driver::fs::FdType::Epoll
         | crate::driver::fs::FdType::File
         | crate::driver::fs::FdType::FakeFile(_)
         | crate::driver::fs::FdType::VirtualFile
         | crate::driver::fs::FdType::Urandom
         | crate::driver::fs::FdType::VfsFile(_)
+        | crate::driver::fs::FdType::Socket(_)
         | crate::driver::fs::FdType::Ext4File(_) => false,
     }
 }

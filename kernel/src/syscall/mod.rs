@@ -2082,6 +2082,16 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         Some((FdType::Timerfd, _, _)) => {
             return epoll::timerfd::timerfd_read(fd as usize, buf, len);
         }
+        Some((FdType::Socket(_), _, _)) => {
+            // Socket write → sendto (no destination for connected sockets)
+            let data = user_read_bytes(buf, len);
+            return crate::net::iface::NetStack::send(
+                get_fd_socket(fd).unwrap_or(0),
+                &data,
+                None,
+                None,
+            );
+        }
         Some((FdType::File, _, _)) => {}
         _ => {
             // Unknown fd — still try to write to console instead of failing
@@ -2230,12 +2240,14 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 Err(_) => ERR_IO,
             };
         }
+        Some((FdType::Socket(_), _, _)) => {
+            // Socket read → recvfrom
+            return sys_recvfrom(fd, buf, len);
+        }
         _ => {
             return ERR_INVAL;
         }
     }
-
-    // File read path
     let (name, pos) = {
         crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
             Some(f) => (f.name.clone(), f.pos),
@@ -3280,6 +3292,9 @@ fn cleanup_fd_resources(fd: usize, desc: FileDescriptor) {
         FdType::VfsFile(vfs_fd) => {
             crate::driver::vfs::close(vfs_fd);
         }
+        FdType::Socket(sock_idx) => {
+            crate::net::iface::NetStack::close_socket(sock_idx);
+        }
         FdType::Eventfd => {
             epoll::eventfd::close_eventfd(fd as i32);
         }
@@ -3754,73 +3769,82 @@ fn sys_socket(domain: usize, socket_type: usize, _protocol: usize) -> isize {
         return ERR_IO;
     }
 
-    crate::net::iface::NetStack::create_socket(stype)
+    // Create socket in NetStack (returns internal index)
+    let sock_idx = crate::net::iface::NetStack::create_socket(stype);
+    if sock_idx < 0 {
+        return sock_idx;
+    }
+
+    // Allocate a real fd from the process FdTable
+    crate::process::with_fd_table(|fd_table| {
+        match fd_table.alloc_socket(sock_idx as usize) {
+            Some(fd) => fd as isize,
+            None => {
+                // No free fd slot — close the socket we just created
+                crate::net::iface::NetStack::close_socket(sock_idx as usize);
+                ERR_NOMEM
+            }
+        }
+    })
 }
 
 /// Syscall 71: bind(fd, addr_ptr, addr_len) → 0
 fn sys_bind(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
-    if fd < 0 {
-        return ERR_INVAL;
-    }
-
+    let sock = match get_fd_socket(fd) {
+        Some(s) => s,
+        None => return ERR_INVAL,
+    };
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
-
     let (port, _) = match parse_sockaddr_in(addr_ptr, addr_len) {
         Ok(v) => v,
         Err(e) => return e,
     };
-
-    crate::net::iface::NetStack::bind(fd as usize, port)
+    crate::net::iface::NetStack::bind(sock, port)
 }
 
 /// Syscall 72: connect(fd, addr_ptr, addr_len) → 0
 fn sys_connect(fd: i32, addr_ptr: usize, addr_len: usize) -> isize {
-    if fd < 0 {
-        return ERR_INVAL;
-    }
-
+    let sock = match get_fd_socket(fd) {
+        Some(s) => s,
+        None => return ERR_INVAL,
+    };
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
-
     let (port, ip) = match parse_sockaddr_in(addr_ptr, addr_len) {
         Ok(v) => v,
         Err(e) => return e,
     };
-
-    crate::net::iface::NetStack::connect(fd as usize, ip, port)
+    crate::net::iface::NetStack::connect(sock, ip, port)
 }
 
 /// Syscall 73: listen(fd, backlog) → 0
 fn sys_listen(fd: i32, _backlog: usize) -> isize {
-    if fd < 0 {
-        return ERR_INVAL;
-    }
-
+    let sock = match get_fd_socket(fd) {
+        Some(s) => s,
+        None => return ERR_INVAL,
+    };
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
-
-    // bind with port 0 means "pick an ephemeral port and listen"
-    crate::net::iface::NetStack::bind(fd as usize, 0)
+    crate::net::iface::NetStack::bind(sock, 0)
 }
 
 /// Syscall 74: accept(fd) → new_fd
 fn sys_accept(fd: i32) -> isize {
-    if fd < 0 {
-        return ERR_INVAL;
-    }
-
+    let sock = match get_fd_socket(fd) {
+        Some(s) => s,
+        None => return ERR_INVAL,
+    };
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
-
-    if crate::net::iface::NetStack::is_connected(fd as usize) {
+    if crate::net::iface::NetStack::is_connected(sock) {
         fd as isize
     } else {
-        ERR_AGAIN // EAGAIN — would block
+        ERR_AGAIN
     }
 }
 
@@ -3834,17 +3858,17 @@ fn sys_sendto(
     addr_ptr: usize,
     addr_len: usize,
 ) -> isize {
-    if fd < 0 || buf == 0 || len == 0 {
+    let sock = match get_fd_socket(fd) {
+        Some(s) => s,
+        None => return ERR_INVAL,
+    };
+    if buf == 0 || len == 0 {
         return ERR_INVAL;
     }
-
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
-
     let data = user_read_bytes(buf, len);
-
-    // If destination address is provided, parse it
     let dest = if addr_ptr != 0 && addr_len >= 8 {
         match parse_sockaddr_in(addr_ptr, addr_len) {
             Ok((port, ip)) => Some((ip, port)),
@@ -3853,28 +3877,27 @@ fn sys_sendto(
     } else {
         None
     };
-
     let (ip, port) = match dest {
         Some((ip, port)) => (Some(ip), Some(port)),
         None => (None, None),
     };
-
-    crate::net::iface::NetStack::send(fd as usize, &data, ip, port)
+    crate::net::iface::NetStack::send(sock, &data, ip, port)
 }
 
 /// Syscall 76: recvfrom(fd, buf, len, flags) → bytes_received
 fn sys_recvfrom(fd: i32, buf: usize, len: usize) -> isize {
-    if fd < 0 || buf == 0 || len == 0 {
+    let sock = match get_fd_socket(fd) {
+        Some(s) => s,
+        None => return ERR_INVAL,
+    };
+    if buf == 0 || len == 0 {
         return ERR_INVAL;
     }
-
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
-
     let mut kbuf = alloc::vec![0u8; len];
-
-    match crate::net::iface::NetStack::recv(fd as usize, &mut kbuf) {
+    match crate::net::iface::NetStack::recv(sock, &mut kbuf) {
         Ok((n, _src_ip, _src_port)) => {
             user_write_bytes(buf, &kbuf[..n]);
             n as isize
@@ -3885,15 +3908,14 @@ fn sys_recvfrom(fd: i32, buf: usize, len: usize) -> isize {
 
 /// Syscall 77: shutdown(fd, how) → 0
 fn sys_shutdown(fd: i32) -> isize {
-    if fd < 0 {
-        return ERR_INVAL;
-    }
-
+    let sock = match get_fd_socket(fd) {
+        Some(s) => s,
+        None => return ERR_INVAL,
+    };
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
-
-    crate::net::iface::NetStack::shutdown(fd as usize)
+    crate::net::iface::NetStack::shutdown(sock)
 }
 
 /// Syscall 81: Read kernel log buffer (for dmesg).
@@ -4433,6 +4455,20 @@ pub(crate) fn get_fd_vfs_fd(fd: i32) -> Option<usize> {
     crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
         Some(f) => match &f.fd_type {
             FdType::VfsFile(vfs_fd) => Some(*vfs_fd),
+            _ => None,
+        },
+        None => None,
+    })
+}
+
+/// Translate a user fd to the NetStack socket index (for network syscalls).
+pub(crate) fn get_fd_socket(fd: i32) -> Option<usize> {
+    if fd < 0 || fd as usize >= MAX_FDS {
+        return None;
+    }
+    crate::process::with_fd_table(|fd_table| match fd_table.get(fd as usize) {
+        Some(f) => match &f.fd_type {
+            FdType::Socket(sock_idx) => Some(*sock_idx),
             _ => None,
         },
         None => None,

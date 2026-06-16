@@ -450,6 +450,10 @@ impl NetStack {
         0
     }
 
+    pub fn close_socket(fd: usize) -> isize {
+        Self::close(fd)
+    }
+
     /// Shut down a socket (TCP only).
     pub fn shutdown(fd: usize) -> isize {
         let mut guard = NET_STACK.lock();
@@ -490,6 +494,54 @@ impl NetStack {
         }
 
         meta.state == SocketState::Connected
+    }
+
+    /// Check if a socket has data available to read (for epoll).
+    pub fn can_recv(fd: usize) -> bool {
+        let mut guard = NET_STACK.lock();
+        let stack = match guard.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+        let meta = match stack.socket_metas.get(fd).and_then(|s| s.as_ref()) {
+            Some(m) => m,
+            None => return false,
+        };
+        match meta.socket_type {
+            SocketType::Tcp => {
+                let sock = stack.socket_set.get_mut::<tcp::Socket>(meta.handle);
+                sock.can_recv()
+            }
+            SocketType::Udp => {
+                let sock = stack.socket_set.get_mut::<udp::Socket>(meta.handle);
+                sock.can_recv()
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if a socket can accept outgoing data (for epoll).
+    pub fn can_send(fd: usize) -> bool {
+        let mut guard = NET_STACK.lock();
+        let stack = match guard.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+        let meta = match stack.socket_metas.get(fd).and_then(|s| s.as_ref()) {
+            Some(m) => m,
+            None => return false,
+        };
+        match meta.socket_type {
+            SocketType::Tcp => {
+                let sock = stack.socket_set.get_mut::<tcp::Socket>(meta.handle);
+                sock.can_send()
+            }
+            SocketType::Udp => {
+                let sock = stack.socket_set.get_mut::<udp::Socket>(meta.handle);
+                sock.can_send()
+            }
+            _ => true,
+        }
     }
 
     /// Get the socket type for a given fd.
