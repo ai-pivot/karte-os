@@ -355,7 +355,7 @@ impl NetStack {
             SocketType::Tcp => {
                 let sock = stack.socket_set.get_mut::<tcp::Socket>(meta.handle);
                 if !sock.can_send() {
-                    return -2;
+                    return -11; // EAGAIN — connection not ready yet
                 }
                 match sock.send_slice(data) {
                     Ok(n) => n as isize,

@@ -1031,14 +1031,11 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                 }
             })
         }
-        Err(e) => {
-            // Only fake virtual pseudo-filesystem paths (/proc, /sys, /dev, /etc, /run)
+        Err(_e) => {
+            // VFS/ext4 open failed. Try known /etc files as FakeFile fallback.
             let is_pseudo = is_pseudo_path(&path_str);
-            // /etc/resolv.conf, /etc/localtime etc. — fake these too
-            let is_etc = path_str.starts_with("/etc");
+            let is_etc = path_str.starts_with("/etc") || path_str.starts_with("etc");
 
-            // /dev/urandom and /dev/random need real random bytes, not FakeFile
-            // Match both "/dev/urandom" and "dev/urandom" (SQLite may use relative path)
             let is_urandom = path_str == "/dev/urandom"
                 || path_str == "/dev/random"
                 || path_str == "dev/urandom"
@@ -1052,9 +1049,7 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                     }
                 })
             } else if is_pseudo || is_etc {
-                // Return correct content for known /etc files
                 let content = if path_str.ends_with("resolv.conf") {
-                    // QEMU user-mode DNS proxy is at 10.0.2.3
                     b"nameserver 10.0.2.3\n".to_vec()
                 } else if path_str.ends_with("hosts") {
                     b"127.0.0.1 localhost\n".to_vec()
