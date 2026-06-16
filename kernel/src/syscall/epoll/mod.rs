@@ -156,8 +156,8 @@ pub fn wake_waiters_for_fd(fd: usize) {
     };
     for epfd in epfds {
         if let Some(slots) = waiters.get_mut(&epfd) {
-            for &proc_idx in slots.iter() {
-                crate::sched::wake_task(proc_idx);
+            for &slot in slots.iter() {
+                crate::sched::wake_task_by_slot(slot);
             }
             slots.clear();
         }
@@ -166,19 +166,23 @@ pub fn wake_waiters_for_fd(fd: usize) {
 }
 
 fn register_waiter(epfd: usize) -> usize {
-    let proc_idx = crate::process::current_index();
+    // Store the scheduler slot, NOT proc_idx. Clone threads share proc_idx
+    // but have distinct scheduler slots. If we stored proc_idx, wake_task()
+    // would only wake the last-registered slot via PROC_TO_SLOT[], leaving
+    // other blocked threads (e.g., Go's netpoller) permanently stuck.
+    let slot = crate::sched::current_running_slot();
     let mut waiters = EPOLL_WAITERS.lock();
     let slots = waiters.entry(epfd).or_insert_with(alloc::vec::Vec::new);
-    if !slots.contains(&proc_idx) {
-        slots.push(proc_idx);
+    if !slots.contains(&slot) {
+        slots.push(slot);
     }
-    proc_idx
+    slot
 }
 
-fn unregister_waiter(epfd: usize, proc_idx: usize) {
+fn unregister_waiter(epfd: usize, slot: usize) {
     let mut waiters = EPOLL_WAITERS.lock();
     if let Some(slots) = waiters.get_mut(&epfd) {
-        slots.retain(|&slot| slot != proc_idx);
+        slots.retain(|&s| s != slot);
         if slots.is_empty() {
             waiters.remove(&epfd);
         }
@@ -216,10 +220,13 @@ fn collect_ready_events(
             revents = EPOLLHUP;
         }
 
-        let is_et = entry.event.events & EPOLLET != 0;
-        if is_et && revents == entry.last_revents && revents != EPOLLHUP {
-            continue;
-        }
+        // Note: EPOLLET (edge-triggered) dedup logic intentionally removed.
+        // The previous code skipped events where revents == last_revents,
+        // but this breaks Go's netpoller: after the first EPOLLIN report,
+        // stdin still has data (Go hasn't read it yet), so the next
+        // epoll_wait would see the same revents and skip it via `continue`.
+        // In real Linux, ET mode only re-arms after the fd is read to EAGAIN.
+        // Since we don't track read-to-EAGAIN state, always report ready fds.
         entry.last_revents = revents;
 
         if revents != 0 {
@@ -353,16 +360,16 @@ pub fn sys_epoll_wait(
         return 0;
     }
 
-    let proc_idx = register_waiter(epfd);
+    let waiter_slot = register_waiter(epfd);
     let ready_events = match collect_ready_events(epfd, max_events) {
         Ok(events) => events,
         Err(e) => {
-            unregister_waiter(epfd, proc_idx);
+            unregister_waiter(epfd, waiter_slot);
             return e;
         }
     };
     if !ready_events.is_empty() {
-        unregister_waiter(epfd, proc_idx);
+        unregister_waiter(epfd, waiter_slot);
         return write_ready_events(events_ptr, &ready_events);
     }
 
@@ -376,7 +383,7 @@ pub fn sys_epoll_wait(
         if let Some(wake_tick) = deadline {
             let now = crate::arch::platform::uptime_ms();
             if now >= wake_tick {
-                unregister_waiter(epfd, proc_idx);
+                unregister_waiter(epfd, waiter_slot);
                 return 0;
             }
             crate::sched::sleep_until(wake_tick);
@@ -387,17 +394,17 @@ pub fn sys_epoll_wait(
         let ready_events = match collect_ready_events(epfd, max_events) {
             Ok(events) => events,
             Err(e) => {
-                unregister_waiter(epfd, proc_idx);
+                unregister_waiter(epfd, waiter_slot);
                 return e;
             }
         };
         if !ready_events.is_empty() {
-            unregister_waiter(epfd, proc_idx);
+            unregister_waiter(epfd, waiter_slot);
             return write_ready_events(events_ptr, &ready_events);
         }
 
         if deadline.is_some() && crate::arch::platform::uptime_ms() >= deadline.unwrap_or(0) {
-            unregister_waiter(epfd, proc_idx);
+            unregister_waiter(epfd, waiter_slot);
             return 0;
         }
     }

@@ -4878,7 +4878,6 @@ pub const TERM_ECHO_OFF: usize = 3; // Disable echo
 ///   cmd=TCSETS, arg=TERM_ECHO_OFF: Disable echo
 ///   cmd=TIOCGWINSZ: Returns (cols << 16 | rows) packed into usize
 pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
-    // Log all ioctl calls for debugging TUI init
     if fd != 0 && fd != 1 {
         return ERR_INVAL;
     }
@@ -4913,7 +4912,7 @@ pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
             }
             0
         }
-        TCSETS => {
+        TCSETS | 0x5403 /* TCSETSW */ | 0x5404 /* TCSETSF */ => {
             // arg is a pointer to struct termios in user space.
             // struct termios { c_iflag: u32, c_oflag: u32, c_cflag: u32, c_lflag: u32,
             //                  c_line: u8, c_cc: [u8; 19] }
