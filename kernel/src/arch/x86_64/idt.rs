@@ -1871,7 +1871,55 @@ pub fn init() {
         idt
     });
 
-    IDT.get().unwrap().load();
+    IDT.get().unwrap();
+
+    // Relocate IDT to a high physical address to avoid conflict with ELF segments.
+    // Go binary loads at 0x400000..~0x6866000. Static IDT at ~0x5e0b80 is inside
+    // this range — when user page table is set up, the IDT page gets ELF data,
+    // causing Timer interrupt delivery to read garbage → #GP → triple fault.
+    // Fix: allocate a frame above the ELF range, copy IDT there, reload IDTR.
+    let idt_src = IDT.get().unwrap() as *const InterruptDescriptorTable as usize;
+    let mut high_frame = None;
+    // Allocate frames until we find one above 0x8000000 (128MB)
+    // Use fixed array to avoid heap allocation
+    let mut low_frames = [0usize; 512];
+    let mut low_count = 0usize;
+    for i in 0..512 {
+        match crate::mm::pmm::alloc_frame() {
+            Some(f) if f >= 0x8000000 => {
+                high_frame = Some(f);
+                break;
+            }
+            Some(f) => {
+                low_frames[i] = f;
+                low_count = i + 1;
+            }
+            None => break,
+        }
+    }
+    for i in 0..low_count {
+        crate::mm::pmm::dealloc_frame(low_frames[i]);
+    }
+    if let Some(frame) = high_frame {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                idt_src as *const u8,
+                frame as *mut u8,
+                core::mem::size_of::<InterruptDescriptorTable>(),
+            );
+        }
+        // Reload IDTR to point to the high address
+        let idtr = x86_64::structures::DescriptorTablePointer {
+            limit: (core::mem::size_of::<InterruptDescriptorTable>() - 1) as u16,
+            base: x86_64::VirtAddr::new(frame as u64),
+        };
+        unsafe {
+            core::arch::asm!("lidt [{}]", in(reg) &idtr, options(nostack, preserves_flags));
+        }
+        crate::console_println!("[idt] Relocated to {:#x}", frame);
+    } else {
+        IDT.get().unwrap().load();
+    }
     cache_kernel_cr3();
     init_syscall_msrs();
 }

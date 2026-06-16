@@ -911,14 +911,15 @@ impl Process {
         copy_kernel_mappings(user_pt, kernel_stack_top);
         vmm::set_all_ad_bits(user_pt);
 
-        // Switch to kernel CR3 for ELF loading. The user page table's identity
-        // mapping (from copy_kernel_mappings) gets overwritten as ELF segments
-        // are loaded. Running map()/translate_user() under user CR3 causes
-        // physical frame writes to go to wrong addresses. Kernel CR3 has a
-        // complete, untampered identity mapping that ensures correct operation.
+        // Switch to kernel CR3 for ELF loading AND disable interrupts.
+        // Timer ISR fires during ELF loading reads IDT via user CR3,
+        // but user CR3 is mid-update (IDT page overwritten by ELF data)
+        // → triple fault. Disabling interrupts prevents this.
         let saved_cr3: u64;
         #[cfg(target_arch = "x86_64")]
         {
+            // Disable interrupts for the entire ELF loading
+            unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
             saved_cr3 = {
                 let cr3: u64;
                 unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
@@ -1062,41 +1063,14 @@ impl Process {
             crate::mm::vma::ensure_mmap_above(page_table_ppn, max_vaddr);
         }
 
-        // 5.5 Restore CR3 after ELF segment loading.
-        // All frame writes (via identity-mapped physical addresses) are done.
-        // Restore the original CR3 so subsequent page table setup works correctly.
+        // 5.5 Restore CR3 and re-enable interrupts.
+        // IDT is at a high address (relocated in idt::init), so no IDT fix needed.
         #[cfg(target_arch = "x86_64")]
         {
-            // CRITICAL: ELF segments may have overwritten identity-mapped kernel
-            // structures (IDT at ~0x5e0b80, GDT, TSS). The Go binary loads at
-            // 0x400000+ which overlaps with these low-memory addresses. Under
-            // user CR3, the IDT virtual address now points to ELF data → Timer
-            // interrupt delivery fails → #GP → triple fault.
-            // Fix: re-establish identity mapping for the IDT in user page table.
-            let idt_base: u64;
-            unsafe {
-                core::arch::asm!(
-                    "sub rsp, 10",
-                    "sidt [rsp]",
-                    "mov {base}, [rsp]",
-                    "add rsp, 10",
-                    base = out(reg) idt_base,
-                    options(nostack),
-                );
-            }
-            // idt_base contains base:limit packed (limit in u16, base in u64)
-            let idt_addr = (idt_base >> 16) as usize;
-            let idt_page = idt_addr & !(pmm::page_size() - 1);
-            vmm::map(
-                user_pt,
-                idt_page,
-                idt_page,
-                vmm::PTEFlags::PRESENT | vmm::PTEFlags::WRITABLE,
-            );
-
             if saved_cr3 != 0 {
                 unsafe { core::arch::asm!("mov cr3, {}", in(reg) saved_cr3) };
             }
+            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
         }
 
         // 6. Stack mapping is done below (after initial stack data computation)
