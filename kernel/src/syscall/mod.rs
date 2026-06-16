@@ -3868,6 +3868,8 @@ fn sys_sendto(
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
+    #[cfg(target_arch = "x86_64")]
+    crate::net::iface::NetStack::poll();
     let data = user_read_bytes(buf, len);
     let dest = if addr_ptr != 0 && addr_len >= 8 {
         match parse_sockaddr_in(addr_ptr, addr_len) {
@@ -3896,6 +3898,9 @@ fn sys_recvfrom(fd: i32, buf: usize, len: usize) -> isize {
     if !crate::net::iface::NetStack::is_initialized() {
         return ERR_IO;
     }
+    // Poll network stack (syscall runs under kernel CR3 — MMIO safe).
+    #[cfg(target_arch = "x86_64")]
+    crate::net::iface::NetStack::poll();
     let mut kbuf = alloc::vec![0u8; len];
     match crate::net::iface::NetStack::recv(sock, &mut kbuf) {
         Ok((n, _src_ip, _src_port)) => {

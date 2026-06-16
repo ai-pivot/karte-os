@@ -73,6 +73,7 @@ struct VringUsedElem {
 struct QueueMem {
     desc: [VringDesc; QUEUE_SIZE],
     avail_buf: [u8; 4 + 2 * QUEUE_SIZE + 2],
+    _pad0: [u8; 2], // align used_buf to 4 bytes
     used_buf: [u8; 6 + 8 * QUEUE_SIZE],
     data: [u8; BUFFER_POOL_SIZE],
 }
@@ -87,6 +88,7 @@ impl QueueMem {
                 next: 0,
             }; QUEUE_SIZE],
             avail_buf: [0u8; 4 + 2 * QUEUE_SIZE + 2],
+            _pad0: [0u8; 2],
             used_buf: [0u8; 6 + 8 * QUEUE_SIZE],
             data: [0u8; BUFFER_POOL_SIZE],
         }
@@ -602,7 +604,7 @@ unsafe fn prepare_rx() {
     }
 
     // Set avail flags and index
-    core::ptr::write_volatile(avail as *mut u16, 0); // flags
+    core::ptr::write_volatile(avail as *mut u16, 1); // flags = VRING_AVAIL_F_NO_INTERRUPT
     core::ptr::write_volatile(avail.add(2) as *mut u16, 0); // idx
     for i in 0..QUEUE_SIZE {
         let ring = avail.add(4) as *mut u16;
@@ -778,9 +780,10 @@ pub fn init_net_device() -> Option<[u8; 6]> {
         dev.function
     );
 
-    // Enable I/O space, Memory space, and Bus Master
+    // Enable I/O space, Memory space, Bus Master, and DISABLE INTx (bit 10).
+    // We use polling mode — no device interrupts.
     let cmd = crate::arch::x86_64::pci::pci_read(dev.bus, dev.device, dev.function, 0x04);
-    crate::arch::x86_64::pci::pci_write(dev.bus, dev.device, dev.function, 0x04, cmd | 0x7);
+    crate::arch::x86_64::pci::pci_write(dev.bus, dev.device, dev.function, 0x04, cmd | 0x7 | 0x400);
 
     // Try modern mode first (parse PCI capabilities)
     let caps = parse_virtio_caps(dev.bus, dev.device, dev.function);
