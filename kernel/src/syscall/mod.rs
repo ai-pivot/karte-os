@@ -2083,14 +2083,19 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             return epoll::timerfd::timerfd_read(fd as usize, buf, len);
         }
         Some((FdType::Socket(_), _, _)) => {
-            // Socket write → sendto (no destination for connected sockets)
+            // Socket write → poll first (routes, RX), then send, then poll (TX flush)
+            #[cfg(target_arch = "x86_64")]
+            crate::net::iface::NetStack::poll();
             let data = user_read_bytes(buf, len);
-            return crate::net::iface::NetStack::send(
+            let result = crate::net::iface::NetStack::send(
                 get_fd_socket(fd).unwrap_or(0),
                 &data,
                 None,
                 None,
             );
+            #[cfg(target_arch = "x86_64")]
+            crate::net::iface::NetStack::poll();
+            return result;
         }
         Some((FdType::File, _, _)) => {}
         _ => {
@@ -3883,7 +3888,10 @@ fn sys_sendto(
         Some((ip, port)) => (Some(ip), Some(port)),
         None => (None, None),
     };
-    crate::net::iface::NetStack::send(sock, &data, ip, port)
+    let result = crate::net::iface::NetStack::send(sock, &data, ip, port);
+    #[cfg(target_arch = "x86_64")]
+    crate::net::iface::NetStack::poll(); // Flush TX
+    result
 }
 
 /// Syscall 76: recvfrom(fd, buf, len, flags) → bytes_received
