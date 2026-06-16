@@ -13,9 +13,10 @@ const PCI_VENDOR_VIRTIO: u16 = 0x1AF4;
 const PCI_DEVICE_VIRTIO_BLK: u16 = 0x1001;
 const PCI_DEVICE_VIRTIO_BLK_MODERN: u16 = 0x1042;
 const PCI_DEVICE_VIRTIO_NET: u16 = 0x1000;
+const PCI_DEVICE_VIRTIO_NET_MODERN: u16 = 0x1041;
 
 /// Read a 32-bit value from PCI configuration space.
-fn pci_read(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+pub fn pci_read(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     let addr: u32 = (1u32 << 31)
         | ((bus as u32) << 16)
         | (((device as u32) & 0x1F) << 11)
@@ -227,14 +228,17 @@ pub fn find_virtio_blk() -> Option<PciDevice> {
     None
 }
 
-/// Find the first VirtIO Net device (PCI vendor 0x1AF4, device 0x1000).
+/// Find the first VirtIO Net device (legacy 0x1000 or modern 0x1041).
 pub fn find_virtio_net() -> Option<PciDevice> {
     for device in 0..32 {
         let header_type = pci_read(0, device, 0, 0x0C);
         let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
         for function in 0..max_fn {
             if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
-                if dev.vendor_id == PCI_VENDOR_VIRTIO && dev.device_id == PCI_DEVICE_VIRTIO_NET {
+                if dev.vendor_id == PCI_VENDOR_VIRTIO
+                    && (dev.device_id == PCI_DEVICE_VIRTIO_NET
+                        || dev.device_id == PCI_DEVICE_VIRTIO_NET_MODERN)
+                {
                     return Some(dev);
                 }
             }
