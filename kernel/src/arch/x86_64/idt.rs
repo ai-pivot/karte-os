@@ -212,16 +212,15 @@ core::arch::global_asm!(
     "je 4f",
     "mov cr3, rax",
     "4:",
-    // Save FPU/SSE state (timer can interrupt Go's SSE instructions)
-    // CPU pushes 40 (no error_code) + 15 GPR(120) = 160 → RSP % 16 == 0. sub 512 stays aligned.
-    "sub rsp, 512",
-    "fxsave64 [rsp]",
-    // Call handler
+    // Align stack for System V ABI (RSP % 16 == 0 before call)
+    "sub rsp, 8",
+    // Call handler. No fxsave/fxrstor: __switch() already saves/restores
+    // FPU state during context switch. fxsave here would save to OLD task's
+    // stack, but after schedule() switches tasks, fxrstor would read from
+    // the NEW task's stack → corrupt FPU → crash.
     "mov rdi, rsp",
     "call timer_trap_handler",
-    // Restore FPU/SSE
-    "fxrstor64 [rsp]",
-    "add rsp, 512",
+    "add rsp, 8",
     // Pop 15 registers
     "pop r15",
     "pop r14",
@@ -561,12 +560,15 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     let stack_ptr = ctx as *mut _ as usize;
-    // timer_isr_stub stack layout after fxsave:
-    //   +0..512   = fxsave area
-    //   +512..632 = 15 pushed GPRs
-    //   +632      = interrupted RIP
-    //   +640      = interrupted CS
-    let interrupted_cs = unsafe { *((stack_ptr + 640) as *const u64) };
+    // Timer ISR stack layout (no fxsave):
+    //   +0     = 8-byte alignment padding
+    //   +8..128 = 15 pushed GPRs (rax, rbx, ... r15)
+    //   +128    = interrupted RIP (CPU-pushed)
+    //   +136    = interrupted CS (CPU-pushed)
+    //   +144    = interrupted RFLAGS
+    //   +152    = interrupted RSP
+    //   +160    = interrupted SS
+    let interrupted_cs = unsafe { *((stack_ptr + 136) as *const u64) };
     let from_user = interrupted_cs & 0x3 != 0;
     super::lapic::local_eoi();
     crate::driver::tty::poll_uart();

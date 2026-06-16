@@ -1066,8 +1066,37 @@ impl Process {
         // All frame writes (via identity-mapped physical addresses) are done.
         // Restore the original CR3 so subsequent page table setup works correctly.
         #[cfg(target_arch = "x86_64")]
-        if saved_cr3 != 0 {
-            unsafe { core::arch::asm!("mov cr3, {}", in(reg) saved_cr3) };
+        {
+            // CRITICAL: ELF segments may have overwritten identity-mapped kernel
+            // structures (IDT at ~0x5e0b80, GDT, TSS). The Go binary loads at
+            // 0x400000+ which overlaps with these low-memory addresses. Under
+            // user CR3, the IDT virtual address now points to ELF data → Timer
+            // interrupt delivery fails → #GP → triple fault.
+            // Fix: re-establish identity mapping for the IDT in user page table.
+            let idt_base: u64;
+            unsafe {
+                core::arch::asm!(
+                    "sub rsp, 10",
+                    "sidt [rsp]",
+                    "mov {base}, [rsp]",
+                    "add rsp, 10",
+                    base = out(reg) idt_base,
+                    options(nostack),
+                );
+            }
+            // idt_base contains base:limit packed (limit in u16, base in u64)
+            let idt_addr = (idt_base >> 16) as usize;
+            let idt_page = idt_addr & !(pmm::page_size() - 1);
+            vmm::map(
+                user_pt,
+                idt_page,
+                idt_page,
+                vmm::PTEFlags::PRESENT | vmm::PTEFlags::WRITABLE,
+            );
+
+            if saved_cr3 != 0 {
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) saved_cr3) };
+            }
         }
 
         // 6. Stack mapping is done below (after initial stack data computation)
