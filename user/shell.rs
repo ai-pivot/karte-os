@@ -22,6 +22,12 @@ const LINE_BUF_SIZE: usize = 512;
 const HISTORY_SIZE: usize = 64;
 const MAX_CMDS_IN_PIPE: usize = 8;
 
+// ── History state (module-level, shared across all functions) ──
+static mut HISTORY: [[u8; LINE_BUF_SIZE]; HISTORY_SIZE] = [[0; LINE_BUF_SIZE]; HISTORY_SIZE];
+static mut HIST_HEAD: usize = 0;
+static mut HIST_COUNT: usize = 0;
+static mut HIST_VIEW: usize = 0;
+
 unsafe fn update_cwd(path: &[u8]) {
     let mut cwd = [0u8; 256];
     let len = path.len().min(255);
@@ -30,10 +36,6 @@ unsafe fn update_cwd(path: &[u8]) {
 }
 
 unsafe fn history_add(line: &[u8]) {
-    static mut HISTORY: [[u8; LINE_BUF_SIZE]; HISTORY_SIZE] = [[0; LINE_BUF_SIZE]; HISTORY_SIZE];
-    static mut HIST_HEAD: usize = 0;
-    static mut HIST_COUNT: usize = 0;
-    static mut HIST_VIEW: usize = 0;
     if line.is_empty() { return; }
     let len = line.len().min(LINE_BUF_SIZE - 1);
     let slot = HIST_HEAD % HISTORY_SIZE;
@@ -45,16 +47,12 @@ unsafe fn history_add(line: &[u8]) {
 }
 
 unsafe fn history_get(offset: usize) -> usize {
-    static mut HISTORY: [[u8; LINE_BUF_SIZE]; HISTORY_SIZE] = [[0; LINE_BUF_SIZE]; HISTORY_SIZE];
-    static mut HIST_HEAD: usize = 0;
-    static mut HIST_COUNT: usize = 0;
     if offset >= HIST_COUNT { return 0; }
     let slot = (HIST_HEAD + HISTORY_SIZE - 1 - offset) % HISTORY_SIZE;
     HISTORY[slot].iter().position(|&b| b == 0).unwrap_or(0)
 }
 
 unsafe fn read_line(buf: &mut [u8]) -> usize {
-    static mut HIST_VIEW: usize = 0;
     let mut pos = 0usize;
 
     loop {
@@ -138,8 +136,6 @@ unsafe fn read_line(buf: &mut [u8]) -> usize {
 }
 
 unsafe fn history_get_entry(offset: usize) -> [u8; LINE_BUF_SIZE] {
-    static mut HISTORY: [[u8; LINE_BUF_SIZE]; HISTORY_SIZE] = [[0; LINE_BUF_SIZE]; HISTORY_SIZE];
-    static mut HIST_HEAD: usize = 0;
     let mut out = [0u8; LINE_BUF_SIZE];
     let slot = (HIST_HEAD + HISTORY_SIZE - 1 - offset) % HISTORY_SIZE;
     out.copy_from_slice(&HISTORY[slot]);
@@ -147,13 +143,11 @@ unsafe fn history_get_entry(offset: usize) -> [u8; LINE_BUF_SIZE] {
 }
 
 unsafe fn history_count() -> usize {
-    static mut HIST_COUNT: usize = 0;
     HIST_COUNT
 }
 
 unsafe fn reset_hist_view() {
-    static mut HIST_VIEW: usize = 0;
-    HIST_VIEW = history_count();
+    HIST_VIEW = HIST_COUNT;
 }
 
 fn wait_for(pid: isize) -> i32 {
@@ -226,11 +220,11 @@ unsafe fn launch(cmd: &[u8], arg: &[u8], redir_stdin: i32, redir_stdout: i32) ->
     let envp_ptr: usize = 0;
 
     if redir_stdin >= 0 || redir_stdout >= 0 {
-        // Try exec with fd redirection (still uses CMD_ARGS internally)
+        // Try exact path with fd redirection
         let pid = syscall4(SYS_EXEC_FD, cmd.as_ptr() as usize, cmd.len(), redir_stdin as usize, redir_stdout as usize);
         if pid >= 0 { return pid; }
         // PATH search with fd redirection
-        let pid = search_path_exec_fd_argv(cmd, argv_ptrs.as_ptr(), envp_ptr, redir_stdin, redir_stdout);
+        let pid = search_path(cmd, true, argv_ptrs.as_ptr(), envp_ptr, redir_stdin, redir_stdout);
         if pid >= 0 { return pid; }
         return -1;
     }
@@ -240,13 +234,29 @@ unsafe fn launch(cmd: &[u8], arg: &[u8], redir_stdin: i32, redir_stdout: i32) ->
     if pid >= 0 { return pid; }
 
     // PATH search with argv
-    let pid = search_path_exec_argv(cmd, argv_ptrs.as_ptr(), envp_ptr);
+    let pid = search_path(cmd, false, argv_ptrs.as_ptr(), envp_ptr, -1, -1);
     if pid >= 0 { return pid; }
 
     -1
 }
 
-unsafe fn search_path_exec_fd(cmd: &[u8], redir_stdin: i32, redir_stdout: i32) -> isize {
+/// Unified PATH search: tries each directory in PATH for cmd_name.
+///
+/// Parameters:
+/// - `cmd_name`: the command name to search for (e.g. b"ls")
+/// - `use_fd_exec`: if true, uses SYS_EXEC_FD with redir_stdin/redir_stdout;
+///                  if false, uses SYS_EXEC with argv_ptrs/envp_ptr
+/// - `argv_ptrs`: null-terminated array of argv string pointers (used when !use_fd_exec)
+/// - `envp_ptr`: environment pointer (used when !use_fd_exec)
+/// - `redir_stdin` / `redir_stdout`: fd redirection targets (used when use_fd_exec)
+unsafe fn search_path(
+    cmd_name: &[u8],
+    use_fd_exec: bool,
+    argv_ptrs: *const *const u8,
+    envp_ptr: usize,
+    redir_stdin: i32,
+    redir_stdout: i32,
+) -> isize {
     let path_buf = match getenv(b"PATH") {
         Some(b) => b,
         None => return -1,
@@ -263,89 +273,13 @@ unsafe fn search_path_exec_fd(cmd: &[u8], redir_stdin: i32, redir_stdout: i32) -
         let mut p = 0;
         for &b in dir { if p < 511 { full[p] = b; p += 1; } }
         if p > 0 && p < 511 { full[p] = b'/'; p += 1; }
-        for &b in cmd { if p < 511 { full[p] = b; p += 1; } }
-        let pid = syscall4(SYS_EXEC_FD, full.as_ptr() as usize, p, redir_stdin as usize, redir_stdout as usize);
-        if pid >= 0 { return pid; }
+        for &b in cmd_name { if p < 511 { full[p] = b; p += 1; } }
 
-        start = if end < len && path_buf[end] == b':' { end + 1 } else { end };
-    }
-    -1
-}
-
-unsafe fn search_path_exec(cmd: &[u8]) -> isize {
-    let path_buf = match getenv(b"PATH") {
-        Some(b) => b,
-        None => return -1,
-    };
-    let mut start = 0;
-    let len = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
-    loop {
-        if start >= len { break; }
-        let mut end = start;
-        while end < len && path_buf[end] != b':' { end += 1; }
-        let dir = &path_buf[start..end];
-
-        let mut full = [0u8; 512];
-        let mut p = 0;
-        for &b in dir { if p < 511 { full[p] = b; p += 1; } }
-        if p > 0 && p < 511 { full[p] = b'/'; p += 1; }
-        for &b in cmd { if p < 511 { full[p] = b; p += 1; } }
-        let pid = syscall2(SYS_EXEC, full.as_ptr() as usize, p);
-        if pid >= 0 { return pid; }
-
-        start = if end < len && path_buf[end] == b':' { end + 1 } else { end };
-    }
-    -1
-}
-
-/// PATH search with argv pointer array for sys_exec.
-unsafe fn search_path_exec_argv(cmd: &[u8], argv_ptrs: *const *const u8, envp_ptr: usize) -> isize {
-    let path_buf = match getenv(b"PATH") {
-        Some(b) => b,
-        None => return -1,
-    };
-    let mut start = 0;
-    let len = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
-    loop {
-        if start >= len { break; }
-        let mut end = start;
-        while end < len && path_buf[end] != b':' { end += 1; }
-        let dir = &path_buf[start..end];
-
-        let mut full = [0u8; 512];
-        let mut p = 0;
-        for &b in dir { if p < 511 { full[p] = b; p += 1; } }
-        if p > 0 && p < 511 { full[p] = b'/'; p += 1; }
-        for &b in cmd { if p < 511 { full[p] = b; p += 1; } }
-        let pid = syscall4(SYS_EXEC, full.as_ptr() as usize, p, argv_ptrs as usize, envp_ptr);
-        if pid >= 0 { return pid; }
-
-        start = if end < len && path_buf[end] == b':' { end + 1 } else { end };
-    }
-    -1
-}
-
-/// PATH search with fd redirection and argv for sys_exec_fd.
-unsafe fn search_path_exec_fd_argv(cmd: &[u8], argv_ptrs: *const *const u8, envp_ptr: usize, redir_stdin: i32, redir_stdout: i32) -> isize {
-    let _ = (argv_ptrs, envp_ptr); // sys_exec_fd uses CMD_ARGS internally
-    let path_buf = match getenv(b"PATH") {
-        Some(b) => b,
-        None => return -1,
-    };
-    let mut start = 0;
-    let len = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
-    loop {
-        if start >= len { break; }
-        let mut end = start;
-        while end < len && path_buf[end] != b':' { end += 1; }
-        let dir = &path_buf[start..end];
-
-        let mut full = [0u8; 512];
-        let mut p = 0;
-        for &b in dir { if p < 511 { full[p] = b; p += 1; } }
-        if p > 0 && p < 511 { full[p] = b'/'; p += 1; }
-        for &b in cmd { if p < 511 { full[p] = b; p += 1; } }
-        let pid = syscall4(SYS_EXEC_FD, full.as_ptr() as usize, p, redir_stdin as usize, redir_stdout as usize);
+        let pid = if use_fd_exec {
+            syscall4(SYS_EXEC_FD, full.as_ptr() as usize, p, redir_stdin as usize, redir_stdout as usize)
+        } else {
+            syscall4(SYS_EXEC, full.as_ptr() as usize, p, argv_ptrs as usize, envp_ptr)
+        };
         if pid >= 0 { return pid; }
 
         start = if end < len && path_buf[end] == b':' { end + 1 } else { end };

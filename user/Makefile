@@ -34,56 +34,9 @@ TARGETS = $(ASM_TARGETS) $(RUST_TARGETS)
 
 all: $(TARGETS)
 
-shell.elf: shell.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ shell.rs
-
-ls.elf: ls.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ ls.rs
-
-cat.elf: cat.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ cat.rs
-
-echo.elf: echo.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ echo.rs
-
-mkdir.elf: mkdir.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ mkdir.rs
-
-rm.elf: rm.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ rm.rs
-
-env.elf: env.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ env.rs
-
-pwd.elf: pwd.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ pwd.rs
-
-grep.elf: grep.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ grep.rs
-
-sed.elf: sed.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ sed.rs
-
-wc.elf: wc.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ wc.rs
-
-head.elf: head.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ head.rs
-
-tail.elf: tail.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ tail.rs
-
-tui-demo.elf: tui-demo.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ tui-demo.rs
-
-dmesg.elf: dmesg.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ dmesg.rs
-
-ext4_write_test.elf: ext4_write_test.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ ext4_write_test.rs
-
-ext4_sparse_test.elf: ext4_sparse_test.rs syscall.rs $(LD_SCRIPT)
-	$(RUSTC) $(RUSTFLAGS_USER) -o $@ ext4_sparse_test.rs
+# Rust programs — single pattern rule builds any .elf from corresponding .rs
+%.elf: %.rs syscall.rs $(LD_SCRIPT)
+	$(RUSTC) $(RUSTFLAGS_USER) -o $@ $<
 
 # Assembly programs (RISC-V only)
 ifeq ($(ARCH),riscv64)

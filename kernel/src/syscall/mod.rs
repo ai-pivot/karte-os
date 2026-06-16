@@ -111,6 +111,12 @@ pub const ERR_AGAIN: isize = -11; // EAGAIN — Resource temporarily unavailable
 pub const ERR_ACCES: isize = -13; // EACCES — Permission denied
 pub const ERR_RANGE: isize = -34; // ERANGE — Result too large
 pub const ERR_INTR: isize = -4; // EINTR — Interrupted system call
+pub const ERR_NOSYS: isize = -38; // ENOSYS — Function not implemented
+pub const ERR_EXIST: isize = -17; // EEXIST — File exists
+pub const ERR_BADF: isize = -9; // EBADF — Bad file descriptor
+pub const ERR_FAULT: isize = -14; // EFAULT — Bad address
+pub const ERR_TIMEDOUT: isize = -110; // ETIMEDOUT — Operation timed out
+pub const ERR_PIPE: isize = -32; // EPIPE — Broken pipe
 
 // ─── VMA (Virtual Memory Area) tracking ────────────────────────────
 //
@@ -294,8 +300,9 @@ pub(crate) fn user_read_u8(addr: usize) -> u8 {
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-pub(crate) fn user_write_u8(addr: usize, byte: u8) {
+pub(crate) fn user_write_u8(addr: usize, byte: u8) -> bool {
     unsafe { core::ptr::write_volatile(addr as *mut u8, byte) }
+    true
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -341,32 +348,44 @@ unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub(crate) fn user_write_u8(addr: usize, byte: u8) {
+pub(crate) fn user_write_u8(addr: usize, byte: u8) -> bool {
     // Kernel-mode or no user page table: direct write
     if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0 {
         unsafe { core::ptr::write_volatile(addr as *mut u8, byte) };
-        return;
+        return true;
     }
     if !ensure_user_write_pages(addr, 1) {
-        return;
+        crate::klog!(
+            WARN,
+            "[syscall] user_write_u8: page allocation failed at {:#x}",
+            addr
+        );
+        return false;
     }
     unsafe { user_write_u8_mapped(addr, byte) };
+    true
 }
 // RISC-V version is implemented as a standalone function above.
 
 /// Write a value to user space with automatic CR3 switching on x86_64.
+/// Returns `true` on success, `false` if page allocation failed.
 #[inline]
-pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
+pub(crate) fn user_write<T: Copy>(addr: usize, val: T) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         // Kernel-mode or no user page table: direct write
         if addr >= crate::process::USER_CODE_LIMIT || crate::process::current_page_table_root() == 0
         {
             unsafe { core::ptr::write(addr as *mut T, val) };
-            return;
+            return true;
         }
         if !ensure_user_write_pages(addr, core::mem::size_of::<T>()) {
-            return;
+            crate::klog!(
+                WARN,
+                "[syscall] user_write: page allocation failed at {:#x}",
+                addr
+            );
+            return false;
         }
         let src = unsafe {
             core::slice::from_raw_parts((&val as *const T) as *const u8, core::mem::size_of::<T>())
@@ -374,6 +393,7 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
         for (i, &byte) in src.iter().enumerate() {
             unsafe { user_write_u8_mapped(addr + i, byte) };
         }
+        true
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -384,6 +404,7 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
         for (i, &byte) in src.iter().enumerate() {
             user_write_u8(addr + i, byte);
         }
+        true
     }
 }
 
@@ -461,8 +482,9 @@ fn ensure_user_write_pages(addr: usize, len: usize) -> bool {
 }
 
 /// Write a slice of bytes to user space with automatic CR3 switching on x86_64.
+/// Returns `true` on success, `false` if page allocation failed.
 #[inline]
-pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) {
+pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         // Kernel-mode addresses: direct write (no CR3 switch needed)
@@ -470,7 +492,7 @@ pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) {
             for (i, &byte) in src.iter().enumerate() {
                 unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
             }
-            return;
+            return true;
         }
         // If no user page table is active (test mode), direct write
         let user_root = crate::process::current_page_table_root();
@@ -478,18 +500,28 @@ pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) {
             for (i, &byte) in src.iter().enumerate() {
                 unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
             }
-            return;
+            return true;
         }
         if !ensure_user_write_pages(addr, src.len()) {
-            return;
+            crate::klog!(
+                WARN,
+                "[syscall] user_write_bytes: page allocation failed at {:#x} len={}",
+                addr,
+                src.len()
+            );
+            return false;
         }
         for (i, &byte) in src.iter().enumerate() {
             unsafe { user_write_u8_mapped(addr + i, byte) };
         }
+        true
     }
     #[cfg(not(target_arch = "x86_64"))]
-    for (i, &byte) in src.iter().enumerate() {
-        unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+    {
+        for (i, &byte) in src.iter().enumerate() {
+            unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+        }
+        true
     }
 }
 
@@ -898,8 +930,8 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         302 => 0,                                          // prlimit64 (stub)
         285 => 0, // fallocate → success (SQLite WAL needs this)
         318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
-        334 => -38, // rseq → ENOSYS (Go gracefully degrades)
-        435 => -38, // clone3: ENOSYS
+        334 => ERR_NOSYS, // rseq → ENOSYS (Go gracefully degrades)
+        435 => ERR_NOSYS, // clone3: ENOSYS
         _ => {
             -38 // ENOSYS
         }
@@ -1021,11 +1053,11 @@ fn linux_stat(pathname: usize, statbuf: usize) -> isize {
 
             // Real filesystem path not found — return ENOENT so Go's MkdirAll
             // knows it needs to create the directory
-            return -2; // ENOENT
+            return ERR_NOENT;
         }
 
         // Couldn't parse path — return ENOENT
-        return -2; // ENOENT
+        return ERR_NOENT;
     }
     0
 }
@@ -1420,7 +1452,7 @@ fn linux_waitpid(pid: usize, status_ptr: usize, options: usize) -> isize {
 #[cfg(target_arch = "x86_64")]
 fn linux_uname(buf: usize) -> isize {
     if buf == 0 {
-        return -14; // EFAULT
+        return ERR_FAULT;
     }
     let fields: [&[u8]; 6] = [
         b"Linux\0",          // sysname
@@ -1557,7 +1589,7 @@ fn linux_sysinfo(info: usize) -> isize {
 fn linux_sched_getaffinity(_pid: usize, size: usize, mask: usize) -> isize {
     const AFFINITY_MASK_BYTES: usize = core::mem::size_of::<usize>();
     if mask == 0 || size < AFFINITY_MASK_BYTES {
-        return -22; // EINVAL
+        return ERR_INVAL;
     }
 
     let mut affinity = [0u8; AFFINITY_MASK_BYTES];
@@ -1696,18 +1728,18 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         131 | 133 | 139 => 0,
 
         // clone3 (Linux generic 435) — return ENOSYS to force Go fallback to clone(220)
-        435 => -38,
+        435 => ERR_NOSYS,
 
         // rseq (Linux generic 293) — return ENOSYS, Go has fallback
         #[cfg(target_arch = "riscv64")]
-        293 | 168 => -38, // rseq, getcpu → ENOSYS
+        293 | 168 => ERR_NOSYS, // rseq, getcpu → ENOSYS
 
         _ => {
             let _ = id;
             // Return -ENOSYS for unrecognized syscalls. Go runtime expects
             // ENOSYS (not EINVAL) for unsupported syscalls — it falls back
             // gracefully to ENOSYS but may abort on EINVAL.
-            -38 // ENOSYS
+            ERR_NOSYS
         }
     };
     let _ = should_trace;
@@ -1819,16 +1851,6 @@ pub fn sys_exit(code: i32) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 fn linux_exit_group(code: i32) -> isize {
-    #[cfg(target_arch = "riscv64")]
-    #[cfg(target_arch = "riscv64")]
-    {
-        let code_str = match code {
-            0 => "0",
-            1 => "1",
-            2 => "2",
-            _ => "?",
-        };
-    }
     unsafe { core::arch::asm!("cli") };
 
     let my_idx = crate::process::current_index();
@@ -2318,7 +2340,7 @@ fn linux_mmap(
     _offset: usize,
 ) -> isize {
     if len == 0 {
-        return -22; // EINVAL
+        return ERR_INVAL;
     }
 
     linux_mmap_inner(addr, len, prot, flags, _fd, _offset)
@@ -2344,7 +2366,7 @@ fn linux_mmap_inner(
         let aligned = addr & !(page_size - 1);
         let end = aligned.saturating_add(aligned_len);
         if aligned >= crate::process::USER_MMAP_LIMIT || end > crate::process::USER_MMAP_LIMIT {
-            return -12;
+            return ERR_NOMEM;
         }
         if crate::mm::vma::vma_is_elf(root, aligned) {
             // Overlaps ELF range — reject.
@@ -2389,7 +2411,7 @@ fn linux_mmap_inner(
 
     // Register the VMA entry. For MAP_FIXED, removes overlapping entries.
     if vma_add(target_addr, end, prot, map_fixed).is_err() {
-        return -12; // ENOMEM — VMA table full
+        return ERR_NOMEM;
     }
 
     // PROT_NONE (prot=0): reserve VA only. No PTEs, no frames.
@@ -2478,7 +2500,7 @@ pub fn prot_to_pte_flags(prot: usize) -> crate::mm::vmm::PTEFlags {
 /// the PF handler will use the updated VMA prot on first access.
 fn linux_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     if addr == 0 || len == 0 {
-        return -22; // EINVAL
+        return ERR_INVAL;
     }
 
     let page_size = crate::mm::pmm::page_size();
@@ -2519,7 +2541,7 @@ fn linux_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 /// Also removes corresponding VMA entries.
 fn linux_munmap(addr: usize, len: usize) -> isize {
     if addr == 0 || len == 0 {
-        return -22; // EINVAL
+        return ERR_INVAL;
     }
 
     let page_size = crate::mm::pmm::page_size();
@@ -2530,7 +2552,7 @@ fn linux_munmap(addr: usize, len: usize) -> isize {
     let valid_start = crate::process::USER_HEAP_BASE;
     let valid_end = crate::process::USER_MMAP_LIMIT;
     if start < valid_start || end > valid_end {
-        return -22; // EINVAL
+        return ERR_INVAL;
     }
 
     // Remove VMA entries
@@ -2588,7 +2610,7 @@ fn flush_tlb_all() {
 /// This is critical for SQLite WAL mode durability guarantees.
 fn linux_fsync(fd: usize) -> isize {
     if fd >= crate::driver::fs::MAX_FDS {
-        return -9; // EBADF
+        return ERR_BADF;
     }
     // Flush pending writes to ensure data reaches physical disk.
     #[cfg(target_arch = "x86_64")]
@@ -2596,7 +2618,7 @@ fn linux_fsync(fd: usize) -> isize {
         if crate::driver::ahci::is_available() {
             if let Err(e) = crate::driver::ahci::flush_cache() {
                 crate::console_println!("[fsync] AHCI flush failed: {}", e);
-                return -5; // EIO
+                return ERR_IO;
             }
         }
     }
@@ -2659,7 +2681,7 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             // arg points to struct flock in user memory.
             // Flock is 24 bytes: l_type(i16) + l_whence(i16) + l_start(i64) + l_len(i64) + l_pid(i32)
             if arg == 0 {
-                return -14; // EFAULT
+                return ERR_FAULT;
             }
             // Read from user space with CR3 switching on x86_64
             let flock_bytes = user_read_bytes(arg, 24);
@@ -2688,7 +2710,7 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
 
             if retval == -1 && (cmd == F_SETLK || cmd == F_SETLKW) {
-                return -11; // EAGAIN
+                return ERR_AGAIN;
             }
             retval
         }
@@ -2835,7 +2857,7 @@ fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
 /// Record the signal handler address. Never actually deliver signals.
 fn linux_rt_sigaction(sig: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
     if sig == 0 || sig > 64 {
-        return -22; // EINVAL
+        return ERR_INVAL;
     }
     // Save old handler if requested
     if oldact_ptr != 0 {
@@ -3444,7 +3466,7 @@ fn sys_mkdir(path: usize, path_len: usize) -> isize {
 
     // Check if already exists
     if crate::driver::fs::lookup_path(&name).is_some() {
-        return -17; // EEXIST
+        return ERR_EXIST;
     }
 
     // Create the directory on ext4
@@ -3727,7 +3749,7 @@ fn sys_accept(fd: i32) -> isize {
     if crate::net::iface::NetStack::is_connected(fd as usize) {
         fd as isize
     } else {
-        -2 // EAGAIN — would block
+        ERR_AGAIN // EAGAIN — would block
     }
 }
 
@@ -4005,7 +4027,7 @@ pub fn run_tests() {
     crate::console_println!("── Syscall Tests ──");
 
     crate::test::run_test("syscall_unknown_returns_error", || {
-        dispatch(9999, [0, 0, 0, 0, 0, 0]) == ERR_INVAL
+        dispatch(9999, [0, 0, 0, 0, 0, 0]) == ERR_NOSYS
     });
 
     crate::test::run_test("syscall_constants_correct", || {
@@ -4718,7 +4740,7 @@ fn copy_user_pages_x86(
 fn sys_fork() -> isize {
     #[cfg(target_arch = "riscv64")]
     {
-        return -38;
+        return ERR_NOSYS;
     }
     // Get current process info
     let current = match crate::process::current() {
@@ -5250,7 +5272,7 @@ fn futex_wait(uaddr: usize, expected_val: u32, timeout_ms: Option<u64>) -> isize
     //    SSTATUS.SUM is set in trap_handler, allowing S-mode to read U-mode pages.
     let current_val = user_read::<u32>(uaddr);
     if current_val != expected_val {
-        return -11; // EAGAIN: value changed, don't block
+        return ERR_AGAIN; // value changed, don't block
     }
 
     // 2. Register current task in the wait queue.
@@ -5271,7 +5293,7 @@ fn futex_wait(uaddr: usize, expected_val: u32, timeout_ms: Option<u64>) -> isize
     if let Some(ms) = timeout_ms {
         if ms == 0 {
             cleanup_futex_waiters_for_processes(&[proc_idx]);
-            return -110; // ETIMEDOUT
+            return ERR_TIMEDOUT;
         }
         let wake_tick = crate::arch::platform::uptime_ms().saturating_add(ms);
         crate::sched::sleep_until(wake_tick);
@@ -5302,7 +5324,7 @@ fn futex_wait(uaddr: usize, expected_val: u32, timeout_ms: Option<u64>) -> isize
     }
 
     if timeout_ms.is_some() && still_waiting {
-        return -110; // ETIMEDOUT
+        return ERR_TIMEDOUT;
     }
 
     // 5. Return success for real and spurious wakeups.
@@ -5354,13 +5376,13 @@ fn linux_futex_impl(addr: usize, op: usize, val: usize, timeout_ptr: usize) -> i
     match base_op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             if addr == 0 {
-                return -1; // EINVAL
+                return ERR_INVAL;
             }
             futex_wait(addr, val as u32, futex_timeout_ms(timeout_ptr))
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             if addr == 0 {
-                return -1; // EINVAL
+                return ERR_INVAL;
             }
             futex_wake(addr, val as u32)
         }
@@ -5427,13 +5449,13 @@ fn linux_tgkill(_tgid: usize, _tid: usize, _sig: usize) -> isize {
 /// Linux nanosleep(req, rem) — sleep for a specified relative interval.
 fn linux_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
     if req_ptr == 0 {
-        return -14; // EFAULT
+        return ERR_FAULT;
     }
 
     let sec = user_read::<i64>(req_ptr);
     let nsec = user_read::<i64>(req_ptr + 8);
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        return -22; // EINVAL
+        return ERR_INVAL;
     }
 
     let ms = (sec as u64)
@@ -5453,12 +5475,12 @@ fn linux_nanosleep(req_ptr: usize, _rem_ptr: usize) -> isize {
 #[cfg(target_arch = "x86_64")]
 fn linux_mkdirat(_dirfd: usize, path_ptr: usize, _mode: usize, _unused: usize) -> isize {
     if path_ptr == 0 {
-        return -22; // EINVAL
+        return ERR_INVAL;
     }
 
     let actual_len = crate::syscall::linux::count_user_string(path_ptr);
     if actual_len == 0 || actual_len > 256 {
-        return -2; // ENOENT
+        return ERR_NOENT;
     }
 
     sys_mkdir(path_ptr, actual_len)

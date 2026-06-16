@@ -1565,9 +1565,6 @@ where
 
 /// Test mode fallback — uses a global static FD table.
 #[cfg(feature = "test_mode")]
-use crate::sync::spinlock::SpinLock;
-
-#[cfg(feature = "test_mode")]
 static TEST_FD_TABLE: SpinLock<Option<crate::driver::fs::FdTable>> = SpinLock::new(None);
 
 #[cfg(feature = "test_mode")]

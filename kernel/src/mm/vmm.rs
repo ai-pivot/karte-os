@@ -359,6 +359,12 @@ pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: P
     }
 }
 
+/// RISC-V fallback: no 2MB huge pages, delegate to regular identity_map.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: PTEFlags) {
+    identity_map(root, start, end, flags);
+}
+
 static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
 
 /// Kernel SATP value for trap_entry.S to switch to on U-mode traps.
@@ -1133,88 +1139,90 @@ pub fn run_tests() {
         true
     });
 
-    crate::test::run_test("vmm_split_does_not_clobber_sibling_pages", || {
-        // After a 2MB huge page is split into 4KB entries, verify that
-        // pages we DID NOT explicitly map still have valid identity mappings.
-        // The split must preserve the original physical mappings for all
-        // 512 sub-pages.
-        let root = PageTable::zeroed();
+    if cfg!(target_arch = "x86_64") {
+        crate::test::run_test("vmm_split_does_not_clobber_sibling_pages", || {
+            // After a 2MB huge page is split into 4KB entries, verify that
+            // pages we DID NOT explicitly map still have valid identity mappings.
+            // The split must preserve the original physical mappings for all
+            // 512 sub-pages.
+            let root = PageTable::zeroed();
 
-        // Create 2MB huge page covering 0..4MB (PD indices 0 and 1)
-        identity_map_2mb(root, 0, 4 * 1024 * 1024, PTEFlags::KRW);
+            // Create 2MB huge page covering 0..4MB (PD indices 0 and 1)
+            identity_map_2mb(root, 0, 4 * 1024 * 1024, PTEFlags::KRW);
 
-        // Write magic to physical address 0x200000 (start of the 2MB range)
-        let phys = 0x200000usize;
-        let magic: u64 = 0xABBA_CDEF_1234_5678;
-        unsafe {
-            (phys as *mut u64).write(magic);
-        }
+            // Write magic to physical address 0x200000 (start of the 2MB range)
+            let phys = 0x200000usize;
+            let magic: u64 = 0xABBA_CDEF_1234_5678;
+            unsafe {
+                (phys as *mut u64).write(magic);
+            }
 
-        // Write magic to another physical address in the same 2MB range
-        let phys2 = 0x300000usize; // 3MB — middle of the 2MB range
-        let magic2: u64 = 0xDEAD_BEEF_CAFE_F00D;
-        unsafe {
-            (phys2 as *mut u64).write(magic2);
-        }
+            // Write magic to another physical address in the same 2MB range
+            let phys2 = 0x300000usize; // 3MB — middle of the 2MB range
+            let magic2: u64 = 0xDEAD_BEEF_CAFE_F00D;
+            unsafe {
+                (phys2 as *mut u64).write(magic2);
+            }
 
-        // Now map a specific 4KB page within the range (triggers split)
-        let trigger_vaddr = 0x201000usize; // 2MB + 4KB
-        let trigger_frame = match pmm::alloc_frame() {
-            Some(f) => f,
-            None => return false,
-        };
-        unsafe {
-            core::ptr::write_bytes(trigger_frame as *mut u8, 0x42, pmm::page_size());
-        }
-        map_user(root, trigger_vaddr, trigger_frame, PTEFlags::URW);
+            // Now map a specific 4KB page within the range (triggers split)
+            let trigger_vaddr = 0x201000usize; // 2MB + 4KB
+            let trigger_frame = match pmm::alloc_frame() {
+                Some(f) => f,
+                None => return false,
+            };
+            unsafe {
+                core::ptr::write_bytes(trigger_frame as *mut u8, 0x42, pmm::page_size());
+            }
+            map_user(root, trigger_vaddr, trigger_frame, PTEFlags::URW);
 
-        // Verify the first page (0x200000) still has its identity mapping and magic
-        match translate_user(root, 0x200000) {
-            Some(f) if f == phys => {
-                let val = unsafe { (phys as *const u64).read() };
-                if val != magic {
+            // Verify the first page (0x200000) still has its identity mapping and magic
+            match translate_user(root, 0x200000) {
+                Some(f) if f == phys => {
+                    let val = unsafe { (phys as *const u64).read() };
+                    if val != magic {
+                        crate::console_println!(
+                            "[FAIL] sibling page 0x200000 val={:#x} expected={:#x}",
+                            val,
+                            magic
+                        );
+                        return false;
+                    }
+                }
+                other => {
                     crate::console_println!(
-                        "[FAIL] sibling page 0x200000 val={:#x} expected={:#x}",
-                        val,
-                        magic
+                        "[FAIL] sibling translate(0x200000) = {:?}, expected {:#x}",
+                        other,
+                        phys
                     );
                     return false;
                 }
             }
-            other => {
-                crate::console_println!(
-                    "[FAIL] sibling translate(0x200000) = {:?}, expected {:#x}",
-                    other,
-                    phys
-                );
-                return false;
-            }
-        }
 
-        // Verify the middle page (0x300000) still intact
-        match translate_user(root, 0x300000) {
-            Some(f) if f == phys2 => {
-                let val = unsafe { (phys2 as *const u64).read() };
-                if val != magic2 {
+            // Verify the middle page (0x300000) still intact
+            match translate_user(root, 0x300000) {
+                Some(f) if f == phys2 => {
+                    let val = unsafe { (phys2 as *const u64).read() };
+                    if val != magic2 {
+                        crate::console_println!(
+                            "[FAIL] sibling page 0x300000 val={:#x} expected={:#x}",
+                            val,
+                            magic2
+                        );
+                        return false;
+                    }
+                }
+                other => {
                     crate::console_println!(
-                        "[FAIL] sibling page 0x300000 val={:#x} expected={:#x}",
-                        val,
-                        magic2
+                        "[FAIL] sibling translate(0x300000) = {:?}, expected {:#x}",
+                        other,
+                        phys2
                     );
                     return false;
                 }
             }
-            other => {
-                crate::console_println!(
-                    "[FAIL] sibling translate(0x300000) = {:?}, expected {:#x}",
-                    other,
-                    phys2
-                );
-                return false;
-            }
-        }
-        true
-    });
+            true
+        });
+    } // end cfg!(x86_64)
 
     // ── Runtime corruption detector test ──
     // Allocate a "canary" frame, fill with magic, track it during

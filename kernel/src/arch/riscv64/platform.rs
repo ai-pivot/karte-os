@@ -26,10 +26,14 @@ pub fn irq_save() -> usize {
     sstatus
 }
 
-/// Restore interrupt state.
-pub fn irq_restore(_flags: usize) {
-    // Simplified: just enable interrupts
-    irq_enable();
+/// Restore interrupt state from a previously saved `irq_save()` value.
+/// On RISC-V, sstatus.SIE (bit 1) controls supervisor interrupts.
+pub fn irq_restore(flags: usize) {
+    if flags & 2 != 0 {
+        irq_enable();
+    } else {
+        irq_disable();
+    }
 }
 
 /// Shutdown the system via SBI.
