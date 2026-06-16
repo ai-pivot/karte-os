@@ -68,6 +68,9 @@ pub struct SocketMeta {
     pub handle: SocketHandle,
     pub socket_type: SocketType,
     pub state: SocketState,
+    /// Connected UDP: remote address (set by connect() on SOCK_DGRAM)
+    pub remote_ip: Option<[u8; 4]>,
+    pub remote_port: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +223,8 @@ impl NetStack {
             handle,
             socket_type,
             state: SocketState::Created,
+            remote_ip: None,
+            remote_port: None,
         });
 
         fd as isize
@@ -265,7 +270,8 @@ impl NetStack {
         }
     }
 
-    /// Connect a TCP socket to a remote address.
+    /// Connect a socket to a remote address.
+    /// For TCP: initiates SYN handshake. For UDP: stores default destination.
     pub fn connect(fd: usize, ip: [u8; 4], port: u16) -> isize {
         let mut guard = NET_STACK.lock();
         let stack = match guard.as_mut() {
@@ -278,21 +284,36 @@ impl NetStack {
             None => return -1,
         };
 
-        if meta.socket_type != SocketType::Tcp {
-            return -1;
-        }
-
-        let remote_addr = IpAddress::v4(ip[0], ip[1], ip[2], ip[3]);
-
-        // TCP connect needs Context from Interface
-        let cx = stack.iface.context();
-        let sock = stack.socket_set.get_mut::<tcp::Socket>(meta.handle);
-        match sock.connect(cx, (remote_addr, port), 0) {
-            Ok(()) => {
-                meta.state = SocketState::Connecting;
+        match meta.socket_type {
+            SocketType::Tcp => {
+                let remote_addr = IpAddress::v4(ip[0], ip[1], ip[2], ip[3]);
+                let cx = stack.iface.context();
+                let sock = stack.socket_set.get_mut::<tcp::Socket>(meta.handle);
+                match sock.connect(cx, (remote_addr, port), 0) {
+                    Ok(()) => {
+                        meta.state = SocketState::Connecting;
+                        0
+                    }
+                    Err(_) => -1,
+                }
+            }
+            SocketType::Udp => {
+                // Connected UDP: store the remote address. Bind to ephemeral port
+                // if not already bound, so smoltcp can send.
+                let endpoint = IpListenEndpoint {
+                    addr: None,
+                    port: 0,
+                };
+                let sock = stack.socket_set.get_mut::<udp::Socket>(meta.handle);
+                if !sock.is_open() {
+                    let _ = sock.bind(endpoint);
+                }
+                meta.remote_ip = Some(ip);
+                meta.remote_port = Some(port);
+                meta.state = SocketState::Connected;
                 0
             }
-            Err(_) => -1,
+            _ => -1,
         }
     }
 
@@ -321,13 +342,15 @@ impl NetStack {
                 }
             }
             SocketType::Udp => {
-                let ip_addr = match ip {
-                    Some([a, b, c, d]) => IpAddress::v4(a, b, c, d),
-                    None => return -1,
-                };
-                let dst_port = match port {
-                    Some(p) => p,
-                    None => return -1,
+                // Use explicit destination if provided, else fall back to connected address
+                let (ip_addr, dst_port) = match (ip, port) {
+                    (Some([a, b, c, d]), Some(p)) => (IpAddress::v4(a, b, c, d), p),
+                    _ => match (meta.remote_ip, meta.remote_port) {
+                        (Some(rip), Some(rport)) => {
+                            (IpAddress::v4(rip[0], rip[1], rip[2], rip[3]), rport)
+                        }
+                        _ => return -1,
+                    },
                 };
                 let sock = stack.socket_set.get_mut::<udp::Socket>(meta.handle);
                 match sock.send_slice(data, (ip_addr, dst_port)) {
