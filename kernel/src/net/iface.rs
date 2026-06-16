@@ -86,6 +86,26 @@ pub struct NetStack {
 
 static NET_STACK: spin::Mutex<Option<NetStack>> = spin::Mutex::new(None);
 
+/// Global ephemeral port counter for auto-binding UDP sockets.
+/// smoltcp requires a non-zero source port; port 0 means "any" for listening
+/// but doesn't work for sending. We assign ports starting from 49152.
+static NEXT_EPHEMERAL_PORT: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(49152);
+
+fn alloc_ephemeral_port() -> u16 {
+    let port = NEXT_EPHEMERAL_PORT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if port < 49152 {
+        // Wrapped — reset to safe range
+        NEXT_EPHEMERAL_PORT.store(49152, core::sync::atomic::Ordering::Relaxed);
+        return 49152;
+    }
+    if port > 65500 {
+        NEXT_EPHEMERAL_PORT.store(49152, core::sync::atomic::Ordering::Relaxed);
+        return 49152;
+    }
+    port
+}
+
 impl NetStack {
     /// Initialize the network stack.
     pub fn init(mac: [u8; 6]) {
@@ -287,9 +307,10 @@ impl NetStack {
         match meta.socket_type {
             SocketType::Tcp => {
                 let remote_addr = IpAddress::v4(ip[0], ip[1], ip[2], ip[3]);
+                let local_port = alloc_ephemeral_port();
                 let cx = stack.iface.context();
                 let sock = stack.socket_set.get_mut::<tcp::Socket>(meta.handle);
-                match sock.connect(cx, (remote_addr, port), 0) {
+                match sock.connect(cx, (remote_addr, port), local_port) {
                     Ok(()) => {
                         meta.state = SocketState::Connecting;
                         0
@@ -298,15 +319,15 @@ impl NetStack {
                 }
             }
             SocketType::Udp => {
-                // Connected UDP: store the remote address. Bind to ephemeral port
-                // if not already bound, so smoltcp can send.
-                let endpoint = IpListenEndpoint {
-                    addr: None,
-                    port: 0,
-                };
+                // Connected UDP: store the remote address. Bind to a real
+                // ephemeral port (NOT port 0 — smoltcp can't send from port 0).
                 let sock = stack.socket_set.get_mut::<udp::Socket>(meta.handle);
                 if !sock.is_open() {
-                    let _ = sock.bind(endpoint);
+                    let port = alloc_ephemeral_port();
+                    let endpoint = IpListenEndpoint { addr: None, port };
+                    if sock.bind(endpoint).is_err() {
+                        return -1;
+                    }
                 }
                 meta.remote_ip = Some(ip);
                 meta.remote_port = Some(port);
@@ -353,13 +374,11 @@ impl NetStack {
                     },
                 };
                 let sock = stack.socket_set.get_mut::<udp::Socket>(meta.handle);
-                // smoltcp requires UDP sockets to be bound before sending.
-                // Auto-bind to ephemeral port if not already open.
+                // smoltcp requires UDP sockets to be bound to a non-zero port
+                // before sending. Auto-bind to ephemeral port if not open.
                 if !sock.is_open() {
-                    let endpoint = IpListenEndpoint {
-                        addr: None,
-                        port: 0,
-                    };
+                    let port = alloc_ephemeral_port();
+                    let endpoint = IpListenEndpoint { addr: None, port };
                     if sock.bind(endpoint).is_err() {
                         return -1;
                     }
@@ -400,14 +419,14 @@ impl NetStack {
             SocketType::Tcp => {
                 let sock = stack.socket_set.get_mut::<tcp::Socket>(meta.handle);
                 if !sock.can_recv() {
-                    return Err(-2); // EAGAIN — no data available
+                    return Err(-11); // EAGAIN — no data available
                 }
                 match sock.recv_slice(buf) {
                     Ok(n) => {
                         if n == 0 {
                             // smoltcp returns 0 when the recv buffer is empty
                             // but can_recv() was true — this means EOF (remote closed)
-                            return Err(-3); // EOF / connection reset
+                            return Err(-104); // EOF / connection reset
                         }
                         Ok((n, None, None))
                     }
@@ -417,7 +436,7 @@ impl NetStack {
             SocketType::Udp => {
                 let sock = stack.socket_set.get_mut::<udp::Socket>(meta.handle);
                 if !sock.can_recv() {
-                    return Err(-2);
+                    return Err(-11);
                 }
                 match sock.recv_slice(buf) {
                     Ok((n, udp_meta)) => {
@@ -433,7 +452,7 @@ impl NetStack {
             SocketType::Icmp => {
                 let sock = stack.socket_set.get_mut::<icmp::Socket>(meta.handle);
                 if !sock.can_recv() {
-                    return Err(-2);
+                    return Err(-11);
                 }
                 match sock.recv_slice(buf) {
                     Ok((n, src_addr)) => {

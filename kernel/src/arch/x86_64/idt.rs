@@ -575,10 +575,8 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     crate::arch::platform::tick_uptime();
     crate::sched::tick_sleep_queue();
 
-    // Network polling on x86_64 is done in syscall paths (recvfrom/sendto)
-    // where kernel CR3 is active. Timer ISR polling causes triple fault
-    // because VirtIO MMIO (0xfe000000) is not in user page tables.
-    #[cfg(not(target_arch = "x86_64"))]
+    // Poll network stack. Safe now: Timer ISR asm stub already switched to
+    // KERNEL_CR3, and IDT is relocated above ELF range (no IDT conflict).
     if crate::net::iface::NetStack::is_initialized() {
         crate::net::iface::NetStack::poll();
     }
