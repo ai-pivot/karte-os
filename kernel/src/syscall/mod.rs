@@ -2012,16 +2012,17 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             return len as isize;
         }
         Some((FdType::VfsFile(vfs_fd), _, _)) => {
-            // VFS file: copy user data to kernel buffer first, because
-            // vfs::write() switches to kernel CR3 where user pages are inaccessible.
             let data = user_read_bytes(buf, len);
             return match crate::driver::vfs::write(vfs_fd, &data) {
                 Ok(n) => {
-                    // Keep fd table position in sync with VFS position
-                    let cur = get_fd_pos(fd);
-                    set_fd_pos(fd, cur + n);
-                    #[cfg(target_arch = "x86_64")]
-                    mirror_user_json_log(&data[..n]);
+                    // Sync fd table position with VFS position (which may
+                    // have jumped to end-of-file for O_APPEND writes)
+                    if let Some(vfs_of) = crate::driver::vfs::get_open_file_pos(vfs_fd) {
+                        set_fd_pos(fd, vfs_of);
+                    } else {
+                        let cur = get_fd_pos(fd);
+                        set_fd_pos(fd, cur + n);
+                    }
                     n as isize
                 }
                 Err(_) => ERR_IO,

@@ -61,6 +61,7 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_CREAT: u32 = 0x100;
 pub const O_TRUNC: u32 = 0x200;
+pub const O_APPEND: u32 = 0x400;
 
 // ─── FileSystem Trait ────────────────────────────────────────────────────
 
@@ -385,11 +386,21 @@ pub fn write(fd: usize, data: &[u8]) -> Result<usize, VfsError> {
     }
     let mount_id = of.mount_id;
     let inode = of.inode;
-    let offset = of.pos;
+    let flags = of.flags;
+    let cur_pos = of.pos;
+
+    // Handle O_APPEND: write at end of file, not current position
+    let offset = if flags & O_APPEND != 0 {
+        let mount = vfs.mounts.get(mount_id).ok_or(VfsError::NotFound)?;
+        mount.fs.metadata(inode).map(|m| m.size).unwrap_or(cur_pos)
+    } else {
+        cur_pos
+    };
+
     let mount = vfs.mounts.get_mut(mount_id).ok_or(VfsError::NotFound)?;
     let bytes_written = mount.fs.write_file(inode, offset, data)?;
     let of = vfs.open_files.get_mut(fd).ok_or(VfsError::InvalidParam)?;
-    of.pos += bytes_written;
+    of.pos = offset + bytes_written;
     Ok(bytes_written)
 }
 
@@ -447,6 +458,12 @@ pub fn seek(fd: usize, offset: i64, whence: i32) -> Result<usize, VfsError> {
 pub fn close(fd: usize) -> bool {
     let mut vfs = VFS.lock();
     vfs.open_files.close(fd)
+}
+
+/// Get the current position of an open VFS file (for fd table sync after O_APPEND writes)
+pub fn get_open_file_pos(fd: usize) -> Option<usize> {
+    let vfs = VFS.lock();
+    vfs.open_files.get(fd).map(|of| of.pos)
 }
 
 /// List directory contents at path, write entries into buf (comma-separated), return total bytes written
