@@ -583,10 +583,9 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
 
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if !from_user {
-        // Do not preempt kernel/syscall code. Returning with a user CR3 while
-        // continuing kernel execution corrupts the execution context.
-        let kernel_pt = crate::mm::vmm::get_kernel_page_table();
-        super::trap::activate_page_table(kernel_pt as *const _ as usize);
+        // Timer fired from kernel mode (idle task or during a syscall).
+        // The IST stub already switched to KERNEL_CR3, so no CR3 change needed.
+        // Do not preempt kernel code — just return.
         return;
     }
 
@@ -902,7 +901,10 @@ extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64)
         );
     }
     if from_user && user_root != 0 {
-        let user_pt = unsafe { &mut *((user_root << 12) as *mut crate::mm::vmm::PageTable) };
+        let user_pt = unsafe {
+            &mut *((crate::mm::vmm::phys_to_virt(user_root << 12))
+                as *mut crate::mm::vmm::PageTable)
+        };
         // Read user stack via translated physical addresses. The GP handler is
         // running under kernel CR3 here, so direct user virtual reads can fault.
         for i in 0..8usize {
@@ -1230,7 +1232,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                     if let Some(new_frame) = crate::mm::pmm::alloc_frame() {
                                         unsafe {
                                             core::ptr::write_bytes(
-                                                new_frame as *mut u8,
+                                                crate::mm::vmm::phys_to_virt(new_frame) as *mut u8,
                                                 0,
                                                 page_size,
                                             );
@@ -1289,6 +1291,13 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                 None => true,
                                 Some(f) => f == page_addr,
                             };
+                            crate::console_println!(
+                                "[PF-LAZY] addr={:#x} old_frame={:?} needs_alloc={} pte={:?}",
+                                page_addr,
+                                old_frame.map(|f| f as usize),
+                                needs_alloc,
+                                old_pte
+                            );
                             if needs_alloc {
                                 let vma_is_elf = crate::syscall::vma_is_elf(fault_addr_val);
                                 if vma_is_elf && old_frame.is_some() {
@@ -1296,7 +1305,11 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                     rejected_pte = old_pte;
                                 } else if let Some(frame) = crate::mm::pmm::alloc_frame() {
                                     unsafe {
-                                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                                        core::ptr::write_bytes(
+                                            crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                                            0,
+                                            page_size,
+                                        );
                                     }
                                     crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
                                     mapped = true;
@@ -1350,7 +1363,11 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 if needs_alloc {
                     if let Some(frame) = crate::mm::pmm::alloc_frame() {
                         unsafe {
-                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                            core::ptr::write_bytes(
+                                crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                                0,
+                                page_size,
+                            );
                         }
                         crate::mm::vmm::map(
                             user_pt,
@@ -1378,7 +1395,11 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
                     if let Some(frame) = crate::mm::pmm::alloc_frame() {
                         unsafe {
-                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                            core::ptr::write_bytes(
+                                crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                                0,
+                                page_size,
+                            );
                         }
                         crate::mm::vmm::map(
                             user_pt,
@@ -1402,7 +1423,11 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
                     if let Some(frame) = crate::mm::pmm::alloc_frame() {
                         unsafe {
-                            core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                            core::ptr::write_bytes(
+                                crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                                0,
+                                page_size,
+                            );
                         }
                         crate::mm::vmm::map(
                             user_pt,
@@ -1871,53 +1896,9 @@ pub fn init() {
 
     IDT.get().unwrap();
 
-    // Relocate IDT to a high physical address to avoid conflict with ELF segments.
-    // Go binary loads at 0x400000..~0x6866000. Static IDT at ~0x5e0b80 is inside
-    // this range — when user page table is set up, the IDT page gets ELF data,
-    // causing Timer interrupt delivery to read garbage → #GP → triple fault.
-    // Fix: allocate a frame above the ELF range, copy IDT there, reload IDTR.
-    let idt_src = IDT.get().unwrap() as *const InterruptDescriptorTable as usize;
-    let mut high_frame = None;
-    // Allocate frames until we find one above 0x8000000 (128MB)
-    // Use fixed array to avoid heap allocation
-    let mut low_frames = [0usize; 512];
-    let mut low_count = 0usize;
-    for i in 0..512 {
-        match crate::mm::pmm::alloc_frame() {
-            Some(f) if f >= 0x8000000 => {
-                high_frame = Some(f);
-                break;
-            }
-            Some(f) => {
-                low_frames[i] = f;
-                low_count = i + 1;
-            }
-            None => break,
-        }
-    }
-    for i in 0..low_count {
-        crate::mm::pmm::dealloc_frame(low_frames[i]);
-    }
-    if let Some(frame) = high_frame {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                idt_src as *const u8,
-                frame as *mut u8,
-                core::mem::size_of::<InterruptDescriptorTable>(),
-            );
-        }
-        // Reload IDTR to point to the high address
-        let idtr = x86_64::structures::DescriptorTablePointer {
-            limit: (core::mem::size_of::<InterruptDescriptorTable>() - 1) as u16,
-            base: x86_64::VirtAddr::new(frame as u64),
-        };
-        unsafe {
-            core::arch::asm!("lidt [{}]", in(reg) &idtr, options(nostack, preserves_flags));
-        }
-        crate::console_println!("[idt] Relocated to {:#x}", frame);
-    } else {
-        IDT.get().unwrap().load();
-    }
+    // High-half kernel: IDT is in PML4[511] (shared with user PT).
+    // No relocation needed — user ELF in PML4[0..256] cannot overlap.
+    IDT.get().unwrap().load();
     cache_kernel_cr3();
     init_syscall_msrs();
 }

@@ -318,7 +318,10 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 #[cfg(target_arch = "x86_64")]
                 {
                     let user_pt_phys = proc.page_table_root << 12;
-                    let user_pt = unsafe { &mut *(user_pt_phys as *mut crate::mm::vmm::PageTable) };
+                    let user_pt = unsafe {
+                        &mut *(crate::mm::vmm::phys_to_virt(user_pt_phys)
+                            as *mut crate::mm::vmm::PageTable)
+                    };
                     let page_addr = proc.entry & !0xFFF;
                     if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
                         crate::console_println!(
@@ -355,7 +358,8 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::console_println!("[init] Initializing network...");
+                    // TEMPORARILY DISABLED to test DMA corruption hypothesis
+                    // crate::console_println!("[init] Initializing network...");
                     if let Some(mac) = crate::arch::virtio_net::init_net_device() {
                         net::iface::NetStack::init(mac);
                     }

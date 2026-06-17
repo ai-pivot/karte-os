@@ -19,12 +19,12 @@
 #
 # Environment:
 #   DISK=disk.img    Path to disk image (default: disk.img)
-#   SIZE=64          Size in MB for 'init' (default: 64)
+#   SIZE=256         Size in MB for 'init' (default: 64)
 
 set -e
 
 DISK="${DISK:-disk.img}"
-SIZE="${SIZE:-64}"  # MB
+SIZE="${SIZE:-256}"  # MB
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJ_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -377,6 +377,6 @@ case "${1:-help}" in
         echo ""
         echo "Environment:"
         echo "  DISK=disk.img        Disk image path (default: disk.img)"
-        echo "  SIZE=64              Size in MB for 'init' (default: 64)"
+        echo "  SIZE=256             Size in MB for 'init' (default: 64)"
         ;;
 esac

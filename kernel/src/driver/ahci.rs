@@ -11,6 +11,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use crate::mm::pmm;
+#[cfg(target_arch = "x86_64")]
+use crate::mm::vmm::phys_to_virt;
 
 const SECTOR_SIZE: usize = 512;
 const PAGE_SIZE: usize = 4096;
@@ -189,8 +191,8 @@ unsafe fn init_port(base: *mut u8, port: usize) -> Result<(), &'static str> {
     let page2 = pmm::alloc_frame().ok_or("OOM for AHCI data")?;
 
     // Zero the pages
-    ptr::write_bytes(page1 as *mut u8, 0, PAGE_SIZE);
-    ptr::write_bytes(page2 as *mut u8, 0, PAGE_SIZE);
+    ptr::write_bytes(phys_to_virt(page1) as *mut u8, 0, PAGE_SIZE);
+    ptr::write_bytes(phys_to_virt(page2) as *mut u8, 0, PAGE_SIZE);
 
     // Layout within page1:
     //   [0x000..0x400) = Command List (1 KB)
@@ -274,7 +276,7 @@ unsafe fn init_port(base: *mut u8, port: usize) -> Result<(), &'static str> {
 
 /// Build a Register Host-to-Device FIS for a read or write command.
 unsafe fn build_cmd_fis(ct_base: usize, command: u8, lba: u64, count: u16, write: bool) {
-    let ct = ct_base as *mut CommandTable;
+    let ct = phys_to_virt(ct_base) as *mut CommandTable;
     let cfis = (*ct).cfis.as_mut_ptr();
 
     // FIS type: Register H2D
@@ -338,7 +340,7 @@ unsafe fn exec_dma(
     build_cmd_fis(mem.ct_base, command, lba, sector_count as u16, write);
 
     // Setup PRD (Physical Region Descriptor) in Command Table
-    let ct = mem.ct_base as *mut CommandTable;
+    let ct = phys_to_virt(mem.ct_base) as *mut CommandTable;
     (*ct).prdt[0].dba = data_phys as u32;
     (*ct).prdt[0].dbau = (data_phys >> 32) as u32;
     (*ct).prdt[0].dbc = (data_len - 1) as u32; // DBC = actual count - 1
@@ -346,7 +348,7 @@ unsafe fn exec_dma(
     (*ct).prdt[0]._rsvd = 0;
 
     // Setup Command Header
-    let ch = mem.clb_base as *mut CommandHeader;
+    let ch = phys_to_virt(mem.clb_base) as *mut CommandHeader;
     // dw0: bit 5 = write, bit 0 = prefetch, PRDTL in bits [15:8] shifted → actually bits [7:0] = CFL, bits [15:8] = PRDTL
     // CFL = FIS length in DWORDs = 5 (20 bytes / 4)
     let cfl: u32 = 5; // Register H2D FIS is 20 bytes = 5 DWORDs
@@ -493,7 +495,11 @@ pub fn read_block(block_id: usize, buf: &mut [u8]) -> Result<(), &'static str> {
         )?;
 
         // Copy from DMA buffer to caller's buffer
-        ptr::copy_nonoverlapping(mem.data_base as *const u8, buf.as_mut_ptr(), SECTOR_SIZE);
+        ptr::copy_nonoverlapping(
+            phys_to_virt(mem.data_base) as *const u8,
+            buf.as_mut_ptr(),
+            SECTOR_SIZE,
+        );
     }
 
     Ok(())
@@ -516,7 +522,11 @@ pub fn write_block(block_id: usize, buf: &[u8]) -> Result<(), &'static str> {
 
     unsafe {
         // Copy caller's data to DMA buffer
-        ptr::copy_nonoverlapping(buf.as_ptr(), mem.data_base as *mut u8, SECTOR_SIZE);
+        ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            phys_to_virt(mem.data_base) as *mut u8,
+            SECTOR_SIZE,
+        );
 
         exec_dma(
             cmd,
@@ -550,7 +560,7 @@ pub fn flush_cache() -> Result<(), &'static str> {
         build_cmd_fis(mem.ct_base, cmd, 0, 0, false);
 
         // Setup Command Header — no PRD entries (PRDTL=0), no data transfer
-        let ch = mem.clb_base as *mut CommandHeader;
+        let ch = phys_to_virt(mem.clb_base) as *mut CommandHeader;
         let cfl: u32 = 5; // FIS length in DWORDs
         (*ch).dw0 = cfl & 0x1F; // No write bit, no PRDTL
         (*ch).dw1 = 0;

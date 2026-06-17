@@ -269,39 +269,13 @@ pub(crate) fn user_read_u8(addr: usize) -> u8 {
         return unsafe { core::ptr::read_volatile(addr as *const u8) };
     }
 
-    // Kernel CR3 active (int 0x80 path) and addr is in low identity-mapped range
-    // (e.g., test buffers on kernel stack). Direct read works.
-    if addr < crate::process::USER_CODE_LIMIT {
-        // Fall through to CR3 switch below for user addresses < USER_CODE_LIMIT
-        // that are NOT identity mapped under kernel CR3
-    }
-
-    // Kernel CR3 active (int 0x80 path): switch to user CR3, read, switch back
-    let user_cr3 = user_cr3_phys;
-    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
-    let rflags: u64;
-    let byte: u8;
-    unsafe {
-        core::arch::asm!(
-            "pushfq",
-            "pop {}",
-            "cli",
-            out(reg) rflags
-        );
-        core::arch::asm!(
-            "mov cr3, {user_cr3}",
-            "mov {byte}, byte ptr [{addr}]",
-            "mov cr3, {kernel_cr3}",
-            user_cr3 = in(reg) user_cr3,
-            kernel_cr3 = in(reg) kernel_cr3,
-            addr = in(reg) addr,
-            byte = lateout(reg_byte) byte,
-            options(nostack)
-        );
-        if (rflags & 0x200) != 0 {
-            core::arch::asm!("sti", options(nomem, nostack));
-        }
-    }
+    // Kernel CR3 active (int 0x80 path): switch to user CR3, read, switch back.
+    // The kernel identity mapping maps user VAs to wrong physical frames,
+    // so we MUST switch to user CR3 for correct reads.
+    let mut byte: u8 = 0;
+    crate::arch::trap::with_user_cr3(|| {
+        byte = unsafe { core::ptr::read_volatile(addr as *const u8) };
+    });
     byte
 }
 
@@ -353,14 +327,12 @@ unsafe fn user_write_u8_mapped(addr: usize, byte: u8) {
     unsafe {
         core::arch::asm!(
             "pushfq",
-            "pop {}",
+            "pop {rflags}",
             "cli",
-            out(reg) rflags
-        );
-        core::arch::asm!(
             "mov cr3, {user_cr3}",
             "mov byte ptr [{addr}], {byte}",
             "mov cr3, {kernel_cr3}",
+            rflags = out(reg) rflags,
             user_cr3 = in(reg) user_cr3,
             kernel_cr3 = in(reg) kernel_cr3,
             addr = in(reg) addr,
@@ -512,7 +484,11 @@ fn ensure_user_write_pages(addr: usize, len: usize) -> bool {
                         None => return false,
                     };
                     unsafe {
-                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                        core::ptr::write_bytes(
+                            crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                            0,
+                            page_size,
+                        );
                     }
                     crate::mm::vmm::map(user_pt, page, frame, flags);
                 }
@@ -2315,7 +2291,11 @@ fn sys_brk(addr: usize) -> isize {
                         None => return,
                     };
                     unsafe {
-                        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                        core::ptr::write_bytes(
+                            crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                            0,
+                            page_size,
+                        );
                     }
                     crate::mm::vmm::map(user_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
                 }
@@ -2337,7 +2317,11 @@ fn sys_brk(addr: usize) -> isize {
                     None => return ERR_NOMEM,
                 };
                 unsafe {
-                    core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+                    core::ptr::write_bytes(
+                        crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                        0,
+                        page_size,
+                    );
                 }
                 crate::mm::vmm::map(user_pt, vaddr, frame, crate::mm::vmm::PTEFlags::URW);
             }
@@ -2896,7 +2880,13 @@ fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
                     };
                     if needs_alloc {
                         if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                            unsafe { core::ptr::write_bytes(frame as *mut u8, 0, page_size) };
+                            unsafe {
+                                core::ptr::write_bytes(
+                                    crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                                    0,
+                                    page_size,
+                                )
+                            };
                             crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
                         }
                         // If alloc_frame fails, silently skip — PF will retry on access
@@ -2912,7 +2902,13 @@ fn linux_madvise(addr: usize, len: usize, advice: usize) -> isize {
                 while vaddr < end {
                     if crate::mm::vmm::translate_user(user_pt, vaddr).is_none() {
                         if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                            unsafe { core::ptr::write_bytes(frame as *mut u8, 0, page_size) };
+                            unsafe {
+                                core::ptr::write_bytes(
+                                    crate::mm::vmm::phys_to_virt(frame) as *mut u8,
+                                    0,
+                                    page_size,
+                                )
+                            };
                             crate::mm::vmm::map(user_pt, vaddr, frame, pte_flags);
                         }
                     }
@@ -4833,8 +4829,8 @@ fn copy_user_pages_x86(
             let new_frame = crate::mm::pmm::alloc_frame().ok_or(ERR_NOMEM)?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    old_frame as *const u8,
-                    new_frame as *mut u8,
+                    crate::mm::vmm::phys_to_virt(old_frame) as *const u8,
+                    crate::mm::vmm::phys_to_virt(new_frame) as *mut u8,
                     crate::mm::pmm::page_size(),
                 );
             }
@@ -4854,12 +4850,17 @@ fn copy_user_pages_x86(
                 existing.ppn()
             } else {
                 let child = crate::mm::vmm::PageTable::zeroed();
-                let ppn = (child as *const crate::mm::vmm::PageTable as usize) >> 12;
+                let ppn = crate::mm::vmm::virt_to_phys(
+                    child as *const crate::mm::vmm::PageTable as usize,
+                ) >> 12;
                 dst.set_entry(idx, crate::mm::vmm::PTE::new_nonleaf(ppn));
                 ppn
             }
         };
-        let dst_child = unsafe { &mut *((dst_child_ppn << 12) as *mut crate::mm::vmm::PageTable) };
+        let dst_child = unsafe {
+            &mut *((crate::mm::vmm::phys_to_virt(dst_child_ppn << 12))
+                as *mut crate::mm::vmm::PageTable)
+        };
         if copy_user_pages_x86(dst_child, src_child, level - 1)? {
             copied_any = true;
         }
@@ -4920,8 +4921,8 @@ fn sys_fork() -> isize {
                 // Copy frame contents
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        old_frame as *const u8,
-                        new_frame as *mut u8,
+                        crate::mm::vmm::phys_to_virt(old_frame) as *const u8,
+                        crate::mm::vmm::phys_to_virt(new_frame) as *mut u8,
                         page_size,
                     );
                 }
@@ -4932,7 +4933,8 @@ fn sys_fork() -> isize {
         }
     }
 
-    let page_table_ppn = (user_pt as *const crate::mm::vmm::PageTable as usize) >> 12;
+    let page_table_ppn =
+        crate::mm::vmm::virt_to_phys(user_pt as *const crate::mm::vmm::PageTable as usize) >> 12;
     let child_pid = crate::process::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     // Clone VMA state from parent to child address space

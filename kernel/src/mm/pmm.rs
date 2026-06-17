@@ -3,9 +3,6 @@
 use spin::Mutex;
 
 const PAGE_SIZE: usize = 4096;
-#[cfg(target_arch = "x86_64")]
-const WATCH_FRAME: usize = 0x45ff000;
-
 #[cfg(target_arch = "riscv64")]
 const MEMORY_START: usize = 0x8020_0000;
 
@@ -37,6 +34,8 @@ struct FrameAllocator {
 impl FrameAllocator {
     fn new() -> Self {
         let kernel_end = unsafe { &_ekernel as *const u8 as usize };
+        #[cfg(target_arch = "x86_64")]
+        let kernel_end = crate::platform::x86_64::virt_to_phys(kernel_end);
         let start = (kernel_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1); // Align up
         #[cfg(target_arch = "riscv64")]
         let mem_size = MEMORY_SIZE;
@@ -54,8 +53,16 @@ impl FrameAllocator {
         let managed_start = (bitmap_start + bitmap_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let managed_frames = (end - managed_start) / PAGE_SIZE;
 
+        // On x86_64 high-half kernel, access the bitmap via the direct map
+        // (phys_to_virt).  The bitmap is at a physical address that may be
+        // above the identity-mapped range, so we MUST use phys_to_virt.
+        #[cfg(target_arch = "x86_64")]
+        let bitmap_vaddr = crate::mm::vmm::phys_to_virt(bitmap_start);
+        #[cfg(not(target_arch = "x86_64"))]
+        let bitmap_vaddr = bitmap_start;
+
         let bitmap =
-            unsafe { core::slice::from_raw_parts_mut(bitmap_start as *mut u64, bitmap_words) };
+            unsafe { core::slice::from_raw_parts_mut(bitmap_vaddr as *mut u64, bitmap_words) };
 
         // Clear the bitmap — all frames start as free
         for word in bitmap.iter_mut() {
@@ -101,10 +108,6 @@ impl FrameAllocator {
                 self.bitmap[word] |= 1u64 << bit;
                 self.next_free = i + 1;
                 let addr = self.start + i * PAGE_SIZE;
-                #[cfg(target_arch = "x86_64")]
-                if addr == WATCH_FRAME {
-                    crate::console_println!("[PMM-WATCH] alloc frame={:#x} idx={}", addr, i);
-                }
                 return Some(addr);
             }
         }
@@ -116,10 +119,6 @@ impl FrameAllocator {
                 self.bitmap[word] |= 1u64 << bit;
                 self.next_free = i + 1;
                 let addr = self.start + i * PAGE_SIZE;
-                #[cfg(target_arch = "x86_64")]
-                if addr == WATCH_FRAME {
-                    crate::console_println!("[PMM-WATCH] alloc-wrap frame={:#x} idx={}", addr, i);
-                }
                 return Some(addr);
             }
         }
@@ -152,15 +151,6 @@ impl FrameAllocator {
                     }
                     self.next_free = run_start + count;
                     let addr = self.start + run_start * PAGE_SIZE;
-                    #[cfg(target_arch = "x86_64")]
-                    if addr <= WATCH_FRAME && WATCH_FRAME < addr + count * PAGE_SIZE {
-                        crate::console_println!(
-                            "[PMM-WATCH] alloc-contig start={:#x} count={} idx={}",
-                            addr,
-                            count,
-                            run_start
-                        );
-                    }
                     return Some(addr);
                 }
             } else {
@@ -173,10 +163,6 @@ impl FrameAllocator {
     fn dealloc(&mut self, frame: usize) {
         let idx = (frame - self.start) / PAGE_SIZE;
         if idx < self.total_frames {
-            #[cfg(target_arch = "x86_64")]
-            if frame == WATCH_FRAME {
-                crate::console_println!("[PMM-WATCH] dealloc frame={:#x} idx={}", frame, idx);
-            }
             let word = idx / 64;
             let bit = idx % 64;
             self.bitmap[word] &= !(1u64 << bit);
@@ -209,6 +195,26 @@ pub fn init_with_size(mem_size: usize) {
         available_mb,
         mem_size / 1024 / 1024
     );
+}
+
+/// Track frame allocation to detect double-mapping bugs.
+/// Returns (alloc_count, used_count, next_free).
+pub fn stats() -> (usize, usize, usize) {
+    let alloc = FRAME_ALLOCATOR.lock();
+    match alloc.as_ref() {
+        Some(alloc) => {
+            let mut used = 0;
+            for i in 0..alloc.total_frames {
+                let word = i / 64;
+                let bit = i % 64;
+                if alloc.bitmap[word] & (1u64 << bit) != 0 {
+                    used += 1;
+                }
+            }
+            (alloc.total_frames, used, alloc.next_free)
+        }
+        None => (0, 0, 0),
+    }
 }
 
 /// Return the total physical memory size (end address).

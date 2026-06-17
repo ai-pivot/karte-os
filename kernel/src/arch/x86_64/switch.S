@@ -69,26 +69,11 @@ __switch:
     # Recover original RSP (the value before alignment was applied)
     mov rsp, [rsp + 512]
 
-    # Debug: validate return address before restoring
-    # Kernel code region (may grow, keep range generous)
-    mov rax, [rsp + 48]    # return address is at orig_rsp + 48
-    cmp rax, 0x100000
-    jb .Lswitch_bad_ret
-    cmp rax, 0x400000
-    jae .Lswitch_bad_ret
-    jmp .Lswitch_restore_ok
-.Lswitch_bad_ret:
-    # Invalid return address! Print BADSW to VGA and halt
-    mov rsi, [rsp + 48]    # bad return address
-    mov rdi, rsp            # orig_rsp
-    mov byte ptr [0xB8000], 'B'
-    mov byte ptr [0xB8002], 'A'
-    mov byte ptr [0xB8004], 'D'
-    mov byte ptr [0xB8006], 'S'
-    mov byte ptr [0xB8008], 'W'
-    cli
-    hlt
-.Lswitch_restore_ok:
+    # High-half kernel: all code addresses are in the upper canonical half
+    # (0xFFFF_FFFF_8000_0000+). No range check needed — the return address
+    # is always valid because it was set by build_initial_stack or the call
+    # instruction. The old [1MB, 4MB) range check was for the identity-mapped
+    # kernel and is obsolete.
 
     # Restore callee-saved registers
     pop r15

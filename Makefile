@@ -40,7 +40,7 @@ KERNEL_X86   := target/$(TARGET_X86)/release/karte-os-kernel
 ISO_DIR      := target/x86_64-iso
 ISO_FILE     := target/karte-os-x86_64.iso
 QEMU_X86_FLAGS := \
-  -machine pc -cpu qemu64 -m 128M -smp 1 \
+  -machine pc -cpu qemu64 -m 512M -smp 1 \
   -cdrom $(ISO_FILE) -serial stdio -display none -no-reboot \
   -drive file=disk.img,format=raw,if=none,id=hd0 \
   -device ich9-ahci,id=ahci \

@@ -38,7 +38,7 @@ pub const KERNEL_STACK_PAGES: usize = 8; // 32 KB kernel stack
 #[cfg(target_arch = "x86_64")]
 const CET_TRANSITION_STACK_PAGE: usize = 0xffff_ffff_ffff_f000;
 #[cfg(target_arch = "x86_64")]
-pub const KERNEL_STACK_VIRT_BASE: usize = 0xffff_8000_0000_0000;
+pub const KERNEL_STACK_VIRT_BASE: usize = crate::platform::x86_64::DIRECT_MAP_BASE;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn kernel_stack_top_from_phys_base(phys_base: usize) -> usize {
@@ -219,84 +219,34 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Copy kernel's identity map (2MB huge pages at PD level with PS=1)
-        // to the user page table. This establishes identity-mapped access to
-        // all physical memory using 2MB huge pages, avoiding the 4KB-PTE
-        // bootstrapping problem (where PT tables created at high physical
-        // addresses aren't yet identity-mapped themselves).
+        // ── Share the kernel's direct-map PML4[256] with the user page table ──
         //
-        // Each kernel PD table is copied independently: we create a new PD
-        // table, clone kernel PD entries, and add USER bit. This keeps kernel
-        // and user page tables fully isolated (no shared tables).
+        // The direct map covers ALL physical memory at DIRECT_MAP_BASE + phys.
+        // This gives the kernel full access to RAM when the user CR3 is active
+        // (during trap entry, page table walks, ELF loading, etc.).
+        //
+        // User code CANNOT access these mappings because all leaf PTEs in the
+        // direct map lack the USER bit.  Ring 3 accesses to upper-half
+        // canonical addresses that lack USER generate a page fault, not #GP.
+        //
+        // User ELF segments live in PML4[0..256] (lower canonical half), so
+        // they can NEVER overlap or corrupt the direct map in PML4[256].
+        // This is the fundamental fix for the IDT/kernel-data corruption bug.
         let kernel_pt = vmm::get_kernel_page_table();
-        let ke = kernel_pt.entries[0];
-        if ke.is_valid() {
-            let kernel_pdp = unsafe { &mut *((ke.ppn() << 12) as *mut vmm::PageTable) };
-            let user_pml4 = &mut user_pt.entries[0];
-            let user_pdp_ppn = if user_pml4.is_valid() {
-                user_pml4.ppn()
-            } else {
-                let new_pdp = vmm::PageTable::zeroed();
-                let ppn = (new_pdp as *const vmm::PageTable as usize) >> 12;
-                let flags = vmm::PTEFlags::PRESENT.bits()
-                    | vmm::PTEFlags::WRITABLE.bits()
-                    | vmm::PTEFlags::USER.bits();
-                *user_pml4 = vmm::PTE(((ppn as u64) << 12) | flags);
-                ppn
-            };
-            let user_pdp = unsafe { &mut *((user_pdp_ppn << 12) as *mut vmm::PageTable) };
-            let user_flag = vmm::PTEFlags::USER.bits();
-            // CRITICAL: Only copy PDP entries that point to PD tables (PS=0).
-            // Skip 1GB huge page entries (PS=1) — these are MMIO ranges
-            // (LAPIC at 0xFEE00000, etc.) which must NOT be user-accessible.
-            const PS_BIT: u64 = 0x80;
-            for i in 0..512 {
-                let kpe = kernel_pdp.entries[i];
-                // Skip non-present and 1GB huge pages (PS=1)
-                if !kpe.is_valid() || (kpe.0 & PS_BIT) != 0 {
-                    continue;
-                }
-                if user_pdp.entries[i].is_valid() {
-                    continue;
-                }
-                let kernel_pd = unsafe { &mut *((kpe.ppn() << 12) as *mut vmm::PageTable) };
-                let new_pd = vmm::PageTable::zeroed();
-                let new_pd_ppn = (new_pd as *const vmm::PageTable as usize) >> 12;
-                for j in 0..512 {
-                    let pd_entry = kernel_pd.entries[j];
-                    if pd_entry.is_valid() {
-                        // Leaf kernel/identity mappings must remain supervisor-only.
-                        // Non-leaf entries need USER so Ring 3 page walks can reach
-                        // user leaves that we install later in the same subtree.
-                        let copied = if pd_entry.flags().contains(vmm::PTEFlags::PS) {
-                            pd_entry.0 & !user_flag
-                        } else {
-                            pd_entry.0 | user_flag
-                        };
-                        new_pd.entries[j] = vmm::PTE(copied);
-                    }
-                }
-                let pd_flags = vmm::PTEFlags::PRESENT.bits()
-                    | vmm::PTEFlags::WRITABLE.bits()
-                    | vmm::PTEFlags::USER.bits();
-                user_pdp.entries[i] = vmm::PTE(((new_pd_ppn as u64) << 12) | pd_flags);
-            }
-        }
+        user_pt.entries[511] = kernel_pt.entries[511];
 
-        // Map VGA text buffer at 0xB8000 (needed for console_putchar in trap path)
+        // Map VGA text buffer at identity address (console_putchar during trap handling).
         vmm::map(user_pt, 0xB8000, 0xB8000, vmm::PTEFlags::KRW);
         vmm::map(user_pt, 0xB9000, 0xB9000, vmm::PTEFlags::KRW);
-        // NOTE: LAPIC (0xFEE00000), IOAPIC (0xFEC00000), PCI MMIO are NOT
-        // mapped into user page tables. Kernel accesses them via with_kernel_cr3().
+        // Identity-map MMIO regions for device access during trap handling
+        // (Timer ISR EOI to LAPIC at 0xFEE00000, IOAPIC, PCI BARs, etc.).
+        // These high physical addresses don't overlap user ELF segments.
+        vmm::identity_map_2mb(user_pt, 0xFE000000, 0xFF000000, vmm::PTEFlags::KRW);
 
-        // Map kernel stack pages into user page table.
-        map_kernel_stack_pages(user_pt, kernel_stack_top);
+        // Kernel stack pages are already covered by the shared direct map
+        // (DIRECT_MAP_BASE + phys). No explicit mapping needed.
 
-        // Some x86_64 emulators/CPUs can perform a CET/shadow-stack transition
-        // access while the user CR3 is already active but before Ring 3 code
-        // runs. Keep the canonical top shadow-stack page mapped supervisor-only
-        // in every user page table. User mode cannot access it because the leaf
-        // PTE intentionally lacks the USER bit.
+        // CET transition page: map supervisor-only at canonical top.
         if vmm::translate_user(user_pt, CET_TRANSITION_STACK_PAGE).is_none() {
             let transition_frame =
                 pmm::alloc_frame().expect("Out of memory for CET transition page");
@@ -421,7 +371,7 @@ where
     let frame = pmm::alloc_frame().ok_or("Out of memory for ELF invariant repair")?;
     vmm::map_user(user_pt, page_addr, frame, flags);
     unsafe {
-        core::ptr::write_bytes(frame as *mut u8, 0, page_size);
+        core::ptr::write_bytes(vmm::phys_to_virt(frame) as *mut u8, 0, page_size);
     }
 
     for seg_idx in 0..elf_info.num_segments {
@@ -453,7 +403,7 @@ where
         unsafe {
             core::ptr::copy_nonoverlapping(
                 tmp_buf[..len].as_ptr(),
-                (frame + dst_offset) as *mut u8,
+                (vmm::phys_to_virt(frame) + dst_offset) as *mut u8,
                 len,
             );
         }
@@ -569,32 +519,7 @@ impl Process {
         // pages, and sfence.vma in the PF handler clears Go's lr/sc reservations.
         vmm::set_all_ad_bits(user_pt);
 
-        // 4.5 Switch to kernel CR3 for ELF loading.
-        // The ELF loader writes frame data via identity-mapped physical addresses
-        // (e.g., `write_bytes(frame as *mut u8, 0, 4096)`). This requires a stable
-        // identity mapping. But as vmm::map() splits 2MB huge pages in the user
-        // page table, the identity mapping can become fragmented/corrupted. Running
-        // on the kernel CR3 (which has a complete, untampered identity mapping)
-        // ensures all physical frame writes go to the correct destination.
-        let saved_cr3: u64;
-        #[cfg(target_arch = "x86_64")]
-        {
-            saved_cr3 = {
-                let cr3: u64;
-                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
-                cr3
-            };
-            let kcr3 = crate::mm::vmm::kernel_cr3() as u64;
-            if kcr3 != 0 {
-                unsafe { core::arch::asm!("mov cr3, {}", in(reg) kcr3) };
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            saved_cr3 = 0;
-        }
-
-        // 5. Load ELF segments into user page table. map() will split any
+        // 5. Load ELF segments into user page table.
         // 2MB huge pages (PS=1) that overlap with ELF segment addresses.
         let mut max_vaddr = 0usize;
         for segment in &elf.loadable_segments {
@@ -606,29 +531,17 @@ impl Process {
             let pte_flags = elf_segment_pte_flags(segment.flags);
 
             for vaddr in (page_start..page_end).step_by(page_size) {
-                // Always allocate a fresh frame for ELF segments.
-                // Do NOT reuse identity-mapped frames (from copy_kernel_mappings).
                 let frame = if let Some(f) = vmm::translate_user(user_pt, vaddr) {
-                    if f == vaddr {
-                        // Identity mapping — allocate new frame instead
-                        let new_f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
-                        vmm::map_user(user_pt, vaddr, new_f, pte_flags);
-                        unsafe {
-                            core::ptr::write_bytes(new_f as *mut u8, 0, page_size);
-                        }
-                        new_f
-                    } else {
-                        // Multiple PT_LOAD segments may share one page. Keep
-                        // the physical frame and merge page-level permissions.
-                        let merged_flags = merge_page_flags(user_pt, vaddr, pte_flags);
-                        vmm::map_user(user_pt, vaddr, f, merged_flags);
-                        f
-                    }
+                    // Multiple PT_LOAD segments may share one page. Keep
+                    // the physical frame and merge page-level permissions.
+                    let merged_flags = merge_page_flags(user_pt, vaddr, pte_flags);
+                    vmm::map_user(user_pt, vaddr, f, merged_flags);
+                    f
                 } else {
                     let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
                     vmm::map_user(user_pt, vaddr, f, pte_flags);
                     unsafe {
-                        core::ptr::write_bytes(f as *mut u8, 0, page_size);
+                        core::ptr::write_bytes(vmm::phys_to_virt(f) as *mut u8, 0, page_size);
                     }
                     f
                 };
@@ -645,7 +558,7 @@ impl Process {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             seg_data[src_offset..src_offset + len].as_ptr(),
-                            (frame + dst_offset) as *mut u8,
+                            (vmm::phys_to_virt(frame) + dst_offset) as *mut u8,
                             len,
                         );
                     }
@@ -659,12 +572,6 @@ impl Process {
             if segment.vaddr + segment.mem_size > max_vaddr {
                 max_vaddr = segment.vaddr + segment.mem_size;
             }
-        }
-
-        // 5.5 Restore CR3 after ELF segment loading.
-        #[cfg(target_arch = "x86_64")]
-        if saved_cr3 != 0 {
-            unsafe { core::arch::asm!("mov cr3, {}", in(reg) saved_cr3) };
         }
 
         // 6. Map user stack in user page table (URW, no execute)
@@ -690,12 +597,12 @@ impl Process {
 
         unsafe fn write_u64_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u64) {
             if let Some(frame) = vmm::translate_user(user_pt, addr) {
-                core::ptr::write_volatile(frame as *mut u64, val);
+                core::ptr::write_volatile(vmm::phys_to_virt(frame) as *mut u64, val);
             }
         }
         unsafe fn write_byte_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u8) {
             if let Some(frame) = vmm::translate_user(user_pt, addr) {
-                core::ptr::write_volatile(frame as *mut u8, val);
+                core::ptr::write_volatile(vmm::phys_to_virt(frame) as *mut u8, val);
             }
         }
         let random_addr = stack_top - 16;
@@ -828,7 +735,7 @@ impl Process {
         let initial_rsp = metadata_start;
 
         // 7. Store page_table_root as PPN and initialize per-root VMA state
-        let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
+        let page_table_ppn = vmm::virt_to_phys(user_pt as *const vmm::PageTable as usize) >> 12;
         crate::mm::vma::init_root(page_table_ppn);
 
         // 8. Set up initial brk (after loaded segments, aligned to page)
@@ -910,31 +817,6 @@ impl Process {
         // 4. Copy kernel mappings + set A/D bits
         copy_kernel_mappings(user_pt, kernel_stack_top);
         vmm::set_all_ad_bits(user_pt);
-
-        // Switch to kernel CR3 for ELF loading AND disable interrupts.
-        // Timer ISR fires during ELF loading reads IDT via user CR3,
-        // but user CR3 is mid-update (IDT page overwritten by ELF data)
-        // → triple fault. Disabling interrupts prevents this.
-        let saved_cr3: u64;
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Disable interrupts for the entire ELF loading
-            unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
-            saved_cr3 = {
-                let cr3: u64;
-                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
-                cr3
-            };
-            let kcr3 = crate::mm::vmm::kernel_cr3() as u64;
-            if kcr3 != 0 {
-                unsafe { core::arch::asm!("mov cr3, {}", in(reg) kcr3) };
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            saved_cr3 = 0;
-        }
-
         // 5. Load ELF segments
         let mut max_vaddr = 0usize;
         let mut total_pages: usize = 0;
@@ -965,36 +847,18 @@ impl Process {
             elf_segments_vma.push((page_start, page_end, seg_prot));
 
             for vaddr in (page_start..page_end).step_by(page_size) {
-                // Always allocate a fresh frame for ELF segments.
-                // Do NOT reuse identity-mapped frames (from copy_kernel_mappings),
-                // as their physical addresses may collide with critical structures
-                // like the current CR3 page table root.
                 let frame = if let Some(f) = vmm::translate_user(user_pt, vaddr) {
-                    // Check if this is an identity mapping (vaddr == paddr).
-                    // Identity-mapped pages come from copy_kernel_mappings and
-                    // their frames should NOT be reused for ELF segments — they
-                    // contain page table structures or other critical data.
-                    if f == vaddr {
-                        // Allocate a new frame and overwrite the identity mapping
-                        let new_f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
-                        vmm::map_user(user_pt, vaddr, new_f, pte_flags);
-                        unsafe {
-                            core::ptr::write_bytes(new_f as *mut u8, 0, page_size);
-                        }
-                        new_f
-                    } else {
-                        // Non-identity mapping from a previous segment — reuse it
-                        let merged_flags = merge_page_flags(user_pt, vaddr, pte_flags);
-                        vmm::map_user(user_pt, vaddr, f, merged_flags);
-                        f
-                    }
+                    // Non-identity mapping from a previous segment — reuse it
+                    let merged_flags = merge_page_flags(user_pt, vaddr, pte_flags);
+                    vmm::map_user(user_pt, vaddr, f, merged_flags);
+                    f
                 } else {
                     // No mapping exists — allocate a new frame
                     let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
                     vmm::map_user(user_pt, vaddr, f, pte_flags);
                     // Zero-fill the entire frame
                     unsafe {
-                        core::ptr::write_bytes(f as *mut u8, 0, page_size);
+                        core::ptr::write_bytes(vmm::phys_to_virt(f) as *mut u8, 0, page_size);
                     }
                     f
                 };
@@ -1023,7 +887,7 @@ impl Process {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             tmp_buf[..len].as_ptr(),
-                            (frame + dst_offset) as *mut u8,
+                            (vmm::phys_to_virt(frame) + dst_offset) as *mut u8,
                             len,
                         );
                     }
@@ -1049,7 +913,7 @@ impl Process {
 
         // 5.05 Register ELF segments as VMA entries. We need page_table_ppn
         //      which we compute here (before step 8 where it's stored in Process).
-        let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
+        let page_table_ppn = vmm::virt_to_phys(user_pt as *const vmm::PageTable as usize) >> 12;
 
         // 5.1 Register ELF segments as VMA entries to prevent mmap from
         // allocating addresses that overlap with loaded ELF data.
@@ -1061,16 +925,6 @@ impl Process {
         }
         if max_vaddr > 0 {
             crate::mm::vma::ensure_mmap_above(page_table_ppn, max_vaddr);
-        }
-
-        // 5.5 Restore CR3 and re-enable interrupts.
-        // IDT is at a high address (relocated in idt::init), so no IDT fix needed.
-        #[cfg(target_arch = "x86_64")]
-        {
-            if saved_cr3 != 0 {
-                unsafe { core::arch::asm!("mov cr3, {}", in(reg) saved_cr3) };
-            }
-            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
         }
 
         // 6. Stack mapping is done below (after initial stack data computation)
@@ -1121,12 +975,12 @@ impl Process {
         // Helper to write u64 to user stack via physical address (translate_user)
         unsafe fn write_u64_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u64) {
             if let Some(frame) = vmm::translate_user(user_pt, addr) {
-                core::ptr::write_volatile(frame as *mut u64, val);
+                core::ptr::write_volatile(vmm::phys_to_virt(frame) as *mut u64, val);
             }
         }
         unsafe fn write_byte_to_user(user_pt: &mut vmm::PageTable, addr: usize, val: u8) {
             if let Some(frame) = vmm::translate_user(user_pt, addr) {
-                core::ptr::write_volatile(frame as *mut u8, val);
+                core::ptr::write_volatile(vmm::phys_to_virt(frame) as *mut u8, val);
             }
         }
 
@@ -1258,7 +1112,7 @@ impl Process {
         }
 
         // 8. Store page_table_root as PPN
-        let page_table_ppn = (user_pt as *const vmm::PageTable as usize) >> 12;
+        let page_table_ppn = vmm::virt_to_phys(user_pt as *const vmm::PageTable as usize) >> 12;
         // NOTE: init_root was already called in step 5.05 before ELF VMA registration.
 
         // 9. Set up initial brk (after loaded segments, aligned to page)
@@ -1328,7 +1182,7 @@ pub fn get_trap_ctx_ptr() -> usize {
 
 /// Get a mutable reference to the user page table from its PPN
 pub fn get_user_page_table(ppn: usize) -> &'static mut vmm::PageTable {
-    unsafe { &mut *((ppn << 12) as *mut vmm::PageTable) }
+    unsafe { &mut *((vmm::phys_to_virt(ppn << 12)) as *mut vmm::PageTable) }
 }
 
 // ─── Global process table ─────────────────────────────────────────

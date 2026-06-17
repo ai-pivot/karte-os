@@ -113,7 +113,7 @@ impl PteChain {
             (addr >> (12 + 9 * level)) & 0x1FF
         }
 
-        let root_table = unsafe { &mut *(root as *mut PageTable) };
+        let root_table = unsafe { &mut *(crate::mm::vmm::phys_to_virt(root) as *mut PageTable) };
         let pml4_idx = vpn(vaddr, 3);
         let pml4e = root_table.entries[pml4_idx].0;
 
@@ -153,7 +153,10 @@ impl PteChain {
             };
         }
 
-        let pd = unsafe { &mut *((pdp.entries[pdp_idx].ppn() << 12) as *mut PageTable) };
+        let pd = unsafe {
+            &mut *((crate::mm::vmm::phys_to_virt(pdp.entries[pdp_idx].ppn() << 12))
+                as *mut PageTable)
+        };
         let pd_idx = vpn(vaddr, 1);
         let pde = pd.entries[pd_idx].0;
 
@@ -178,7 +181,9 @@ impl PteChain {
             };
         }
 
-        let pt = unsafe { &mut *((pd.entries[pd_idx].ppn() << 12) as *mut PageTable) };
+        let pt = unsafe {
+            &mut *((crate::mm::vmm::phys_to_virt(pd.entries[pd_idx].ppn() << 12)) as *mut PageTable)
+        };
         let pt_idx = vpn(vaddr, 0);
         let pte = pt.entries[pt_idx].0;
 

@@ -118,7 +118,7 @@ pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
         // Phase 1: shared kernel page table (no separate per-process PT yet)
         crate::mm::vmm::get_kernel_page_table()
     } else {
-        unsafe { &mut *((ppn << 12) as *mut crate::mm::vmm::PageTable) }
+        unsafe { &mut *((crate::mm::vmm::phys_to_virt(ppn << 12)) as *mut crate::mm::vmm::PageTable) }
     }
 }
 

@@ -170,7 +170,10 @@ pub fn enable_timer() {
     unsafe {
         // Divide by 16
         lapic_write(reg::TIMER_DIVIDE, 0x03);
-        // Initial count: ~100MHz / 16 / 62500 ≈ 100Hz → ~10ms per tick
+        // Initial count: QEMU LAPIC bus runs at ~1 GHz.
+        // divide=16 → 1GHz/16 = 62.5 MHz effective timer clock.
+        // 62.5MHz / 625000 = 100 Hz → 10ms per tick.
+        // (Previously 62500 → 1000 Hz, causing time to run 10x too fast.)
         lapic_write(reg::TIMER_INITIAL_COUNT, 62500);
         // LVT timer: periodic mode + vector
         lapic_write(

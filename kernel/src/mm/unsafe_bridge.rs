@@ -22,7 +22,7 @@ use crate::mm::vmm::PageTable;
 /// 3. The frame is not freed while the reference is held
 #[inline(always)]
 pub unsafe fn frame_to_page_table_mut(frame_addr: PhysAddr) -> &'static mut PageTable {
-    &mut *(frame_addr.as_usize() as *mut PageTable)
+    &mut *(crate::mm::vmm::phys_to_virt(frame_addr.as_usize()) as *mut PageTable)
 }
 
 /// Convert a physical frame address to a page table reference (read-only).
@@ -33,7 +33,7 @@ pub unsafe fn frame_to_page_table_mut(frame_addr: PhysAddr) -> &'static mut Page
 /// 2. The frame is not freed while the reference is held
 #[inline(always)]
 pub unsafe fn frame_to_page_table(frame_addr: PhysAddr) -> &'static PageTable {
-    &*(frame_addr.as_usize() as *const PageTable)
+    &*(crate::mm::vmm::phys_to_virt(frame_addr.as_usize()) as *const PageTable)
 }
 
 /// Write to a user-space virtual address under user CR3 (x86_64).

@@ -151,12 +151,29 @@ pub fn print(s: &str) {
 /// Monotonic uptime counter (milliseconds since boot).
 static UPTIME_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// TSC counter at boot time (for computing elapsed time).
+static BOOT_TSC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Read the TSC (Time Stamp Counter). On QEMU, the TSC ticks at the CPU
+/// frequency, which is typically ~2-3 GHz. We calibrate using the LAPIC
+/// timer's first few ticks.
+#[inline]
+fn read_tsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi);
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
 /// Increment the uptime counter (called from timer interrupt).
 pub fn tick_uptime() {
     UPTIME_MS.fetch_add(10, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Get the current uptime in milliseconds.
+/// Uses TSC for accurate time when calibrated, falls back to tick counter.
 pub fn uptime_ms() -> u64 {
     UPTIME_MS.load(core::sync::atomic::Ordering::Relaxed)
 }

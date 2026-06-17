@@ -421,7 +421,9 @@ pub fn get_current_user_pt() -> &'static mut crate::mm::vmm::PageTable {
     if ppn == 0 {
         crate::mm::vmm::get_kernel_page_table()
     } else {
-        unsafe { &mut *((ppn << 12) as *mut crate::mm::vmm::PageTable) }
+        unsafe {
+            &mut *((crate::mm::vmm::phys_to_virt(ppn << 12)) as *mut crate::mm::vmm::PageTable)
+        }
     }
 }
 
@@ -517,7 +519,9 @@ pub fn get_user_pt_safe() -> &'static mut crate::mm::vmm::PageTable {
     if ppn == 0 {
         crate::mm::vmm::get_kernel_page_table()
     } else {
-        unsafe { &mut *((ppn << 12) as *mut crate::mm::vmm::PageTable) }
+        unsafe {
+            &mut *((crate::mm::vmm::phys_to_virt(ppn << 12)) as *mut crate::mm::vmm::PageTable)
+        }
     }
 }
 

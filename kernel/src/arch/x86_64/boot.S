@@ -1,16 +1,31 @@
-# boot.S — Multiboot2 boot entry for x86_64 KarteOS
+# boot.S — Multiboot2 boot entry for x86_64 KarteOS (high-half kernel)
 #
-# GRUB loads us in 32-bit protected mode with paging ENABLED.
-# We disable paging, set up identity mapping, enable long mode, and jump to 64-bit.
+# GRUB loads us in 32-bit protected mode with paging ENABLED at physical 1 MB.
+# We disable GRUB's paging, set up our own page tables with BOTH identity mapping
+# (low 4 GB) and a high-half direct map (DIRECT_MAP_BASE + phys), enable long mode,
+# and jump to 64-bit code at the identity address.  Once in 64-bit mode we set up
+# the stack and then jump to kmain at its high-half VMA.
 #
-# Page table layout:
-#   P4[0] → P3 → P2 (2MB pages, identity map 0..128MB for kernel + MMIO fallback)
-#   P4[511] → P3_mmio → P2_mmio (map 0xFEE00000 area for LAPIC)
-#   All mapped with 2MB huge pages for simplicity.
+# DIRECT_MAP_BASE = 0xFFFF_FFFF_8000_0000 → PML4[511], PDP[510].
+#
+# Page table layout (boot):
+#   PML4[0]   → PDP_identity:
+#     PDP[0]    → PD (2 MB pages, phys 0..512 MB)
+#     PDP[1..3] = 1 GB pages (phys 1..4 GB)
+#   PML4[511] → PDP_high:
+#     PDP[510]  → same PD (2 MB pages, maps DIRECT_MAP_BASE+0..512MB → 0..512MB)
+#     PDP[511]  = 1 GB page (maps DIRECT_MAP_BASE+1GB..2GB → 1GB..2GB)
 
 .set MULTIBOOT2_MAGIC, 0xE85250D6
 .set MULTIBOOT2_ARCH,  0
 .set MULTIBOOT2_HDR_SIZE, 24
+
+# PML4 index for the direct map: DIRECT_MAP_BASE = 0xFFFF_FFFF_8000_0000 → PML4[511]
+.set DIRECT_MAP_PML4_IDX, 511
+
+# PDP index within PML4[511]:
+#   0xFFFF_FFFF_8000_0000 >> 30 = 0x3FFFFFFFE, & 0x1FF = 0x1FE = 510
+.set DIRECT_MAP_PDP_IDX, 510
 
 .section .multiboot2, "a"
 .balign 8
@@ -25,9 +40,10 @@ multiboot2_header:
 
 .section .data.boot, "aw", @progbits
 .balign 4096
-boot_p4_table:  .fill 4096, 1, 0
-boot_p3_table:  .fill 4096, 1, 0
-boot_p2_table:  .fill 4096, 1, 0
+boot_p4_table:  .fill 4096, 1, 0     # PML4
+boot_p3_table:  .fill 4096, 1, 0     # PDP for PML4[0]   (identity)
+boot_p3_high:   .fill 4096, 1, 0     # PDP for PML4[511] (direct map)
+boot_p2_table:  .fill 4096, 1, 0     # PD shared by both PDPs (2 MB pages 0..1 GB)
 boot_stack:     .fill 4096 * 16, 1, 0
 boot_stack_top:
 .balign 4
@@ -57,8 +73,10 @@ _start:
     cli
     debug_char S
 
-    movl %eax, %edi
-    movl %ebx, %esi
+    # Save multiboot2 magic and info pointer to fixed low memory addresses
+    # (safe area below the boot page tables at 0x10000)
+    movl %eax, 0x8000
+    movl %ebx, 0x8004
 
     # ── Disable GRUB's paging ──
     movl %cr0, %eax
@@ -67,31 +85,49 @@ _start:
     xorl %eax, %eax
     movl %eax, %cr3
 
-    # ── Get PC ──
+    # ── Get PC (for PC-relative addressing in 32-bit mode) ──
     call .Lget_pc
 .Lget_pc:
     popl %ebp
 
-    # ── Set up identity-mapped page tables (0..128MB) ──
-    # P4[0] → P3
+    # ════════════════════════════════════════════════════════════
+    # Set up boot page tables: identity map + direct map
+    # ════════════════════════════════════════════════════════════
+
+    # ── PML4[0] → boot_p3_table (identity) ──
     leal boot_p3_table - .Lget_pc(%ebp), %ecx
+    orl $0x03, %ecx              # PRESENT | WRITABLE
+    leal boot_p4_table - .Lget_pc(%ebp), %eax
+    movl %ecx, 0(%eax)           # PML4[0]
+    movl $0, 4(%eax)
+
+    # ── PML4[511] → boot_p3_high (direct map) ──
+    leal boot_p3_high - .Lget_pc(%ebp), %ecx
     orl $0x03, %ecx
     leal boot_p4_table - .Lget_pc(%ebp), %eax
-    movl %ecx, (%eax)
+    movl %ecx, (DIRECT_MAP_PML4_IDX * 8)(%eax)   # PML4[511]
+    movl $0, (DIRECT_MAP_PML4_IDX * 8 + 4)(%eax)
 
-    # P3[0] → P2
+    # ── PDP_identity[0] → boot_p2_table (2 MB pages) ──
     leal boot_p2_table - .Lget_pc(%ebp), %ecx
     orl $0x03, %ecx
     leal boot_p3_table - .Lget_pc(%ebp), %eax
-    movl %ecx, (%eax)
+    movl %ecx, 0(%eax)           # PDP_identity[0]
+    movl $0, 4(%eax)
 
-    # P2: 256 × 2MB huge pages covering 0..512MB
+    # ── PDP_high[510] → boot_p2_table (SAME PD, shared) ──
+    # PDP_high is at index 510 (0x1FE) because DIRECT_MAP_BASE maps to PDP[510].
+    leal boot_p3_high - .Lget_pc(%ebp), %eax
+    movl %ecx, (DIRECT_MAP_PDP_IDX * 8)(%eax)    # PDP_high[510]
+    movl $0, (DIRECT_MAP_PDP_IDX * 8 + 4)(%eax)
+
+    # ── PD: 256 × 2 MB huge pages covering 0..512 MB ──
     leal boot_p2_table - .Lget_pc(%ebp), %edi
     movl $0, %ecx
     movl $256, %edx
 .fill_loop:
     movl %ecx, %eax
-    orl $0x00000083, %eax
+    orl $0x00000083, %eax        # PRESENT | WRITABLE | PS (huge)
     movl %eax, (%edi)
     movl $0, 4(%edi)
     addl $0x200000, %ecx
@@ -99,44 +135,42 @@ _start:
     decl %edx
     jnz .fill_loop
 
-    # Also map P3[508..511] → same P2 entries to cover high MMIO area
-    # LAPIC is at 0xFEE00000 = P4[510], P3[508..511], P2 offset
-    # For simplicity, use 1GB page at P3[508] to map 0xFC0000000..0xFFFFFFFFF
-    # But this is > 4GB physical which we don't have.
-    # Instead, map P4[510] → P3 with 1:1 identity for MMIO range
-    # Actually LAPIC 0xFEE00000 is at physical < 4GB, it's virtual 0xFEE00000 = P4[0] area.
-    # 0xFEE00000 / 512GB = 0 → already covered by P4[0] → P3[0] → P2
-    # Wait, 0xFEE00000 = 4,275,898,880 bytes = ~3.98GB
-    # P4[0] covers 0..512GB, P3[0] covers 0..1GB. We need P3 entries for 1..4GB range.
-    # Let's fill ALL 512 P3 entries (each covering 1GB via 512 P2 entries)
-    # Actually, let's just fill P3 entries 1..3 with 1GB pages:
+    # ── PDP_identity[1..3] and PDP_high[511]: 1 GB pages ──
+    # Identity: PDP_identity[1..3] map phys 1..4 GB at identity addresses
+    # Direct:   PDP_high[511] maps phys 1..2 GB at DIRECT_MAP_BASE+1GB
 
-    # P3[1] = 1GB page at 1GB (0x40000000), present + writable + huge (1GB)
-    leal boot_p3_table - .Lget_pc(%ebp), %edi
-    movl $0x40000083, 8(%edi)       # P3[1]: 1GB at 1GB, PS=1
+    leal boot_p3_table - .Lget_pc(%ebp), %edi    # identity PDP
+
+    # PDP_identity[1] = 1 GB page at 1 GB (0x40000000)
+    movl $0x40000083, 8(%edi)        # PS=1, PRESENT, WRITABLE
     movl $0, 12(%edi)
 
-    # P3[2] = 1GB page at 2GB
+    # PDP_identity[2] = 1 GB page at 2 GB (0x80000000)
     movl $0x80000083, 16(%edi)
     movl $0, 20(%edi)
 
-    # P3[3] = 1GB page at 3GB (covers LAPIC at 0xFEE00000)
+    # PDP_identity[3] = 1 GB page at 3 GB (0xC0000000, covers LAPIC at 0xFEE00000)
     movl $0xC0000083, 24(%edi)
     movl $0, 28(%edi)
 
+    # PDP_high[511] = 1 GB page at 1 GB
+    leal boot_p3_high - .Lget_pc(%ebp), %esi     # high PDP
+    movl $0x40000083, (511 * 8)(%esi)
+    movl $0, (511 * 8 + 4)(%esi)
+
     debug_char P
 
-    # ── Enable PAE, OSFXSR (SSE), OSXMMEXCPT (SIMD exceptions) ──
+    # ── Enable PAE, OSFXSR, OSXMMEXCPT ──
     movl %cr4, %eax
     orl $((1 << 5) | (1 << 9) | (1 << 10)), %eax
-    andl $~(1 << 23), %eax             # CET disabled (no user shadow stacks yet)
+    andl $~(1 << 23), %eax             # CET disabled
     movl %eax, %cr4
 
     # ── Load CR3 ──
     leal boot_p4_table - .Lget_pc(%ebp), %eax
     movl %eax, %cr3
 
-    # ── Enable long mode ──
+    # ── Enable long mode (EFER.LME) ──
     movl $0xC0000080, %ecx
     rdmsr
     orl $(1 << 8), %eax
@@ -151,13 +185,13 @@ _start:
 
     debug_char G
 
-    # ── Enable paging + clear CR0.EM/TS, set CR0.MP for SSE ──
+    # ── Enable paging + clear CR0.EM/TS, set CR0.MP ──
     movl %cr0, %eax
     orl $((1 << 31) | (1 << 0) | (1 << 1)), %eax   # PG | PE | MP
     andl $~((1 << 2) | (1 << 3)), %eax               # clear EM, TS
     movl %eax, %cr0
 
-    # ── Far jump to 64-bit code ──
+    # ── Far jump to 64-bit code (at identity address) ──
     leal _start64 - .Lget_pc(%ebp), %eax
     leal far_ptr - .Lget_pc(%ebp), %edi
     movl %eax, (%edi)
@@ -191,17 +225,26 @@ _start64:
     movb $'K', %al
     outb %al, %dx
 
+    # Set up boot stack (in .data.boot at identity address, within RIP range)
     lea boot_stack_top(%rip), %rsp
 
-    # Pass multiboot2 info to kmain:
-    #   EDI = multiboot2 magic (from %eax at _start)
-    #   ESI = multiboot2 info physical address (from %ebx at _start)
-    # Clear upper 32 bits to ensure valid 64-bit values.
+    # Load multiboot2 magic and info pointer from fixed low memory
+    movl 0x8000, %edi
+    movl 0x8004, %esi
+    # Clean upper 32 bits
     movl %edi, %edi
     movl %esi, %esi
 
-    call kmain
+    # ── Jump to kmain at its high-half VMA ──
+    movabs $kmain, %rax
+    call *%rax
 
+    # kmain should never return, but just in case:
+    cli
+1:  hlt
+    jmp 1b
+
+    # kmain should never return, but just in case:
     cli
 1:  hlt
     jmp 1b

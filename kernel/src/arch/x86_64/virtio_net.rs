@@ -4,6 +4,7 @@
 //! QEMU 8.2+ defaults to modern mode; older versions use legacy.
 //! Provides `init_net_device()`, `send_raw()`, `recv_raw()`.
 
+use crate::mm::vmm::virt_to_phys;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -96,26 +97,49 @@ impl QueueMem {
 
     /// Physical address of the descriptor table
     fn desc_phys(&self) -> u64 {
-        core::ptr::addr_of!(self.desc[0]) as u64
+        virt_to_phys(core::ptr::addr_of!(self.desc[0]) as usize) as u64
     }
     fn avail_phys(&self) -> u64 {
-        core::ptr::addr_of!(self.avail_buf[0]) as u64
+        virt_to_phys(core::ptr::addr_of!(self.avail_buf[0]) as usize) as u64
     }
     fn used_phys(&self) -> u64 {
-        core::ptr::addr_of!(self.used_buf[0]) as u64
+        virt_to_phys(core::ptr::addr_of!(self.used_buf[0]) as usize) as u64
     }
 }
 
-static mut RX_QUEUE: QueueMem = QueueMem::zeroed();
-static mut TX_QUEUE: QueueMem = QueueMem::zeroed();
 static TX_NEXT_DESC: AtomicU16 = AtomicU16::new(0);
 static RX_LAST_SEEN_USED: AtomicU16 = AtomicU16::new(0);
 
+// QueueMem is too large for static placement (~388KB each).
+// Allocate from PMM and store the pointer.
+static mut RX_QUEUE_PTR: usize = 0;
+static mut TX_QUEUE_PTR: usize = 0;
+
 unsafe fn rx_queue() -> &'static mut QueueMem {
-    core::ptr::addr_of_mut!(RX_QUEUE).as_mut().unwrap()
+    if RX_QUEUE_PTR == 0 {
+        let frames_needed = (core::mem::size_of::<QueueMem>() + 4095) / 4096;
+        let phys = crate::mm::pmm::alloc_contiguous_frames(frames_needed)
+            .expect("OOM for VirtIO net RX queue");
+        let virt = crate::mm::vmm::phys_to_virt(phys);
+        unsafe {
+            core::ptr::write_bytes(virt as *mut u8, 0, core::mem::size_of::<QueueMem>());
+        }
+        RX_QUEUE_PTR = virt;
+    }
+    unsafe { &mut *(RX_QUEUE_PTR as *mut QueueMem) }
 }
 unsafe fn tx_queue() -> &'static mut QueueMem {
-    core::ptr::addr_of_mut!(TX_QUEUE).as_mut().unwrap()
+    if TX_QUEUE_PTR == 0 {
+        let frames_needed = (core::mem::size_of::<QueueMem>() + 4095) / 4096;
+        let phys = crate::mm::pmm::alloc_contiguous_frames(frames_needed)
+            .expect("OOM for VirtIO net TX queue");
+        let virt = crate::mm::vmm::phys_to_virt(phys);
+        unsafe {
+            core::ptr::write_bytes(virt as *mut u8, 0, core::mem::size_of::<QueueMem>());
+        }
+        TX_QUEUE_PTR = virt;
+    }
+    unsafe { &mut *(TX_QUEUE_PTR as *mut QueueMem) }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -389,6 +413,42 @@ fn init_modern(bus: u8, dev: u8, func: u8, caps: &[VirtioCap]) -> Result<[u8; 6]
             0,
             rx,
         );
+
+        // Prime the RX queue: add ALL descriptors to the avail ring so the
+        // device can deliver incoming packets into them. Each descriptor points
+        // to a PHYSICAL address in the data pool (VirtIO DMA requires phys).
+        {
+            let mem = rx_queue();
+            for i in 0..QUEUE_SIZE {
+                let buf_offset = i * NET_MAX_PACKET_SIZE;
+                mem.desc[i] = VringDesc {
+                    addr: virt_to_phys(core::ptr::addr_of!(mem.data[buf_offset]) as usize) as u64,
+                    len: NET_MAX_PACKET_SIZE as u32,
+                    flags: VRING_DESC_F_WRITE, // device-writable
+                    next: 0,
+                };
+                let avail = mem.avail_buf.as_mut_ptr();
+                let avail_idx = core::ptr::read_volatile(avail.add(2) as *const u16);
+                let slot = (avail_idx as usize) % QUEUE_SIZE;
+                let ring = avail.add(4) as *mut u16;
+                core::ptr::write_volatile(ring.add(slot), i as u16);
+                core::ptr::write_volatile(avail.add(2) as *mut u16, avail_idx.wrapping_add(1));
+            }
+
+            // Notify the device that RX buffers are available.
+            // Without this kick, the device never delivers packets.
+            let notify_off = mmio_r16((common_base + COMMON_QUEUE_NOTIFY_OFF) as u64);
+            let notify_addr =
+                notify_base + (notify_off as usize) * (notify.notify_off_multiplier as usize);
+            // Write queue index 0 (RX) to the notify address
+            mmio_w16(notify_addr as u64, 0);
+            crate::console_println!(
+                "[virtio-net] RX queue primed with {} buffers, notified at {:#x}",
+                QUEUE_SIZE,
+                notify_addr
+            );
+        }
+
         let tx = tx_queue();
         setup_modern_queue(
             common_base,
@@ -594,7 +654,7 @@ unsafe fn prepare_rx() {
 
     for i in 0..QUEUE_SIZE {
         let buf_offset = i * NET_MAX_PACKET_SIZE;
-        let buf_addr = core::ptr::addr_of!(mem.data[buf_offset]) as u64;
+        let buf_addr = virt_to_phys(core::ptr::addr_of!(mem.data[buf_offset]) as usize) as u64;
         mem.desc[i] = VringDesc {
             addr: buf_addr,
             len: NET_MAX_PACKET_SIZE as u32,
@@ -666,7 +726,7 @@ pub fn send_raw(data: &[u8]) {
         );
 
         mem.desc[desc_id] = VringDesc {
-            addr: core::ptr::addr_of!(mem.data[buf_offset]) as u64,
+            addr: virt_to_phys(core::ptr::addr_of!(mem.data[buf_offset]) as usize) as u64,
             len: total as u32,
             flags: 0,
             next: 0,
@@ -734,8 +794,8 @@ pub fn recv_raw(buf: &mut [u8]) -> Option<usize> {
 
         RX_LAST_SEEN_USED.store(last_seen.wrapping_add(1), Ordering::Release);
 
-        // Re-queue descriptor
-        let buf_addr = &mem.data[buf_offset] as *const _ as u64;
+        // Re-queue descriptor with PHYSICAL address (VirtIO DMA needs phys)
+        let buf_addr = virt_to_phys(&mem.data[buf_offset] as *const _ as usize) as u64;
         mem.desc[desc_id] = VringDesc {
             addr: buf_addr,
             len: NET_MAX_PACKET_SIZE as u32,

@@ -76,10 +76,21 @@ pub fn init() {
         .max(2048) // minimum 8MB
         .min(16384); // maximum 64MB
 
-    let heap_start = pmm::alloc_contiguous_frames(heap_pages)
+    let heap_start_phys = pmm::alloc_contiguous_frames(heap_pages)
         .expect("Failed to allocate contiguous heap memory");
 
     let heap_size = heap_pages * pmm::page_size();
+
+    // Use phys_to_virt so heap allocations are accessible under BOTH kernel CR3
+    // (identity mapping) and user CR3 (direct map via shared PML4[511]).
+    // Without this, any code inside with_user_cr3() that touches heap data
+    // (Vec, String, etc.) would page-fault because the user page table has no
+    // identity mapping of low RAM.
+    #[cfg(target_arch = "x86_64")]
+    let heap_start = crate::mm::vmm::phys_to_virt(heap_start_phys);
+    #[cfg(not(target_arch = "x86_64"))]
+    let heap_start = heap_start_phys;
+
     unsafe {
         HEAP_START = heap_start;
         HEAP_SIZE = heap_size;

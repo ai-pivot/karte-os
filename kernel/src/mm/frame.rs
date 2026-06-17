@@ -101,7 +101,7 @@ impl PageTableFrame {
     /// The caller must ensure no aliasing mutable references exist.
     #[inline]
     pub unsafe fn as_page_table_mut(&self) -> &'static mut crate::mm::vmm::PageTable {
-        &mut *(self.addr.as_usize() as *mut crate::mm::vmm::PageTable)
+        &mut *(crate::mm::vmm::phys_to_virt(self.addr.as_usize()) as *mut crate::mm::vmm::PageTable)
     }
 }
 

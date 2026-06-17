@@ -71,6 +71,39 @@ bitflags! {
     }
 }
 
+// ─── Physical ↔ Virtual address conversion ──────────────────────────────
+//
+// On x86_64 the kernel runs in the higher half: all physical memory is
+// direct-mapped at DIRECT_MAP_BASE.  Page-table code must convert physical
+// addresses (returned by pmm::alloc_frame or stored in PTEs) to virtual
+// addresses before dereferencing them.
+//
+// On RISC-V the kernel uses identity mapping so the conversion is a no-op.
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn phys_to_virt(paddr: usize) -> usize {
+    crate::platform::x86_64::phys_to_virt(paddr)
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub const fn phys_to_virt(paddr: usize) -> usize {
+    paddr
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn virt_to_phys(vaddr: usize) -> usize {
+    crate::platform::x86_64::virt_to_phys(vaddr)
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub const fn virt_to_phys(vaddr: usize) -> usize {
+    vaddr
+}
+
 const PAGE_SIZE: usize = 4096;
 
 /// x86_64 non-leaf page table entry flags: Present + Writable + User.
@@ -160,7 +193,7 @@ pub struct PageTable {
 impl PageTable {
     pub fn zeroed() -> &'static mut Self {
         let frame = pmm::alloc_frame().expect("VMM: no frames for page table");
-        let table = unsafe { &mut *(frame as *mut Self) };
+        let table = unsafe { &mut *(phys_to_virt(frame) as *mut Self) };
         for entry in table.entries.iter_mut() {
             *entry = PTE(0);
         }
@@ -196,7 +229,7 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
 
         if !entry.is_valid() {
             let new_table = PageTable::zeroed();
-            let ppn = (new_table as *const PageTable as usize) >> 12;
+            let ppn = virt_to_phys(new_table as *const PageTable as usize) >> 12;
 
             #[cfg(target_arch = "riscv64")]
             {
@@ -219,7 +252,7 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
             //   level 2 (PD) splits to level 1 (PT) → 4KB sub-pages
             let sub_page_size = if level == 3 { 1 << 21 } else { 1 << 12 };
             let new_table = PageTable::zeroed();
-            let new_ppn = (new_table as *const PageTable as usize) >> 12;
+            let new_ppn = virt_to_phys(new_table as *const PageTable as usize) >> 12;
             for i in 0..512 {
                 let sub_paddr = huge_paddr + i * sub_page_size;
                 let sub_flags: u64 = if sub_page_size > 4096 {
@@ -238,7 +271,7 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
             // FLUSH TLB for this entry so the split takes effect immediately
             crate::arch::trap::flush_tlb_addr(vaddr);
             // Continue traversal into the new table
-            table = unsafe { &mut *((new_ppn << 12) as *mut PageTable) };
+            table = unsafe { &mut *(phys_to_virt(new_ppn << 12) as *mut PageTable) };
             if sub_page_size == PAGE_SIZE {
                 // Splitting a 2MB PD leaf produces a PT that already contains
                 // 4KB leaf entries. Stop here so the level-0 mapping code below
@@ -262,7 +295,7 @@ pub fn map(root: &mut PageTable, vaddr: usize, paddr: usize, flags: PTEFlags) {
             );
             return;
         }
-        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+        table = unsafe { &mut *(phys_to_virt(ppn << 12) as *mut PageTable) };
 
         // x86_64: ensure non-leaf entries have User bit for Ring 3 page walks.
         // identity_map_skip creates entries without User bit; we must add it
@@ -334,38 +367,70 @@ pub fn identity_map_skip(root: &mut PageTable, start: usize, end: usize, flags: 
     );
 }
 
-/// Identity map using 2MB huge pages (x86_64 only).
-/// Uses P2-level entries with PS=1 to cover 2MB per entry, avoiding page table alloc overhead.
+/// Map a range of physical memory using 2MB huge pages.
+///
+/// `vaddr_offset` is added to the physical address to obtain the virtual address:
+///   `vaddr = paddr + vaddr_offset`
+///
+/// When `vaddr_offset == 0`, this is identity mapping.
+/// When `vaddr_offset == DIRECT_MAP_BASE`, this is the kernel direct map.
 #[cfg(target_arch = "x86_64")]
-pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: PTEFlags) {
+fn map_2mb_internal(
+    root: &mut PageTable,
+    phys_start: usize,
+    phys_end: usize,
+    flags: PTEFlags,
+    vaddr_offset: usize,
+) {
     const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
-    let start_aligned = start & !(HUGE_PAGE_SIZE - 1);
-    let end_aligned = (end + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
+    let start_aligned = phys_start & !(HUGE_PAGE_SIZE - 1);
+    let end_aligned = (phys_end + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
 
-    let mut addr = start_aligned;
-    while addr < end_aligned {
-        let p4_idx = PageTable::vpn(addr, 3);
+    let mut paddr = start_aligned;
+    while paddr < end_aligned {
+        let vaddr = paddr + vaddr_offset;
+        let p4_idx = PageTable::vpn(vaddr, 3);
         if !root.entries[p4_idx].is_valid() {
             let new_p3 = PageTable::zeroed();
-            let ppn = (new_p3 as *const PageTable as usize) >> 12;
+            let ppn = virt_to_phys(new_p3 as *const PageTable as usize) >> 12;
             root.entries[p4_idx] = PTE::new_nonleaf(ppn);
         }
 
-        let p3 = unsafe { &mut *((root.entries[p4_idx].ppn() << 12) as *mut PageTable) };
-        let p3_idx = PageTable::vpn(addr, 2);
+        let p3 =
+            unsafe { &mut *(phys_to_virt(root.entries[p4_idx].ppn() << 12) as *mut PageTable) };
+        let p3_idx = PageTable::vpn(vaddr, 2);
         if !p3.entries[p3_idx].is_valid() {
             let new_p2 = PageTable::zeroed();
-            let ppn = (new_p2 as *const PageTable as usize) >> 12;
+            let ppn = virt_to_phys(new_p2 as *const PageTable as usize) >> 12;
             p3.entries[p3_idx] = PTE::new_nonleaf(ppn);
         }
 
-        let p2 = unsafe { &mut *((p3.entries[p3_idx].ppn() << 12) as *mut PageTable) };
-        let vpn = PageTable::vpn(addr, 1);
-        let ppn = addr >> 12;
+        let p2 = unsafe { &mut *(phys_to_virt(p3.entries[p3_idx].ppn() << 12) as *mut PageTable) };
+        let vpn = PageTable::vpn(vaddr, 1);
+        let ppn = paddr >> 12;
         let huge_flags = flags.bits() | PTEFlags::PS.bits();
         p2.entries[vpn] = PTE(((ppn as u64) << 12) | huge_flags);
-        addr += HUGE_PAGE_SIZE;
+        paddr += HUGE_PAGE_SIZE;
     }
+}
+
+/// Identity map using 2MB huge pages (x86_64 only).
+#[cfg(target_arch = "x86_64")]
+pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: PTEFlags) {
+    map_2mb_internal(root, start, end, flags, 0);
+}
+
+/// Direct map physical memory at `DIRECT_MAP_BASE + phys` using 2MB huge pages.
+/// This is the kernel's primary mechanism for accessing all physical memory.
+#[cfg(target_arch = "x86_64")]
+pub fn direct_map_2mb(root: &mut PageTable, phys_start: usize, phys_end: usize, flags: PTEFlags) {
+    map_2mb_internal(
+        root,
+        phys_start,
+        phys_end,
+        flags,
+        crate::platform::x86_64::DIRECT_MAP_BASE,
+    );
 }
 
 /// RISC-V fallback: no 2MB huge pages, delegate to regular identity_map.
@@ -389,12 +454,12 @@ pub fn get_kernel_page_table() -> &'static mut PageTable {
 
 /// Get the physical address of the kernel page table root (for CR3 loading).
 pub fn kernel_cr3() -> u64 {
-    unsafe { (KERNEL_PAGE_TABLE as *const PageTable as u64) }
+    unsafe { (virt_to_phys(KERNEL_PAGE_TABLE as usize) as u64) }
 }
 
 pub fn init() {
     let root = PageTable::zeroed();
-    let root_addr = root as *const PageTable as usize;
+    let root_addr = virt_to_phys(root as *const PageTable as usize);
 
     unsafe {
         KERNEL_PAGE_TABLE = root;
@@ -423,9 +488,17 @@ pub fn init() {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Map all PMM-managed physical memory for kernel access.
-        identity_map_2mb(root, 0x0, pmm::total_memory(), PTEFlags::KRWX);
-        // Map MMIO regions via 2MB pages (AHCI, LAPIC, IOAPIC, etc.)
+        // Direct-map all physical memory at DIRECT_MAP_BASE (PML4[511]).
+        // This is the kernel's primary access path to all RAM.  User memory
+        // is accessed via phys_to_virt() (direct map), NOT via identity mapping,
+        // to avoid aliasing with user virtual addresses.
+        direct_map_2mb(root, 0x0, pmm::total_memory(), PTEFlags::KRWX);
+        // Identity-map low memory for boot stack and legacy device access.
+        // The boot stack is at identity address ~1 MB; this mapping keeps it
+        // alive after CR3 switch.  User memory is NEVER accessed via this
+        // identity mapping — all user buffer access goes through phys_to_virt().
+        identity_map_2mb(root, 0x0, 0x20000000, PTEFlags::KRWX);
+        // Identity-map MMIO regions (device drivers use identity addresses).
         identity_map_2mb(root, 0xFE000000, 0xFF000000, PTEFlags::KRW);
     }
 
@@ -484,7 +557,7 @@ fn walk_to_pt(root: &mut PageTable, vaddr: usize) -> Option<(&mut PageTable, usi
         if ppn == 0 {
             return None;
         }
-        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+        table = unsafe { &mut *(phys_to_virt(ppn << 12) as *mut PageTable) };
     }
     Some((table, PageTable::vpn(vaddr, 0)))
 }
@@ -512,7 +585,7 @@ pub fn translate_user(root: &mut PageTable, vaddr: usize) -> Option<usize> {
         if ppn == 0 {
             return None;
         }
-        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+        table = unsafe { &mut *(phys_to_virt(ppn << 12) as *mut PageTable) };
     }
     // Leaf level (PT)
     let vpn = PageTable::vpn(vaddr, 0);
@@ -555,7 +628,7 @@ pub fn walk_mapping(root: &mut PageTable, vaddr: usize) -> super::page_table::Wa
         if ppn == 0 {
             return WalkResult::Invalid;
         }
-        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+        table = unsafe { &mut *(phys_to_virt(ppn << 12) as *mut PageTable) };
     }
     // Leaf level (PT)
     let vpn = PageTable::vpn(vaddr, 0);
@@ -638,7 +711,7 @@ pub fn mprotect_user(root: &mut PageTable, vaddr: usize, flags: PTEFlags) -> boo
         if ppn == 0 {
             return false;
         }
-        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+        table = unsafe { &mut *(phys_to_virt(ppn << 12) as *mut PageTable) };
     }
     let vpn = PageTable::vpn(vaddr, 0);
     let entry = table.entries[vpn];
@@ -674,7 +747,7 @@ pub fn or_pte_flags(root: &mut PageTable, vaddr: usize, add_flags: PTEFlags) -> 
         if ppn == 0 {
             return false;
         }
-        table = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+        table = unsafe { &mut *(phys_to_virt(ppn << 12) as *mut PageTable) };
     }
     let vpn = PageTable::vpn(vaddr, 0);
     let entry = table.entries[vpn];
@@ -704,7 +777,7 @@ pub fn set_all_ad_bits(root: &mut PageTable) {
                 // Non-leaf PTE: recurse into next level
                 let ppn = entry.ppn();
                 if ppn != 0 {
-                    let next = unsafe { &mut *((ppn << 12) as *mut PageTable) };
+                    let next = unsafe { &mut *(phys_to_virt(ppn << 12) as *mut PageTable) };
                     walk(next, level - 1);
                 }
             }
@@ -714,7 +787,7 @@ pub fn set_all_ad_bits(root: &mut PageTable) {
 }
 
 pub fn free_user_page_table(root_ppn: usize) {
-    let root = unsafe { &mut *((root_ppn << 12) as *mut PageTable) };
+    let root = unsafe { &mut *(phys_to_virt(root_ppn << 12) as *mut PageTable) };
 
     fn free_level(table: &mut PageTable, level: usize) {
         for i in 0..512 {
@@ -728,7 +801,7 @@ pub fn free_user_page_table(root_ppn: usize) {
             let is_huge = entry.flags().contains(PTEFlags::PS);
 
             if level > 1 && !is_huge {
-                let child = unsafe { &mut *((entry.ppn() << 12) as *mut PageTable) };
+                let child = unsafe { &mut *(phys_to_virt(entry.ppn() << 12) as *mut PageTable) };
                 free_level(child, level - 1);
                 pmm::dealloc_frame(entry.ppn() << 12);
             } else if level == 1 {
@@ -754,7 +827,7 @@ pub fn run_tests() {
 
     crate::test::run_test("vmm_create_page_table", || {
         let pt = PageTable::zeroed();
-        let addr = pt as *const PageTable as usize;
+        let addr = virt_to_phys(pt as *const PageTable as usize);
         addr % 4096 == 0
     });
 
