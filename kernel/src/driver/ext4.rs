@@ -140,6 +140,39 @@ impl Ext4BlockDevice for KarteBlockDevice {
         let base_sector = offset / SECTOR_SIZE;
         let skip = offset % SECTOR_SIZE;
 
+        // Try to read all 8 sectors from cache first (single lock acquisition)
+        let mut all_cached = true;
+        let mut sector_data: [[u8; SECTOR_SIZE]; 8] = [[0u8; SECTOR_SIZE]; 8];
+        {
+            let cache = SECTOR_CACHE.lock();
+            for i in 0..8usize {
+                let abs_sector = base_sector + i;
+                match cache.get(abs_sector) {
+                    Some(cached) => sector_data[i] = *cached,
+                    None => {
+                        all_cached = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if all_cached {
+            // Fast path: all sectors were in cache
+            let mut buf_pos = 0;
+            for i in 0..8usize {
+                let src_start = if i == 0 { skip } else { 0 };
+                let remaining = BLOCK_SIZE - buf_pos;
+                let copy_len = core::cmp::min(SECTOR_SIZE - src_start, remaining);
+                buf[buf_pos..buf_pos + copy_len]
+                    .copy_from_slice(&sector_data[i][src_start..src_start + copy_len]);
+                buf_pos += copy_len;
+            }
+            READ_COUNT.fetch_add(1, Ordering::Relaxed);
+            return buf;
+        }
+
+        // Slow path: read sectors individually with cache check per sector
         let mut buf_pos = 0;
         let mut sector_idx = 0;
         while buf_pos < BLOCK_SIZE {
@@ -158,22 +191,17 @@ impl Ext4BlockDevice for KarteBlockDevice {
                 drop(cache);
                 let mut sector = [0u8; SECTOR_SIZE];
                 if (self.read_sector_fn)(abs_sector, &mut sector).is_err() {
-                    crate::console_println!(
-                        "[read_offset] DISK READ FAIL sector={} offset={:#x}",
-                        abs_sector,
-                        offset
-                    );
                     break;
                 }
                 buf[buf_pos..buf_pos + copy_len]
                     .copy_from_slice(&sector[src_start..src_start + copy_len]);
-                // Populate cache on disk read miss so subsequent writes see
-                // the latest data without a redundant disk read.
+                // Populate cache on disk read miss
                 SECTOR_CACHE.lock().insert(abs_sector, sector);
             }
             buf_pos += copy_len;
             sector_idx += 1;
         }
+        READ_COUNT.fetch_add(1, Ordering::Relaxed);
         buf
     }
 
