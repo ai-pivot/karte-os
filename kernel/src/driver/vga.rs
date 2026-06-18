@@ -100,6 +100,11 @@ static mut BLINK: bool = false;
 static mut FAINT: bool = false; // Dim (mapped to darker fg)
 static mut CONCEALED: bool = false; // Hidden text
 
+/// Scroll region (DECSTBM): lines outside [top, bottom] are not scrolled.
+/// Default: full screen (0..ROWS-1).
+static mut SCROLL_TOP: usize = 0;
+static mut SCROLL_BOTTOM: usize = ROWS - 1;
+
 /// Saved cursor position
 static mut SAVED_COL: usize = 0;
 static mut SAVED_ROW: usize = 0;
@@ -176,16 +181,43 @@ unsafe fn read_attr(col: usize, row: usize) -> u8 {
 }
 
 unsafe fn scroll_up() {
-    let src = VGA_BUFFER + COLS * 2;
-    let dst = VGA_BUFFER;
-    let len = COLS * (ROWS - 1) * 2;
-    ptr::copy(src as *const u8, dst as *mut u8, len);
+    // Respect scroll region: only scroll lines within [SCROLL_TOP, SCROLL_BOTTOM]
+    let top = SCROLL_TOP;
+    let bottom = SCROLL_BOTTOM;
+    if bottom <= top {
+        return;
+    }
+    let region_height = bottom - top + 1;
+    if region_height >= ROWS {
+        // Full-screen scroll (original behavior)
+        let src = VGA_BUFFER + COLS * 2;
+        let dst = VGA_BUFFER;
+        let len = COLS * (ROWS - 1) * 2;
+        ptr::copy(src as *const u8, dst as *mut u8, len);
 
-    let last_row = VGA_BUFFER + COLS * (ROWS - 1) * 2;
-    let attr = current_attr();
-    for col in 0..COLS {
-        ptr::write_volatile((last_row + col * 2) as *mut u8, b' ');
-        ptr::write_volatile((last_row + col * 2 + 1) as *mut u8, attr);
+        let last_row = VGA_BUFFER + COLS * (ROWS - 1) * 2;
+        let attr = current_attr();
+        for col in 0..COLS {
+            ptr::write_volatile((last_row + col * 2) as *mut u8, b' ');
+            ptr::write_volatile((last_row + col * 2 + 1) as *mut u8, attr);
+        }
+    } else {
+        // Region-only scroll: shift lines [top+1..=bottom] up by 1
+        let src_row = top + 1;
+        let dst_row = top;
+        let rows_to_copy = bottom - top;
+        let len = COLS * rows_to_copy * 2;
+        let src = VGA_BUFFER + src_row * COLS * 2;
+        let dst = VGA_BUFFER + dst_row * COLS * 2;
+        ptr::copy(src as *const u8, dst as *mut u8, len);
+
+        // Clear bottom line of the region
+        let clear_row = VGA_BUFFER + bottom * COLS * 2;
+        let attr = current_attr();
+        for col in 0..COLS {
+            ptr::write_volatile((clear_row + col * 2) as *mut u8, b' ');
+            ptr::write_volatile((clear_row + col * 2 + 1) as *mut u8, attr);
+        }
     }
 }
 
@@ -624,11 +656,23 @@ unsafe fn csi_dispatch(final_byte: u8) {
             }
         }
 
-        // ── Scroll regions (basic support) ──
+        // ── Scroll regions ──
         b'r' => {
-            // DECSTBM — Set Scrolling Region: \033[top;bottomr
-            // For now, ignore (full implementation needs scroll region tracking)
-            // TUI programs that use this (vim, less) will work in limited mode
+            // DECSTBM — Set Scrolling Region: \033[top;bottomr (1-based)
+            let top = (csi_param(0, 1) as usize).saturating_sub(1).min(ROWS - 1);
+            let bottom = if CSI_PARAM_COUNT > 1 && CSI_PARAMS[1] != 0 {
+                (CSI_PARAMS[1] as usize).min(ROWS)
+            } else {
+                ROWS
+            };
+            let bottom = bottom.saturating_sub(1).max(top);
+            if bottom > top {
+                SCROLL_TOP = top;
+                SCROLL_BOTTOM = bottom;
+                // Move cursor to home position within scroll region
+                CURSOR_ROW = top;
+                CURSOR_COL = 0;
+            }
         }
 
         // ── Insert/Delete lines ──
@@ -800,6 +844,8 @@ pub fn putchar(c: u8) {
                         BLINK = false;
                         FAINT = false;
                         CONCEALED = false;
+                        SCROLL_TOP = 0;
+                        SCROLL_BOTTOM = ROWS - 1;
                         CURSOR_VISIBLE = true;
                         PARSE_STATE = ParseState::Normal;
                     }
