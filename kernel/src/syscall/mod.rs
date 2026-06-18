@@ -865,8 +865,8 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         43 => linux_accept(args[0] as i32),                  // accept
         44 => sys_sendto(args[0] as i32, args[1], args[2], args[3], args[4], args[5]), // sendto
         45 => sys_recvfrom(args[0] as i32, args[1], args[2]), // recvfrom
-        46 => 0,                                             // sendmsg (not implemented)
-        47 => 0,                                             // recvmsg (not implemented)
+        46 => linux_sendmsg(args[0], args[1], args[2]),      // sendmsg
+        47 => linux_recvmsg(args[0], args[1], args[2]),      // recvmsg
         48 => sys_shutdown(args[0] as i32),                  // shutdown
         49 => sys_bind(args[0] as i32, args[1], args[2]),    // bind
         50 => sys_listen(args[0] as i32, args[1]),           // listen
@@ -6047,4 +6047,48 @@ fn linux_mremap(old_address: usize, _old_size: usize, new_size: usize, _flags: u
     // Go's mmap hint fallback already handles this by using the bump allocator.
     // The VMA tracking will handle page faults lazily for the new size.
     old_address as isize
+}
+
+/// Linux sendmsg(fd, msg, flags) — send data via msghdr (simplified: first iovec only)
+#[cfg(target_arch = "x86_64")]
+fn linux_sendmsg(fd: usize, msg_ptr: usize, flags: usize) -> isize {
+    if msg_ptr == 0 {
+        return ERR_FAULT;
+    }
+    // struct msghdr: msg_iov at offset 16, msg_iovlen at offset 24
+    let iov_ptr = user_read::<usize>(msg_ptr + 16);
+    let iov_len = user_read::<usize>(msg_ptr + 24);
+    if iov_len == 0 || iov_ptr == 0 {
+        return 0;
+    }
+    // Use first iovec: iov_base (8), iov_len (8)
+    let buf = user_read::<usize>(iov_ptr);
+    let len = user_read::<usize>(iov_ptr + 8);
+    if len == 0 {
+        return 0;
+    }
+    // Delegate to sendto (no destination address for connected sockets)
+    sys_sendto(fd as i32, buf, len, flags, 0, 0)
+}
+
+/// Linux recvmsg(fd, msg, flags) — receive data via msghdr (simplified: first iovec only)
+#[cfg(target_arch = "x86_64")]
+fn linux_recvmsg(fd: usize, msg_ptr: usize, _flags: usize) -> isize {
+    if msg_ptr == 0 {
+        return ERR_FAULT;
+    }
+    // struct msghdr: msg_iov at offset 16, msg_iovlen at offset 24
+    let iov_ptr = user_read::<usize>(msg_ptr + 16);
+    let iov_len = user_read::<usize>(msg_ptr + 24);
+    if iov_len == 0 || iov_ptr == 0 {
+        return 0;
+    }
+    // Use first iovec
+    let buf = user_read::<usize>(iov_ptr);
+    let len = user_read::<usize>(iov_ptr + 8);
+    if len == 0 {
+        return 0;
+    }
+    // Delegate to recvfrom
+    sys_recvfrom(fd as i32, buf, len)
 }
