@@ -77,6 +77,7 @@ enum ParseState {
     Normal,
     Escape, // Received ESC (\x1b)
     Csi,    // Received ESC [ — collecting parameters
+    Osc,    // Received ESC ] — collecting OSC string (skip until BEL/ST)
 }
 
 /// Global ANSI parser state (only accessed from putchar, single-threaded)
@@ -947,6 +948,19 @@ pub fn putchar(c: u8) {
                         // Designate G1 — same as above
                         PARSE_STATE = ParseState::Normal;
                     }
+                    b']' => {
+                        // OSC — Operating System Command
+                        // Skip until BEL (\x07) or ST (\033\\)
+                        PARSE_STATE = ParseState::Osc;
+                    }
+                    b'_' => {
+                        // APC — Application Program Command (skip until BEL/ST)
+                        PARSE_STATE = ParseState::Osc;
+                    }
+                    b'P' => {
+                        // DCS — Device Control String (skip until BEL/ST)
+                        PARSE_STATE = ParseState::Osc;
+                    }
                     _ => {
                         // Unknown escape sequence — return to normal
                         PARSE_STATE = ParseState::Normal;
@@ -988,6 +1002,24 @@ pub fn putchar(c: u8) {
                     _ => {
                         // Invalid byte in CSI — abort
                         PARSE_STATE = ParseState::Normal;
+                    }
+                }
+            }
+            ParseState::Osc => {
+                // OSC/DCS/APC string: skip everything until BEL (\x07) or ST (\033\\)
+                match c {
+                    0x07 => {
+                        // BEL — end of OSC string
+                        PARSE_STATE = ParseState::Normal;
+                    }
+                    0x1B => {
+                        // ESC — might be start of ST (\033\\)
+                        // Just go to Escape state; if next byte is \, it will be
+                        // consumed as unknown escape and return to Normal
+                        PARSE_STATE = ParseState::Escape;
+                    }
+                    _ => {
+                        // Skip all other bytes in OSC string
                     }
                 }
             }
