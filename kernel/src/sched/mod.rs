@@ -833,7 +833,8 @@ fn idle_loop() -> ! {
     loop {
         schedule();
 
-        // Use idle time to pre-zero pages for the PF handler
+        // Use idle time to pre-zero pages for the PF handler (x86_64 only)
+        #[cfg(target_arch = "x86_64")]
         crate::mm::pmm::refill_zeroed_pool();
 
         #[cfg(target_arch = "x86_64")]

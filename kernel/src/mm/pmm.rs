@@ -85,6 +85,7 @@ fn zero_frame(frame: usize) {
 
 /// Refill the zeroed page pool. Called from idle loop to pre-zero frames
 /// during otherwise-wasted CPU cycles.
+#[cfg(target_arch = "x86_64")]
 pub fn refill_zeroed_pool() {
     let mut pool = ZEROED_POOL.lock();
     while pool.count < ZEROED_POOL_SIZE {
@@ -98,6 +99,9 @@ pub fn refill_zeroed_pool() {
         }
     }
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn refill_zeroed_pool() {}
 
 struct FrameAllocator {
     start: usize,
