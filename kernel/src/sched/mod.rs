@@ -561,6 +561,10 @@ pub fn sleep_until(wake_tick: u64) {
 }
 
 pub fn tick_sleep_queue() {
+    // Fast path: skip if no sleeping tasks
+    if SLEEPQ_LEN.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let now = crate::arch::platform::uptime_ms();
     let mut to_wake = [NO_SLOT; MAX_SLEEPQ];
     let mut wake_len = 0usize;
