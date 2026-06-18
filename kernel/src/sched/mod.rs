@@ -331,6 +331,11 @@ pub fn schedule() {
             None => return, // No Ready task — caller continues
         };
 
+        // Optimization: skip self-context-switch when only one task is runnable
+        if next == current {
+            return;
+        }
+
         if matches!(sched.kinds[current], TaskKind::User { .. }) {
             if let Some(ref mut task) = sched.tasks[current] {
                 if task.state == TaskState::Running {
