@@ -114,7 +114,7 @@ impl UserSlice {
     /// Create from raw address and length. Returns None if addr is 0 or len is 0.
     #[inline]
     pub fn new(addr: usize, len: usize) -> Option<Self> {
-        if addr == 0 || len == 0 || len > 65536 {
+        if addr == 0 || len == 0 {
             None
         } else {
             Some(Self { addr, len })
