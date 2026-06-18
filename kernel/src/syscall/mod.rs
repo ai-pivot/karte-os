@@ -2072,6 +2072,9 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             for &byte in &data {
                 crate::arch::platform::console_putchar(byte);
             }
+            // Update hardware cursor after batch write (deferred from per-char path)
+            #[cfg(target_arch = "x86_64")]
+            crate::driver::vga::flush_cursor();
             return len as isize;
         }
         Some((FdType::FakeFile(_), _, _)) => {
