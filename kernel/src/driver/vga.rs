@@ -816,9 +816,11 @@ pub fn putchar(c: u8) {
                             scroll_up();
                             CURSOR_ROW = ROWS - 1;
                         }
+                        update_hardware_cursor();
                     }
                     b'\r' => {
                         CURSOR_COL = 0;
+                        update_hardware_cursor();
                     }
                     b'\t' => {
                         let next_tab = (CURSOR_COL + 8) & !7;
@@ -847,12 +849,17 @@ pub fn putchar(c: u8) {
                             CURSOR_COL -= 1;
                             // Don't erase — TUI programs use \b + write to update
                         }
+                        update_hardware_cursor();
                     }
                     b'\x07' => {
                         // BEL — beep (no-op for now, could use PC speaker)
+                        update_hardware_cursor();
                     }
                     _ => {
                         if c >= 0x20 {
+                            // Fast path: printable character — no hardware cursor update
+                            // Cursor is tracked in CURSOR_COL/CURSOR_ROW variables.
+                            // Hardware cursor updated on next control char or escape seq.
                             let attr = current_attr();
                             write_char(CURSOR_COL, CURSOR_ROW, c, attr);
                             CURSOR_COL += 1;
@@ -867,7 +874,8 @@ pub fn putchar(c: u8) {
                         }
                     }
                 }
-                update_hardware_cursor();
+                // Note: update_hardware_cursor() removed from here for performance.
+                // It's now called only for control characters and escape sequences.
             }
             ParseState::Escape => {
                 match c {
@@ -1048,4 +1056,10 @@ pub fn screen_size() -> (usize, usize) {
 /// Get current cursor position (col, row) — 0-based.
 pub fn cursor_pos() -> (usize, usize) {
     unsafe { (CURSOR_COL, CURSOR_ROW) }
+}
+
+/// Flush hardware cursor to match the internal cursor position.
+/// Call after batch writes to ensure the hardware cursor is visible.
+pub fn flush_cursor() {
+    unsafe { update_hardware_cursor() }
 }

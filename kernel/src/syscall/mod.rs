@@ -246,12 +246,10 @@ pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
         }
         // Kernel CR3 active — switch once, read, switch back
         let mut val = T::default();
-        crate::arch::trap::with_user_cr3(|| {
-            unsafe {
-                let src = core::slice::from_raw_parts(addr as *const u8, size);
-                let dst = core::slice::from_raw_parts_mut(&mut val as *mut T as *mut u8, size);
-                dst.copy_from_slice(src);
-            }
+        crate::arch::trap::with_user_cr3(|| unsafe {
+            let src = core::slice::from_raw_parts(addr as *const u8, size);
+            let dst = core::slice::from_raw_parts_mut(&mut val as *mut T as *mut u8, size);
+            dst.copy_from_slice(src);
         });
         val
     }
@@ -418,12 +416,10 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) -> bool {
         }
         // Bulk copy under user CR3 (single switch)
         let size = core::mem::size_of::<T>();
-        crate::arch::trap::with_user_cr3(|| {
-            unsafe {
-                let src = core::slice::from_raw_parts(&val as *const T as *const u8, size);
-                let dst = core::slice::from_raw_parts_mut(addr as *mut u8, size);
-                dst.copy_from_slice(src);
-            }
+        crate::arch::trap::with_user_cr3(|| unsafe {
+            let src = core::slice::from_raw_parts(&val as *const T as *const u8, size);
+            let dst = core::slice::from_raw_parts_mut(addr as *mut u8, size);
+            dst.copy_from_slice(src);
         });
         true
     }
