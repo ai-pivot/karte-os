@@ -223,21 +223,40 @@ extern crate alloc;
 // Syscall handlers run under kernel CR3 on x86_64. These helpers
 // temporarily switch to user CR3 for accessing user-space memory.
 
-/// Read a value from user space with automatic CR3 switching on x86_64.
+/// Read a value from user space with optimized CR3 handling on x86_64.
 #[inline]
 pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
     #[cfg(target_arch = "x86_64")]
     {
-        let mut val = core::mem::MaybeUninit::<T>::uninit();
-        let dst = val.as_mut_ptr() as *mut u8;
-        for i in 0..core::mem::size_of::<T>() {
-            unsafe { core::ptr::write(dst.add(i), user_read_u8(addr + i)) };
+        let size = core::mem::size_of::<T>();
+        // True kernel addresses — direct read
+        if addr >= 0xFFFF_8000_0000_0000 {
+            return unsafe { core::ptr::read_volatile(addr as *const T) };
         }
-        unsafe { val.assume_init() }
+        let user_root = crate::process::current_page_table_root();
+        if user_root == 0 {
+            return unsafe { core::ptr::read_volatile(addr as *const T) };
+        }
+        // Check if we're already on user CR3 (SYSCALL path)
+        let user_cr3 = user_root << 12;
+        let current_cr3: usize;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) current_cr3) };
+        if current_cr3 == user_cr3 {
+            return unsafe { core::ptr::read_volatile(addr as *const T) };
+        }
+        // Kernel CR3 active — switch once, read, switch back
+        let mut val = T::default();
+        crate::arch::trap::with_user_cr3(|| {
+            unsafe {
+                let src = core::slice::from_raw_parts(addr as *const u8, size);
+                let dst = core::slice::from_raw_parts_mut(&mut val as *mut T as *mut u8, size);
+                dst.copy_from_slice(src);
+            }
+        });
+        val
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        // Delegate to byte-by-byte user_read_u8 which handles satp switching
         let mut val = core::mem::MaybeUninit::<T>::zeroed();
         let dst = val.as_mut_ptr() as *mut u8;
         for i in 0..core::mem::size_of::<T>() {
