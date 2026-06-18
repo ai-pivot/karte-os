@@ -253,13 +253,7 @@ impl Ext4BlockDevice for KarteBlockDevice {
             sector[sector_offset..sector_offset + bytes_in_sector]
                 .copy_from_slice(&data[data_pos..data_pos + bytes_in_sector]);
 
-            if let Err(e) = (self.write_sector_fn)(sector_idx, &sector) {
-                crate::console_println!(
-                    "[write_offset] DISK WRITE FAIL sector={} offset={:#x} err={}",
-                    sector_idx,
-                    current_offset,
-                    e
-                );
+            if (self.write_sector_fn)(sector_idx, &sector).is_err() {
                 return;
             }
 
