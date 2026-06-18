@@ -1229,14 +1229,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                     rejected_pte = crate::mm::vmm::debug_pte(user_pt, page_addr);
                                 } else {
                                     // Anonymous mmap/heap/stack identity mapping: replace with a private zeroed frame.
-                                    if let Some(new_frame) = crate::mm::pmm::alloc_frame() {
-                                        unsafe {
-                                            core::ptr::write_bytes(
-                                                crate::mm::vmm::phys_to_virt(new_frame) as *mut u8,
-                                                0,
-                                                page_size,
-                                            );
-                                        }
+                                    if let Some(new_frame) = crate::mm::pmm::alloc_zeroed_frame() {
                                         crate::mm::vmm::map(
                                             user_pt, page_addr, new_frame, pte_flags,
                                         );
@@ -1297,14 +1290,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                 if vma_is_elf && old_frame.is_some() {
                                     rejected_elf_identity = true;
                                     rejected_pte = old_pte;
-                                } else if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                                    unsafe {
-                                        core::ptr::write_bytes(
-                                            crate::mm::vmm::phys_to_virt(frame) as *mut u8,
-                                            0,
-                                            page_size,
-                                        );
-                                    }
+                                } else if let Some(frame) = crate::mm::pmm::alloc_zeroed_frame() {
                                     crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
                                     mapped = true;
                                 }
@@ -1355,14 +1341,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                     Some(f) => f == page_addr,
                 };
                 if needs_alloc {
-                    if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                        unsafe {
-                            core::ptr::write_bytes(
-                                crate::mm::vmm::phys_to_virt(frame) as *mut u8,
-                                0,
-                                page_size,
-                            );
-                        }
+                    if let Some(frame) = crate::mm::pmm::alloc_zeroed_frame() {
                         crate::mm::vmm::map(
                             user_pt,
                             page_addr,
@@ -1387,14 +1366,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             super::trap::with_kernel_cr3(|| {
                 let user_pt = super::trap::get_user_pt_safe();
                 if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
-                    if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                        unsafe {
-                            core::ptr::write_bytes(
-                                crate::mm::vmm::phys_to_virt(frame) as *mut u8,
-                                0,
-                                page_size,
-                            );
-                        }
+                    if let Some(frame) = crate::mm::pmm::alloc_zeroed_frame() {
                         crate::mm::vmm::map(
                             user_pt,
                             page_addr,
@@ -1415,14 +1387,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
             super::trap::with_kernel_cr3(|| {
                 let user_pt = super::trap::get_user_pt_safe();
                 if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
-                    if let Some(frame) = crate::mm::pmm::alloc_frame() {
-                        unsafe {
-                            core::ptr::write_bytes(
-                                crate::mm::vmm::phys_to_virt(frame) as *mut u8,
-                                0,
-                                page_size,
-                            );
-                        }
+                    if let Some(frame) = crate::mm::pmm::alloc_zeroed_frame() {
                         crate::mm::vmm::map(
                             user_pt,
                             page_addr,

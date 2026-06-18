@@ -829,6 +829,9 @@ fn idle_loop() -> ! {
     loop {
         schedule();
 
+        // Use idle time to pre-zero pages for the PF handler
+        crate::mm::pmm::refill_zeroed_pool();
+
         #[cfg(target_arch = "x86_64")]
         x86_64::instructions::interrupts::enable_and_hlt();
 

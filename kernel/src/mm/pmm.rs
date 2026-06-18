@@ -23,6 +23,82 @@ unsafe extern "C" {
 
 static FRAME_ALLOCATOR: Mutex<Option<FrameAllocator>> = Mutex::new(None);
 
+// ─── Pre-zeroed page pool ────────────────────────────────────────────────
+/// Pool of pre-zeroed physical frames for fast page fault handling.
+/// When the PF handler needs a zeroed frame, it pops from this pool
+/// instead of allocating + zeroing (saves ~4KB write per PF).
+const ZEROED_POOL_SIZE: usize = 32;
+static ZEROED_POOL: Mutex<ZeroedPool> = Mutex::new(ZeroedPool::new());
+
+struct ZeroedPool {
+    frames: [usize; ZEROED_POOL_SIZE],
+    count: usize,
+}
+
+impl ZeroedPool {
+    const fn new() -> Self {
+        Self {
+            frames: [0; ZEROED_POOL_SIZE],
+            count: 0,
+        }
+    }
+
+    fn pop(&mut self) -> Option<usize> {
+        if self.count > 0 {
+            self.count -= 1;
+            Some(self.frames[self.count])
+        } else {
+            None
+        }
+    }
+
+    fn push(&mut self, frame: usize) {
+        if self.count < ZEROED_POOL_SIZE {
+            self.frames[self.count] = frame;
+            self.count += 1;
+        } else {
+            // Pool full, just deallocate
+            dealloc_frame(frame);
+        }
+    }
+}
+
+/// Allocate a pre-zeroed frame. Falls back to regular alloc + zero if pool empty.
+pub fn alloc_zeroed_frame() -> Option<usize> {
+    // Try the zeroed pool first
+    if let Some(frame) = ZEROED_POOL.lock().pop() {
+        return Some(frame);
+    }
+    // Fall back: allocate and zero manually
+    let frame = alloc_frame()?;
+    zero_frame(frame);
+    Some(frame)
+}
+
+/// Zero a physical frame using its high-half virtual mapping.
+fn zero_frame(frame: usize) {
+    let vaddr = crate::mm::vmm::phys_to_virt(frame);
+    unsafe {
+        core::ptr::write_bytes(vaddr as *mut u8, 0, PAGE_SIZE);
+    }
+}
+
+/// Refill the zeroed page pool. Called from idle loop to pre-zero frames
+/// during otherwise-wasted CPU cycles.
+pub fn refill_zeroed_pool() {
+    let mut pool = ZEROED_POOL.lock();
+    while pool.count < ZEROED_POOL_SIZE {
+        drop(pool); // Release lock during alloc+zero
+        if let Some(frame) = alloc_frame() {
+            zero_frame(frame);
+            pool = ZEROED_POOL.lock();
+            pool.push(frame);
+        } else {
+            break; // Out of memory
+        }
+    }
+}
+
 struct FrameAllocator {
     start: usize,
     // Bitmap: each bit represents one 4KB frame
