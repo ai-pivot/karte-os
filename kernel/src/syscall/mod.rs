@@ -427,12 +427,66 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) -> bool {
 ///
 /// CRITICAL: kernel buffers are only mutated under kernel CR3. The x86_64
 /// helper switches to user CR3 only for the single-byte load itself.
+/// Batch read bytes from user space with optimized CR3 handling.
+/// Instead of checking CR3 per-byte, checks once and does a bulk copy.
 #[inline]
 pub(crate) fn user_read_bytes(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
-    let mut buf = alloc::vec::Vec::with_capacity(len);
-    for i in 0..len {
-        buf.push(user_read_u8(addr + i));
+    if len == 0 {
+        return alloc::vec::Vec::new();
     }
+    let mut buf = alloc::vec::Vec::with_capacity(len);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // True kernel addresses — direct read
+        if addr >= 0xFFFF_8000_0000_0000 {
+            buf.resize(len, 0u8);
+            unsafe {
+                core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
+            }
+            return buf;
+        }
+
+        let user_root = crate::process::current_page_table_root();
+        if user_root == 0 {
+            // No user page table (test mode or boot)
+            buf.resize(len, 0u8);
+            unsafe {
+                core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
+            }
+            return buf;
+        }
+
+        // Check if we're already on user CR3
+        let user_cr3_phys = user_root << 12;
+        let current_cr3: usize;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) current_cr3) };
+
+        if current_cr3 == user_cr3_phys {
+            // Already on user CR3 — direct bulk copy
+            buf.resize(len, 0u8);
+            unsafe {
+                core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
+            }
+        } else {
+            // Kernel CR3 active — switch once, bulk copy, switch back
+            buf.resize(len, 0u8);
+            crate::arch::trap::with_user_cr3(|| {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
+                }
+            });
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        buf.resize(len, 0u8);
+        unsafe {
+            core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
+        }
+    }
+
     buf
 }
 
@@ -500,54 +554,50 @@ fn ensure_user_write_pages(addr: usize, len: usize) -> bool {
     })
 }
 
-/// Write a slice of bytes to user space with automatic CR3 switching on x86_64.
+/// Write a slice of bytes to user space with optimized CR3 handling.
 /// Returns `true` on success, `false` if page allocation failed.
 #[inline]
 pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) -> bool {
+    let len = src.len();
+    if len == 0 {
+        return true;
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
-        // True kernel addresses or no user PT: direct write
-        if addr >= 0xFFFF_8000_0000_0000 {
-            for (i, &byte) in src.iter().enumerate() {
-                unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+        // True kernel addresses or no user PT: direct bulk write
+        if addr >= 0xFFFF_8000_0000_0000 || crate::process::current_page_table_root() == 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, len);
             }
             return true;
         }
-        let user_root = crate::process::current_page_table_root();
-        if user_root == 0 {
-            for (i, &byte) in src.iter().enumerate() {
-                unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
-            }
-            return true;
-        }
-        // If already on user CR3 (SYSCALL path), direct write
-        let user_cr3 = user_root << 12;
+        // If already on user CR3 (SYSCALL path), direct bulk write
+        let user_cr3 = crate::process::current_page_table_root() << 12;
         let current_cr3: usize;
         unsafe { core::arch::asm!("mov {}, cr3", out(reg) current_cr3) };
         if current_cr3 == user_cr3 {
-            for (i, &byte) in src.iter().enumerate() {
-                unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, len);
             }
             return true;
         }
-        if !ensure_user_write_pages(addr, src.len()) {
-            crate::klog!(
-                WARN,
-                "[syscall] user_write_bytes: page allocation failed at {:#x} len={}",
-                addr,
-                src.len()
-            );
+        // Kernel CR3 active: ensure pages exist, then bulk write under user CR3
+        if !ensure_user_write_pages(addr, len) {
             return false;
         }
-        for (i, &byte) in src.iter().enumerate() {
-            unsafe { user_write_u8_mapped(addr + i, byte) };
-        }
+        crate::arch::trap::with_user_cr3(|| {
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, len);
+            }
+        });
         true
     }
+
     #[cfg(not(target_arch = "x86_64"))]
     {
-        for (i, &byte) in src.iter().enumerate() {
-            unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, len);
         }
         true
     }
@@ -2053,9 +2103,9 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
             return ERR_INVAL; // can't write to read end
         }
         Some((FdType::Stdio, _, _)) => {
-            // Stdio: write to console
-            for i in 0..len {
-                let byte = user_read::<u8>(buf + i);
+            // Stdio: batch-read user buffer then output to console
+            let data = user_read_bytes(buf, len);
+            for &byte in &data {
                 crate::arch::platform::console_putchar(byte);
             }
             return len as isize;
@@ -2252,9 +2302,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             let mut kbuf = alloc::vec![0u8; len];
             match crate::driver::ext4::read_file_at_offset(ext4_desc.inode_num, pos, &mut kbuf) {
                 Ok(n) => {
-                    for i in 0..n {
-                        user_write_u8(buf + i, kbuf[i]);
-                    }
+                    user_write_bytes(buf, &kbuf[..n]);
                     crate::process::with_fd_table(|fdt| {
                         if let Some(f) = fdt.get_mut(fd as usize) {
                             f.pos += n;

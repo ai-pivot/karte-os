@@ -86,6 +86,14 @@ pub struct NetStack {
 
 static NET_STACK: spin::Mutex<Option<NetStack>> = spin::Mutex::new(None);
 
+/// Active socket count — when 0, skip network polling to save CPU.
+static ACTIVE_SOCKETS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Check if network polling is needed (any active sockets).
+pub fn has_active_sockets() -> bool {
+    ACTIVE_SOCKETS.load(core::sync::atomic::Ordering::Relaxed) > 0
+}
+
 /// Global ephemeral port counter for auto-binding UDP sockets.
 /// smoltcp requires a non-zero source port; port 0 means "any" for listening
 /// but doesn't work for sending. We assign ports starting from 49152.
@@ -147,6 +155,10 @@ impl NetStack {
 
     /// Poll the network stack (called from timer interrupt).
     pub fn poll() {
+        // Skip if no active sockets — saves CPU when no network activity
+        if !has_active_sockets() {
+            return;
+        }
         // Use try_lock: this is called from timer ISR.
         // If a syscall holds the lock, skip this tick.
         let mut guard = match NET_STACK.try_lock() {
@@ -247,6 +259,7 @@ impl NetStack {
             remote_port: None,
         });
 
+        ACTIVE_SOCKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         fd as isize
     }
 
@@ -499,6 +512,7 @@ impl NetStack {
         // Remove from socket set
         let _ = stack.socket_set.remove(meta.handle);
         stack.socket_metas[fd] = None;
+        ACTIVE_SOCKETS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
 
         0
     }
