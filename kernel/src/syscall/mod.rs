@@ -820,10 +820,10 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         17 => linux_pread64(args[0] as i32, args[1], args[2], args[3], args[4]), // pread64
         18 => linux_pwrite64(args[0] as i32, args[1], args[2], args[3], args[4]), // pwrite64
         19 => linux_readv(args[0], args[1], args[2]),      // readv
-        20 => linux_writev(args[0], args[1], args[2]),     // writev (stub)
-        21 => 0,                                           // access (stub)
+        20 => linux_writev(args[0], args[1], args[2]),     // writev
+        21 => linux_access(args[0], args[1]),              // access
         22 => linux_pipe(args[0]),                         // pipe
-        23 => 0,                                           // select (stub)
+        23 => 0,                                           // select (stub — epoll used instead)
         24 => {
             crate::sched::schedule();
             0
@@ -836,7 +836,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         30 => linux_dup2(args[0], args[1]),                // dup2
         31 => linux_pause(),                               // pause
         32 => linux_dup(args[0]),                          // dup
-        33 => 0,                                           // chdir (stub — use Linux 80)
+        33 => linux_chdir(args[0]),                       // chdir (proper impl)
         34 => 0,                                           // fchdir (stub)
         35 => linux_nanosleep(args[0], args[1]),           // nanosleep
         36 => 0,                                           // alarm (stub)
@@ -851,20 +851,20 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         43 => linux_accept(args[0] as i32),                  // accept
         44 => sys_sendto(args[0] as i32, args[1], args[2], args[3], args[4], args[5]), // sendto
         45 => sys_recvfrom(args[0] as i32, args[1], args[2]), // recvfrom
-        46 => sys_bind(args[0] as i32, args[1], args[2]),    // bind
-        47 => 0,                                             // getsockname (stub)
-        48 => 0,                                             // getpeername (stub)
-        49 => sys_socket(args[0], args[1], args[2]),         // socket (alternate number?)
+        46 => 0,                                             // sendmsg (not implemented)
+        47 => 0,                                             // recvmsg (not implemented)
+        48 => sys_shutdown(args[0] as i32),                  // shutdown
+        49 => sys_bind(args[0] as i32, args[1], args[2]),   // bind
         50 => sys_listen(args[0] as i32, args[1]),           // listen
-        51 => 0,                                             // getsockname (stub)
-        52 => 0,                                             // getpeername (stub)
-        53 => 0,                                             // setsockopt (stub)
-        54 => 0,                                             // getsockopt (stub)
-        55 => sys_shutdown(args[0] as i32),                  // shutdown
+        51 => linux_getsockname(args[0], args[1], args[2]), // getsockname
+        52 => linux_getpeername(args[0], args[1], args[2]), // getpeername
+        53 => ERR_INVAL,                                     // socketpair (not implemented)
+        54 => linux_setsockopt(args[0], args[1], args[2], args[3], args[4]), // setsockopt
+        55 => linux_getsockopt(args[0], args[1], args[2], args[3], args[4]), // getsockopt
 
         56 => linux_clone(args[0], args[1], args[2], args[3], args[4]), // clone
         57 => sys_fork(),                                               // fork
-        58 => 0, // vfork stub: parent continues, no child created
+        58 => linux_vfork(), // vfork (implemented as fork)
         59 => sys_exec(args[0], linux::count_user_string(args[0]), args[1], args[2]), // execve
         60 => sys_exit(args[0] as i32), // exit
 
@@ -878,12 +878,12 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         87 => sys_unlink(args[0], linux::count_user_string(args[0])), // unlink
 
         // ─── More process ─────────────────────────────────────────
-        89 => 0,                                    // readlink (stub)
+        89 => linux_readlink(args[0], args[1], args[2]),  // readlink
         96 => linux_gettimeofday(args[0], args[1]), // gettimeofday
-        97 => 0,                                    // getrlimit (stub)
-        98 => 0,                                    // getrusage (stub)
+        97 => linux_getrlimit(args[0], args[1]),    // getrlimit
+        98 => linux_getrusage(args[0], args[1]),    // getrusage
         99 => linux_sysinfo(args[0]),               // sysinfo
-        100 => 0,                                   // times (stub)
+        100 => linux_times(args[0]),                // times
         101 => ERR_INVAL,                           // ptrace (stub)
         102 => 0,                                   // getuid (stub: root)
         103 => 0,                                   // syslog (stub)
@@ -925,7 +925,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         }
         122 => linux_uname(args[0]),                // uname (new)
         131 => linux_sigaltstack(args[0], args[1]), // sigaltstack
-        157 => 0,                                   // prctl (stub)
+        157 => linux_prctl(args[0], args[1], args[2], args[3], args[4]), // prctl
         158 => linux_arch_prctl(args[0], args[1]),  // arch_prctl
         160 => 0,                                   // setrlimit (stub)
         186 => sys_getpid(),                        // gettid → getpid
@@ -943,7 +943,8 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         258 => linux_mkdirat(args[0], args[1], args[2], args[3]), // mkdirat
         262 => linux_newfstatat(args[0], args[1], args[2], args[3]), // newfstatat
         263 => sys_unlink(args[1], linux::count_user_string(args[1])), // unlinkat
-        267 => 0,                                   // readlinkat (stub)
+        267 => linux_readlinkat(args[0], args[1], args[2], args[3]), // readlinkat
+        269 => linux_access(args[1], args[2]),                       // faccessat
         272 => 0,                                   // unshare (stub)
         273 => 0,                                   // set_robust_list (stub)
         274 => 0,                                   // get_robust_list (stub)
@@ -953,12 +954,13 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         281 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_pwait (same as epoll_wait, ignoring sigmask)
         291 => epoll::sys_epoll_create1(args[0]),                                  // epoll_create1
         292 => sys_dup2(args[0] as i32, args[1] as i32),                           // dup3 → dup2
-        293 => 0,                                                                  // pipe2 (stub)
-        302 => 0,                                          // prlimit64 (stub)
+        293 => linux_pipe2(args[0], args[1]),                                 // pipe2
+        302 => linux_prlimit64(args[0], args[1], args[2], args[3]),          // prlimit64
         285 => 0, // fallocate → success (SQLite WAL needs this)
         318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
         334 => ERR_NOSYS, // rseq → ENOSYS (Go gracefully degrades)
         435 => ERR_NOSYS, // clone3: ENOSYS
+        439 => linux_access(args[1], args[2]), // faccessat2
         _ => ERR_NOSYS,
     }
 }
@@ -1427,15 +1429,56 @@ fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset: usize, _offset_hi: 
 }
 
 #[cfg(target_arch = "x86_64")]
-fn linux_readv(_fd: usize, _iov: usize, _iovcnt: usize) -> isize {
-    // Stub: return 0 bytes read
-    0
+fn linux_readv(fd: usize, iov: usize, iovcnt: usize) -> isize {
+    // Read from fd into multiple buffers (scatter read)
+    let mut total = 0isize;
+    for i in 0..iovcnt {
+        // Each iovec is 16 bytes: iov_base (8) + iov_len (8)
+        let entry = iov + i * 16;
+        let base = user_read::<usize>(entry);
+        let len = user_read::<usize>(entry + 8);
+        if len == 0 {
+            continue;
+        }
+        let r = sys_read(fd as i32, base, len);
+        if r < 0 {
+            if total > 0 {
+                return total;
+            }
+            return r;
+        }
+        total += r;
+        if (r as usize) < len {
+            break; // Short read
+        }
+    }
+    total
 }
 
 #[cfg(target_arch = "x86_64")]
-fn linux_writev(_fd: usize, _iov: usize, _iovcnt: usize) -> isize {
-    // Stub: preserve existing behavior while proving whether Bubble Tea writes here.
-    0
+fn linux_writev(fd: usize, iov: usize, iovcnt: usize) -> isize {
+    // Write from multiple buffers to fd (gather write)
+    let mut total = 0isize;
+    for i in 0..iovcnt {
+        let entry = iov + i * 16;
+        let base = user_read::<usize>(entry);
+        let len = user_read::<usize>(entry + 8);
+        if len == 0 {
+            continue;
+        }
+        let r = sys_write(fd as i32, base, len);
+        if r < 0 {
+            if total > 0 {
+                return total;
+            }
+            return r;
+        }
+        total += r;
+        if (r as usize) < len {
+            break; // Short write
+        }
+    }
+    total
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -5603,6 +5646,220 @@ fn linux_arch_prctl(code: usize, addr: usize) -> isize {
 fn linux_tgkill(_tgid: usize, _tid: usize, _sig: usize) -> isize {
     // For now, just acknowledge. Go uses tgkill for goroutine preemption signals.
     0
+}
+
+/// Linux access(path, mode) — check file accessibility.
+fn linux_access(path: usize, _mode: usize) -> isize {
+    let path_len = crate::syscall::linux::count_user_string(path);
+    if path_len == 0 {
+        return ERR_NOENT;
+    }
+    // Try to stat the file to check existence
+    match linux_stat(path, 0) {
+        0 => 0,
+        _ => ERR_NOENT,
+    }
+}
+
+/// Linux getrlimit(resource, rlim) — get resource limits.
+/// rlim is a pointer to struct rlimit { rlim_cur, rlim_max } (each u64).
+fn linux_getrlimit(resource: usize, rlim_ptr: usize) -> isize {
+    if rlim_ptr == 0 {
+        return ERR_FAULT;
+    }
+    let (cur, max) = match resource {
+        7 => (1024u64, 1024u64), // RLIMIT_NOFILE
+        3 => (1024u64, 1024u64), // RLIMIT_STACK (1MB)
+        9 => (1024u64, 1024u64), // RLIMIT_AS (256MB)
+        _ => (u64::MAX, u64::MAX), // unlimited
+    };
+    user_write::<u64>(rlim_ptr, cur);
+    user_write::<u64>(rlim_ptr + 8, max);
+    0
+}
+
+/// Linux prlimit64(pid, resource, new_rlim, old_rlim) — get/set resource limits.
+fn linux_prlimit64(_pid: usize, resource: usize, new_rlim: usize, old_rlim: usize) -> isize {
+    if old_rlim != 0 {
+        let (cur, max) = match resource {
+            7 => (1024u64, 1024u64), // RLIMIT_NOFILE
+            3 => (1024u64, 1024u64), // RLIMIT_STACK
+            9 => (1024u64, 1024u64), // RLIMIT_AS
+            _ => (u64::MAX, u64::MAX),
+        };
+        user_write::<u64>(old_rlim, cur);
+        user_write::<u64>(old_rlim + 8, max);
+    }
+    // Ignore new_rlim (we don't actually enforce limits)
+    0
+}
+
+/// Linux getrusage(who, usage) — get resource usage.
+/// struct rusage is 144 bytes on x86_64.
+fn linux_getrusage(_who: usize, usage_ptr: usize) -> isize {
+    if usage_ptr == 0 {
+        return ERR_FAULT;
+    }
+    // Zero-fill the entire rusage struct (144 bytes)
+    for i in 0..144usize {
+        user_write::<u8>(usage_ptr + i, 0);
+    }
+    // Set ru_utime and ru_stime to a small nonzero value
+    let uptime = crate::arch::platform::uptime_ms();
+    let ticks = uptime / 10; // 100Hz clock
+    // ru_utime (offset 0): timeval { tv_sec, tv_usec }
+    user_write::<u64>(usage_ptr, ticks / 100);
+    user_write::<u64>(usage_ptr + 8, (ticks % 100) * 10000);
+    // ru_stime (offset 16): timeval { tv_sec, tv_usec }
+    user_write::<u64>(usage_ptr + 16, ticks / 100);
+    user_write::<u64>(usage_ptr + 24, (ticks % 100) * 10000);
+    // ru_maxrss (offset 32) — max resident set size in KB
+    user_write::<u64>(usage_ptr + 32, 65536);
+    0
+}
+
+/// Linux times(buf) — get process times.
+/// Returns clock ticks elapsed since boot.
+fn linux_times(buf_ptr: usize) -> isize {
+    if buf_ptr != 0 {
+        // struct tms { tms_utime, tms_stime, tms_cutime, tms_cstime } (4 × u64)
+        let uptime = crate::arch::platform::uptime_ms();
+        let ticks = uptime / 10;
+        user_write::<u64>(buf_ptr, ticks / 2);       // utime
+        user_write::<u64>(buf_ptr + 8, ticks / 2);   // stime
+        user_write::<u64>(buf_ptr + 16, 0);           // cutime
+        user_write::<u64>(buf_ptr + 24, 0);           // cstime
+    }
+    let uptime = crate::arch::platform::uptime_ms();
+    (uptime / 10) as isize
+}
+
+/// Linux getsockname(fd, addr, addrlen) — get socket local address.
+fn linux_getsockname(_fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
+    if addr_ptr != 0 && addrlen_ptr != 0 {
+        // Return 0.0.0.0:0 as the local address
+        // struct sockaddr_in { sa_family(2), port(2), addr(4), zero(8) } = 16 bytes
+        user_write::<u16>(addr_ptr, 2); // AF_INET
+        user_write::<u16>(addr_ptr + 2, 0); // port 0
+        user_write::<u32>(addr_ptr + 4, 0); // 0.0.0.0
+        user_write::<u32>(addrlen_ptr, 16);
+    }
+    0
+}
+
+/// Linux getpeername(fd, addr, addrlen) — get socket remote address.
+fn linux_getpeername(fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
+    // Try to get the remote address from the socket
+    // For now, return ENOTCONN if we can't determine it
+    if addr_ptr != 0 && addrlen_ptr != 0 {
+        // Check if this is a connected socket
+        let fd_type = crate::process::with_fd_table(|fd_table| {
+            fd_table.get(fd as usize).map(|d| d.fd_type.clone())
+        });
+        match fd_type {
+            Some(FdType::Socket(_)) => {
+                // Return a generic remote address
+                user_write::<u16>(addr_ptr, 2); // AF_INET
+                user_write::<u16>(addr_ptr + 2, 0);
+                user_write::<u32>(addr_ptr + 4, 0);
+                user_write::<u32>(addrlen_ptr, 16);
+                0
+            }
+            _ => ERR_INVAL,
+        }
+    } else {
+        0
+    }
+}
+
+/// Linux setsockopt(fd, level, optname, optval, optlen) — set socket option.
+/// Accept all options but mostly ignore them (standard approach for minimal OS).
+fn linux_setsockopt(_fd: usize, _level: usize, _optname: usize, _optval: usize, _optlen: usize) -> isize {
+    0
+}
+
+/// Linux getsockopt(fd, level, optname, optval, optlen) — get socket option.
+fn linux_getsockopt(_fd: usize, level: usize, optname: usize, optval: usize, optlen_ptr: usize) -> isize {
+    if optval != 0 && optlen_ptr != 0 {
+        match (level, optname) {
+            (1, 3) => {
+                // SO_ERROR at SOL_SOCKET — return 0 (no error)
+                user_write::<i32>(optval, 0);
+                user_write::<u32>(optlen_ptr, 4);
+            }
+            (1, 2) => {
+                // SO_TYPE — return SOCK_STREAM (1)
+                user_write::<i32>(optval, 1);
+                user_write::<u32>(optlen_ptr, 4);
+            }
+            (1, 8) => {
+                // SO_KEEPALIVE — return 0
+                user_write::<i32>(optval, 0);
+                user_write::<u32>(optlen_ptr, 4);
+            }
+            (6, 1) => {
+                // TCP_NODELAY at IPPROTO_TCP — return 0 (disabled)
+                user_write::<i32>(optval, 0);
+                user_write::<u32>(optlen_ptr, 4);
+            }
+            _ => {
+                // Default: return 0 value
+                user_write::<i32>(optval, 0);
+                user_write::<u32>(optlen_ptr, 4);
+            }
+        }
+    }
+    0
+}
+
+/// Linux pipe2(fds, flags) — create pipe with flags.
+fn linux_pipe2(fds_ptr: usize, _flags: usize) -> isize {
+    if fds_ptr == 0 {
+        return ERR_FAULT;
+    }
+    // Use sys_pipe which writes [read_fd, write_fd] to user buffer
+    sys_pipe(fds_ptr)
+}
+
+/// Linux readlink(path, buf, bufsiz) — read value of symbolic link.
+/// We don't support symlinks, so return EINVAL.
+fn linux_readlink(_path: usize, _buf: usize, _bufsiz: usize) -> isize {
+    ERR_INVAL
+}
+
+/// Linux readlinkat(dirfd, path, buf, bufsiz) — readlink relative to dirfd.
+fn linux_readlinkat(_dirfd: usize, _path: usize, _buf: usize, _bufsiz: usize) -> isize {
+    ERR_INVAL
+}
+
+/// Linux prctl(option, ...) — process control operations.
+fn linux_prctl(option: usize, arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> isize {
+    match option {
+        15 => {
+            // PR_SET_NAME — set thread name, just accept
+            0
+        }
+        16 => {
+            // PR_GET_NAME — get thread name, write empty string
+            if arg2 != 0 {
+                for i in 0..16usize {
+                    user_write::<u8>(arg2 + i, 0);
+                }
+            }
+            0
+        }
+        36 => {
+            // PR_SET_TIMERSLACK — accept
+            0
+        }
+        _ => 0, // Accept all other prctl options silently
+    }
+}
+
+/// Linux vfork() — behaves like fork but parent blocks until child exits.
+/// We implement it as fork since we don't have memory sharing.
+fn linux_vfork() -> isize {
+    sys_fork()
 }
 
 /// Linux nanosleep(req, rem) — sleep for a specified relative interval.
