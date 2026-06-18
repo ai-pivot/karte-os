@@ -270,6 +270,11 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **VGA scroll region**: DECSTBM (\033[top;bottomr) sets scroll boundaries. `scroll_up()` only scrolls within [SCROLL_TOP, SCROLL_BOTTOM]. Reset by RIS (\033c) and when region is full screen.
 - **VGA alternate screen**: \033[?1049h saves screen to ALT_SCREEN_BUF and clears. \033[?1049l restores. Mode 1049 also saves/restores cursor. Mode 47/1047 also supported.
 - **Lazy FPU infrastructure**: `__switch_no_fpu` in `switch_nofpu.S` skips fxsave/fxrstor and sets CR0.TS. Same stack frame layout as `__switch` — fully compatible. Not yet activated in scheduler (enable by changing `switch_to` to call `__switch_no_fpu` when neither task uses FPU).
+- **Timer ISR schedule frequency**: Schedule runs every 3 ticks (33Hz, 30ms time slice), not every tick. Uses `TICK_COUNT % 3 != 0` to skip. Combined with schedule() self-switch skip (returns early when next==current), single-task scenarios have zero context switch overhead.
+- **VGA cached attribute**: `CACHED_ATTR` static variable is updated only when SGR attributes change (in `csi_dispatch` for 'm' and in RIS reset). Printable character path uses `CACHED_ATTR` directly instead of calling `current_attr()` per character.
+- **VMA lookup cache**: `VmState.last_vma_idx` caches the last matched VMA index. `vma_query` checks this first (O(1) hit) before full scan. Exploits PF locality (consecutive PFs typically in same VMA region).
+- **ext4 read-ahead**: `read_offset` prefetches next block's first sector into sector cache on cache miss. Speeds up sequential file reads (ELF loading, file streaming).
+- **poll/sendmsg/recvmsg syscalls**: `linux_poll` checks fd readiness for POLLIN/POLLOUT. `linux_sendmsg`/`linux_recvmsg` extract first iovec from msghdr and delegate to sendto/recvfrom (simplified for common single-iovec case).
 
 ## Knowledge Files
 
