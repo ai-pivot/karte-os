@@ -77,6 +77,10 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
     mm::heap::init();
 
+    // Initialize RTC for real wall clock time
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::rtc::init_rtc();
+
     // ── Test mode ──
     #[cfg(feature = "test_mode")]
     {

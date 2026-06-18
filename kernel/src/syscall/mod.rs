@@ -1547,18 +1547,25 @@ fn linux_chdir(path: usize) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 fn linux_gettimeofday(tv: usize, _tz: usize) -> isize {
-    let uptime_ms = crate::arch::platform::uptime_ms();
-    let tv_sec = (uptime_ms / 1000 + FAKE_EPOCH) as i64;
-    let tv_usec = ((uptime_ms % 1000) * 1000) as i64;
+    #[cfg(target_arch = "x86_64")]
+    let (secs, nsecs) = crate::arch::rtc::wall_clock();
+    #[cfg(not(target_arch = "x86_64"))]
+    let (secs, nsecs) = {
+        let up = crate::arch::platform::uptime_ms();
+        ((FAKE_EPOCH + up / 1000) as i64, ((up % 1000) * 1_000_000) as i64)
+    };
     if tv != 0 {
-        user_write::<i64>(tv, tv_sec);
-        user_write::<i64>(tv + 8, tv_usec);
+        user_write::<i64>(tv, secs);
+        user_write::<i64>(tv + 8, nsecs / 1000);
     }
     0
 }
 
 #[cfg(target_arch = "x86_64")]
 fn linux_time(tloc: usize) -> isize {
+    #[cfg(target_arch = "x86_64")]
+    let now = crate::arch::rtc::wall_clock().0;
+    #[cfg(not(target_arch = "x86_64"))]
     let now = (FAKE_EPOCH + crate::arch::platform::uptime_ms() / 1000) as i64;
     if tloc != 0 {
         user_write::<i64>(tloc, now);
@@ -1578,27 +1585,28 @@ fn linux_clock_gettime(clockid: usize, tp: usize) -> isize {
         const CLOCK_MONOTONIC_COARSE: usize = 6;
         const CLOCK_BOOTTIME: usize = 7;
 
-        let uptime_ms = crate::arch::platform::uptime_ms();
+        #[cfg(target_arch = "x86_64")]
+        let (real_secs, real_nsecs) = crate::arch::rtc::wall_clock();
+        #[cfg(not(target_arch = "x86_64"))]
+        let (real_secs, real_nsecs) = {
+            let up = crate::arch::platform::uptime_ms();
+            ((FAKE_EPOCH + up / 1000) as i64, ((up % 1000) * 1_000_000) as i64)
+        };
+
+        let up_ms = crate::arch::platform::uptime_ms();
         let (secs, nsecs) = match clockid {
-            CLOCK_REALTIME | CLOCK_REALTIME_COARSE => (
-                (FAKE_EPOCH + uptime_ms / 1000) as i64,
-                ((uptime_ms % 1000) * 1_000_000) as i64,
-            ),
+            CLOCK_REALTIME | CLOCK_REALTIME_COARSE => (real_secs, real_nsecs),
             CLOCK_MONOTONIC
             | CLOCK_MONOTONIC_RAW
             | CLOCK_MONOTONIC_COARSE
             | CLOCK_BOOTTIME
             | CLOCK_PROCESS_CPUTIME_ID
             | CLOCK_THREAD_CPUTIME_ID => {
-                let secs = (uptime_ms / 1000) as i64;
-                let mut nsecs = ((uptime_ms % 1000) * 1_000_000) as i64;
-                if secs == 0 && nsecs == 0 {
-                    // Go timers require monotonic deadlines to be strictly positive.
-                    nsecs = 1;
-                }
+                let secs = (up_ms / 1000) as i64;
+                let nsecs = ((up_ms % 1000) * 1_000_000) as i64;
                 (secs, nsecs)
             }
-            _ => return -22, // EINVAL
+            _ => (real_secs, real_nsecs),
         };
         user_write::<i64>(tp, secs);
         user_write::<i64>(tp + 8, nsecs);

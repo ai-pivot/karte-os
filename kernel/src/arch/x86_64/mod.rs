@@ -28,6 +28,7 @@ pub mod uart;
 pub mod user_return;
 pub mod virtio_blk;
 pub mod virtio_net;
+pub mod rtc;
 
 #[cfg(feature = "test_mode")]
 pub mod test;
