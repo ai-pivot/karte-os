@@ -243,6 +243,16 @@ pub struct Ext4FileDesc {
 
 // ─── Ext4Fs (VFS FileSystem implementation) ────────────────────────────────
 
+/// Directory entry cache: maps (dir_inode, name) → child_inode
+/// Speeds up repeated lookups by avoiding full directory scans.
+const DCACHE_MAX: usize = 512;
+static DCACHE: spin::Mutex<BTreeMap<(u32, String), u32>> = spin::Mutex::new(BTreeMap::new());
+
+/// Flush the dcache (called after file creation/deletion).
+pub fn dcache_flush() {
+    DCACHE.lock().clear();
+}
+
 pub struct Ext4Fs {
     pub(crate) ext4: spin::Mutex<Ext4>,
 }
@@ -268,11 +278,29 @@ impl FileSystem for Ext4Fs {
     }
 
     fn lookup(&self, dir: u64, name: &str) -> Result<u64, VfsError> {
+        // Check dcache first
+        let top_key = (dir as u32, String::from(name));
+        {
+            let cache = DCACHE.lock();
+            if let Some(&inode) = cache.get(&top_key) {
+                return Ok(inode as u64);
+            }
+        }
+
         let ext4 = self.ext4.lock();
         let mut current_dir = dir as u32;
         for component in name.split('/') {
             if component.is_empty() {
                 continue;
+            }
+            // Check dcache for this component
+            let key = (current_dir, String::from(component));
+            {
+                let cache = DCACHE.lock();
+                if let Some(&inode) = cache.get(&key) {
+                    current_dir = inode;
+                    continue;
+                }
             }
             let entries = ext4.dir_get_entries(current_dir);
             let mut found = None;
@@ -283,7 +311,15 @@ impl FileSystem for Ext4Fs {
                 }
             }
             match found {
-                Some(inode) => current_dir = inode,
+                Some(inode) => {
+                    // Populate dcache
+                    let mut cache = DCACHE.lock();
+                    if cache.len() >= DCACHE_MAX {
+                        cache.clear();
+                    }
+                    cache.insert(key, inode);
+                    current_dir = inode;
+                }
                 None => return Err(VfsError::NotFound),
             }
         }
@@ -350,7 +386,10 @@ impl FileSystem for Ext4Fs {
     fn create_file(&mut self, dir: u64, name: &str) -> Result<u64, VfsError> {
         let ext4 = self.ext4.lock();
         match ext4.create(dir as u32, name, EXT4_INODE_MODE_FILE as u16) {
-            Ok(inode_ref) => Ok(inode_ref.inode_num as u64),
+            Ok(inode_ref) => {
+                dcache_flush();
+                Ok(inode_ref.inode_num as u64)
+            }
             Err(_) => Err(VfsError::IoError),
         }
     }
@@ -358,7 +397,10 @@ impl FileSystem for Ext4Fs {
     fn create_dir(&mut self, dir: u64, name: &str) -> Result<u64, VfsError> {
         let ext4 = self.ext4.lock();
         match ext4.create(dir as u32, name, 0x4000) {
-            Ok(inode_ref) => Ok(inode_ref.inode_num as u64),
+            Ok(inode_ref) => {
+                dcache_flush();
+                Ok(inode_ref.inode_num as u64)
+            }
             Err(_) => Err(VfsError::IoError),
         }
     }
@@ -373,7 +415,10 @@ impl FileSystem for Ext4Fs {
             .ok_or(VfsError::NotFound)?;
         let mut child_ref = ext4.get_inode_ref(child_entry.inode);
         match ext4.unlink(&mut parent_ref, &mut child_ref, name) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                dcache_flush();
+                Ok(())
+            }
             Err(_) => Err(VfsError::IoError),
         }
     }
