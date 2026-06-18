@@ -599,38 +599,6 @@ pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) -> bool {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn mirror_user_json_log(data: &[u8]) {
-    if !contains_bytes(data, br#""level""#)
-        || !(contains_bytes(data, br#""fatal""#)
-            || contains_bytes(data, br#""error""#)
-            || contains_bytes(data, b"Failed"))
-    {
-        return;
-    }
-
-    crate::arch::platform::print("[xbot-log] ");
-    for &byte in data {
-        let ch = if byte == b'\n' || byte == b'\r' || (0x20..=0x7e).contains(&byte) {
-            byte
-        } else {
-            b'.'
-        };
-        crate::arch::platform::console_putchar(ch);
-    }
-    if !data.ends_with(b"\n") {
-        crate::arch::platform::console_putchar(b'\n');
-    }
-}
-
 /// Check if a path refers to a pseudo-filesystem that doesn't exist on disk.
 fn is_pseudo_path(path: &str) -> bool {
     path.starts_with("/proc")
