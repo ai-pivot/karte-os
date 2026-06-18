@@ -61,7 +61,7 @@ deploy: disk.img
 	@cd user && $(MAKE) ARCH=riscv64 clean > /dev/null 2>&1 && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
 	@bash tools/mkdisk.sh deploy-riscv
 
-## Create disk.img and deploy all x86_64 user programs + xbot + /etc
+## Create disk.img and deploy all x86_64 user programs + xbot + /etc + CA certs
 deploy-x86: disk.img
 	@echo "[deploy] Installing x86_64 programs..."
 	@cd user && $(MAKE) ARCH=x86_64 clean > /dev/null 2>&1 && $(MAKE) ARCH=x86_64 > /dev/null 2>&1
@@ -73,12 +73,12 @@ deploy-x86: disk.img
 	@mkdir -p /tmp/karte_etc
 	@printf '127.0.0.1 localhost\n' > /tmp/karte_etc/hosts
 	@printf 'nameserver 10.0.2.3\n' > /tmp/karte_etc/resolv.conf
-	@echo "mkdir etc" | debugfs -w disk.img 2>/dev/null; \
-	echo "cd etc" > /tmp/_dbg_e; \
-	echo "write /tmp/karte_etc/hosts hosts" >> /tmp/_dbg_e; \
-	echo "write /tmp/karte_etc/resolv.conf resolv.conf" >> /tmp/_dbg_e; \
-	cat /tmp/_dbg_e | debugfs -w disk.img 2>/dev/null; \
-	echo "[deploy] /etc/hosts and /etc/resolv.conf deployed"
+	@printf 'mkdir etc\nmkdir etc/ssl\nmkdir etc/ssl/certs\nwrite /tmp/karte_etc/hosts etc/hosts\nwrite /tmp/karte_etc/resolv.conf etc/resolv.conf\n' > /tmp/_dbg_deploy
+	@if [ -f /etc/ssl/certs/ca-certificates.crt ]; then \
+		printf 'write /etc/ssl/certs/ca-certificates.crt etc/ssl/certs/ca-certificates.crt\n' >> /tmp/_dbg_deploy; \
+	fi
+	@cat /tmp/_dbg_deploy | debugfs -w disk.img 2>/dev/null
+	@echo "[deploy] /etc/hosts, resolv.conf, ssl/certs deployed"
 
 ## Create empty disk.img if missing
 disk.img:

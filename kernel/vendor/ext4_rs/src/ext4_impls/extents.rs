@@ -485,11 +485,7 @@ impl Ext4 {
                 let move_len = ext_size * (entries - insert_pos);
                 unsafe {
                     let data_ptr = ext4block.data.as_mut_ptr();
-                    core::ptr::copy(
-                        data_ptr.add(src_offset),
-                        data_ptr.add(dst_offset),
-                        move_len,
-                    );
+                    core::ptr::copy(data_ptr.add(src_offset), data_ptr.add(dst_offset), move_len);
                 }
             }
 
@@ -523,24 +519,75 @@ impl Ext4 {
         search_path: &mut SearchPath,
         new_extent: &mut Ext4Extent,
     ) -> Result<()> {
-        // If depth is already >= 1, the leaf block should have 340 slots.
-        // If we're here, it means the leaf is somehow full. Instead of growing
-        // depth further (which causes infinite recursion), just overwrite the
-        // extent at position+1 in the existing leaf. This may lose an extent
-        // but prevents a crash.
         let current_depth = inode_ref.inode.root_extent_header().depth;
+
         if current_depth >= 1 {
-            log::debug!(
-                "[create_new_leaf] depth={}, inserting directly into leaf (may overwrite)",
-                current_depth
+            // Depth=1: root is an index node pointing to leaf blocks.
+            // The current leaf is full. Allocate a NEW leaf block and add
+            // a new index entry in root pointing to it.
+            let root_hdr = inode_ref.inode.root_extent_header();
+            let root_entries = root_hdr.entries_count as usize;
+            let root_max = root_hdr.max_entries_count as usize;
+
+            // Allocate new leaf block
+            let new_leaf_pblock = self.balloc_alloc_block(inode_ref, None)?;
+
+            // Initialize the new leaf block as empty
+            let mut new_leaf =
+                Block::load(&self.block_device, new_leaf_pblock as usize * BLOCK_SIZE);
+            new_leaf.data.fill(0);
+            let leaf_hdr = Ext4ExtentHeader::new(
+                EXT4_EXTENT_MAGIC,
+                0, // will be set to 1 after inserting
+                ((BLOCK_SIZE - EXT4_EXTENT_HEADER_SIZE) / EXT4_EXTENT_SIZE) as u16,
+                0, // leaf depth = 0
+                0,
             );
+            let hdr_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &leaf_hdr as *const _ as *const u8,
+                    EXT4_EXTENT_HEADER_SIZE,
+                )
+            };
+            new_leaf.data[..EXT4_EXTENT_HEADER_SIZE].copy_from_slice(hdr_bytes);
+
+            // Insert the new extent into the new leaf at position 0
+            let ext_bytes = unsafe {
+                core::slice::from_raw_parts(new_extent as *const _ as *const u8, EXT4_EXTENT_SIZE)
+            };
+            new_leaf.data[EXT4_EXTENT_HEADER_SIZE..EXT4_EXTENT_HEADER_SIZE + EXT4_EXTENT_SIZE]
+                .copy_from_slice(ext_bytes);
+            // Update leaf header entries_count = 1
+            let leaf_hdr_mut: &mut Ext4ExtentHeader = new_leaf.read_offset_as_mut(0);
+            leaf_hdr_mut.entries_count = 1;
+
+            new_leaf.sync_blk_to_disk(&self.block_device);
+            let _ = self.set_extent_block_checksum(inode_ref, new_leaf_pblock as usize);
+
+            // Add index entry in root pointing to new leaf
+            if root_entries < root_max {
+                let new_index = inode_ref.inode.root_index_mut_at(root_entries);
+                new_index.first_block = new_extent.first_block;
+                new_index.store_pblock(new_leaf_pblock);
+                inode_ref.inode.root_extent_header_mut().entries_count += 1;
+                self.write_back_inode(inode_ref);
+                log::debug!(
+                    "[create_new_leaf] Added index entry {} → leaf block {} for lblock {}",
+                    root_entries,
+                    new_leaf_pblock,
+                    new_extent.first_block
+                );
+                return Ok(());
+            }
+
+            // Root index is also full — fall back to direct insert
+            // (best effort, may overwrite an extent in the current leaf)
+            log::debug!("[create_new_leaf] Root index full, direct insert");
             return self.insert_new_extent(inode_ref, search_path, new_extent);
         }
 
-        log::debug!("[create_new_leaf] Tree is full, calling ext_grow_indepth");
+        // Depth=0: grow tree to depth=1, then insert
         self.ext_grow_indepth(inode_ref)?;
-
-        log::debug!("[create_new_leaf] After ext_grow_indepth, inserting extent again");
         self.insert_extent(inode_ref, new_extent)
     }
 

@@ -173,8 +173,7 @@ pub fn enable_timer() {
         // Initial count: QEMU LAPIC bus runs at ~1 GHz.
         // divide=16 → 1GHz/16 = 62.5 MHz effective timer clock.
         // 62.5MHz / 625000 = 100 Hz → 10ms per tick.
-        // (Previously 62500 → 1000 Hz, causing time to run 10x too fast.)
-        lapic_write(reg::TIMER_INITIAL_COUNT, 62500);
+        lapic_write(reg::TIMER_INITIAL_COUNT, 625000);
         // LVT timer: periodic mode + vector
         lapic_write(
             reg::LVT_TIMER,
