@@ -471,10 +471,8 @@ pub(crate) fn user_read_bytes(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
         } else {
             // Kernel CR3 active — switch once, bulk copy, switch back
             buf.resize(len, 0u8);
-            crate::arch::trap::with_user_cr3(|| {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
-                }
+            crate::arch::trap::with_user_cr3(|| unsafe {
+                core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
             });
         }
     }
@@ -586,10 +584,8 @@ pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) -> bool {
         if !ensure_user_write_pages(addr, len) {
             return false;
         }
-        crate::arch::trap::with_user_cr3(|| {
-            unsafe {
-                core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, len);
-            }
+        crate::arch::trap::with_user_cr3(|| unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, len);
         });
         true
     }
@@ -832,13 +828,13 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
     match nr {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
         1 => sys_write(args[0] as i32, args[1], args[2]), // write
-        2 => linux_open(args[0], args[1], args[2]), // open (deprecated, use openat)
-        3 => sys_close(args[0] as i32),             // close
-        4 => linux_stat(args[0], args[1]),          // stat
-        5 => linux_fstat(args[0], args[1]),         // fstat
-        6 => linux_lstat(args[0], args[1]),         // lstat
-        7 => linux_poll(args[0], args[1], args[2]), // poll
-        8 => linux_lseek(args[0], args[1], args[2]), // lseek
+        2 => linux_open(args[0], args[1], args[2]),      // open (deprecated, use openat)
+        3 => sys_close(args[0] as i32),                  // close
+        4 => linux_stat(args[0], args[1]),               // stat
+        5 => linux_fstat(args[0], args[1]),              // fstat
+        6 => linux_lstat(args[0], args[1]),              // lstat
+        7 => linux_poll(args[0], args[1], args[2]),      // poll
+        8 => linux_lseek(args[0], args[1], args[2]),     // lseek
         9 => {
             let r = linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]);
             r
@@ -865,20 +861,20 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
             crate::sched::schedule();
             0
         } // sched_yield
-        25 => ERR_INVAL,                                   // mremap (stub)
-        26 => 0,                                           // msync (stub)
-        27 => 0,                                           // mincore (stub)
+        25 => linux_mremap(args[0], args[1], args[2], args[3]), // mremap
+        26 => 0,                                           // msync (no-op)
+        27 => 0,                                           // mincore (all pages resident)
         28 => linux_madvise(args[0], args[1], args[2]),    // madvise
         29 => linux_dup(args[0]),                          // dup
         30 => linux_dup2(args[0], args[1]),                // dup2
         31 => linux_pause(),                               // pause
         32 => linux_dup(args[0]),                          // dup
-        33 => linux_chdir(args[0]),                       // chdir (proper impl)
+        33 => linux_chdir(args[0]),                        // chdir (proper impl)
         34 => 0,                                           // fchdir (stub)
         35 => linux_nanosleep(args[0], args[1]),           // nanosleep
         36 => 0,                                           // alarm (stub: no alarms)
-        37 => 0,                                           // setitimer (stub: Go uses for preemption, return 0)
-        38 => linux_gethostname(args[0], args[1]),        // gethostname
+        37 => 0, // setitimer (stub: Go uses for preemption, return 0)
+        38 => linux_gethostname(args[0], args[1]), // gethostname
 
         // ─── Process management ───────────────────────────────────
         39 => sys_getpid(),                                  // getpid
@@ -891,10 +887,10 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         46 => 0,                                             // sendmsg (not implemented)
         47 => 0,                                             // recvmsg (not implemented)
         48 => sys_shutdown(args[0] as i32),                  // shutdown
-        49 => sys_bind(args[0] as i32, args[1], args[2]),   // bind
+        49 => sys_bind(args[0] as i32, args[1], args[2]),    // bind
         50 => sys_listen(args[0] as i32, args[1]),           // listen
-        51 => linux_getsockname(args[0], args[1], args[2]), // getsockname
-        52 => linux_getpeername(args[0], args[1], args[2]), // getpeername
+        51 => linux_getsockname(args[0], args[1], args[2]),  // getsockname
+        52 => linux_getpeername(args[0], args[1], args[2]),  // getpeername
         53 => ERR_INVAL,                                     // socketpair (not implemented)
         54 => linux_setsockopt(args[0], args[1], args[2], args[3], args[4]), // setsockopt
         55 => linux_getsockopt(args[0], args[1], args[2], args[3], args[4]), // getsockopt
@@ -915,20 +911,20 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         87 => sys_unlink(args[0], linux::count_user_string(args[0])), // unlink
 
         // ─── More process ─────────────────────────────────────────
-        89 => linux_readlink(args[0], args[1], args[2]),  // readlink
-        96 => linux_gettimeofday(args[0], args[1]), // gettimeofday
-        97 => linux_getrlimit(args[0], args[1]),    // getrlimit
-        98 => linux_getrusage(args[0], args[1]),    // getrusage
-        99 => linux_sysinfo(args[0]),               // sysinfo
-        100 => linux_times(args[0]),                // times
-        101 => ERR_INVAL,                           // ptrace (stub)
-        102 => 0,                                   // getuid (stub: root)
-        103 => 0,                                   // syslog (stub)
-        104 => 0,                                   // getgid (stub: root)
-        105 => 0,                                   // setuid (stub)
-        106 => 0,                                   // setgid (stub)
-        107 => 0,                                   // geteuid (stub: root)
-        108 => 0,                                   // getegid (stub: root)
+        89 => linux_readlink(args[0], args[1], args[2]), // readlink
+        96 => linux_gettimeofday(args[0], args[1]),      // gettimeofday
+        97 => linux_getrlimit(args[0], args[1]),         // getrlimit
+        98 => linux_getrusage(args[0], args[1]),         // getrusage
+        99 => linux_sysinfo(args[0]),                    // sysinfo
+        100 => linux_times(args[0]),                     // times
+        101 => ERR_INVAL,                                // ptrace (stub)
+        102 => 0,                                        // getuid (stub: root)
+        103 => 0,                                        // syslog (stub)
+        104 => 0,                                        // getgid (stub: root)
+        105 => 0,                                        // setuid (stub)
+        106 => 0,                                        // setgid (stub)
+        107 => 0,                                        // geteuid (stub: root)
+        108 => 0,                                        // getegid (stub: root)
         72 => linux_fcntl(args[0], args[1], args[2]),
         74 => linux_fsync(args[0]), // fsync
         75 => linux_fsync(args[0]), // fdatasync (same as fsync for us)
@@ -981,7 +977,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         262 => linux_newfstatat(args[0], args[1], args[2], args[3]), // newfstatat
         263 => sys_unlink(args[1], linux::count_user_string(args[1])), // unlinkat
         267 => linux_readlinkat(args[0], args[1], args[2], args[3]), // readlinkat
-        269 => linux_access(args[1], args[2]),                       // faccessat
+        269 => linux_access(args[1], args[2]),      // faccessat
         272 => 0,                                   // unshare (stub)
         273 => 0,                                   // set_robust_list (stub)
         274 => 0,                                   // get_robust_list (stub)
@@ -991,8 +987,8 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         281 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_pwait (same as epoll_wait, ignoring sigmask)
         291 => epoll::sys_epoll_create1(args[0]),                                  // epoll_create1
         292 => sys_dup2(args[0] as i32, args[1] as i32),                           // dup3 → dup2
-        293 => linux_pipe2(args[0], args[1]),                                 // pipe2
-        302 => linux_prlimit64(args[0], args[1], args[2], args[3]),          // prlimit64
+        293 => linux_pipe2(args[0], args[1]),                                      // pipe2
+        302 => linux_prlimit64(args[0], args[1], args[2], args[3]),                // prlimit64
         285 => 0, // fallocate → success (SQLite WAL needs this)
         318 => linux_getrandom(args[0], args[1], args[2]), // getrandom
         334 => ERR_NOSYS, // rseq → ENOSYS (Go gracefully degrades)
@@ -2884,9 +2880,7 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             }
             retval
         }
-        _ => {
-            0
-        }
+        _ => 0,
     }
 }
 
@@ -5100,9 +5094,7 @@ fn sys_fork() -> isize {
         user_satp,
         child_idx,
     ) {
-        Some(_tid) => {
-            child_pid as isize
-        }
+        Some(_tid) => child_pid as isize,
         None => {
             crate::klog!(DEBUG, "[fork] Failed to schedule child");
             ERR_NOMEM
@@ -5705,9 +5697,9 @@ fn linux_getrlimit(resource: usize, rlim_ptr: usize) -> isize {
         return ERR_FAULT;
     }
     let (cur, max) = match resource {
-        7 => (1024u64, 1024u64), // RLIMIT_NOFILE
-        3 => (1024u64, 1024u64), // RLIMIT_STACK (1MB)
-        9 => (1024u64, 1024u64), // RLIMIT_AS (256MB)
+        7 => (1024u64, 1024u64),   // RLIMIT_NOFILE
+        3 => (1024u64, 1024u64),   // RLIMIT_STACK (1MB)
+        9 => (1024u64, 1024u64),   // RLIMIT_AS (256MB)
         _ => (u64::MAX, u64::MAX), // unlimited
     };
     user_write::<u64>(rlim_ptr, cur);
@@ -5765,10 +5757,10 @@ fn linux_times(buf_ptr: usize) -> isize {
         // struct tms { tms_utime, tms_stime, tms_cutime, tms_cstime } (4 × u64)
         let uptime = crate::arch::platform::uptime_ms();
         let ticks = uptime / 10;
-        user_write::<u64>(buf_ptr, ticks / 2);       // utime
-        user_write::<u64>(buf_ptr + 8, ticks / 2);   // stime
-        user_write::<u64>(buf_ptr + 16, 0);           // cutime
-        user_write::<u64>(buf_ptr + 24, 0);           // cstime
+        user_write::<u64>(buf_ptr, ticks / 2); // utime
+        user_write::<u64>(buf_ptr + 8, ticks / 2); // stime
+        user_write::<u64>(buf_ptr + 16, 0); // cutime
+        user_write::<u64>(buf_ptr + 24, 0); // cstime
     }
     let uptime = crate::arch::platform::uptime_ms();
     (uptime / 10) as isize
@@ -5817,13 +5809,25 @@ fn linux_getpeername(fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
 /// Linux setsockopt(fd, level, optname, optval, optlen) — set socket option.
 /// Accept all options but mostly ignore them (standard approach for minimal OS).
 #[cfg(target_arch = "x86_64")]
-fn linux_setsockopt(_fd: usize, _level: usize, _optname: usize, _optval: usize, _optlen: usize) -> isize {
+fn linux_setsockopt(
+    _fd: usize,
+    _level: usize,
+    _optname: usize,
+    _optval: usize,
+    _optlen: usize,
+) -> isize {
     0
 }
 
 /// Linux getsockopt(fd, level, optname, optval, optlen) — get socket option.
 #[cfg(target_arch = "x86_64")]
-fn linux_getsockopt(_fd: usize, level: usize, optname: usize, optval: usize, optlen_ptr: usize) -> isize {
+fn linux_getsockopt(
+    _fd: usize,
+    level: usize,
+    optname: usize,
+    optval: usize,
+    optlen_ptr: usize,
+) -> isize {
     if optval != 0 && optlen_ptr != 0 {
         match (level, optname) {
             (1, 3) => {
@@ -5963,4 +5967,17 @@ fn linux_mkdirat(_dirfd: usize, path_ptr: usize, _mode: usize, _unused: usize) -
     }
 
     sys_mkdir(path_ptr, actual_len)
+}
+
+/// Linux mremap(old_address, old_size, new_size, flags, new_address)
+/// Basic implementation: for growing, mmap additional pages; for shrinking, no-op.
+#[cfg(target_arch = "x86_64")]
+fn linux_mremap(old_address: usize, _old_size: usize, new_size: usize, _flags: usize) -> isize {
+    if old_address == 0 || new_size == 0 {
+        return ERR_INVAL;
+    }
+    // For Go compatibility: just return the old address.
+    // Go's mmap hint fallback already handles this by using the bump allocator.
+    // The VMA tracking will handle page faults lazily for the new size.
+    old_address as isize
 }

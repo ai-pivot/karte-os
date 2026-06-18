@@ -161,11 +161,7 @@ unsafe fn current_attr() -> u8 {
     };
 
     // Blink uses bit 7
-    if BLINK {
-        base | 0x80
-    } else {
-        base
-    }
+    if BLINK { base | 0x80 } else { base }
 }
 
 // ─── Low-level screen operations ────────────────────────────────────────
@@ -602,7 +598,9 @@ unsafe fn csi_dispatch(final_byte: u8) {
             if CSI_HAS_QUESTION {
                 let mode = csi_param(0, 0);
                 match mode {
-                    25 => { CURSOR_VISIBLE = true; }
+                    25 => {
+                        CURSOR_VISIBLE = true;
+                    }
                     7 => { /* Auto-wrap ON — VGA always wraps, no-op */ }
                     47 | 1047 | 1049 => {
                         // Switch to alternate screen buffer
@@ -635,7 +633,9 @@ unsafe fn csi_dispatch(final_byte: u8) {
             if CSI_HAS_QUESTION {
                 let mode = csi_param(0, 0);
                 match mode {
-                    25 => { CURSOR_VISIBLE = false; }
+                    25 => {
+                        CURSOR_VISIBLE = false;
+                    }
                     7 => { /* Auto-wrap OFF — not fully supported */ }
                     47 | 1047 | 1049 => {
                         // Switch back to main screen buffer
