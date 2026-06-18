@@ -1182,8 +1182,84 @@ fn linux_newfstatat(_dirfd: usize, pathname: usize, statbuf: usize, _flags: usiz
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")]
+fn linux_poll(fds_ptr: usize, nfds: usize, _timeout: usize) -> isize {
+    if nfds == 0 || fds_ptr == 0 {
+        return 0;
+    }
+
+    const POLLIN: u16 = 0x001;
+    const POLLOUT: u16 = 0x004;
+    const POLLERR: u16 = 0x008;
+    const POLLHUP: u16 = 0x010;
+
+    // struct pollfd { int fd (4), short events (2), short revents (2) } = 8 bytes
+    let mut ready_count = 0i32;
+    for i in 0..nfds {
+        let entry = fds_ptr + i * 8;
+        let fd = user_read::<i32>(entry as usize);
+        let events = user_read::<u16>(entry as usize + 4);
+        if fd < 0 {
+            // Negative fd: revents is always 0 (ignored)
+            user_write::<u16>(entry as usize + 6, 0);
+            continue;
+        }
+
+        let mut revents: u16 = 0;
+
+        // Check readability (POLLIN)
+        if events & POLLIN != 0 {
+            if fd == 0 {
+                // stdin: check TTY input
+                if crate::driver::tty::has_input() {
+                    revents |= POLLIN;
+                }
+            } else {
+                // Other fds: check type
+                let fd_info = get_fd_info(fd);
+                match fd_info {
+                    Some((FdType::PipeRead, _, _)) => {
+                        // Pipe: check if data available
+                        revents |= POLLIN; // Simplified: assume ready
+                    }
+                    Some((FdType::VfsFile(_), _, _))
+                    | Some((FdType::Ext4File(_), _, _))
+                    | Some((FdType::FakeFile(_), _, _)) => {
+                        // Files: always readable
+                        revents |= POLLIN;
+                    }
+                    Some((FdType::Socket(_), _, _)) => {
+                        // Socket: simplified check
+                        revents |= POLLIN;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Check writability (POLLOUT)
+        if events & POLLOUT != 0 {
+            // All writable fds are ready for writing
+            revents |= POLLOUT;
+        }
+
+        // Always set POLLERR for invalid fds
+        let fd_info = get_fd_info(fd);
+        if fd_info.is_none() && fd != 0 && fd != 1 && fd != 2 {
+            revents |= POLLERR;
+        }
+
+        user_write::<u16>(entry as usize + 6, revents);
+        if revents != 0 {
+            ready_count += 1;
+        }
+    }
+
+    ready_count as isize
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 fn linux_poll(_fds: usize, _nfds: usize, _timeout: usize) -> isize {
-    // No events ready
     0
 }
 
