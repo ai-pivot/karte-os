@@ -5684,6 +5684,7 @@ fn linux_tgkill(_tgid: usize, _tid: usize, _sig: usize) -> isize {
 }
 
 /// Linux access(path, mode) — check file accessibility.
+#[cfg(target_arch = "x86_64")]
 fn linux_access(path: usize, _mode: usize) -> isize {
     let path_len = crate::syscall::linux::count_user_string(path);
     if path_len == 0 {
@@ -5698,6 +5699,7 @@ fn linux_access(path: usize, _mode: usize) -> isize {
 
 /// Linux getrlimit(resource, rlim) — get resource limits.
 /// rlim is a pointer to struct rlimit { rlim_cur, rlim_max } (each u64).
+#[cfg(target_arch = "x86_64")]
 fn linux_getrlimit(resource: usize, rlim_ptr: usize) -> isize {
     if rlim_ptr == 0 {
         return ERR_FAULT;
@@ -5714,6 +5716,7 @@ fn linux_getrlimit(resource: usize, rlim_ptr: usize) -> isize {
 }
 
 /// Linux prlimit64(pid, resource, new_rlim, old_rlim) — get/set resource limits.
+#[cfg(target_arch = "x86_64")]
 fn linux_prlimit64(_pid: usize, resource: usize, new_rlim: usize, old_rlim: usize) -> isize {
     if old_rlim != 0 {
         let (cur, max) = match resource {
@@ -5731,6 +5734,7 @@ fn linux_prlimit64(_pid: usize, resource: usize, new_rlim: usize, old_rlim: usiz
 
 /// Linux getrusage(who, usage) — get resource usage.
 /// struct rusage is 144 bytes on x86_64.
+#[cfg(target_arch = "x86_64")]
 fn linux_getrusage(_who: usize, usage_ptr: usize) -> isize {
     if usage_ptr == 0 {
         return ERR_FAULT;
@@ -5755,6 +5759,7 @@ fn linux_getrusage(_who: usize, usage_ptr: usize) -> isize {
 
 /// Linux times(buf) — get process times.
 /// Returns clock ticks elapsed since boot.
+#[cfg(target_arch = "x86_64")]
 fn linux_times(buf_ptr: usize) -> isize {
     if buf_ptr != 0 {
         // struct tms { tms_utime, tms_stime, tms_cutime, tms_cstime } (4 × u64)
@@ -5770,6 +5775,7 @@ fn linux_times(buf_ptr: usize) -> isize {
 }
 
 /// Linux getsockname(fd, addr, addrlen) — get socket local address.
+#[cfg(target_arch = "x86_64")]
 fn linux_getsockname(_fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
     if addr_ptr != 0 && addrlen_ptr != 0 {
         // Return 0.0.0.0:0 as the local address
@@ -5783,6 +5789,7 @@ fn linux_getsockname(_fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
 }
 
 /// Linux getpeername(fd, addr, addrlen) — get socket remote address.
+#[cfg(target_arch = "x86_64")]
 fn linux_getpeername(fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
     // Try to get the remote address from the socket
     // For now, return ENOTCONN if we can't determine it
@@ -5809,11 +5816,13 @@ fn linux_getpeername(fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> isize {
 
 /// Linux setsockopt(fd, level, optname, optval, optlen) — set socket option.
 /// Accept all options but mostly ignore them (standard approach for minimal OS).
+#[cfg(target_arch = "x86_64")]
 fn linux_setsockopt(_fd: usize, _level: usize, _optname: usize, _optval: usize, _optlen: usize) -> isize {
     0
 }
 
 /// Linux getsockopt(fd, level, optname, optval, optlen) — get socket option.
+#[cfg(target_arch = "x86_64")]
 fn linux_getsockopt(_fd: usize, level: usize, optname: usize, optval: usize, optlen_ptr: usize) -> isize {
     if optval != 0 && optlen_ptr != 0 {
         match (level, optname) {
@@ -5848,6 +5857,7 @@ fn linux_getsockopt(_fd: usize, level: usize, optname: usize, optval: usize, opt
 }
 
 /// Linux pipe2(fds, flags) — create pipe with flags.
+#[cfg(target_arch = "x86_64")]
 fn linux_pipe2(fds_ptr: usize, _flags: usize) -> isize {
     if fds_ptr == 0 {
         return ERR_FAULT;
@@ -5858,16 +5868,19 @@ fn linux_pipe2(fds_ptr: usize, _flags: usize) -> isize {
 
 /// Linux readlink(path, buf, bufsiz) — read value of symbolic link.
 /// We don't support symlinks, so return EINVAL.
+#[cfg(target_arch = "x86_64")]
 fn linux_readlink(_path: usize, _buf: usize, _bufsiz: usize) -> isize {
     ERR_INVAL
 }
 
 /// Linux readlinkat(dirfd, path, buf, bufsiz) — readlink relative to dirfd.
+#[cfg(target_arch = "x86_64")]
 fn linux_readlinkat(_dirfd: usize, _path: usize, _buf: usize, _bufsiz: usize) -> isize {
     ERR_INVAL
 }
 
 /// Linux prctl(option, ...) — process control operations.
+#[cfg(target_arch = "x86_64")]
 fn linux_prctl(option: usize, arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> isize {
     match option {
         15 => {
@@ -5893,6 +5906,7 @@ fn linux_prctl(option: usize, arg2: usize, _arg3: usize, _arg4: usize, _arg5: us
 
 /// Linux vfork() — behaves like fork but parent blocks until child exits.
 /// We implement it as fork since we don't have memory sharing.
+#[cfg(target_arch = "x86_64")]
 fn linux_vfork() -> isize {
     sys_fork()
 }
