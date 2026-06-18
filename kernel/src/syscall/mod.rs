@@ -414,19 +414,17 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) -> bool {
             return true;
         }
         if !ensure_user_write_pages(addr, core::mem::size_of::<T>()) {
-            crate::klog!(
-                WARN,
-                "[syscall] user_write: page allocation failed at {:#x}",
-                addr
-            );
             return false;
         }
-        let src = unsafe {
-            core::slice::from_raw_parts((&val as *const T) as *const u8, core::mem::size_of::<T>())
-        };
-        for (i, &byte) in src.iter().enumerate() {
-            unsafe { user_write_u8_mapped(addr + i, byte) };
-        }
+        // Bulk copy under user CR3 (single switch)
+        let size = core::mem::size_of::<T>();
+        crate::arch::trap::with_user_cr3(|| {
+            unsafe {
+                let src = core::slice::from_raw_parts(&val as *const T as *const u8, size);
+                let dst = core::slice::from_raw_parts_mut(addr as *mut u8, size);
+                dst.copy_from_slice(src);
+            }
+        });
         true
     }
     #[cfg(not(target_arch = "x86_64"))]
