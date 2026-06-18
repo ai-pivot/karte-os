@@ -591,7 +591,6 @@ fn is_pseudo_path(path: &str) -> bool {
         || path.starts_with("/sys")
         || path.starts_with("/dev")
         || path.starts_with("/run")
-        || path.starts_with("/etc")
         || path.starts_with("/tmp")
 }
 
@@ -1024,7 +1023,7 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
                         None => ERR_NOENT,
                     }
                 })
-            } else if is_pseudo || is_etc {
+            } else if is_pseudo {
                 let content = if path_str.ends_with("resolv.conf") {
                     b"nameserver 10.0.2.3\n".to_vec()
                 } else if path_str.ends_with("hosts") {
