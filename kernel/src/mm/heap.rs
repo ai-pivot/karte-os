@@ -72,9 +72,9 @@ pub fn init() {
     //     scaling with hardware (512MB RAM → ~448MB for user, 4GB → ~4GB).
     let (total_frames, used_frames, _) = pmm::debug_stats();
     let total_ram = total_frames * pmm::page_size();
-    let heap_pages = ((total_ram / 16) / pmm::page_size())
-        .max(2048) // minimum 8MB
-        .min(16384); // maximum 64MB
+    let heap_pages = ((total_ram / 8) / pmm::page_size())
+        .max(4096) // minimum 16MB
+        .min(32768); // maximum 128MB
 
     let heap_start_phys = pmm::alloc_contiguous_frames(heap_pages)
         .expect("Failed to allocate contiguous heap memory");

@@ -1291,13 +1291,7 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                                 None => true,
                                 Some(f) => f == page_addr,
                             };
-                            crate::console_println!(
-                                "[PF-LAZY] addr={:#x} old_frame={:?} needs_alloc={} pte={:?}",
-                                page_addr,
-                                old_frame.map(|f| f as usize),
-                                needs_alloc,
-                                old_pte
-                            );
+                            // PF-LAZY logging removed — too noisy during Go heap expansion
                             if needs_alloc {
                                 let vma_is_elf = crate::syscall::vma_is_elf(fault_addr_val);
                                 if vma_is_elf && old_frame.is_some() {

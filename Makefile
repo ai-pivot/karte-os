@@ -40,7 +40,7 @@ KERNEL_X86   := target/$(TARGET_X86)/release/karte-os-kernel
 ISO_DIR      := target/x86_64-iso
 ISO_FILE     := target/karte-os-x86_64.iso
 QEMU_X86_FLAGS := \
-  -machine pc -cpu qemu64 -m 512M -smp 1 \
+  -machine pc -cpu qemu64 -m 512M -smp 2 \
   -cdrom $(ISO_FILE) -serial stdio -display none -no-reboot \
   -drive file=disk.img,format=raw,if=none,id=hd0 \
   -device ich9-ahci,id=ahci \
@@ -61,11 +61,24 @@ deploy: disk.img
 	@cd user && $(MAKE) ARCH=riscv64 clean > /dev/null 2>&1 && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
 	@bash tools/mkdisk.sh deploy-riscv
 
-## Create disk.img and deploy all x86_64 user programs
+## Create disk.img and deploy all x86_64 user programs + xbot + /etc
 deploy-x86: disk.img
 	@echo "[deploy] Installing x86_64 programs..."
 	@cd user && $(MAKE) ARCH=x86_64 clean > /dev/null 2>&1 && $(MAKE) ARCH=x86_64 > /dev/null 2>&1
 	@bash tools/mkdisk.sh deploy-x86
+	@if [ -f xbot-cli-static-x86_64 ]; then \
+		DISK=disk.img bash tools/mkdisk.sh put xbot-cli-static-x86_64 xbot-cli-static > /dev/null 2>&1; \
+		echo "[deploy] xbot-cli-static deployed"; \
+	fi
+	@mkdir -p /tmp/karte_etc
+	@printf '127.0.0.1 localhost\n' > /tmp/karte_etc/hosts
+	@printf 'nameserver 10.0.2.3\n' > /tmp/karte_etc/resolv.conf
+	@echo "mkdir etc" | debugfs -w disk.img 2>/dev/null; \
+	echo "cd etc" > /tmp/_dbg_e; \
+	echo "write /tmp/karte_etc/hosts hosts" >> /tmp/_dbg_e; \
+	echo "write /tmp/karte_etc/resolv.conf resolv.conf" >> /tmp/_dbg_e; \
+	cat /tmp/_dbg_e | debugfs -w disk.img 2>/dev/null; \
+	echo "[deploy] /etc/hosts and /etc/resolv.conf deployed"
 
 ## Create empty disk.img if missing
 disk.img:
@@ -133,7 +146,7 @@ build-x86:
 	@$(MAKE) _build-x86-iso
 
 ## Run on x86_64 QEMU (build ISO + run)
-run-x86: _build-x86-iso disk.img
+run-x86: iso-x86
 	$(QEMU_X86) $(QEMU_X86_FLAGS)
 
 ## Debug on x86_64 (GDB stub)
