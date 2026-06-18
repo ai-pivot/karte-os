@@ -118,6 +118,19 @@ pub fn console_putchar(c: u8) {
     crate::driver::vga::putchar(c);
 }
 
+/// Write a batch of bytes to the console efficiently.
+/// Processes VGA sequentially (for ANSI parsing) then batch-writes to UART.
+/// Reduces port I/O overhead compared to per-byte console_putchar calls.
+pub fn console_write_batch(data: &[u8]) {
+    // Process all bytes through VGA first (sequential for ANSI state machine)
+    for &byte in data {
+        crate::driver::vga::putchar(byte);
+    }
+    // Batch-write to UART (single code path, efficient port I/O)
+    let mut uart = crate::arch::uart::ComPort::new(0x3F8);
+    uart.write_batch(data);
+}
+
 /// Execute the HLT instruction — halt until the next interrupt.
 pub fn wait_for_interrupt() {
     x86_64::instructions::hlt();

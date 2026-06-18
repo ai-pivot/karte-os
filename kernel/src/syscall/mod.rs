@@ -2069,12 +2069,19 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
         Some((FdType::Stdio, _, _)) => {
             // Stdio: batch-read user buffer then output to console
             let data = user_read_bytes(buf, len);
-            for &byte in &data {
-                crate::arch::platform::console_putchar(byte);
-            }
-            // Update hardware cursor after batch write (deferred from per-char path)
+            // Batch console output: VGA sequentially (ANSI parsing),
+            // then UART batch-write (reduces port I/O overhead)
             #[cfg(target_arch = "x86_64")]
-            crate::driver::vga::flush_cursor();
+            {
+                crate::arch::platform::console_write_batch(&data);
+                crate::driver::vga::flush_cursor();
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                for &byte in &data {
+                    crate::arch::platform::console_putchar(byte);
+                }
+            }
             return len as isize;
         }
         Some((FdType::FakeFile(_), _, _)) => {
