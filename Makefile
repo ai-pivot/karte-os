@@ -75,9 +75,10 @@ deploy-x86:
 	@mkdir -p /tmp/karte_etc
 	@printf '127.0.0.1 localhost\n' > /tmp/karte_etc/hosts
 	@printf 'nameserver 10.0.2.3\n' > /tmp/karte_etc/resolv.conf
-	@printf 'mkdir etc\nmkdir etc/ssl\nmkdir etc/ssl/certs\nwrite /tmp/karte_etc/hosts etc/hosts\nwrite /tmp/karte_etc/resolv.conf etc/resolv.conf\n' > /tmp/_dbg_deploy
+	@printf 'mkdir etc\nmkdir etc/ssl\nmkdir etc/ssl/certs\nmkdir etc/pki\nmkdir etc/pki/tls\nmkdir etc/pki/tls/certs\nwrite /tmp/karte_etc/hosts etc/hosts\nwrite /tmp/karte_etc/resolv.conf etc/resolv.conf\n' > /tmp/_dbg_deploy
 	@if [ -f /etc/ssl/certs/ca-certificates.crt ]; then \
 		printf 'write /etc/ssl/certs/ca-certificates.crt etc/ssl/certs/ca-certificates.crt\n' >> /tmp/_dbg_deploy; \
+		printf 'write /etc/ssl/certs/ca-certificates.crt etc/pki/tls/certs/ca-bundle.crt\n' >> /tmp/_dbg_deploy; \
 	fi
 	@cat /tmp/_dbg_deploy | debugfs -w disk.img 2>/dev/null
 	@echo "[deploy] /etc/hosts, resolv.conf, ssl/certs deployed"
