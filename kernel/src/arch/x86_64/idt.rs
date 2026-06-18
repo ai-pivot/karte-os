@@ -584,8 +584,15 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if !from_user {
         // Timer fired from kernel mode (idle task or during a syscall).
-        // The IST stub already switched to KERNEL_CR3, so no CR3 change needed.
-        // Do not preempt kernel code — just return.
+        return;
+    }
+
+    // Optimization: only schedule every 3 ticks (~33Hz, 30ms time slice)
+    // instead of every tick (100Hz, 10ms time slice). This reduces context
+    // switch overhead by 3x for multi-task scenarios.
+    // schedule() already skips self-switch when only one task is runnable.
+    let tick = TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    if tick % 3 != 0 {
         return;
     }
 
