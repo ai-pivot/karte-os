@@ -201,6 +201,21 @@ impl Ext4BlockDevice for KarteBlockDevice {
             buf_pos += copy_len;
             sector_idx += 1;
         }
+
+        // Read-ahead: prefetch next block's first sector into cache
+        // (speeds up sequential file reads like ELF loading)
+        let next_sector = base_sector + 8; // First sector of next block
+        if is_offset_valid(next_sector * SECTOR_SIZE) {
+            let cache = SECTOR_CACHE.lock();
+            if cache.get(next_sector).is_none() {
+                drop(cache);
+                let mut sector = [0u8; SECTOR_SIZE];
+                if (self.read_sector_fn)(next_sector, &mut sector).is_ok() {
+                    SECTOR_CACHE.lock().insert(next_sector, sector);
+                }
+            }
+        }
+
         READ_COUNT.fetch_add(1, Ordering::Relaxed);
         buf
     }
