@@ -876,9 +876,9 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         33 => linux_chdir(args[0]),                       // chdir (proper impl)
         34 => 0,                                           // fchdir (stub)
         35 => linux_nanosleep(args[0], args[1]),           // nanosleep
-        36 => 0,                                           // alarm (stub)
-        37 => 0,                                           // setitimer (stub)
-        38 => 0,                                           // gethostname (stub)
+        36 => 0,                                           // alarm (stub: no alarms)
+        37 => 0,                                           // setitimer (stub: Go uses for preemption, return 0)
+        38 => linux_gethostname(args[0], args[1]),        // gethostname
 
         // ─── Process management ───────────────────────────────────
         39 => sys_getpid(),                                  // getpid
@@ -5909,6 +5909,20 @@ fn linux_prctl(option: usize, arg2: usize, _arg3: usize, _arg4: usize, _arg5: us
 #[cfg(target_arch = "x86_64")]
 fn linux_vfork() -> isize {
     sys_fork()
+}
+
+/// Linux gethostname(name, len) — return the system hostname.
+#[cfg(target_arch = "x86_64")]
+fn linux_gethostname(buf: usize, len: usize) -> isize {
+    if buf == 0 || len == 0 {
+        return ERR_FAULT;
+    }
+    let hostname = b"karteos\0";
+    let copy_len = hostname.len().min(len);
+    for (i, &byte) in hostname.iter().enumerate().take(copy_len) {
+        user_write::<u8>(buf + i, byte);
+    }
+    0
 }
 
 /// Linux nanosleep(req, rem) — sleep for a specified relative interval.
