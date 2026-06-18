@@ -101,6 +101,9 @@ static mut BLINK: bool = false;
 static mut FAINT: bool = false; // Dim (mapped to darker fg)
 static mut CONCEALED: bool = false; // Hidden text
 
+/// Cached attribute byte (recomputed only when SGR changes, not per-char)
+static mut CACHED_ATTR: u8 = 0x07;
+
 /// Scroll region (DECSTBM): lines outside [top, bottom] are not scrolled.
 /// Default: full screen (0..ROWS-1).
 static mut SCROLL_TOP: usize = 0;
@@ -163,6 +166,11 @@ unsafe fn current_attr() -> u8 {
 
     // Blink uses bit 7
     if BLINK { base | 0x80 } else { base }
+}
+
+/// Recompute and cache the VGA attribute byte. Call after any attribute change.
+unsafe fn update_cached_attr() {
+    CACHED_ATTR = current_attr();
 }
 
 // ─── Low-level screen operations ────────────────────────────────────────
@@ -592,9 +600,9 @@ unsafe fn csi_dispatch(final_byte: u8) {
                 }
                 i += 1;
             }
+            // Update cached attribute after SGR changes
+            update_cached_attr();
         }
-
-        // ── Cursor show/hide + private modes ──
         b'h' => {
             if CSI_HAS_QUESTION {
                 let mode = csi_param(0, 0);
@@ -857,11 +865,9 @@ pub fn putchar(c: u8) {
                     }
                     _ => {
                         if c >= 0x20 {
-                            // Fast path: printable character — no hardware cursor update
-                            // Cursor is tracked in CURSOR_COL/CURSOR_ROW variables.
-                            // Hardware cursor updated on next control char or escape seq.
-                            let attr = current_attr();
-                            write_char(CURSOR_COL, CURSOR_ROW, c, attr);
+                            // Fast path: printable character — use cached attribute
+                            // (no current_attr() call per character — major perf win)
+                            write_char(CURSOR_COL, CURSOR_ROW, c, CACHED_ATTR);
                             CURSOR_COL += 1;
                             if CURSOR_COL >= COLS {
                                 CURSOR_COL = 0;
@@ -900,6 +906,7 @@ pub fn putchar(c: u8) {
                         SCROLL_BOTTOM = ROWS - 1;
                         CURSOR_VISIBLE = true;
                         PARSE_STATE = ParseState::Normal;
+                        update_cached_attr();
                     }
                     b'7' => {
                         // DECSC — Save cursor + attributes
