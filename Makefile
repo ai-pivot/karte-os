@@ -62,8 +62,10 @@ deploy: disk.img
 	@bash tools/mkdisk.sh deploy-riscv
 
 ## Create disk.img and deploy all x86_64 user programs + xbot + /etc + CA certs
-deploy-x86: disk.img
-	@echo "[deploy] Installing x86_64 programs..."
+deploy-x86:
+	@echo "[deploy] Rebuilding disk image from scratch..."
+	@rm -f disk.img
+	@bash tools/mkdisk.sh init > /dev/null 2>&1
 	@cd user && $(MAKE) ARCH=x86_64 clean > /dev/null 2>&1 && $(MAKE) ARCH=x86_64 > /dev/null 2>&1
 	@bash tools/mkdisk.sh deploy-x86
 	@if [ -f xbot-cli-static-x86_64 ]; then \

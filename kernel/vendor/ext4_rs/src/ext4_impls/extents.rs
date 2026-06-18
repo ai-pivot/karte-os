@@ -35,7 +35,22 @@ impl Ext4 {
 
         // Traverse down the tree if depth > 0
         let mut pblock_of_node = 0;
+        let mut _depth_guard = 0u32; // prevent infinite loops on corrupt trees
         while depth > 0 {
+            _depth_guard += 1;
+            if _depth_guard > 5 {
+                // Corrupt extent tree — too many levels.
+                // Return pblock=0 so read_at zero-fills (hole behavior).
+                search_path.path.push(ExtentPathNode {
+                    header: node.header,
+                    index: None,
+                    extent: None,
+                    position: 0,
+                    pblock: 0,
+                    pblock_of_node,
+                });
+                return Ok(search_path);
+            }
             let index_pos = node.binsearch_idx(lblock);
             if let Some(pos) = index_pos {
                 let index = node.get_index(pos)?;
