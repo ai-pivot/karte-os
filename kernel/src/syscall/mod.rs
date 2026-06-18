@@ -831,20 +831,7 @@ fn dispatch_linux_raw(nr: usize, args: [usize; 6]) -> isize {
 fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
     match nr {
         0 => sys_read(args[0] as i32, args[1], args[2]), // read
-        1 => {
-            let result = sys_write(args[0] as i32, args[1], args[2]);
-            // Validate write return: must be 0..len or negative errno
-            let len = args[2];
-            if result > 0 && (result as usize) > len {
-                crate::console_println!(
-                    "[write] BAD RETURN: fd={} len={} got={:#x}",
-                    args[0],
-                    len,
-                    result
-                );
-            }
-            result
-        }
+        1 => sys_write(args[0] as i32, args[1], args[2]), // write
         2 => linux_open(args[0], args[1], args[2]), // open (deprecated, use openat)
         3 => sys_close(args[0] as i32),             // close
         4 => linux_stat(args[0], args[1]),          // stat
