@@ -94,13 +94,20 @@ pub fn shutdown() -> ! {
 ///
 /// On x86_64, output goes to both COM1 serial port and VGA text buffer.
 pub fn console_putchar(c: u8) {
-    // COM1 serial output
+    // COM1 serial output (with timeout protection)
     unsafe {
         let mut lsr: x86_64::instructions::port::Port<u8> =
             x86_64::instructions::port::Port::new(0x3FD);
 
-        // Wait until THR is empty (bit 5 of LSR)
-        while lsr.read() & 0x20 == 0 {}
+        // Wait until THR is empty (bit 5 of LSR), with timeout
+        let mut timeout = 1_000_000u32;
+        while lsr.read() & 0x20 == 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                break; // Prevent infinite deadlock
+            }
+            core::hint::spin_loop();
+        }
 
         let mut data: x86_64::instructions::port::Port<u8> =
             x86_64::instructions::port::Port::new(0x3F8);

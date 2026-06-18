@@ -192,10 +192,16 @@ pub fn set_mode(mode: TtyMode) {
         TtyMode::Canonical => {
             TTY_MODE.store(false, Ordering::Relaxed);
             TTY_ECHO.store(true, Ordering::Relaxed);
+            // Re-enable kernel output to VGA
+            #[cfg(target_arch = "x86_64")]
+            crate::driver::vga::set_raw_mode(false);
         }
         TtyMode::Raw => {
             TTY_MODE.store(true, Ordering::Relaxed);
             TTY_ECHO.store(false, Ordering::Relaxed);
+            // Suppress kernel output to VGA — TUI program owns the screen
+            #[cfg(target_arch = "x86_64")]
+            crate::driver::vga::set_raw_mode(true);
             // Flush any pending line editor content
             let line = unsafe { &mut *TTY_LINE.inner.get() };
             line.clear();

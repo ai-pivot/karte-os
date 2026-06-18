@@ -9,15 +9,27 @@ pub fn console_putchar(c: u8) {
 }
 
 /// Print a raw string to the console.
+///
+/// In raw mode (TUI programs own the VGA screen), kernel output goes to
+/// UART and the kernel log buffer only, NOT VGA. This prevents kernel
+/// log messages from corrupting TUI layouts.
 pub fn print(s: &str) {
+    let raw_mode = crate::driver::vga::is_raw_mode();
     for byte in s.bytes() {
-        // Write to log buffer first (lock-free, never fails)
+        // Always write to kernel log buffer (for dmesg)
         crate::kernel_log::log_write_byte(byte);
-        // Then write to UART + VGA
+        // UART always gets output (for debugging via serial)
         if byte == b'\n' {
-            console_putchar(b'\r');
+            crate::arch::uart::putchar(b'\r');
+            if !raw_mode {
+                crate::driver::vga::putchar(b'\r');
+            }
         }
-        console_putchar(byte);
+        crate::arch::uart::putchar(byte);
+        // VGA only in non-raw mode (prevents TUI corruption)
+        if !raw_mode {
+            crate::driver::vga::putchar(byte);
+        }
     }
 }
 

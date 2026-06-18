@@ -2807,7 +2807,6 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             retval
         }
         _ => {
-            crate::console_println!("[fcntl] unhandled cmd={} fd={} arg={:#x}", cmd, fd, arg);
             0
         }
     }
@@ -5024,11 +5023,6 @@ fn sys_fork() -> isize {
         child_idx,
     ) {
         Some(_tid) => {
-            crate::console_println!(
-                "[fork] Created child pid={} (parent pid={})",
-                child_pid,
-                current.pid
-            );
             child_pid as isize
         }
         None => {

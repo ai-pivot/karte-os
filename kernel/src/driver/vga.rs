@@ -52,6 +52,21 @@ const CURSOR_LOW: u8 = 0x0F;
 /// Global VGA state.
 static VGA_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// Raw mode flag: when true, kernel console output is suppressed from VGA.
+/// This prevents kernel log messages from corrupting TUI programs.
+/// Set by tty::set_mode(Raw), cleared by tty::set_mode(Canonical).
+static VGA_RAW_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Check if VGA is in raw mode (TUI program owns the screen).
+pub fn is_raw_mode() -> bool {
+    VGA_RAW_MODE.load(Ordering::Relaxed)
+}
+
+/// Set VGA raw mode flag.
+pub fn set_raw_mode(enabled: bool) {
+    VGA_RAW_MODE.store(enabled, Ordering::Relaxed);
+}
+
 // ─── ANSI Escape Sequence Parser State ──────────────────────────────────
 
 /// CSI parameter buffer max
@@ -81,6 +96,9 @@ static mut CURRENT_FG: u8 = 7; // Light gray
 static mut CURRENT_BG: u8 = 0; // Black
 static mut BOLD: bool = false;
 static mut REVERSE: bool = false;
+static mut BLINK: bool = false;
+static mut FAINT: bool = false; // Dim (mapped to darker fg)
+static mut CONCEALED: bool = false; // Hidden text
 
 /// Saved cursor position
 static mut SAVED_COL: usize = 0;
@@ -121,11 +139,23 @@ unsafe fn current_attr() -> u8 {
         fg += 8;
     }
 
-    if REVERSE {
-        // Swap foreground and background (limited to 7 bits each)
-        (bg & 0x0F) << 4 | (fg & 0x07)
+    // Concealed text: fg = bg (invisible)
+    if CONCEALED {
+        return ((bg & 0x0F) << 4) | (bg & 0x0F);
+    }
+
+    let base = if REVERSE {
+        // Swap foreground and background
+        ((bg & 0x0F) << 4) | (fg & 0x0F)
     } else {
-        (bg & 0x0F) << 4 | (fg & 0x0F)
+        ((bg & 0x0F) << 4) | (fg & 0x0F)
+    };
+
+    // Blink uses bit 7
+    if BLINK {
+        base | 0x80
+    } else {
+        base
     }
 }
 
@@ -168,6 +198,79 @@ unsafe fn csi_param(idx: usize, default: u16) -> u16 {
     } else {
         default
     }
+}
+
+/// VGA 16-color palette as RGB values for nearest-color matching.
+/// Index matches VGA color number (0-15).
+const VGA_PALETTE_RGB: [(u8, u8, u8); 16] = [
+    (0, 0, 0),       // 0: Black
+    (170, 0, 0),     // 1: Red (dark)
+    (0, 170, 0),     // 2: Green (dark)
+    (170, 85, 0),    // 3: Yellow/Brown (dark)
+    (0, 0, 170),     // 4: Blue (dark)
+    (170, 0, 170),   // 5: Magenta (dark)
+    (0, 170, 170),   // 6: Cyan (dark)
+    (170, 170, 170), // 7: White/Light gray
+    (85, 85, 85),    // 8: Bright black/Dark gray
+    (255, 85, 85),   // 9: Bright red
+    (85, 255, 85),   // 10: Bright green
+    (255, 255, 85),  // 11: Bright yellow
+    (85, 85, 255),   // 12: Bright blue
+    (255, 85, 255),  // 13: Bright magenta
+    (85, 255, 255),  // 14: Bright cyan
+    (255, 255, 255), // 15: Bright white
+];
+
+/// Standard 256-color palette (same as xterm).
+/// Indices 0-15 match the 16 VGA colors above.
+/// Indices 16-231 are a 6x6x6 color cube.
+/// Indices 232-255 are a grayscale ramp.
+fn color256_to_rgb(idx: u8) -> (u8, u8, u8) {
+    if idx < 16 {
+        VGA_PALETTE_RGB[idx as usize]
+    } else if idx < 232 {
+        // 6x6x6 color cube: idx = 16 + 36*r + 6*g + b
+        let i = (idx - 16) as usize;
+        let r = i / 36;
+        let g = (i / 6) % 6;
+        let b = i % 6;
+        // Convert 0-5 to RGB values
+        let component = |v: usize| -> u8 {
+            if v == 0 {
+                0
+            } else {
+                (55 + v * 40) as u8 // 0, 95, 135, 175, 215, 255
+            }
+        };
+        (component(r), component(g), component(b))
+    } else {
+        // Grayscale ramp: 232-255
+        let v = 8 + (idx - 232) * 10; // 8, 18, ..., 248
+        (v, v, v)
+    }
+}
+
+/// Find the nearest VGA 16-color index for an RGB value.
+fn nearest_vga_color(r: u8, g: u8, b: u8) -> u8 {
+    let mut best = 0u8;
+    let mut best_dist = u32::MAX;
+    for (i, &(pr, pg, pb)) in VGA_PALETTE_RGB.iter().enumerate() {
+        let dr = r as i32 - pr as i32;
+        let dg = g as i32 - pg as i32;
+        let db = b as i32 - pb as i32;
+        let dist = (dr * dr + dg * dg + db * db) as u32;
+        if dist < best_dist {
+            best_dist = dist;
+            best = i as u8;
+        }
+    }
+    best
+}
+
+/// Map a 256-color index to the nearest VGA 16-color.
+fn color256_to_vga(idx: u8) -> u8 {
+    let (r, g, b) = color256_to_rgb(idx);
+    nearest_vga_color(r, g, b)
 }
 
 // ─── ANSI CSI dispatch ──────────────────────────────────────────────────
@@ -321,39 +424,96 @@ unsafe fn csi_dispatch(final_byte: u8) {
                 CSI_PARAMS[0] = 0;
                 CSI_PARAM_COUNT = 1;
             }
-            for i in 0..CSI_PARAM_COUNT {
+            let mut i = 0;
+            while i < CSI_PARAM_COUNT {
                 let p = CSI_PARAMS[i];
                 match p {
                     0 => {
-                        // Reset
+                        // Reset all
                         CURRENT_FG = 7;
                         CURRENT_BG = 0;
                         BOLD = false;
                         REVERSE = false;
+                        BLINK = false;
+                        FAINT = false;
+                        CONCEALED = false;
                     }
                     1 => {
-                        // Bold (bright)
+                        // Bold / increased intensity
                         BOLD = true;
+                    }
+                    2 => {
+                        // Dim / faint
+                        FAINT = true;
+                    }
+                    3 => {
+                        // Italic — no VGA support, ignore
+                    }
+                    4 => {
+                        // Underline — no VGA support, ignore
+                    }
+                    5 => {
+                        // Blink (VGA supports this via bit 7)
+                        BLINK = true;
                     }
                     7 => {
                         // Reverse video
                         REVERSE = true;
                     }
+                    8 => {
+                        // Concealed (invisible)
+                        CONCEALED = true;
+                    }
+                    9 => {
+                        // Strikethrough — no VGA support, ignore
+                    }
                     22 => {
-                        // Normal intensity (not bold)
+                        // Normal intensity (not bold, not faint)
                         BOLD = false;
+                        FAINT = false;
+                    }
+                    23 => {
+                        // Not italic — ignore
+                    }
+                    24 => {
+                        // Not underlined — ignore
+                    }
+                    25 => {
+                        // Not blinking
+                        BLINK = false;
                     }
                     27 => {
-                        // Not reverse
+                        // Not reversed
                         REVERSE = false;
+                    }
+                    28 => {
+                        // Not concealed
+                        CONCEALED = false;
+                    }
+                    29 => {
+                        // Not crossed out — ignore
                     }
                     30..=37 => {
                         // Set foreground color (ANSI 0-7)
                         CURRENT_FG = (p - 30) as u8;
                     }
                     38 => {
-                        // Extended foreground — skip next param if 5 (256-color)
-                        // For now, just ignore
+                        // Extended foreground color
+                        if i + 1 < CSI_PARAM_COUNT {
+                            let mode = CSI_PARAMS[i + 1];
+                            if mode == 5 && i + 2 < CSI_PARAM_COUNT {
+                                // 256-color: \033[38;5;Nm
+                                CURRENT_FG = color256_to_vga(CSI_PARAMS[i + 2] as u8);
+                                i += 2;
+                            } else if mode == 2 && i + 4 < CSI_PARAM_COUNT {
+                                // TrueColor: \033[38;2;R;G;Bm
+                                let r = CSI_PARAMS[i + 2] as u8;
+                                let g = CSI_PARAMS[i + 3] as u8;
+                                let b = CSI_PARAMS[i + 4] as u8;
+                                CURRENT_FG = nearest_vga_color(r, g, b);
+                                i += 4;
+                            }
+                        }
                     }
                     39 => {
                         // Default foreground
@@ -364,7 +524,22 @@ unsafe fn csi_dispatch(final_byte: u8) {
                         CURRENT_BG = (p - 40) as u8;
                     }
                     48 => {
-                        // Extended background — skip
+                        // Extended background color
+                        if i + 1 < CSI_PARAM_COUNT {
+                            let mode = CSI_PARAMS[i + 1];
+                            if mode == 5 && i + 2 < CSI_PARAM_COUNT {
+                                // 256-color: \033[48;5;Nm
+                                CURRENT_BG = color256_to_vga(CSI_PARAMS[i + 2] as u8);
+                                i += 2;
+                            } else if mode == 2 && i + 4 < CSI_PARAM_COUNT {
+                                // TrueColor: \033[48;2;R;G;Bm
+                                let r = CSI_PARAMS[i + 2] as u8;
+                                let g = CSI_PARAMS[i + 3] as u8;
+                                let b = CSI_PARAMS[i + 4] as u8;
+                                CURRENT_BG = nearest_vga_color(r, g, b);
+                                i += 4;
+                            }
+                        }
                     }
                     49 => {
                         // Default background
@@ -382,6 +557,7 @@ unsafe fn csi_dispatch(final_byte: u8) {
                         // Ignore unknown SGR parameters
                     }
                 }
+                i += 1;
             }
         }
 
@@ -621,6 +797,9 @@ pub fn putchar(c: u8) {
                         CURRENT_BG = 0;
                         BOLD = false;
                         REVERSE = false;
+                        BLINK = false;
+                        FAINT = false;
+                        CONCEALED = false;
                         CURSOR_VISIBLE = true;
                         PARSE_STATE = ParseState::Normal;
                     }
