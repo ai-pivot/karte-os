@@ -21,6 +21,7 @@ pub mod multiboot2;
 pub mod paging;
 pub mod pci;
 pub mod platform;
+pub mod rtc;
 pub mod smp;
 pub mod switch;
 pub mod trap;
@@ -28,7 +29,6 @@ pub mod uart;
 pub mod user_return;
 pub mod virtio_blk;
 pub mod virtio_net;
-pub mod rtc;
 
 #[cfg(feature = "test_mode")]
 pub mod test;

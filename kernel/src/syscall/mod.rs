@@ -1375,6 +1375,24 @@ fn linux_pread64(fd: i32, buf: usize, count: usize, offset: usize, _offset_hi: u
         }
     }
 
+    // Check for Ext4File
+    if let Some(ext4_desc) = crate::process::with_fd_table(|fd_table| {
+        fd_table
+            .get(fd as usize)
+            .and_then(|desc| match &desc.fd_type {
+                FdType::Ext4File(ext4_desc) => Some(ext4_desc.clone()),
+                _ => None,
+            })
+    }) {
+        match crate::driver::ext4::read_file_at_offset(ext4_desc.inode_num, offset, &mut data) {
+            Ok(n) => {
+                user_write_bytes(buf, &data[..n]);
+                return n as isize;
+            }
+            Err(_) => {}
+        }
+    }
+
     // Fallback to regular sys_read for non-VFS fds (pipes, stdio, etc.)
     sys_read(fd, buf, count)
 }
@@ -1552,7 +1570,10 @@ fn linux_gettimeofday(tv: usize, _tz: usize) -> isize {
     #[cfg(not(target_arch = "x86_64"))]
     let (secs, nsecs) = {
         let up = crate::arch::platform::uptime_ms();
-        ((FAKE_EPOCH + up / 1000) as i64, ((up % 1000) * 1_000_000) as i64)
+        (
+            (FAKE_EPOCH + up / 1000) as i64,
+            ((up % 1000) * 1_000_000) as i64,
+        )
     };
     if tv != 0 {
         user_write::<i64>(tv, secs);
@@ -1590,7 +1611,10 @@ fn linux_clock_gettime(clockid: usize, tp: usize) -> isize {
         #[cfg(not(target_arch = "x86_64"))]
         let (real_secs, real_nsecs) = {
             let up = crate::arch::platform::uptime_ms();
-            ((FAKE_EPOCH + up / 1000) as i64, ((up % 1000) * 1_000_000) as i64)
+            (
+                (FAKE_EPOCH + up / 1000) as i64,
+                ((up % 1000) * 1_000_000) as i64,
+            )
         };
 
         let up_ms = crate::arch::platform::uptime_ms();
@@ -2210,9 +2234,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             let mut kbuf = alloc::vec![0u8; len];
             return match crate::driver::vfs::read(vfs_fd, &mut kbuf) {
                 Ok(n) => {
-                    if let Some(user_buf) = UserSliceMut::new(buf, len) {
-                        user_buf.copy_from_slice(&kbuf[..n]);
-                    }
+                    user_write_bytes(buf, &kbuf[..n]);
                     crate::process::with_fd_table(|fd_table| {
                         if let Some(f) = fd_table.get_mut(fd as usize) {
                             f.pos += n;

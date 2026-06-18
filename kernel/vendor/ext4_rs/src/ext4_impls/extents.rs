@@ -596,7 +596,10 @@ impl Ext4 {
     // initializes new top-level, creating index that points to the
     // just created block
     fn ext_grow_indepth(&self, inode_ref: &mut Ext4InodeRef) -> Result<()> {
-        log::debug!("[ext_grow_indepth] depth={}", inode_ref.inode.root_extent_header().depth);
+        log::debug!(
+            "[ext_grow_indepth] depth={}",
+            inode_ref.inode.root_extent_header().depth
+        );
 
         // Allocate new block to store original root node content
         let new_block = self.balloc_alloc_block(inode_ref, None)?;
