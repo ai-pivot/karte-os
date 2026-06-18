@@ -109,6 +109,10 @@ static mut SCROLL_BOTTOM: usize = ROWS - 1;
 static mut SAVED_COL: usize = 0;
 static mut SAVED_ROW: usize = 0;
 
+/// Alternate screen buffer (for \033[?1049h / \033[?47h)
+static mut ALT_SCREEN_SAVED: bool = false;
+static mut ALT_SCREEN_BUF: [u8; COLS * ROWS * 2] = [0; COLS * ROWS * 2];
+
 // ─── I/O helpers ────────────────────────────────────────────────────────
 
 #[inline(always)]
@@ -593,22 +597,61 @@ unsafe fn csi_dispatch(final_byte: u8) {
             }
         }
 
-        // ── Cursor show/hide ──
+        // ── Cursor show/hide + private modes ──
         b'h' => {
             if CSI_HAS_QUESTION {
                 let mode = csi_param(0, 0);
-                if mode == 25 {
-                    // Show cursor
-                    CURSOR_VISIBLE = true;
+                match mode {
+                    25 => { CURSOR_VISIBLE = true; }
+                    7 => { /* Auto-wrap ON — VGA always wraps, no-op */ }
+                    47 | 1047 | 1049 => {
+                        // Switch to alternate screen buffer
+                        if !ALT_SCREEN_SAVED {
+                            // Save current screen
+                            unsafe {
+                                let buf_ptr = core::ptr::addr_of_mut!(ALT_SCREEN_BUF) as *mut u8;
+                                ptr::copy(VGA_BUFFER as *const u8, buf_ptr, COLS * ROWS * 2);
+                            }
+                            ALT_SCREEN_SAVED = true;
+                            if mode == 1049 {
+                                // Also save cursor position
+                                SAVED_COL = CURSOR_COL;
+                                SAVED_ROW = CURSOR_ROW;
+                            }
+                            // Clear screen for alternate buffer
+                            let attr = current_attr();
+                            for row in 0..ROWS {
+                                for col in 0..COLS {
+                                    write_char(col, row, b' ', attr);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         b'l' => {
             if CSI_HAS_QUESTION {
                 let mode = csi_param(0, 0);
-                if mode == 25 {
-                    // Hide cursor
-                    CURSOR_VISIBLE = false;
+                match mode {
+                    25 => { CURSOR_VISIBLE = false; }
+                    7 => { /* Auto-wrap OFF — not fully supported */ }
+                    47 | 1047 | 1049 => {
+                        // Switch back to main screen buffer
+                        if ALT_SCREEN_SAVED {
+                            unsafe {
+                                let buf_ptr = core::ptr::addr_of!(ALT_SCREEN_BUF) as *const u8;
+                                ptr::copy(buf_ptr, VGA_BUFFER as *mut u8, COLS * ROWS * 2);
+                            }
+                            ALT_SCREEN_SAVED = false;
+                            if mode == 1049 {
+                                CURSOR_COL = SAVED_COL;
+                                CURSOR_ROW = SAVED_ROW;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
