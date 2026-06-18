@@ -43,6 +43,8 @@ pub struct VmState {
     vmas: [VmaRegion; MAX_VMAS],
     next_mmap_addr: usize,
     max_elf_vaddr: usize,
+    /// Cache: index of last matched VMA for vma_query (exploits PF locality)
+    last_vma_idx: usize,
 }
 
 impl VmState {
@@ -52,6 +54,7 @@ impl VmState {
         }
         self.next_mmap_addr = 0;
         self.max_elf_vaddr = 0;
+        self.last_vma_idx = 0;
     }
 
     fn copy_from(&mut self, other: &VmState) {
@@ -60,6 +63,7 @@ impl VmState {
         }
         self.next_mmap_addr = other.next_mmap_addr;
         self.max_elf_vaddr = other.max_elf_vaddr;
+        self.last_vma_idx = 0;
     }
 }
 
@@ -86,6 +90,7 @@ const fn vm_state_slot_default() -> VmStateSlot {
             vmas: [VmaRegion::empty(); MAX_VMAS],
             next_mmap_addr: 0,
             max_elf_vaddr: 0,
+            last_vma_idx: 0,
         },
     }
 }
@@ -241,9 +246,19 @@ pub fn vma_check(root: usize, addr: usize) -> Option<usize> {
 /// Returns `Some(prot)` if a VMA covers this address (prot may be 0 for PROT_NONE).
 /// Returns `None` if no VMA covers this address at all.
 pub fn vma_query(root: usize, addr: usize) -> Option<usize> {
-    with_state_ref(root, |state| {
-        for vma in state.vmas.iter() {
+    with_state(root, |state| {
+        // Fast path: check last matched VMA first (exploits PF locality)
+        let last = state.last_vma_idx;
+        if last < MAX_VMAS {
+            let vma = &state.vmas[last];
             if vma.active && addr >= vma.start && addr < vma.end {
+                return Some(vma.prot);
+            }
+        }
+        // Slow path: full scan
+        for (i, vma) in state.vmas.iter().enumerate() {
+            if vma.active && addr >= vma.start && addr < vma.end {
+                state.last_vma_idx = i; // Update cache
                 return Some(vma.prot);
             }
         }
