@@ -35,22 +35,7 @@ impl Ext4 {
 
         // Traverse down the tree if depth > 0
         let mut pblock_of_node = 0;
-        let mut _depth_guard = 0u32; // prevent infinite loops on corrupt trees
         while depth > 0 {
-            _depth_guard += 1;
-            if _depth_guard > 5 {
-                // Corrupt extent tree — too many levels.
-                // Return pblock=0 so read_at zero-fills (hole behavior).
-                search_path.path.push(ExtentPathNode {
-                    header: node.header,
-                    index: None,
-                    extent: None,
-                    position: 0,
-                    pblock: 0,
-                    pblock_of_node,
-                });
-                return Ok(search_path);
-            }
             let index_pos = node.binsearch_idx(lblock);
             if let Some(pos) = index_pos {
                 let index = node.get_index(pos)?;
@@ -611,25 +596,7 @@ impl Ext4 {
     // initializes new top-level, creating index that points to the
     // just created block
     fn ext_grow_indepth(&self, inode_ref: &mut Ext4InodeRef) -> Result<()> {
-        // CRITICAL: Prevent depth from growing beyond 1.
-        // Our insert_extent code has a bug where ext_grow_indepth is called
-        // repeatedly, inflating depth to 30+. A depth=1 tree (root index → leaf)
-        // can address 340 * 4096 = 1.39MB of extents, which is sufficient for
-        // all use cases. If depth is already >= 1, do nothing.
-        let current_depth = inode_ref.inode.root_extent_header().depth;
-        if current_depth >= 1 {
-            log::debug!(
-                "[ext_grow_indepth] depth already {}, refusing to grow further",
-                current_depth
-            );
-            return Ok(());
-        }
-        log::debug!("[ext_grow_indepth] Starting - Current tree state:");
-        log::debug!(
-            "[ext_grow_indepth] Root header: magic={:x}, entries={}, max={}, depth={}",
-            inode_ref.inode.root_extent_header().magic,
-            inode_ref.inode.root_extent_header().entries_count,
-            inode_ref.inode.root_extent_header().max_entries_count,
+        log::debug!("[ext_grow_indepth] depth={}", inode_ref.inode.root_extent_header().depth);
             inode_ref.inode.root_extent_header().depth
         );
 
