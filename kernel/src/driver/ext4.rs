@@ -140,39 +140,6 @@ impl Ext4BlockDevice for KarteBlockDevice {
         let base_sector = offset / SECTOR_SIZE;
         let skip = offset % SECTOR_SIZE;
 
-        // Try to read all 8 sectors from cache first (single lock acquisition)
-        let mut all_cached = true;
-        let mut sector_data: [[u8; SECTOR_SIZE]; 8] = [[0u8; SECTOR_SIZE]; 8];
-        {
-            let cache = SECTOR_CACHE.lock();
-            for i in 0..8usize {
-                let abs_sector = base_sector + i;
-                match cache.get(abs_sector) {
-                    Some(cached) => sector_data[i] = *cached,
-                    None => {
-                        all_cached = false;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if all_cached {
-            // Fast path: all sectors were in cache
-            let mut buf_pos = 0;
-            for i in 0..8usize {
-                let src_start = if i == 0 { skip } else { 0 };
-                let remaining = BLOCK_SIZE - buf_pos;
-                let copy_len = core::cmp::min(SECTOR_SIZE - src_start, remaining);
-                buf[buf_pos..buf_pos + copy_len]
-                    .copy_from_slice(&sector_data[i][src_start..src_start + copy_len]);
-                buf_pos += copy_len;
-            }
-            READ_COUNT.fetch_add(1, Ordering::Relaxed);
-            return buf;
-        }
-
-        // Slow path: read sectors individually with cache check per sector
         let mut buf_pos = 0;
         let mut sector_idx = 0;
         while buf_pos < BLOCK_SIZE {
@@ -191,32 +158,22 @@ impl Ext4BlockDevice for KarteBlockDevice {
                 drop(cache);
                 let mut sector = [0u8; SECTOR_SIZE];
                 if (self.read_sector_fn)(abs_sector, &mut sector).is_err() {
+                    crate::console_println!(
+                        "[read_offset] DISK READ FAIL sector={} offset={:#x}",
+                        abs_sector,
+                        offset
+                    );
                     break;
                 }
                 buf[buf_pos..buf_pos + copy_len]
                     .copy_from_slice(&sector[src_start..src_start + copy_len]);
-                // Populate cache on disk read miss
+                // Populate cache on disk read miss so subsequent writes see
+                // the latest data without a redundant disk read.
                 SECTOR_CACHE.lock().insert(abs_sector, sector);
             }
             buf_pos += copy_len;
             sector_idx += 1;
         }
-
-        // Read-ahead: prefetch next block's first sector into cache
-        // (speeds up sequential file reads like ELF loading)
-        let next_sector = base_sector + 8; // First sector of next block
-        if is_offset_valid(next_sector * SECTOR_SIZE) {
-            let cache = SECTOR_CACHE.lock();
-            if cache.get(next_sector).is_none() {
-                drop(cache);
-                let mut sector = [0u8; SECTOR_SIZE];
-                if (self.read_sector_fn)(next_sector, &mut sector).is_ok() {
-                    SECTOR_CACHE.lock().insert(next_sector, sector);
-                }
-            }
-        }
-
-        READ_COUNT.fetch_add(1, Ordering::Relaxed);
         buf
     }
 
@@ -253,7 +210,13 @@ impl Ext4BlockDevice for KarteBlockDevice {
             sector[sector_offset..sector_offset + bytes_in_sector]
                 .copy_from_slice(&data[data_pos..data_pos + bytes_in_sector]);
 
-            if (self.write_sector_fn)(sector_idx, &sector).is_err() {
+            if let Err(e) = (self.write_sector_fn)(sector_idx, &sector) {
+                crate::console_println!(
+                    "[write_offset] DISK WRITE FAIL sector={} offset={:#x} err={}",
+                    sector_idx,
+                    current_offset,
+                    e
+                );
                 return;
             }
 
@@ -280,16 +243,6 @@ pub struct Ext4FileDesc {
 
 // ─── Ext4Fs (VFS FileSystem implementation) ────────────────────────────────
 
-/// Directory entry cache: maps (dir_inode, name) → child_inode
-/// Speeds up repeated lookups by avoiding full directory scans.
-const DCACHE_MAX: usize = 512;
-static DCACHE: spin::Mutex<BTreeMap<(u32, String), u32>> = spin::Mutex::new(BTreeMap::new());
-
-/// Flush the dcache (called after file creation/deletion).
-pub fn dcache_flush() {
-    DCACHE.lock().clear();
-}
-
 pub struct Ext4Fs {
     pub(crate) ext4: spin::Mutex<Ext4>,
 }
@@ -315,29 +268,11 @@ impl FileSystem for Ext4Fs {
     }
 
     fn lookup(&self, dir: u64, name: &str) -> Result<u64, VfsError> {
-        // Check dcache first
-        let top_key = (dir as u32, String::from(name));
-        {
-            let cache = DCACHE.lock();
-            if let Some(&inode) = cache.get(&top_key) {
-                return Ok(inode as u64);
-            }
-        }
-
         let ext4 = self.ext4.lock();
         let mut current_dir = dir as u32;
         for component in name.split('/') {
             if component.is_empty() {
                 continue;
-            }
-            // Check dcache for this component
-            let key = (current_dir, String::from(component));
-            {
-                let cache = DCACHE.lock();
-                if let Some(&inode) = cache.get(&key) {
-                    current_dir = inode;
-                    continue;
-                }
             }
             let entries = ext4.dir_get_entries(current_dir);
             let mut found = None;
@@ -348,15 +283,7 @@ impl FileSystem for Ext4Fs {
                 }
             }
             match found {
-                Some(inode) => {
-                    // Populate dcache
-                    let mut cache = DCACHE.lock();
-                    if cache.len() >= DCACHE_MAX {
-                        cache.clear();
-                    }
-                    cache.insert(key, inode);
-                    current_dir = inode;
-                }
+                Some(inode) => current_dir = inode,
                 None => return Err(VfsError::NotFound),
             }
         }
@@ -423,10 +350,7 @@ impl FileSystem for Ext4Fs {
     fn create_file(&mut self, dir: u64, name: &str) -> Result<u64, VfsError> {
         let ext4 = self.ext4.lock();
         match ext4.create(dir as u32, name, EXT4_INODE_MODE_FILE as u16) {
-            Ok(inode_ref) => {
-                dcache_flush();
-                Ok(inode_ref.inode_num as u64)
-            }
+            Ok(inode_ref) => Ok(inode_ref.inode_num as u64),
             Err(_) => Err(VfsError::IoError),
         }
     }
@@ -434,10 +358,7 @@ impl FileSystem for Ext4Fs {
     fn create_dir(&mut self, dir: u64, name: &str) -> Result<u64, VfsError> {
         let ext4 = self.ext4.lock();
         match ext4.create(dir as u32, name, 0x4000) {
-            Ok(inode_ref) => {
-                dcache_flush();
-                Ok(inode_ref.inode_num as u64)
-            }
+            Ok(inode_ref) => Ok(inode_ref.inode_num as u64),
             Err(_) => Err(VfsError::IoError),
         }
     }
@@ -452,10 +373,7 @@ impl FileSystem for Ext4Fs {
             .ok_or(VfsError::NotFound)?;
         let mut child_ref = ext4.get_inode_ref(child_entry.inode);
         match ext4.unlink(&mut parent_ref, &mut child_ref, name) {
-            Ok(_) => {
-                dcache_flush();
-                Ok(())
-            }
+            Ok(_) => Ok(()),
             Err(_) => Err(VfsError::IoError),
         }
     }
