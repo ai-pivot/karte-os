@@ -244,14 +244,13 @@ pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
         if current_cr3 == user_cr3 {
             return unsafe { core::ptr::read_volatile(addr as *const T) };
         }
-        // Kernel CR3 active — switch once, read, switch back
-        let mut val = T::default();
-        crate::arch::trap::with_user_cr3(|| unsafe {
-            let src = core::slice::from_raw_parts(addr as *const u8, size);
-            let dst = core::slice::from_raw_parts_mut(&mut val as *mut T as *mut u8, size);
-            dst.copy_from_slice(src);
-        });
-        val
+        // Kernel CR3 active — per-byte read via user_read_u8
+        let mut val = core::mem::MaybeUninit::<T>::uninit();
+        let dst = val.as_mut_ptr() as *mut u8;
+        for i in 0..core::mem::size_of::<T>() {
+            unsafe { core::ptr::write(dst.add(i), user_read_u8(addr + i)) };
+        }
+        unsafe { val.assume_init() }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -414,13 +413,13 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) -> bool {
         if !ensure_user_write_pages(addr, core::mem::size_of::<T>()) {
             return false;
         }
-        // Bulk copy under user CR3 (single switch)
-        let size = core::mem::size_of::<T>();
-        crate::arch::trap::with_user_cr3(|| unsafe {
-            let src = core::slice::from_raw_parts(&val as *const T as *const u8, size);
-            let dst = core::slice::from_raw_parts_mut(addr as *mut u8, size);
-            dst.copy_from_slice(src);
-        });
+        // Per-byte write: load byte into register before CR3 switch
+        let src = unsafe {
+            core::slice::from_raw_parts(&val as *const T as *const u8, core::mem::size_of::<T>())
+        };
+        for (i, &byte) in src.iter().enumerate() {
+            unsafe { user_write_u8_mapped(addr + i, byte) };
+        }
         true
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -444,9 +443,6 @@ pub(crate) fn user_write<T: Copy>(addr: usize, val: T) -> bool {
 /// Instead of checking CR3 per-byte, checks once and does a bulk copy.
 #[inline]
 pub(crate) fn user_read_bytes(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
-    if len == 0 {
-        return alloc::vec::Vec::new();
-    }
     let mut buf = alloc::vec::Vec::with_capacity(len);
 
     #[cfg(target_arch = "x86_64")]
@@ -462,7 +458,6 @@ pub(crate) fn user_read_bytes(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
 
         let user_root = crate::process::current_page_table_root();
         if user_root == 0 {
-            // No user page table (test mode or boot)
             buf.resize(len, 0u8);
             unsafe {
                 core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
@@ -470,23 +465,25 @@ pub(crate) fn user_read_bytes(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
             return buf;
         }
 
-        // Check if we're already on user CR3
+        // Check if we're already on user CR3 (SYSCALL path)
         let user_cr3_phys = user_root << 12;
         let current_cr3: usize;
         unsafe { core::arch::asm!("mov {}, cr3", out(reg) current_cr3) };
 
         if current_cr3 == user_cr3_phys {
-            // Already on user CR3 — direct bulk copy
+            // Already on user CR3 — direct bulk copy (kernel mappings are complete)
             buf.resize(len, 0u8);
             unsafe {
                 core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
             }
         } else {
-            // Kernel CR3 active — switch once, bulk copy, switch back
-            buf.resize(len, 0u8);
-            crate::arch::trap::with_user_cr3(|| unsafe {
-                core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
-            });
+            // Kernel CR3 active — per-byte read via user_read_u8.
+            // We CANNOT use with_user_cr3 + bulk copy because the Vec's backing
+            // memory (kernel heap) may not be mapped in the user page table.
+            // user_read_u8 loads a single byte into a register under user CR3.
+            for i in 0..len {
+                buf.push(user_read_u8(addr + i));
+            }
         }
     }
 
@@ -593,13 +590,16 @@ pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) -> bool {
             }
             return true;
         }
-        // Kernel CR3 active: ensure pages exist, then bulk write under user CR3
+        // Kernel CR3 active: ensure pages exist, then per-byte write.
+        // CANNOT use with_user_cr3 + bulk copy because src (kernel data)
+        // may not be mapped in the user page table. Per-byte user_write_u8
+        // loads the byte into a register before CR3 switch.
         if !ensure_user_write_pages(addr, len) {
             return false;
         }
-        crate::arch::trap::with_user_cr3(|| unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, len);
-        });
+        for (i, &byte) in src.iter().enumerate() {
+            unsafe { user_write_u8_mapped(addr + i, byte) };
+        }
         true
     }
 
