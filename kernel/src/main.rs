@@ -287,10 +287,6 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         // ── Load user program ──
         crate::console_println!("[init] Loading user program...");
 
-        // Pre-fill zeroed page pool for faster page fault handling during ELF loading
-        #[cfg(target_arch = "x86_64")]
-        crate::mm::pmm::refill_zeroed_pool();
-
         // Load init program (shell).
         let init_result = {
             #[cfg(target_arch = "x86_64")]
