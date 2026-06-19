@@ -1482,6 +1482,54 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
                 cr3,
                 rsp0
             );
+            // Dump page table walk for the faulting address
+            let pt_root = cr3 as usize;
+            let va = fault_addr_val;
+            let pml4_idx = (va >> 39) & 0x1FF;
+            let pdp_idx = (va >> 30) & 0x1FF;
+            let pd_idx = (va >> 21) & 0x1FF;
+            let pt_idx = (va >> 12) & 0x1FF;
+            crate::console_println!(
+                "[PF] walk: PML4[{}] PDP[{}] PD[{}] PT[{}] root={:#x}",
+                pml4_idx,
+                pdp_idx,
+                pd_idx,
+                pt_idx,
+                pt_root
+            );
+            unsafe {
+                let pml4e = *((crate::mm::vmm::phys_to_virt(pt_root) + pml4_idx * 8) as *const u64);
+                crate::console_println!("[PF] PML4E = {:#x}", pml4e);
+                if pml4e & 1 != 0 {
+                    let pdp_phys = (pml4e & 0x000FFFFFFFFFF000) as usize;
+                    let pdpe =
+                        *((crate::mm::vmm::phys_to_virt(pdp_phys) + pdp_idx * 8) as *const u64);
+                    crate::console_println!("[PF] PDPE  = {:#x}", pdpe);
+                    if pdpe & 1 != 0 && pdpe & 0x80 == 0 {
+                        let pd_phys = (pdpe & 0x000FFFFFFFFFF000) as usize;
+                        let pde =
+                            *((crate::mm::vmm::phys_to_virt(pd_phys) + pd_idx * 8) as *const u64);
+                        crate::console_println!("[PF] PDE   = {:#x}", pde);
+                        if pde & 1 != 0 && pde & 0x80 == 0 {
+                            let pt_phys = (pde & 0x000FFFFFFFFFF000) as usize;
+                            let pte = *((crate::mm::vmm::phys_to_virt(pt_phys) + pt_idx * 8)
+                                as *const u64);
+                            crate::console_println!("[PF] PTE   = {:#x}", pte);
+                        }
+                    }
+                }
+                // Also dump heap info
+                crate::console_println!(
+                    "[PF] heap: start={:#x} size={}MB end={:#x}",
+                    crate::mm::heap::heap_start(),
+                    crate::mm::heap::heap_size() / 1024 / 1024,
+                    crate::mm::heap::heap_start() + crate::mm::heap::heap_size()
+                );
+                let phys = va
+                    .wrapping_sub(0xFFFF_8000_0000_0000)
+                    .wrapping_sub(0x7FFF_FFFF_0000_0000);
+                crate::console_println!("[PF] phys={:#x} ({:.1}MB)", phys, phys as f64 / 1048576.0);
+            }
             loop {}
         }
     }

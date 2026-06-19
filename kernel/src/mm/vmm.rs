@@ -816,7 +816,31 @@ pub fn free_user_page_table(root_ppn: usize) {
         }
     }
 
-    free_level(root, PT_LEVELS);
+    // On x86_64, PML4[511] is shared with the kernel page table (direct map).
+    // We MUST NOT free or recurse into it — those page tables belong to the kernel.
+    // Skip PML4[511] and only free user-owned PML4 entries [0..510].
+    #[cfg(target_arch = "x86_64")]
+    {
+        for i in 0..511 {
+            let entry = root.entries[i];
+            if !entry.is_valid() {
+                continue;
+            }
+            let is_huge = entry.flags().contains(PTEFlags::PS);
+            if !is_huge {
+                let child = unsafe { &mut *(phys_to_virt(entry.ppn() << 12) as *mut PageTable) };
+                free_level(child, PT_LEVELS - 1);
+                pmm::dealloc_frame(entry.ppn() << 12);
+            }
+        }
+        // PML4[511] is shared — do NOT free it.
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        free_level(root, PT_LEVELS);
+    }
+
     pmm::dealloc_frame(root_ppn << 12);
 }
 
