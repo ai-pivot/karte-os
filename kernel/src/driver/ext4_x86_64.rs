@@ -138,8 +138,20 @@ impl crate::driver::vfs::FileSystem for Ext4FileSystem {
             let fs = guard
                 .as_mut()
                 .ok_or(crate::driver::vfs::VfsError::NotFound)?;
-            fs.write_file(inode, offset, data)
-                .map_err(|_| crate::driver::vfs::VfsError::IoError)
+            let result = fs
+                .write_file(inode, offset, data)
+                .map_err(|_| crate::driver::vfs::VfsError::IoError)?;
+
+            // Update inode mtime/ctime after successful write
+            let ext4 = fs.ext4.lock();
+            let mut inode_ref = ext4.get_inode_ref(inode as u32);
+            let (sec, _) = crate::arch::rtc::wall_clock();
+            inode_ref.inode.set_mtime(sec as u32);
+            inode_ref.inode.set_ctime(sec as u32);
+            ext4.write_back_inode(&mut inode_ref);
+            drop(ext4);
+
+            Ok(result)
         })
     }
 

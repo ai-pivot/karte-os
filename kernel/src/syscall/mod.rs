@@ -627,6 +627,15 @@ fn is_pseudo_path(path: &str) -> bool {
 ///         st_blksize(56-64), st_blocks(64-72)
 #[cfg(target_arch = "x86_64")]
 fn fill_stat_buffer(buf: &mut [u8; 144], st_mode: u32, st_size: i64, st_ino: u64) {
+    // Get current wall clock time for timestamps.
+    // ext4 inodes don't have timestamps set by our write path, so we use
+    // the current time as a reasonable approximation. This is critical for
+    // xbot's log rotation (checks mtime) and file freshness checks.
+    #[cfg(target_arch = "x86_64")]
+    let (now_sec, now_nsec) = crate::arch::rtc::wall_clock();
+    #[cfg(not(target_arch = "x86_64"))]
+    let (now_sec, now_nsec) = (0i64, 0i64);
+
     unsafe {
         core::ptr::write_bytes(buf.as_mut_ptr(), 0, 144);
         *((buf.as_mut_ptr() as usize + 8) as *mut u64) = st_ino;
@@ -634,6 +643,16 @@ fn fill_stat_buffer(buf: &mut [u8; 144], st_mode: u32, st_size: i64, st_ino: u64
         *((buf.as_mut_ptr() as usize + 24) as *mut u32) = st_mode;
         *((buf.as_mut_ptr() as usize + 48) as *mut i64) = st_size;
         *((buf.as_mut_ptr() as usize + 56) as *mut i64) = 4096; // st_blksize
+        // x86_64 struct stat layout:
+        //   offset 72: st_atim (tv_sec: i64, tv_nsec: i64)
+        //   offset 88: st_mtim (tv_sec: i64, tv_nsec: i64)
+        //   offset 104: st_ctim (tv_sec: i64, tv_nsec: i64)
+        *((buf.as_mut_ptr() as usize + 72) as *mut i64) = now_sec;
+        *((buf.as_mut_ptr() as usize + 80) as *mut i64) = now_nsec;
+        *((buf.as_mut_ptr() as usize + 88) as *mut i64) = now_sec;
+        *((buf.as_mut_ptr() as usize + 96) as *mut i64) = now_nsec;
+        *((buf.as_mut_ptr() as usize + 104) as *mut i64) = now_sec;
+        *((buf.as_mut_ptr() as usize + 112) as *mut i64) = now_nsec;
     }
 }
 
