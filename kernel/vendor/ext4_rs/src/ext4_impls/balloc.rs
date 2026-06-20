@@ -616,10 +616,6 @@ impl Ext4 {
                     // Check if this is a system reserved block
                     let block_num = self.bg_idx_to_addr(current_idx, bgid);
                     if self.is_system_reserved_block(block_num, bgid) {
-                        log::error!(
-                            "[Block Alloc] System reserved block found at {:x?}",
-                            block_num
-                        );
                         current_idx += 1;
                         continue;
                     }
@@ -668,11 +664,6 @@ impl Ext4 {
                     let block_num = self.bg_idx_to_addr(rel_blk_idx, bgid);
                     if self.is_system_reserved_block(block_num, bgid) {
                         // Skip this block and continue search
-                        log::error!(
-                            "[Block Alloc] System reserved block found at {:x?} bgid {}",
-                            block_num,
-                            bgid
-                        );
                         start_idx = rel_blk_idx + 1;
                         continue;
                     }
