@@ -547,8 +547,31 @@ fn write_file_inner(name: &str, data: &[u8]) -> Result<(), &'static str> {
     let fs = guard.as_mut().ok_or("ext4 not initialized")?;
     let inode = fs.lookup(ROOT_INODE as u64, name).unwrap_or_else(|_| 0);
     if inode != 0 {
-        fs.write_file(inode, 0, data)
-            .map_err(|_| "ext4 write failed")?;
+        // Check if existing inode is a directory — if so, it's a stale/wrong
+        // entry (inode allocator bug). Delete it and create fresh as file.
+        let meta = fs.metadata(inode).map_err(|_| "ext4 metadata failed")?;
+        if meta.is_dir() {
+            // Drop lock, delete the directory entry, re-acquire and create as file
+            drop(guard);
+            let _ = delete_file(name);
+            guard = EXT4_FS.lock();
+            let fs = guard.as_mut().ok_or("ext4 not initialized")?;
+            let (parent_path, file_name) = split_last_component(name);
+            let parent_inode = if parent_path.is_empty() {
+                ROOT_INODE as u64
+            } else {
+                fs.lookup(ROOT_INODE as u64, parent_path)
+                    .map_err(|_| "ext4: parent directory not found")?
+            };
+            let new_inode = fs
+                .create_file(parent_inode, file_name)
+                .map_err(|_| "ext4 create failed")?;
+            fs.write_file(new_inode, 0, data)
+                .map_err(|_| "ext4 write failed")?;
+        } else {
+            fs.write_file(inode, 0, data)
+                .map_err(|_| "ext4 write failed")?;
+        }
     } else {
         let (parent_path, file_name) = split_last_component(name);
         let parent_inode = if parent_path.is_empty() {
