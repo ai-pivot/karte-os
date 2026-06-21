@@ -155,14 +155,6 @@ impl Ext4 {
             if let Ok(last_ex) = last_ex {
                 if self.can_merge(&last_ex, newex) {
                     let new_len = last_ex.get_actual_len() + newex.get_actual_len();
-                    log::error!(
-                        "[MERGE] lb={} cnt={}+{}={} pb={}",
-                        last_ex.first_block,
-                        last_ex.get_actual_len(),
-                        newex.get_actual_len(),
-                        new_len,
-                        last_ex.get_pblock()
-                    );
                     let mut merged = last_ex;
                     merged.set_actual_len(new_len);
                     if at_root {
