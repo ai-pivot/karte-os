@@ -389,85 +389,15 @@ impl Ext4 {
         // Start bgid for block allocation
         let mut start_bgid = 0;
 
-        // Pre-allocate blocks if needed (with overflow protection for unsigned subtraction)
-        let existing_blocks_after_start = (ifile_blocks as usize).saturating_sub(iblk_idx);
-        let blocks_to_allocate = if iblk_idx >= ifile_blocks as usize {
-            total_blocks_needed
-        } else if total_blocks_needed > existing_blocks_after_start {
-            total_blocks_needed - existing_blocks_after_start
-        } else {
-            0
-        };
+        // DISABLED: batch pre-allocation creates DUPLICATE extents that corrupt
+        // the extent tree. The per-block ensure_pblock below handles allocation
+        // correctly with goal-based contiguous allocation.
+        // Original batch code removed to prevent extent tree corruption.
+        let blocks_to_allocate: usize = 0;
+        let _ = blocks_to_allocate;
 
-        if blocks_to_allocate > 0 {
-            log::trace!("[Pre-allocation] Allocating {} blocks", blocks_to_allocate);
-
-            // 使用append_inode_pblk_batch进行批量块分配
-            let allocated_blocks =
-                self.append_inode_pblk_batch(&mut inode_ref, &mut start_bgid, blocks_to_allocate)?;
-
-            // If we couldn't allocate all blocks, adjust the write size
-            if allocated_blocks.len() < blocks_to_allocate {
-                log::trace!(
-                    "[Write] Could only allocate {} out of {} blocks",
-                    allocated_blocks.len(),
-                    blocks_to_allocate
-                );
-
-                // Calculate new write size based on allocated blocks
-                let max_write_size = allocated_blocks.len() * BLOCK_SIZE;
-                let adjusted_write_size = if unaligned > 0 {
-                    // For unaligned writes, we need to account for the unaligned portion
-                    if allocated_blocks.len() > 0 {
-                        let first_block_available = BLOCK_SIZE - unaligned;
-                        let remaining_blocks_available = (allocated_blocks.len() - 1) * BLOCK_SIZE;
-                        first_block_available + remaining_blocks_available
-                    } else {
-                        0
-                    }
-                } else {
-                    max_write_size
-                };
-
-                if adjusted_write_size == 0 {
-                    log::error!("[Write] No space available for write after block allocation");
-                    return return_errno_with_message!(
-                        Errno::ENOSPC,
-                        "No blocks available for write"
-                    );
-                }
-
-                // Update write size
-                write_buf_len = min(write_buf_len, adjusted_write_size);
-                log::trace!(
-                    "[Write] Adjusted write size from {} to {} bytes",
-                    write_buf.len(),
-                    write_buf_len
-                );
-            }
-
-            new_blocks += allocated_blocks.len();
-        }
-
-        // Verify we have enough blocks for the write
-        let required_blocks = (write_buf_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        let available_blocks = if iblk_idx >= ifile_blocks as usize {
-            new_blocks
-        } else {
-            (ifile_blocks as usize - iblk_idx).saturating_add(new_blocks)
-        };
-
-        if available_blocks < required_blocks {
-            log::error!(
-                "[Write] Not enough blocks available: required {}, available {}",
-                required_blocks,
-                available_blocks
-            );
-            return return_errno_with_message!(
-                Errno::ENOSPC,
-                "Not enough blocks available for write"
-            );
-        }
+        // available_blocks check removed — ensure_pblock allocates on demand.
+        // The old check used new_blocks (always 0 now) and would falsely report ENOSPC.
 
         // Unaligned write
         if unaligned > 0 && written < write_buf_len {
