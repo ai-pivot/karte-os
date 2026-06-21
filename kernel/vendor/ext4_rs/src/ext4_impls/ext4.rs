@@ -185,7 +185,17 @@ impl Ext4 {
 
         let is_dir = child.inode.is_dir();
 
-        self.ialloc_free_inode(child.inode_num, is_dir);
+        // Only free the inode if link count drops to 0.
+        // This is critical for rename (link+unlink): the inode has 2 links
+        // after link, so unlink should decrement to 1 and NOT free it.
+        let links = child.inode.links_count();
+        if links > 1 {
+            child.inode.set_links_count(links - 1);
+            self.write_back_inode(child);
+        } else {
+            child.inode.set_links_count(0);
+            self.ialloc_free_inode(child.inode_num, is_dir);
+        }
 
         Ok(EOK)
     }
