@@ -909,6 +909,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         80 => linux_chdir(args[0]),                   // chdir
         83 => sys_mkdir(args[0], linux::count_user_string(args[0])), // mkdir
         87 => sys_unlink(args[0], linux::count_user_string(args[0])), // unlink
+        82 => linux_rename(args[0], args[1]),         // rename(oldpath, newpath)
 
         // ─── More process ─────────────────────────────────────────
         89 => linux_readlink(args[0], args[1], args[2]), // readlink
@@ -976,11 +977,13 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
         258 => linux_mkdirat(args[0], args[1], args[2], args[3]), // mkdirat
         262 => linux_newfstatat(args[0], args[1], args[2], args[3]), // newfstatat
         263 => sys_unlink(args[1], linux::count_user_string(args[1])), // unlinkat
+        264 => linux_rename(args[1], args[3]), // renameat(olddirfd, oldpath, newdirfd, newpath)
+        316 => linux_rename(args[1], args[3]), // renameat2
         267 => linux_readlinkat(args[0], args[1], args[2], args[3]), // readlinkat
-        269 => linux_access(args[1], args[2]),      // faccessat
-        272 => 0,                                   // unshare (stub)
-        273 => 0,                                   // set_robust_list (stub)
-        274 => 0,                                   // get_robust_list (stub)
+        269 => linux_access(args[1], args[2]), // faccessat
+        272 => 0,                              // unshare (stub)
+        273 => 0,                              // set_robust_list (stub)
+        274 => 0,                              // get_robust_list (stub)
         290 => epoll::eventfd::sys_eventfd2(args[0], args[1]), // eventfd2
         232 => epoll::sys_epoll_wait(args[0], args[1], args[2], args[3] as isize), // epoll_wait
         233 => epoll::sys_epoll_ctl(args[0], args[1], args[2], args[3]), // epoll_ctl
@@ -6052,6 +6055,39 @@ fn linux_mkdirat(_dirfd: usize, path_ptr: usize, _mode: usize, _unused: usize) -
     }
 
     sys_mkdir(path_ptr, actual_len)
+}
+
+/// Linux rename(oldpath, newpath) — rename or move a file.
+/// Implemented as: read old file → write to new → delete old.
+#[cfg(target_arch = "x86_64")]
+fn linux_rename(old_path: usize, new_path: usize) -> isize {
+    let old_name = match read_user_path(old_path, linux::count_user_string(old_path)) {
+        Some(n) if !n.is_empty() => n,
+        _ => return ERR_INVAL,
+    };
+    let new_name = match read_user_path(new_path, linux::count_user_string(new_path)) {
+        Some(n) if !n.is_empty() => n,
+        _ => return ERR_INVAL,
+    };
+
+    let old_name = resolve_path(&old_name);
+    let new_name = resolve_path(&new_name);
+
+    // Read existing file data
+    let data = match crate::driver::ext4::read_file(&old_name) {
+        Some(d) => d,
+        None => return ERR_NOENT,
+    };
+
+    // Write to new path (creates or overwrites)
+    if let Err(_) = crate::driver::ext4::write_file(&new_name, &data) {
+        return ERR_IO;
+    }
+
+    // Delete old file
+    let _ = crate::driver::ext4::delete_file(&old_name);
+
+    0
 }
 
 /// Linux mremap(old_address, old_size, new_size, flags, new_address)
