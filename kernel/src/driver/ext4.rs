@@ -148,28 +148,16 @@ impl Ext4BlockDevice for KarteBlockDevice {
             let remaining = BLOCK_SIZE - buf_pos;
             let copy_len = core::cmp::min(SECTOR_SIZE - src_start, remaining);
 
-            // Try cache first
-            let cache = SECTOR_CACHE.lock();
-            if let Some(cached) = cache.get(abs_sector) {
-                buf[buf_pos..buf_pos + copy_len]
-                    .copy_from_slice(&cached[src_start..src_start + copy_len]);
-                drop(cache);
-            } else {
-                drop(cache);
+            // Bypass cache for reads — always read from disk to avoid stale data.
+            // Cache is still used for write-through (write_offset updates both).
+            {
                 let mut sector = [0u8; SECTOR_SIZE];
                 if (self.read_sector_fn)(abs_sector, &mut sector).is_err() {
-                    crate::console_println!(
-                        "[read_offset] DISK READ FAIL sector={} offset={:#x}",
-                        abs_sector,
-                        offset
-                    );
+                    // Disk read fail — break silently
                     break;
                 }
                 buf[buf_pos..buf_pos + copy_len]
                     .copy_from_slice(&sector[src_start..src_start + copy_len]);
-                // Populate cache on disk read miss so subsequent writes see
-                // the latest data without a redundant disk read.
-                SECTOR_CACHE.lock().insert(abs_sector, sector);
             }
             buf_pos += copy_len;
             sector_idx += 1;
@@ -210,13 +198,7 @@ impl Ext4BlockDevice for KarteBlockDevice {
             sector[sector_offset..sector_offset + bytes_in_sector]
                 .copy_from_slice(&data[data_pos..data_pos + bytes_in_sector]);
 
-            if let Err(e) = (self.write_sector_fn)(sector_idx, &sector) {
-                crate::console_println!(
-                    "[write_offset] DISK WRITE FAIL sector={} offset={:#x} err={}",
-                    sector_idx,
-                    current_offset,
-                    e
-                );
+            if (self.write_sector_fn)(sector_idx, &sector).is_err() {
                 return;
             }
 
@@ -687,6 +669,70 @@ pub fn delete_file(name: &str) -> Result<(), &'static str> {
         };
         fs.unlink(parent_inode, file_name)
             .map_err(|_| "ext4 unlink failed")?;
+        Ok(())
+    })
+}
+
+/// Rename/move a file by reusing the same inode (no data copy).
+/// This is the correct ext4 rename: unlink old entry, link new entry to same inode.
+pub fn rename_file(old_name: &str, new_name: &str) -> Result<(), &'static str> {
+    if !has_ext4() {
+        return Err("ext4 not initialized");
+    }
+    with_kernel_cr3_ext4(|| {
+        let mut guard = EXT4_FS.lock();
+        let fs = guard.as_mut().ok_or("ext4 not initialized")?;
+
+        // Find source inode
+        let src_inode = fs
+            .lookup(ROOT_INODE as u64, old_name)
+            .map_err(|_| "ext4: source not found")?;
+
+        // Get source metadata to check if it's a directory
+        let meta = fs
+            .metadata(src_inode)
+            .map_err(|_| "ext4: metadata failed")?;
+        if meta.is_dir() {
+            return Err("ext4: cannot rename directory via this path");
+        }
+
+        // Delete destination if it exists
+        let (new_parent_path, new_file_name) = split_last_component(new_name);
+        let new_parent_inode = if new_parent_path.is_empty() {
+            ROOT_INODE as u64
+        } else {
+            fs.lookup(ROOT_INODE as u64, new_parent_path)
+                .map_err(|_| "ext4: destination parent not found")?
+        };
+        // Try to unlink destination (ignore error if not found)
+        let _ = fs.unlink(new_parent_inode, new_file_name);
+
+        // Delete old directory entry (this decrements link count)
+        let (old_parent_path, old_file_name) = split_last_component(old_name);
+        let old_parent_inode = if old_parent_path.is_empty() {
+            ROOT_INODE as u64
+        } else {
+            fs.lookup(ROOT_INODE as u64, old_parent_path)
+                .map_err(|_| "ext4: source parent not found")?
+        };
+
+        // Use ext4 directly: get inode ref, link to new parent, unlink from old
+        let ext4 = fs.ext4.lock();
+        let mut parent_old = ext4.get_inode_ref(old_parent_inode as u32);
+        let mut parent_new = ext4.get_inode_ref(new_parent_inode as u32);
+        let mut child = ext4.get_inode_ref(src_inode as u32);
+
+        // Link child to new parent
+        ext4.link(&mut parent_new, &mut child, new_file_name)
+            .map_err(|_| "ext4: link failed")?;
+        ext4.write_back_inode(&mut parent_new);
+        ext4.write_back_inode(&mut child);
+
+        // Unlink from old parent
+        ext4.unlink(&mut parent_old, &mut child, old_file_name)
+            .map_err(|_| "ext4: unlink failed")?;
+        ext4.write_back_inode(&mut parent_old);
+
         Ok(())
     })
 }

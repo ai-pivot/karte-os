@@ -6073,21 +6073,23 @@ fn linux_rename(old_path: usize, new_path: usize) -> isize {
     let old_name = resolve_path(&old_name);
     let new_name = resolve_path(&new_name);
 
-    // Read existing file data
-    let data = match crate::driver::ext4::read_file(&old_name) {
-        Some(d) => d,
-        None => return ERR_NOENT,
-    };
-
-    // Write to new path (creates or overwrites)
-    if let Err(_) = crate::driver::ext4::write_file(&new_name, &data) {
-        return ERR_IO;
+    // Use ext4 rename: moves directory entry without creating new inode
+    match crate::driver::ext4::rename_file(&old_name, &new_name) {
+        Ok(()) => 0,
+        Err(_) => {
+            // Fallback: read + write + delete
+            let data = match crate::driver::ext4::read_file(&old_name) {
+                Some(d) => d,
+                None => return ERR_NOENT,
+            };
+            crate::driver::ext4::delete_file(&new_name);
+            if crate::driver::ext4::write_file(&new_name, &data).is_err() {
+                return ERR_IO;
+            }
+            let _ = crate::driver::ext4::delete_file(&old_name);
+            0
+        }
     }
-
-    // Delete old file
-    let _ = crate::driver::ext4::delete_file(&old_name);
-
-    0
 }
 
 /// Linux mremap(old_address, old_size, new_size, flags, new_address)

@@ -476,6 +476,8 @@ impl Ext4Inode {
     }
 
     pub fn sync_inode_to_disk(&self, block_device: &Arc<dyn BlockDevice>, inode_pos: usize) {
+        // Write the full struct (156 bytes). The sector cache does read-modify-write
+        // at 512-byte granularity, so partial writes within a sector are safe.
         let data = unsafe {
             core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Inode>())
         };

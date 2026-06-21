@@ -71,8 +71,7 @@ impl Ext4 {
         let init_child_ref = self.create_inode(inode_mode)?;
 
         self.write_back_inode_without_csum(&init_child_ref);
-        // load new
-        let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
+        let mut child_inode_ref = init_child_ref;
 
         self.link(&mut parent_inode_ref, &mut child_inode_ref, name)?;
 
@@ -142,8 +141,7 @@ impl Ext4 {
         init_child_ref.inode.set_gid(gid);
 
         self.write_back_inode_without_csum(&init_child_ref);
-        // load new
-        let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
+        let mut child_inode_ref = init_child_ref;
 
         self.link(&mut parent_inode_ref, &mut child_inode_ref, name)?;
 
