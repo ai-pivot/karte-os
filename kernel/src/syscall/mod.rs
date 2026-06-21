@@ -1010,6 +1010,14 @@ fn linux_open(path: usize, flags: usize, _mode: usize) -> isize {
     if path_len == 0 {
         return ERR_NOENT;
     }
+
+    // Block .db-shm: force rollback journal mode (no mmap needed)
+    if let Some(name) = read_user_path(path, path_len) {
+        if name.ends_with(".db-shm") {
+            return ERR_NOENT;
+        }
+    }
+
     sys_open(path, path_len, flags as u32)
 }
 
@@ -1022,13 +1030,14 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
         _ => return ERR_NOENT,
     };
 
-    // SQLite WAL recovery: when opening .db-shm without O_CREAT, return ENOENT.
-    // Our mmap doesn't back file pages, so SHM is always zeros after restart.
-    // SQLite sees mxFrame=0 → ignores WAL → data loss.
-    // Returning ENOENT forces SQLite to delete stale SHM and rebuild from WAL scan.
+    // Block ALL .db-shm access. Our mmap doesn't map file pages, so SHM is
+    // always zeros → SQLite ignores WAL → data loss on restart.
+    // Returning ENOENT for ALL shm opens (including O_CREAT) forces SQLite
+    // to fall back to rollback journal mode (DELETE mode), which uses only
+    // regular read/write syscalls — no mmap needed.
     let linux_creat = 0x40;
     let has_creat = (flags & linux_creat) != 0;
-    if !has_creat && path_str.ends_with(".db-shm") {
+    if path_str.ends_with(".db-shm") {
         return ERR_NOENT;
     }
 
