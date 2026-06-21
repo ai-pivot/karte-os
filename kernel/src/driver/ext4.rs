@@ -713,24 +713,8 @@ pub fn write_file_at_offset(inode: u32, offset: usize, data: &[u8]) -> Result<us
     }
     let mut guard = EXT4_FS.lock();
     let fs = guard.as_mut().ok_or("ext4 not initialized")?;
-    let result = fs
-        .write_file(inode as u64, offset, data)
-        .map_err(|_| "ext4 write_at failed")?;
-
-    // Update inode mtime/ctime after successful write
-    // This is needed because ext4_rs's write_at doesn't set timestamps,
-    // and xbot's log rotation depends on correct mtime from stat().
-    #[cfg(target_arch = "x86_64")]
-    {
-        let ext4 = fs.ext4.lock();
-        let mut inode_ref = ext4.get_inode_ref(inode);
-        let (sec, _) = crate::arch::rtc::wall_clock();
-        inode_ref.inode.set_mtime(sec as u32);
-        inode_ref.inode.set_ctime(sec as u32);
-        ext4.write_back_inode(&mut inode_ref);
-    }
-
-    Ok(result)
+    fs.write_file(inode as u64, offset, data)
+        .map_err(|_| "ext4 write_at failed")
 }
 
 /// Truncate file to 0 bytes (for O_TRUNC).
