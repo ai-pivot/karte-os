@@ -515,11 +515,12 @@ impl Ext4 {
             }
         }
 
-        // Update file size. Always set to offset + written, even if smaller
-        // than the old size. This handles overwrites where the new data is
-        // shorter than the old (e.g., config.json rewrite via rename).
+        // Update file size: only grow, never shrink.
+        // Partial writes (write less than current file size) must not
+        // truncate the file. This is critical for SQLite WAL mode where
+        // random page overwrites are common.
         let new_size = offset + written;
-        if new_size != file_size as usize {
+        if new_size > file_size as usize {
             inode_ref.inode.set_size(new_size as u64);
             self.write_back_inode(&mut inode_ref);
         }
