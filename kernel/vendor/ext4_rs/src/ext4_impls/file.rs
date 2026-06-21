@@ -343,8 +343,21 @@ impl Ext4 {
                     return Ok(existing);
                 }
 
-                let mut start_bgid = 0;
-                let new_block = fs.balloc_alloc_block_from(inode_ref, &mut start_bgid)?;
+                // Try to allocate contiguously after the last physical block.
+                // This ensures extents merge, preventing extent tree overflow
+                // and the broken B-tree split corruption.
+                let goal = if lblock > 0 {
+                    let prev = fs.get_pblock_idx(inode_ref, lblock - 1).unwrap_or(0);
+                    if prev > 0 {
+                        Some(prev + 1)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let new_block = fs.balloc_alloc_block(inode_ref, goal)?;
                 let mut newex = Ext4Extent::default();
                 newex.first_block = lblock;
                 newex.store_pblock(new_block);
@@ -357,20 +370,8 @@ impl Ext4 {
                     inode_ref.inode.set_size(0);
                     fs.write_back_inode(inode_ref);
                     fs.insert_extent(inode_ref, &mut newex)?;
-                    log::debug!(
-                    "[EXT4-REPAIR] reset corrupt empty extent tree inode={} lblock={} pblock={}",
-                    inode_ref.inode_num,
-                    lblock,
-                    new_block
-                );
                 }
                 fs.write_back_inode(inode_ref);
-                log::debug!(
-                    "[EXT4-REPAIR] allocated missing extent inode={} lblock={} pblock={}",
-                    inode_ref.inode_num,
-                    lblock,
-                    new_block
-                );
                 Ok(new_block)
             };
 

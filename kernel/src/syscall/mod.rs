@@ -2868,8 +2868,7 @@ fn linux_fsync(fd: usize) -> isize {
     #[cfg(target_arch = "x86_64")]
     {
         if crate::driver::ahci::is_available() {
-            if let Err(e) = crate::driver::ahci::flush_cache() {
-                crate::console_println!("[fsync] AHCI flush failed: {}", e);
+            if let Err(_e) = crate::driver::ahci::flush_cache() {
                 return ERR_IO;
             }
         }
