@@ -78,12 +78,12 @@ impl Ext4 {
 
                 // Skip GDT sync — it corrupts inode_table_first_block_lo on non-64bit filesystems.
                 // The block group descriptor is not critical for basic file operations.
-                // bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
+                bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
 
                 /* Update superblock */
                 super_block.decrease_free_inodes_count();
                 // Skip superblock sync — not critical for basic file operations.
-                // super_block.sync_to_disk_with_csum(&self.block_device);
+                super_block.sync_to_disk_with_csum(&self.block_device);
 
                 /* Compute the absolute i-nodex number */
                 let inodes_per_group = super_block.inodes_per_group();
@@ -132,10 +132,10 @@ impl Ext4 {
         }
 
         // Skip GDT write-back — corrupts data on non-64bit FS
-        // bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
+        bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
 
         super_block.decrease_free_inodes_count();
         // Skip superblock write-back
-        // super_block.sync_to_disk_with_csum(&self.block_device);
+        super_block.sync_to_disk_with_csum(&self.block_device);
     }
 }
