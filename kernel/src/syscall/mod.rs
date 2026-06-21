@@ -1022,10 +1022,15 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
         _ => return ERR_NOENT,
     };
 
-    // Convert Linux x86_64 flags to our internal flags
-    // Linux x86_64: O_CREAT=0x40, O_TRUNC=0x200, O_APPEND=0x400, O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+    // SQLite WAL: force WAL recovery by returning ENOENT for .db-shm files
+    // opened without O_CREAT. Our mmap doesn't map file pages, so SHM is
+    // always zeros after process restart. By returning ENOENT, SQLite
+    // will scan the WAL file and rebuild the SHM index from scratch.
     let linux_creat = 0x40;
     let has_creat = (flags & linux_creat) != 0;
+    if path_str.ends_with(".db-shm") && !has_creat {
+        return ERR_NOENT;
+    }
 
     // Try VFS open with converted flags
     // Preserve access mode bits (O_RDONLY=0, O_WRONLY=0x1, O_RDWR=0x2)
