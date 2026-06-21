@@ -2078,6 +2078,10 @@ pub fn sys_exit(code: i32) -> isize {
 fn linux_exit_group(code: i32) -> isize {
     unsafe { core::arch::asm!("cli") };
 
+    // SQLite WAL checkpoint: merge WAL data into main db before exit
+    #[cfg(target_arch = "x86_64")]
+    {}
+
     let my_idx = crate::process::current_index();
     let my_pid = crate::process::current_pid();
     let root = crate::process::current_page_table_root();
@@ -2124,6 +2128,12 @@ fn linux_exit_group(code: i32) -> isize {
     // exit_group tears down the shared file table once for the whole Go
     // thread group before its process-table entries disappear.
     cleanup_current_process_fds();
+
+    // SQLite WAL checkpoint: merge WAL data into main db after fd cleanup
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::driver::ext4::wal_checkpoint(".xbot/xbot.db");
+    }
 
     crate::klog!(
         INFO,
