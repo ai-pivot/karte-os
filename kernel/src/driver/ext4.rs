@@ -722,14 +722,6 @@ pub fn rename_file(old_name: &str, new_name: &str) -> Result<(), &'static str> {
         let mut parent_new = ext4.get_inode_ref(new_parent_inode as u32);
         let mut child = ext4.get_inode_ref(src_inode as u32);
 
-        // CRITICAL: Force mode to regular file if metadata says it's a file.
-        // get_inode_ref may return stale mode from disk (directory instead of file)
-        // due to inode table sector cache inconsistency. This causes link() to
-        // incorrectly create "." and ".." directory entries.
-        if !meta.is_dir() {
-            child.inode.set_mode(0x81FF); // S_IFREG | 0777
-        }
-
         // Link child to new parent
         ext4.link(&mut parent_new, &mut child, new_file_name)
             .map_err(|_| "ext4: link failed")?;
