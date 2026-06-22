@@ -1266,10 +1266,13 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
         // 1. VMA-backed lazy allocation — highest priority, any address
         if can_lazy_alloc {
             // Check for file-backed mapping first
-            if let Some((inode, file_off)) = crate::syscall::vma_file_info(fault_addr_val) {
+            // NOTE: use page_addr (aligned), not fault_addr_val.
+            // fault_addr_val may have sub-page offset which corrupts
+            // the file_off calculation in vma_file_info.
+            if let Some((inode, file_off)) = crate::syscall::vma_file_info(page_addr) {
                 // File-backed mmap: read page from ext4 into a new frame
                 let pte_flags = crate::syscall::prot_to_pte_flags(
-                    crate::syscall::vma_query(fault_addr_val).unwrap_or(0x3),
+                    crate::syscall::vma_query(page_addr).unwrap_or(0x3),
                 );
                 let mut mapped = false;
                 super::trap::with_kernel_cr3(|| {

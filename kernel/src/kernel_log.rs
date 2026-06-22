@@ -273,6 +273,9 @@ impl log::Log for KernelLogger {
             for &b in msg.as_bytes() {
                 crate::kernel_log::log_write_byte(b);
             }
+            // Also output Error/Warn to UART console for real-time debugging
+            // (safe: no locks, direct I/O port writes)
+            crate::console_print!("{}", msg);
         }
     }
 
