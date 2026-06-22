@@ -156,11 +156,14 @@ trap cleanup_mount EXIT
 
 info "Installing GRUB bootloader..."
 mkdir -p "$BOOT_MNT/boot/grub"
-cat > "$BOOT_MNT/boot/grub/grub.cfg" << 'GRUBCFG'
+ cat > "$BOOT_MNT/boot/grub/grub.cfg" << 'GRUBCFG'
 set timeout=3
 set default=0
-terminal_input console
-terminal_output console
+insmod all_video
+insmod gfxterm
+set gfxmode=auto
+set gfxpayload=text
+terminal_output gfxterm
 
 menuentry "KarteOS" {
    multiboot2 /boot/karte-os-kernel
