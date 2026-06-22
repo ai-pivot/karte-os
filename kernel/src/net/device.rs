@@ -81,6 +81,8 @@ impl TxToken for VirtTxToken {
             crate::driver::net::send_raw(&buf[..write_len]);
             #[cfg(target_arch = "x86_64")]
             crate::arch::virtio_net::send_raw(&buf[..write_len]);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::e1000::send_raw(&buf[..write_len]);
         }
 
         result
@@ -118,7 +120,8 @@ impl NetDevice {
         #[cfg(target_arch = "riscv64")]
         let result = crate::driver::net::recv_raw(&mut buf);
         #[cfg(target_arch = "x86_64")]
-        let result = crate::arch::virtio_net::recv_raw(&mut buf);
+        let result = crate::arch::virtio_net::recv_raw(&mut buf)
+            .or_else(|| crate::arch::e1000::recv_raw(&mut buf));
         match result {
             Some(len) => {
                 let mut state = NET_STATE.lock();

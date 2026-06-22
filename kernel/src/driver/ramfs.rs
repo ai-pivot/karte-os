@@ -117,6 +117,10 @@ impl RamFileSystem {
         fs.write_static("init", include_bytes!("../../../user/shell.elf"))
             .unwrap();
 
+        // xbot CLI for AI assistant features
+        fs.write_static("xbot-cli", include_bytes!("../../../user/xbot-cli"))
+            .unwrap();
+
         fs
     }
 

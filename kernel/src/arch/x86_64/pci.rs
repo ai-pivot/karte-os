@@ -265,6 +265,37 @@ pub fn find_ahci() -> Option<PciDevice> {
     None
 }
 
+/// Find an Intel E1000 series network card.
+/// Supports 82540EM (QEMU default) and common I2xx variants.
+pub fn find_e1000() -> Option<PciDevice> {
+    const E1000_IDS: &[u16] = &[
+        0x100E, // 82540EM
+        0x100F, // 82544EI/GC
+        0x10EA, // 82577LM
+        0x1502, // 82579LM
+        0x1503, // 82579V
+        0x153A, // I217-LM
+        0x153B, // I217-V
+        0x15B8, // I219-V
+        0x15B7, // I219-LM
+        0x15F3, // I225-V
+    ];
+    const INTEL_VENDOR: u16 = 0x8086;
+
+    for device in 0..32 {
+        let header_type = pci_read(0, device, 0, 0x0C);
+        let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
+        for function in 0..max_fn {
+            if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
+                if dev.vendor_id == INTEL_VENDOR && E1000_IDS.contains(&dev.device_id) {
+                    return Some(dev);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Initialize PCI and try to find block devices.
 pub fn init() {
     crate::console_println!("[pci] Enumerating PCI devices...");

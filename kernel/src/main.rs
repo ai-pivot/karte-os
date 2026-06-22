@@ -362,9 +362,15 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    // TEMPORARILY DISABLED to test DMA corruption hypothesis
-                    // crate::console_println!("[init] Initializing network...");
-                    if let Some(mac) = crate::arch::virtio_net::init_net_device() {
+                    crate::console_println!("[init] Initializing network...");
+                    // Try real hardware NIC first (E1000), then fall back to VirtIO
+                    let e1000_mac = crate::arch::e1000::init_net_device();
+                    let mac = if e1000_mac.is_some() {
+                        e1000_mac
+                    } else {
+                        crate::arch::virtio_net::init_net_device()
+                    };
+                    if let Some(mac) = mac {
                         net::iface::NetStack::init(mac);
                     }
                 }
