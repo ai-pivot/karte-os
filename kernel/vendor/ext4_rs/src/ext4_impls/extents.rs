@@ -547,14 +547,31 @@ impl Ext4 {
                 return self.insert_extent(inode_ref, new_extent);
             }
 
-            // Not empty, insert at search result pos + 1
-            log::debug!(
-                "[insert_new_extent] Inserting at root at position {} (entries: {})",
-                node.position + 1,
-                header.entries_count
-            );
-            *inode_ref.inode.root_extent_mut_at(node.position + 1) = *new_extent;
-            inode_ref.inode.root_extent_header_mut().entries_count += 1;
+            // Not empty — find correct sorted position and shift entries to make room
+            {
+                let count = header.entries_count as usize;
+                // Linear search for correct insertion position (sorted by first_block)
+                let mut insert_pos = count; // Default: append at end
+                for i in 0..count {
+                    let existing = inode_ref.inode.root_extent_at(i);
+                    if existing.first_block > new_extent.first_block {
+                        insert_pos = i;
+                        break;
+                    }
+                }
+
+                // Shift entries [insert_pos..count) right by 1
+                if insert_pos < count {
+                    for i in (insert_pos..count).rev() {
+                        let ext = inode_ref.inode.root_extent_at(i);
+                        *inode_ref.inode.root_extent_mut_at(i + 1) = ext;
+                    }
+                }
+
+                // Insert new extent at insert_pos
+                *inode_ref.inode.root_extent_mut_at(insert_pos) = *new_extent;
+                inode_ref.inode.root_extent_header_mut().entries_count += 1;
+            }
 
             log::debug!("[insert_new_extent] Successfully inserted at root:");
             log::debug!(
