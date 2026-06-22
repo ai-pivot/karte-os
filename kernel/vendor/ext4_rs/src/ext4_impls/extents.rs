@@ -182,6 +182,29 @@ impl Ext4 {
             }
         }
 
+        // Check if an existing extent already covers this lblock.
+        // If so, the block already has a physical mapping — skip insertion.
+        // This prevents duplicate extents when the leaf block has unsorted entries.
+        if header.entries_count > 0 {
+            let count = header.entries_count as usize;
+            for i in 0..count {
+                let check_ex = if node.pblock_of_node == 0 {
+                    inode_ref.inode.root_extent_at(i)
+                } else {
+                    match self.get_extent_from_node(node, i) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    }
+                };
+                let ex_start = check_ex.first_block as u64;
+                let ex_end = ex_start + check_ex.get_actual_len() as u64;
+                if (newex.first_block as u64) >= ex_start && (newex.first_block as u64) < ex_end {
+                    // Already covered — no-op
+                    return Ok(());
+                }
+            }
+        }
+
         // Universal merge check: try to merge with the LAST extent in the node.
         // This covers both depth=0 (root inline) and depth>0 (leaf block).
         // Must happen BEFORE the "Insert to existing extent" path to prevent
