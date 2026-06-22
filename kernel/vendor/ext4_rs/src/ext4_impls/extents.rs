@@ -385,7 +385,9 @@ impl Ext4 {
             return false;
         }
 
-        // Check if the physical blocks are contiguous
+        // We require physical contiguity for correct extent merging.
+        // If physical blocks are not contiguous, we CANNOT merge —
+        // reading would compute wrong physical block offsets.
         if ex1.get_pblock() + ext1_ee_len as u64 == ex2.get_pblock() {
             return true;
         }

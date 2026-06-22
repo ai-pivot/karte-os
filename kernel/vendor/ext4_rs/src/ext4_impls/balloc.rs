@@ -221,7 +221,7 @@ impl Ext4 {
 
             // Try to find free block near to goal
             let blk_in_bg = blocks_per_group;
-            let end_idx = min((idx_in_bg + 63) & !63, blk_in_bg);
+            let end_idx = min(idx_in_bg + 1024, blk_in_bg);
 
             for tmp_idx in (idx_in_bg + 1)..end_idx {
                 if ext4_bmap_is_bit_clr(&bitmap_block.data, tmp_idx) {
