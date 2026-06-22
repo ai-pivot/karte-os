@@ -159,11 +159,12 @@ mkdir -p "$BOOT_MNT/boot/grub"
 cat > "$BOOT_MNT/boot/grub/grub.cfg" << 'GRUBCFG'
 set timeout=3
 set default=0
-set gfxpayload=text
+terminal_input console
+terminal_output console
 
 menuentry "KarteOS" {
-    multiboot2 /boot/karte-os-kernel
-    boot
+   multiboot2 /boot/karte-os-kernel
+   boot
 }
 
 menuentry "KarteOS (verbose)" {
