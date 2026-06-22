@@ -1566,7 +1566,13 @@ fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset: usize, _offset_hi: 
         }
     }
 
-    // Fallback for non-file fds (pipes, etc.): ignore offset, do regular write
+    // Fallback: lseek to offset then write. This preserves the offset parameter
+    // for fds that don't have a specific pwrite handler.
+    crate::process::with_fd_table(|fd_table| {
+        if let Some(desc) = fd_table.get_mut(fd as usize) {
+            desc.pos = offset;
+        }
+    });
     sys_write(fd, buf, count)
 }
 
