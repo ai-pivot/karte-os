@@ -75,17 +75,70 @@ impl Ext4 {
     pub fn get_pblock_idx(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
         let search_path = self.find_extent(inode_ref, lblock);
         if let Ok(path) = search_path {
-            // get the last path
             let path = path.path.last().unwrap();
-
-            // get physical block id
             let fblock = path.pblock;
-
-            return Ok(fblock);
+            if fblock != 0 {
+                return Ok(fblock);
+            }
         }
 
-        // No extent found for this lblock. For new/empty files this is normal.
-        // Return 0 to indicate "no physical block mapped".
+        // find_extent returned pblock=0. This could be a hole, or the extent
+        // tree has unsorted entries that binsearch missed. Do a thorough
+        // linear search across ALL leaf blocks to find the real mapping.
+
+        // Read root header
+        let root_hdr = inode_ref.inode.root_extent_header();
+        let root_depth = root_hdr.depth;
+        let root_entries = root_hdr.entries_count as usize;
+
+        if root_depth == 0 {
+            // Inline extents — linear search
+            for i in 0..root_entries {
+                let ext_raw: &[u32] = unsafe {
+                    core::slice::from_raw_parts(inode_ref.inode.block.as_ptr().add(3 + i * 3), 3)
+                };
+                let ext = Ext4Extent::load_from_u32(ext_raw);
+                let ext_start = ext.first_block as u64;
+                let ext_end = ext_start + ext.get_actual_len() as u64;
+                if (lblock as u64) >= ext_start && (lblock as u64) < ext_end {
+                    let pblock = ext.get_pblock() + ((lblock as u64) - ext_start);
+                    return Ok(pblock);
+                }
+            }
+        } else {
+            // Depth > 0: search all index entries → all leaf blocks
+            for i in 0..root_entries {
+                let idx_raw: &[u32] = unsafe {
+                    core::slice::from_raw_parts(inode_ref.inode.block.as_ptr().add(3 + i * 3), 3)
+                };
+                let idx = Ext4ExtentIndex::load_from_u32(idx_raw);
+                let leaf_pblock = idx.get_pblock();
+                if leaf_pblock == 0 {
+                    continue;
+                }
+
+                // Read leaf block from disk
+                let leaf_data = self
+                    .block_device
+                    .read_offset(leaf_pblock as usize * BLOCK_SIZE);
+                let leaf_hdr = ExtentNode::load_from_data(&leaf_data, false);
+                if let Ok(node) = leaf_hdr {
+                    let leaf_entries = node.header.entries_count as usize;
+                    for j in 0..leaf_entries {
+                        if let Some(ext) = node.get_extent(j) {
+                            let ext_start = ext.first_block as u64;
+                            let ext_end = ext_start + ext.get_actual_len() as u64;
+                            if (lblock as u64) >= ext_start && (lblock as u64) < ext_end {
+                                let pblock = ext.get_pblock() + ((lblock as u64) - ext_start);
+                                return Ok(pblock);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Truly no extent found — return 0
         Ok(0)
     }
 
