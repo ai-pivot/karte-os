@@ -199,6 +199,22 @@ pub fn vma_add(start: usize, end: usize, prot: usize, map_fixed: bool) -> Result
     crate::mm::vma::vma_add(current_root(), start, end, prot, map_fixed)
 }
 
+pub fn vma_add_file(
+    start: usize,
+    end: usize,
+    prot: usize,
+    map_fixed: bool,
+    inode: u32,
+    offset: usize,
+) -> Result<(), ()> {
+    crate::mm::vma::vma_add_file(current_root(), start, end, prot, map_fixed, inode, offset)
+}
+
+/// Query file mapping info for a virtual address.
+pub fn vma_file_info(addr: usize) -> Option<(u32, usize)> {
+    crate::mm::vma::vma_file_info(current_root(), addr)
+}
+
 /// Remove all VMA entries overlapping [start, end).
 /// Re-inserts tail fragments (portions of VMAs outside the removed range).
 pub fn vma_remove_range(start: usize, end: usize) {
@@ -862,7 +878,7 @@ fn dispatch_linux_syscall(nr: usize, args: [usize; 6]) -> isize {
             0
         } // sched_yield
         25 => linux_mremap(args[0], args[1], args[2], args[3]), // mremap
-        26 => 0,                                           // msync (no-op)
+        26 => linux_msync(args[0], args[1]),               // msync
         27 => 0,                                           // mincore (all pages resident)
         28 => linux_madvise(args[0], args[1], args[2]),    // madvise
         29 => linux_dup(args[0]),                          // dup
@@ -2669,8 +2685,22 @@ fn linux_mmap_inner(
 
     let end = target_addr + aligned_len;
 
-    // Register the VMA entry. For MAP_FIXED, removes overlapping entries.
-    if vma_add(target_addr, end, prot, map_fixed).is_err() {
+    // Resolve fd for file-backed mmap
+    let file_inode = if !is_anonymous && _fd != usize::MAX {
+        // Resolve fd → VFS inode
+        crate::process::with_fd_table(|fd_table| {
+            fd_table.get(_fd).and_then(|desc| match &desc.fd_type {
+                crate::driver::fs::FdType::VfsFile(vfs_fd) => crate::driver::vfs::fd_inode(*vfs_fd),
+                _ => None,
+            })
+        })
+        .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Register the VMA entry with file mapping info
+    if vma_add_file(target_addr, end, prot, map_fixed, file_inode, _offset).is_err() {
         return ERR_NOMEM;
     }
 
@@ -2799,6 +2829,34 @@ fn linux_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 
 /// Linux munmap(addr, len) — unmap pages and free physical frames.
 /// Also removes corresponding VMA entries.
+
+#[cfg(target_arch = "x86_64")]
+fn linux_msync(addr: usize, len: usize) -> isize {
+    let page_size = crate::mm::pmm::page_size();
+    let start = addr & !(page_size - 1);
+    let end = (addr + len + page_size - 1) & !(page_size - 1);
+
+    let root = current_root();
+    let mut vaddr = start;
+    while vaddr < end {
+        // Check if this page is a file-backed mapping
+        if let Some((inode, file_off)) = crate::syscall::vma_file_info(vaddr) {
+            crate::arch::trap::with_kernel_cr3(|| {
+                let user_pt = crate::arch::trap::get_user_pt_safe();
+                if let Some(frame) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+                    // Read page data from frame and write to ext4
+                    let vaddr_frame = crate::mm::vmm::phys_to_virt(frame);
+                    let buf =
+                        unsafe { core::slice::from_raw_parts(vaddr_frame as *const u8, page_size) };
+                    let _ = crate::driver::ext4::write_file_at_offset(inode, file_off, buf);
+                }
+            });
+        }
+        vaddr += page_size;
+    }
+    0
+}
+
 fn linux_munmap(addr: usize, len: usize) -> isize {
     if addr == 0 || len == 0 {
         return ERR_INVAL;
@@ -2813,6 +2871,24 @@ fn linux_munmap(addr: usize, len: usize) -> isize {
     let valid_end = crate::process::USER_MMAP_LIMIT;
     if start < valid_start || end > valid_end {
         return ERR_INVAL;
+    }
+
+    // Write back dirty file-backed pages before unmapping
+    let mut va = start;
+    while va < end {
+        if let Some((inode, file_off)) = crate::syscall::vma_file_info(va) {
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::trap::with_kernel_cr3(|| {
+                let user_pt = crate::arch::trap::get_user_pt_safe();
+                if let Some(frame) = crate::mm::vmm::translate_user(user_pt, va) {
+                    let vaddr_frame = crate::mm::vmm::phys_to_virt(frame);
+                    let buf =
+                        unsafe { core::slice::from_raw_parts(vaddr_frame as *const u8, page_size) };
+                    let _ = crate::driver::ext4::write_file_at_offset(inode, file_off, buf);
+                }
+            });
+        }
+        va += page_size;
     }
 
     // Remove VMA entries

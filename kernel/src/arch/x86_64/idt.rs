@@ -1265,6 +1265,46 @@ unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
 
         // 1. VMA-backed lazy allocation — highest priority, any address
         if can_lazy_alloc {
+            // Check for file-backed mapping first
+            if let Some((inode, file_off)) = crate::syscall::vma_file_info(fault_addr_val) {
+                // File-backed mmap: read page from ext4 into a new frame
+                let pte_flags = crate::syscall::prot_to_pte_flags(
+                    crate::syscall::vma_query(fault_addr_val).unwrap_or(0x3),
+                );
+                let mut mapped = false;
+                super::trap::with_kernel_cr3(|| {
+                    let user_pt = super::trap::get_user_pt_safe();
+                    if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                        if let Some(frame) = crate::mm::pmm::alloc_zeroed_frame() {
+                            // Read file data into the frame
+                            let page_size = crate::mm::pmm::page_size();
+                            let vaddr = crate::mm::vmm::phys_to_virt(frame);
+                            // Zero the frame first
+                            unsafe {
+                                core::ptr::write_bytes(vaddr as *mut u8, 0, page_size);
+                            }
+                            // Read from ext4
+                            let mut buf = unsafe {
+                                core::slice::from_raw_parts_mut(vaddr as *mut u8, page_size)
+                            };
+                            if let Ok(n) =
+                                crate::driver::ext4::read_file_at_offset(inode, file_off, &mut buf)
+                            {
+                                // If read less than page_size, rest is already zeroed
+                                let _ = n;
+                            }
+                            // Map the frame
+                            crate::mm::vmm::map(user_pt, page_addr, frame, pte_flags);
+                            mapped = true;
+                        }
+                    }
+                });
+                if mapped {
+                    super::trap::flush_tlb_addr(page_addr);
+                    break 'handler true;
+                }
+            }
+
             match crate::syscall::vma_query(fault_addr_val) {
                 Some(vma_prot) => {
                     if vma_prot != 0 {

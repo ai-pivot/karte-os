@@ -25,6 +25,8 @@ struct VmaRegion {
     end: usize,  // exclusive (first byte past the region)
     prot: usize, // PROT_* bit flags (0 = PROT_NONE)
     active: bool,
+    file_inode: u32,    // 0 = anonymous, >0 = file-backed mapping
+    file_offset: usize, // byte offset in file for file-backed mapping
 }
 
 impl VmaRegion {
@@ -34,6 +36,8 @@ impl VmaRegion {
             end: 0,
             prot: 0,
             active: false,
+            file_inode: 0,
+            file_offset: 0,
         }
     }
 }
@@ -267,6 +271,21 @@ pub fn vma_query(root: usize, addr: usize) -> Option<usize> {
     .unwrap_or(None)
 }
 
+/// Query file mapping info for an address.
+/// Returns (inode, file_offset_within_file) if this is a file-backed mapping.
+pub fn vma_file_info(root: usize, addr: usize) -> Option<(u32, usize)> {
+    with_state_ref(root, |state| {
+        for vma in state.vmas.iter() {
+            if vma.active && addr >= vma.start && addr < vma.end && vma.file_inode != 0 {
+                let page_offset = addr - vma.start;
+                return Some((vma.file_inode, vma.file_offset + page_offset));
+            }
+        }
+        None
+    })
+    .unwrap_or(None)
+}
+
 /// Dump VMA entries near a given address for debugging (root-aware).
 pub fn vma_dump_region(root: usize, addr: usize) {
     let _ = with_state_ref(root, |state| {
@@ -321,6 +340,8 @@ fn insert_vma(
     start: usize,
     end: usize,
     prot: usize,
+    file_inode: u32,
+    file_offset: usize,
 ) -> Result<(), ()> {
     if start >= end {
         return Ok(());
@@ -332,6 +353,8 @@ fn insert_vma(
                 end,
                 prot,
                 active: true,
+                file_inode,
+                file_offset,
             };
             return Ok(());
         }
@@ -352,11 +375,23 @@ fn split_overlapping_vmas(
         }
         let vma_end = vma.end;
         let vma_prot = vma.prot;
+        let vma_file_inode = vma.file_inode;
+        let vma_file_offset = vma.file_offset;
+        let vma_start = vma.start;
 
         if vma.start < start && vma.end > end {
             // Fully contains: split into [vma_start, start) + [end, vma_end)
             vmas[i].end = start;
-            insert_vma(vmas, end, vma_end, vma_prot)?;
+            // Tail fragment: adjust file offset for the new start
+            let tail_file_offset = vma_file_offset + (end - vma_start);
+            insert_vma(
+                vmas,
+                end,
+                vma_end,
+                vma_prot,
+                vma_file_inode,
+                tail_file_offset,
+            )?;
         } else if vma.start < start {
             // Overlaps tail: truncate
             vmas[i].end = start;
@@ -381,11 +416,24 @@ pub fn vma_add(
     prot: usize,
     map_fixed: bool,
 ) -> Result<(), ()> {
+    vma_add_file(root, start, end, prot, map_fixed, 0, 0)
+}
+
+/// Add a file-backed VMA region.
+pub fn vma_add_file(
+    root: usize,
+    start: usize,
+    end: usize,
+    prot: usize,
+    map_fixed: bool,
+    file_inode: u32,
+    file_offset: usize,
+) -> Result<(), ()> {
     with_state(root, |state| {
         if map_fixed {
             split_overlapping_vmas(&mut state.vmas, start, end)?;
         }
-        insert_vma(&mut state.vmas, start, end, prot)
+        insert_vma(&mut state.vmas, start, end, prot, file_inode, file_offset)
     })?
 }
 

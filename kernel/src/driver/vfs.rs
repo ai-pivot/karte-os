@@ -328,6 +328,14 @@ pub fn get_inode_for_fd(fd: usize) -> Option<u64> {
 }
 
 /// Get metadata for an open VFS fd.
+/// Get the inode number for an open VFS fd.
+pub fn fd_inode(fd: usize) -> Option<u32> {
+    let vfs = VFS.lock();
+    let file = vfs.open_files.get(fd)?;
+    Some(file.inode as u32)
+}
+
+/// Get metadata for an open file fd.
 pub fn fd_metadata(fd: usize) -> Result<VfsMetadata, VfsError> {
     let vfs = VFS.lock();
     let file = vfs.open_files.get(fd).ok_or(VfsError::InvalidParam)?;
