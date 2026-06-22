@@ -351,99 +351,56 @@ impl ExtentNode {
         if self.header.entries_count == 0 {
             return None;
         }
-
-        // Single-index tree: return the only entry immediately.
-        // The Linux kernel does the same in ext4_binsearch_idx:
-        //   if (unlikely(l > r)) { path->p_idx = EXT_FIRST_INDEX(eh); return; }
         if self.header.entries_count == 1 {
             return Some(0);
         }
 
         match &self.data {
             NodeData::Root(root_data) => {
-                // Root node handling
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let indexes = &root_data[start..];
-
-                let mut l = 1; // Skip the first index (it's the implicit fallback)
-                let mut r = self.header.entries_count as usize - 1;
-
-                // Clamp r based on actual available data to prevent out-of-bounds access.
                 let entry_size = size_of::<Ext4ExtentIndex>() / 4;
-                let max_entries = if entry_size > 0 {
-                    indexes.len() / entry_size
-                } else {
-                    0
-                };
-                if r >= max_entries {
-                    r = max_entries.saturating_sub(1);
-                }
-                // If only one valid entry, return it
-                if l > r {
-                    return Some(0);
-                }
+                let count = self.header.entries_count as usize;
 
-                while l <= r {
-                    let m = l + (r - l) / 2;
-                    let offset = m * entry_size;
-                    let extent_index = Ext4ExtentIndex::load_from_u32(&indexes[offset..]);
-
-                    if lblock < extent_index.first_block {
-                        if m == 0 {
-                            break; // Prevent underflow
-                        }
-                        r = m - 1;
-                    } else {
-                        l = m + 1;
-                    }
-                }
-
-                // After binary search, l is the insertion point.
-                // If l == 0, no entry was >= lblock, so use entry 0 as fallback.
-                if l == 0 {
-                    return Some(0);
-                }
-
-                Some(l - 1)
-            }
-            NodeData::Internal(internal_data) => {
-                // Internal node handling
-                let start = size_of::<Ext4ExtentHeader>();
-                let indexes = &internal_data[start..];
-                let index_size = size_of::<Ext4ExtentIndex>();
-                let max_entries = indexes.len() / index_size;
-                let entries = (self.header.entries_count as usize).min(max_entries);
-
-                if entries == 0 {
-                    return None;
-                }
-
-                let mut l = 0;
-                let mut r = entries - 1;
-
-                while l <= r {
-                    let m = l + (r - l) / 2;
-                    let offset = m * index_size;
-                    if offset + index_size > indexes.len() {
+                // Linear search: find the last index whose first_block <= lblock
+                let mut result = 0usize;
+                for i in 0..count {
+                    let offset = i * entry_size;
+                    if offset + entry_size > indexes.len() {
                         break;
                     }
-                    let extent_index = Ext4ExtentIndex::load_from_u8(&indexes[offset..]);
-
-                    if lblock < extent_index.first_block {
-                        if m == 0 {
-                            break; // Prevent underflow
-                        }
-                        r = m - 1;
+                    let idx = Ext4ExtentIndex::load_from_u32(&indexes[offset..]);
+                    if idx.first_block <= lblock {
+                        result = i;
                     } else {
-                        l = m + 1;
+                        break;
                     }
                 }
-
-                if l == 0 {
-                    return None;
+                Some(result)
+            }
+            NodeData::Internal(internal_data) => {
+                let entry_size = size_of::<Ext4ExtentIndex>();
+                let count = self.header.entries_count as usize;
+                let mut result = 0usize;
+                for i in 0..count {
+                    let byte_offset = i * entry_size;
+                    if byte_offset + entry_size > internal_data.len() {
+                        break;
+                    }
+                    let u32_data: &[u32] = unsafe {
+                        core::slice::from_raw_parts(
+                            internal_data[byte_offset..].as_ptr() as *const u32,
+                            core::mem::size_of::<Ext4ExtentIndex>() / 4,
+                        )
+                    };
+                    let idx = Ext4ExtentIndex::load_from_u32(u32_data);
+                    if idx.first_block <= lblock {
+                        result = i;
+                    } else {
+                        break;
+                    }
                 }
-
-                Some(l - 1)
+                Some(result)
             }
         }
     }
