@@ -2094,6 +2094,41 @@ pub fn sys_exit(code: i32) -> isize {
 fn linux_exit_group(code: i32) -> isize {
     unsafe { core::arch::asm!("cli") };
 
+    // Flush all mmap'd file-backed dirty pages to ext4 before exit.
+    // This is what Linux kernel does automatically on process exit.
+    // Without this, SQLite's .db-shm (mmap'd) data is lost because
+    // physical pages are freed without writeback.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let root = crate::process::current_page_table_root();
+        let page_size = crate::mm::pmm::page_size();
+        // Scan all VMA regions for file-backed mappings
+        if let Some(regions) = crate::mm::vma::vma_dump_regions(root) {
+            for (start, end, inode, offset) in regions {
+                if inode == 0 {
+                    continue; // Anonymous mapping, skip
+                }
+                // Write back each page in the file mapping
+                let mut vaddr = start;
+                let mut file_off = offset;
+                while vaddr < end {
+                    crate::arch::trap::with_kernel_cr3(|| {
+                        let user_pt = crate::arch::trap::get_user_pt_safe();
+                        if let Some(frame) = crate::mm::vmm::translate_user(user_pt, vaddr) {
+                            let buf_vaddr = crate::mm::vmm::phys_to_virt(frame);
+                            let buf = unsafe {
+                                core::slice::from_raw_parts(buf_vaddr as *const u8, page_size)
+                            };
+                            let _ = crate::driver::ext4::write_file_at_offset(inode, file_off, buf);
+                        }
+                    });
+                    vaddr += page_size;
+                    file_off += page_size;
+                }
+            }
+        }
+    }
+
     let my_idx = crate::process::current_index();
     let my_pid = crate::process::current_pid();
     let root = crate::process::current_page_table_root();

@@ -271,6 +271,26 @@ pub fn vma_query(root: usize, addr: usize) -> Option<usize> {
     .unwrap_or(None)
 }
 
+/// Dump all active file-backed VMA regions for a given address space.
+/// Returns (start, end, file_inode, file_offset) tuples.
+/// Used by exit_group to flush mmap'd dirty pages to ext4.
+pub fn vma_dump_regions(root: usize) -> Option<alloc::vec::Vec<(usize, usize, u32, usize)>> {
+    with_state_ref(root, |state| {
+        let mut result = alloc::vec::Vec::new();
+        for vma in state.vmas.iter() {
+            if vma.active && vma.file_inode != 0 {
+                result.push((vma.start, vma.end, vma.file_inode, vma.file_offset));
+            }
+        }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    })
+    .unwrap_or(None)
+}
+
 /// Query file mapping info for an address.
 /// Returns (inode, file_offset_within_file) if this is a file-backed mapping.
 pub fn vma_file_info(root: usize, addr: usize) -> Option<(u32, usize)> {
