@@ -212,6 +212,20 @@ impl Ext4 {
                     self.block_device
                         .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_block.data);
                     alloc = self.bg_idx_to_addr(idx_in_bg, bgid);
+                    // Reject metadata blocks (superblock, GDT, bitmap, inode table)
+                    let inode_tbl = block_group.inode_table_first_block_lo as u64;
+                    let inode_tbl_end = inode_tbl
+                        + (self.super_block.inodes_per_group() as u64
+                            * self.super_block.inode_size() as u64)
+                            / (BLOCK_SIZE as u64);
+                    if alloc < inode_tbl_end {
+                        // This is a metadata block — skip it
+                        ext4_bmap_bit_set(&mut bitmap_block.data, idx_in_bg); // Mark as used
+                        self.block_device
+                            .write_offset(bmp_blk_adr as usize * BLOCK_SIZE, &bitmap_block.data);
+                        idx_in_bg += 1;
+                        continue;
+                    }
 
                     /* Update free block counts */
                     self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
