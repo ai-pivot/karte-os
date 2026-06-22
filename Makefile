@@ -111,7 +111,7 @@ _build-x86-iso:
 	@mkdir -p $(ISO_DIR)/boot/grub
 	@cp $(KERNEL_X86) $(ISO_DIR)/boot/karte-os-kernel
 	@printf 'set timeout=0\nset default=0\nterminal_input console\nterminal_output console\nmenuentry "KarteOS" {\n    multiboot2 /boot/karte-os-kernel\n    boot\n}\n' > $(ISO_DIR)/boot/grub/grub.cfg
-	grub-mkrescue -o $(ISO_FILE) $(ISO_DIR) 2>/dev/null
+	grub-mkrescue -V KARTEOS -o $(ISO_FILE) $(ISO_DIR) 2>/dev/null
 	@echo "[x86_64] ISO ready: $(ISO_FILE)"
 
 # ═══════════════════════════════════════════════════════════════
