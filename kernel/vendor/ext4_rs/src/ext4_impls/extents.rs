@@ -574,17 +574,28 @@ impl Ext4 {
             let entries = header.entries_count as usize;
             let max_entries = header.max_entries_count as usize;
 
-            // Determine insert position: use position+1 or entries (append to end)
-            let insert_pos = if node.position + 1 <= entries {
-                node.position + 1
-            } else {
-                entries
-            };
+            // Determine insert position using linear search for correct sorted order.
+            // binsearch_extent can return wrong position when entries are unsorted.
+            // Find the first entry whose first_block > new_extent.first_block.
+            let ext_size = core::mem::size_of::<Ext4Extent>();
+            let header_size = core::mem::size_of::<Ext4ExtentHeader>();
+            let mut insert_pos = entries; // Default: append at end
+            for i in 0..entries {
+                let off = header_size + i * ext_size;
+                let existing_blk = u32::from_le_bytes([
+                    ext4block.data[off],
+                    ext4block.data[off + 1],
+                    ext4block.data[off + 2],
+                    ext4block.data[off + 3],
+                ]);
+                if existing_blk > new_extent.first_block {
+                    insert_pos = i;
+                    break;
+                }
+            }
 
             // Shift extents [insert_pos..entries) right by 1 to make room
             if insert_pos < entries && entries < max_entries {
-                let ext_size = core::mem::size_of::<Ext4Extent>();
-                let header_size = core::mem::size_of::<Ext4ExtentHeader>();
                 let src_offset = header_size + ext_size * insert_pos;
                 let dst_offset = header_size + ext_size * (insert_pos + 1);
                 let move_len = ext_size * (entries - insert_pos);
