@@ -1541,23 +1541,32 @@ fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset: usize, _offset_hi: 
     // Read from user space into kernel buffer
     let data = user_read_bytes(buf, count);
 
-    // Try VFS pwrite (offset-based, no fd position update). The Linux fd must
-    // first be resolved through the per-process fd table to the internal VFS fd.
-    if let Some(vfs_fd) = crate::process::with_fd_table(|fd_table| {
+    // Resolve fd type and dispatch to the correct pwrite handler.
+    let fd_info = crate::process::with_fd_table(|fd_table| {
         fd_table
             .get(fd as usize)
-            .and_then(|desc| match &desc.fd_type {
-                FdType::VfsFile(vfs_fd) => Some(*vfs_fd),
-                _ => None,
-            })
-    }) {
-        match crate::driver::vfs::pwrite(vfs_fd, &data, offset) {
-            Ok(n) => return n as isize,
-            Err(_) => {}
+            .map(|desc| (desc.fd_type.clone(), desc.pos))
+    });
+
+    if let Some((fd_type, _pos)) = fd_info {
+        match &fd_type {
+            FdType::VfsFile(vfs_fd) => match crate::driver::vfs::pwrite(*vfs_fd, &data, offset) {
+                Ok(n) => return n as isize,
+                Err(_) => {}
+            },
+            FdType::Ext4File(ext4_desc) => {
+                // Direct ext4 pwrite using inode and offset
+                match crate::driver::ext4::write_file_at_offset(ext4_desc.inode_num, offset, &data)
+                {
+                    Ok(n) => return n as isize,
+                    Err(_) => {}
+                }
+            }
+            _ => {}
         }
     }
 
-    // Fallback for non-VFS fds (pipes, etc.): ignore offset, do regular write
+    // Fallback for non-file fds (pipes, etc.): ignore offset, do regular write
     sys_write(fd, buf, count)
 }
 
