@@ -352,7 +352,7 @@ impl Ext4 {
             }
 
             // Try to find free block near to goal
-            let end_idx = min((idx_in_bg + 63) & !63, max_blocks_in_bitmap as u32);
+            let end_idx = min(idx_in_bg + 1024, max_blocks_in_bitmap as u32);
 
             for tmp_idx in (idx_in_bg + 1)..end_idx {
                 if ext4_bmap_is_bit_clr(&bitmap_block.data, tmp_idx) {
