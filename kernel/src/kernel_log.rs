@@ -268,7 +268,11 @@ impl log::Log for KernelLogger {
                 log::Level::Debug => "DEBUG",
                 log::Level::Trace => "TRACE",
             };
-            crate::console_println!("[{}] {}", level, record.args());
+            let msg = alloc::format!("[{}] {}\n", level, record.args());
+            // Write to kernel log buffer (for dmesg)
+            for &b in msg.as_bytes() {
+                crate::kernel_log::log_write_byte(b);
+            }
         }
     }
 

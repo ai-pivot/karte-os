@@ -340,6 +340,22 @@ impl Ext4 {
                 if existing != 0 {
                     return Ok(existing);
                 }
+                // Retry with fresh inode read if file covers this block
+                let file_sz = inode_ref.inode.size() as usize;
+                if file_sz > (lblock as usize) * 4096 {
+                    let inode_num = inode_ref.inode_num;
+                    *inode_ref = fs.get_inode_ref(inode_num);
+                    let existing2 = fs.get_pblock_idx(inode_ref, lblock)?;
+                    if existing2 != 0 {
+                        return Ok(existing2);
+                    }
+                    log::error!(
+                        "[EPB] inode={} lblock={} fsize={} — alloc new block",
+                        inode_num,
+                        lblock,
+                        file_sz
+                    );
+                }
 
                 // Try to allocate contiguously after the last physical block.
                 // This ensures extents merge, preventing extent tree overflow
