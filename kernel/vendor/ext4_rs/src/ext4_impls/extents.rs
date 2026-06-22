@@ -182,6 +182,46 @@ impl Ext4 {
             }
         }
 
+        // Universal merge check: try to merge with the LAST extent in the node.
+        // This covers both depth=0 (root inline) and depth>0 (leaf block).
+        // Must happen BEFORE the "Insert to existing extent" path to prevent
+        // duplicate extents when binsearch returns a non-adjacent old entry.
+        if header.entries_count > 0 {
+            let last_pos = header.entries_count as usize - 1;
+            let last_ex = if node.pblock_of_node == 0 {
+                Ok(inode_ref.inode.root_extent_at(last_pos))
+            } else {
+                self.get_extent_from_node(node, last_pos)
+            };
+            if let Ok(last_ex) = last_ex {
+                if self.can_merge(&last_ex, newex) {
+                    let new_len = last_ex.get_actual_len() + newex.get_actual_len();
+                    let mut merged = last_ex;
+                    merged.set_actual_len(new_len);
+                    if at_root {
+                        *inode_ref.inode.root_extent_mut_at(last_pos) = merged;
+                        self.write_back_inode(inode_ref);
+                    } else {
+                        let pblock = node.pblock_of_node;
+                        if pblock > 0 {
+                            let blk_off = pblock as usize * BLOCK_SIZE;
+                            let ext_offset = core::mem::size_of::<Ext4ExtentHeader>()
+                                + last_pos * core::mem::size_of::<Ext4Extent>();
+                            let mut blk = Block::load(&self.block_device, blk_off);
+                            let ext_ptr = unsafe {
+                                (blk.data.as_mut_ptr().add(ext_offset)) as *mut Ext4Extent
+                            };
+                            unsafe {
+                                *ext_ptr = merged;
+                            }
+                            blk.sync_blk_to_disk(&self.block_device);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         // Insert to existing extent
         if let Some(mut ex) = node.extent {
             let pos = node.position;
