@@ -2687,10 +2687,10 @@ fn linux_mmap_inner(
 
     // Resolve fd for file-backed mmap
     let file_inode = if !is_anonymous && _fd != usize::MAX {
-        // Resolve fd → VFS inode
         crate::process::with_fd_table(|fd_table| {
             fd_table.get(_fd).and_then(|desc| match &desc.fd_type {
                 crate::driver::fs::FdType::VfsFile(vfs_fd) => crate::driver::vfs::fd_inode(*vfs_fd),
+                crate::driver::fs::FdType::Ext4File(ext4_desc) => Some(ext4_desc.inode_num),
                 _ => None,
             })
         })
