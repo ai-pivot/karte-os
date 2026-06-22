@@ -1566,8 +1566,9 @@ fn linux_pwrite64(fd: i32, buf: usize, count: usize, offset: usize, _offset_hi: 
         }
     }
 
-    // Fallback for non-file fds (pipes, etc.): ignore offset, do regular write
-    sys_write(fd, buf, count)
+    // No matching fd type — return EBADF.
+    // DO NOT fallback to sys_write: it ignores offset → data corruption.
+    -9 // EBADF
 }
 
 #[cfg(target_arch = "x86_64")]
