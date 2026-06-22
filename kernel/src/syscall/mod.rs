@@ -4245,7 +4245,9 @@ fn sys_syslog(buf: usize, len: usize, offset: usize) -> isize {
 
     let mut kbuf = alloc::vec![0u8; len];
     let read = crate::kernel_log::log_peek(&mut kbuf, offset);
-    user_write_bytes(buf, &kbuf[..read]);
+    for i in 0..read {
+        user_write::<u8>(buf + i, kbuf[i]);
+    }
     read as isize
 }
 
