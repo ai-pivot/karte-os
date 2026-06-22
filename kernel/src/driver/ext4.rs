@@ -75,6 +75,11 @@ impl SectorCache {
         self.map.get(&sector)
     }
 
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
     fn insert(&mut self, sector: usize, data: [u8; SECTOR_SIZE]) {
         if self.map.insert(sector, data).is_none() {
             self.order.push_back(sector);
@@ -88,6 +93,11 @@ impl SectorCache {
 }
 
 static SECTOR_CACHE: spin::Mutex<SectorCache> = spin::Mutex::new(SectorCache::new());
+
+/// Flush entire sector cache. Forces next reads to go directly to disk.
+pub fn flush_sector_cache() {
+    SECTOR_CACHE.lock().clear();
+}
 
 // ─── I/O statistics ───────────────────────────────────────────────────────
 
@@ -414,6 +424,9 @@ fn with_kernel_cr3_ext4<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
+    // Flush sector cache before every ext4 operation to prevent
+    // stale leaf block reads in depth>0 extent trees.
+    flush_sector_cache();
     f()
 }
 
@@ -757,6 +770,10 @@ pub fn write_file_at_offset(inode: u32, offset: usize, data: &[u8]) -> Result<us
     if !has_ext4() {
         return Err("ext4 not initialized");
     }
+    // Flush sector cache to ensure fresh extent tree reads.
+    // Without this, depth>0 extent tree lookups can return stale leaf
+    // block data, causing get_pblock_idx to return 0 for existing blocks.
+    flush_sector_cache();
     let mut guard = EXT4_FS.lock();
     let fs = guard.as_mut().ok_or("ext4 not initialized")?;
     fs.write_file(inode as u64, offset, data)
