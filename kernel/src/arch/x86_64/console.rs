@@ -43,6 +43,8 @@ pub fn print(s: &str) {
         if !raw_mode {
             crate::driver::vga::putchar(byte);
         }
+        // Framebuffer console (UEFI GOP fallback when VGA not available)
+        crate::arch::fb_console::putchar(byte);
     }
 
     // Batch UART output (single write_batch call instead of per-byte putchar)

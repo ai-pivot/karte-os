@@ -36,14 +36,12 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::arch::uart::init_uart();
         crate::driver::vga::init();
 
-        // Parse multiboot2 info to get actual RAM size.
+        // Parse multiboot2 info to get RAM size and framebuffer.
         // kmain params: EDI=multiboot2_magic, ESI=multiboot2_info_addr
         let (_mb2_magic, mb2_info) = (hartid, dtb_ptr);
-        let (_mem_lower, mem_upper_kb) = crate::arch::multiboot2::parse_memory_size(mb2_info);
+        let (mem_lower, mem_upper_kb, fb_info) = crate::arch::multiboot2::parse_mbi(mb2_info);
+        let _ = mem_lower;
         if mem_upper_kb > 0 {
-            // mem_upper_kb = KB of RAM above 1MB.
-            // Total RAM = 1MB (below) + mem_upper_kb KB (above).
-            // Leave 2MB for kernel/code start area.
             let total_ram = 1024 * 1024 + (mem_upper_kb as usize) * 1024;
             crate::console_println!(
                 "[init] Multiboot2 memory: {} MB total",
@@ -52,6 +50,14 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             mm::pmm::init_with_size(total_ram - 0x0020_0000);
         } else {
             mm::pmm::init();
+        }
+
+        // Initialize framebuffer console from GOP (UEFI without CSM fallback)
+        if let Some(fb) = fb_info {
+            crate::arch::fb_console::init(fb.addr, fb.pitch, fb.width, fb.height, fb.bpp);
+            crate::arch::fb_console::write_str(
+                "FB console ready\n",
+            );
         }
     }
 
