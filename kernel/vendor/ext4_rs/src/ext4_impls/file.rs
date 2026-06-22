@@ -340,6 +340,25 @@ impl Ext4 {
                 if existing != 0 {
                     return Ok(existing);
                 }
+                // If file covers this block, the extent lookup failed.
+                // Do a raw read_at to verify the block exists and get its pblock.
+                let file_sz = inode_ref.inode.size() as usize;
+                if file_sz > (lblock as usize) * 4096 {
+                    // Try reading one byte from this block
+                    let mut tmp = [0u8; 1];
+                    if fs
+                        .read_at(inode_ref.inode_num, (lblock as usize) * 4096, &mut tmp)
+                        .is_ok()
+                    {
+                        // Block exists! Retry get_pblock_idx with fresh inode
+                        let inode_num = inode_ref.inode_num;
+                        *inode_ref = fs.get_inode_ref(inode_num);
+                        let existing2 = fs.get_pblock_idx(inode_ref, lblock)?;
+                        if existing2 != 0 {
+                            return Ok(existing2);
+                        }
+                    }
+                }
                 // Retry with fresh inode read if file covers this block
                 let file_sz = inode_ref.inode.size() as usize;
                 if file_sz > (lblock as usize) * 4096 {
