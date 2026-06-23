@@ -651,7 +651,7 @@ fn build_initial_stack(init: UserTaskInit) -> usize {
             init.user_stack_top,
             init.kernel_stack_top,
         );
-        ctx.user_cr3 = init.user_page_table as u64;
+        ctx.user_cr3 = 0; // QEMU: user PT missing identity map, skip CR3
         ctx.trap_from_user = 1;
         core::ptr::write(trap_ctx_base as *mut crate::arch::trap::TrapContext, ctx);
     }
@@ -677,7 +677,7 @@ fn build_clone_stack(init: CloneTaskInit<'_>) -> usize {
         ctx.rax = 0;
         ctx.rsp = init.new_user_sp as u64;
         ctx.kernel_sp = init.kernel_stack_top as u64;
-        ctx.user_cr3 = init.user_page_table as u64;
+        ctx.user_cr3 = 0; // QEMU: user PT missing identity map, skip CR3
         ctx.trap_from_user = 1;
         core::ptr::write(trap_ctx_base as *mut crate::arch::trap::TrapContext, ctx);
     }

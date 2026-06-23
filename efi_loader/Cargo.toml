@@ -1,0 +1,17 @@
+[package]
+name = "efi-loader"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "efi-loader"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2

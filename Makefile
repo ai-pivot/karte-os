@@ -3,6 +3,7 @@
         run-riscv run-x86 build-riscv build-x86 shell-riscv shell-x86 \
         iso-riscv iso-x86 setup-riscv setup-x86 \
         share-riscv share-x86 usb-image usb-write \
+        uefi-x86 run-uefi-x86 shell-uefi-x86 uefi-usb uefi-usb-write \
         release release-riscv release-x86 release-all
 
 # ═══════════════════════════════════════════════════════════════
@@ -144,6 +145,14 @@ iso-riscv: deploy
 #  x86_64 (secondary, nightly Rust + GRUB ISO)
 # ═══════════════════════════════════════════════════════════════
 
+# ── UEFI config ──
+TARGET_UEFI  := x86_64-unknown-uefi
+EFI_LOADER   := target/$(TARGET_UEFI)/release/efi-loader.efi
+KERNEL_BIN   := target/$(TARGET_X86)/release/kernel.bin
+OVMF_CODE    := /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS    := /tmp/OVMF_VARS.fd
+UEFI_DISK    := target/uefi_disk.img
+
 ## Build x86_64 kernel + ISO only (no deploy)
 build-x86:
 	@$(MAKE) _build-x86-iso
@@ -279,15 +288,74 @@ setup-x86:
 	sudo apt-get install -y qemu-system-x86_64 grub-common xorriso
 
 # ═══════════════════════════════════════════════════════════════
+#  UEFI Boot (x86_64) — Build kernel + EFI loader, run on QEMU OVMF
+# ═══════════════════════════════════════════════════════════════
+
+## Build UEFI kernel binary (.bin) from ELF
+_build-uefi-kernel:
+	@cd user && $(MAKE) ARCH=x86_64 clean > /dev/null 2>&1 && $(MAKE) ARCH=x86_64 > /dev/null 2>&1
+	@rm -f $(KERNEL_X86)
+	@rm -rf target/$(TARGET_X86)/release/.fingerprint/karte-os-kernel-*
+	cargo +nightly build --release --target $(TARGET_X86) -p karte-os-kernel -Z build-std=core,alloc
+	objcopy -O binary $(KERNEL_X86) $(KERNEL_BIN)
+	@echo "[uefi] Kernel binary: $(KERNEL_BIN) ($(shell ls -lh $(KERNEL_BIN) | awk '{print $$5}'))"
+
+## Build UEFI EFI loader (embeds kernel binary)
+_build-efi-loader: _build-uefi-kernel
+	KERNEL_BIN_PATH=$(KERNEL_BIN) cargo +nightly build --release --target $(TARGET_UEFI) -p efi-loader -Z build-std=core
+	@echo "[uefi] EFI loader: $(EFI_LOADER)"
+
+## Create FAT32 UEFI boot disk with BOOTX64.EFI
+$(UEFI_DISK): _build-efi-loader
+	@dd if=/dev/zero of=$(UEFI_DISK) bs=1M count=128 2>/dev/null
+	@mformat -t 256 -h 16 -s 63 -F -i $(UEFI_DISK) ::
+	@mmd -i $(UEFI_DISK) ::/EFI ::/EFI/BOOT 2>/dev/null
+	@mcopy -i $(UEFI_DISK) $(EFI_LOADER) ::/EFI/BOOT/BOOTX64.EFI
+	@echo "[uefi] Boot disk: $(UEFI_DISK)"
+
+## Build UEFI boot disk (kernel + EFI loader in FAT32 image)
+uefi-x86: $(UEFI_DISK)
+	@echo "[uefi] Ready. Run: make run-uefi-x86"
+
+## Run on UEFI QEMU (OVMF firmware)
+run-uefi-x86: $(UEFI_DISK)
+	@cp /usr/share/OVMF/OVMF_VARS_4M.fd $(OVMF_VARS)
+	qemu-system-x86_64 \
+	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	  -drive if=pflash,format=raw,file=$(OVMF_VARS) \
+	  -drive format=raw,file=$(UEFI_DISK) \
+	  -serial stdio -display none \
+	  -m 512M -smp 1 -no-reboot -cpu qemu64
+
+## Build + deploy + run UEFI (one command)
+shell-uefi-x86: deploy-x86 $(UEFI_DISK)
+	@echo "Note: disk.img is attached as secondary drive"
+	@cp /usr/share/OVMF/OVMF_VARS_4M.fd $(OVMF_VARS)
+	qemu-system-x86_64 \
+	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	  -drive if=pflash,format=raw,file=$(OVMF_VARS) \
+	  -drive format=raw,file=$(UEFI_DISK) \
+	  -drive file=disk.img,format=raw,if=none,id=hd0 \
+	  -device ich9-ahci,id=ahci \
+	  -device ide-hd,drive=hd0,bus=ahci.0 \
+	  -serial stdio -display none \
+	  -m 512M -smp 2 -no-reboot -cpu qemu64
+
+# ═══════════════════════════════════════════════════════════════
 #  USB / Installation (x86_64)
 # ═══════════════════════════════════════════════════════════════
 
-## Create bootable USB image (set USB_SIZE_MB=... for size)
-usb-image: _build-x86-iso disk.img
-	@echo "[usb] Creating bootable USB image..."
-	sudo tools/mkusb.sh image
+## Create UEFI bootable USB image (kernel + EFI loader + user programs)
+uefi-usb: _build-efi-loader
+	@echo "[usb] Creating UEFI bootable USB image..."
+	@bash tools/mkusb.sh image
 	@echo "[usb] Image: target/karte-os-usb.img"
-	@echo "[usb] Write: dd if=target/karte-os-usb.img of=/dev/sdX bs=4M status=progress"
+	@echo "[usb] Write: sudo dd if=target/karte-os-usb.img of=/dev/sdX bs=4M status=progress"
+
+## Write UEFI image directly to USB drive (USB_DEV=/dev/sdX)
+uefi-usb-write: _build-efi-loader
+	@test -n "$(USB_DEV)" || (echo "Usage: make uefi-usb-write USB_DEV=/dev/sdX" && exit 1)
+	@bash tools/mkusb.sh $(USB_DEV)
 
 ## Write directly to USB drive (USB_DEV=/dev/sdX)
 usb-write: _build-x86-iso disk.img

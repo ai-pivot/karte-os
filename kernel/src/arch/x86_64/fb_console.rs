@@ -74,7 +74,8 @@ fn draw_char(c: u8, col: usize, row: usize) {
     let pitch = FB_PITCH.load(Ordering::Relaxed) as usize;
     let bpp = (FB_BPP.load(Ordering::Relaxed) / 8) as usize;
 
-    let glyph = &FONT[(c as usize) * CHAR_H..(c as usize + 1) * CHAR_H];
+    let idx = (c as usize & 0x7F) * CHAR_H;
+    let glyph = &FONT[idx..idx + CHAR_H];
     let px = col * CHAR_W;
     let py = row * CHAR_H;
 

@@ -452,6 +452,11 @@ pub fn get_kernel_page_table() -> &'static mut PageTable {
     unsafe { &mut *KERNEL_PAGE_TABLE }
 }
 
+/// Check if VMM has been initialized (KERNEL_PAGE_TABLE is non-null).
+pub fn is_initialized() -> bool {
+    unsafe { !KERNEL_PAGE_TABLE.is_null() }
+}
+
 /// Get the physical address of the kernel page table root (for CR3 loading).
 pub fn kernel_cr3() -> u64 {
     unsafe { (virt_to_phys(KERNEL_PAGE_TABLE as usize) as u64) }
@@ -497,7 +502,7 @@ pub fn init() {
         // The boot stack is at identity address ~1 MB; this mapping keeps it
         // alive after CR3 switch.  User memory is NEVER accessed via this
         // identity mapping — all user buffer access goes through phys_to_virt().
-        identity_map_2mb(root, 0x0, 0x20000000, PTEFlags::KRWX);
+        identity_map_2mb(root, 0x0, 0x1_0000_0000, PTEFlags::KRWX);
         // Identity-map MMIO regions (device drivers use identity addresses).
         identity_map_2mb(root, 0xFE000000, 0xFF000000, PTEFlags::KRW);
     }

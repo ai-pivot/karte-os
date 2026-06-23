@@ -1,37 +1,26 @@
 #!/bin/bash
-# mkusb.sh — Create a bootable USB image for KarteOS x86_64
+# mkusb.sh — Create a bootable UEFI USB for KarteOS x86_64
 #
 # Usage:
-#   tools/mkusb.sh /dev/sdX          # Write directly to USB drive
-#   tools/mkusb.sh image             # Create a USB disk image file
+#   tools/mkusb.sh image             # Create a USB image file
+#   tools/mkusb.sh /dev/sdX          # Write directly to USB drive (DANGEROUS)
 #
-# Requirements:
-#   - sfdisk, mkfs.fat, mkfs.ext4, grub-install, mtools
-#   - KarteOS kernel already built (make build-x86)
-#
-# The USB layout:
-#   Partition 1 (64MB, FAT32, bootable): GRUB bootloader + kernel
-#   Partition 2 (rest, ext4): Root filesystem with OS files
+# Layout (GPT):
+#   Partition 1 (ESP, FAT32, 128MB): EFI/BOOT/BOOTX64.EFI
+#   Partition 2 (ext4, rest): User programs (ls, cat, shell, etc.)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 error() { echo -e "${RED}ERROR:${NC} $1" >&2; exit 1; }
 info()  { echo -e "${GREEN}[mkusb]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[mkusb] WARNING:${NC} $1"; }
 
-# ── Parse Arguments ──
-
 TARGET="$1"
-[ -z "$TARGET" ] && error "Usage: $0 /dev/sdX  OR  $0 image"
+[ -z "$TARGET" ] && error "Usage: $0 image  OR  $0 /dev/sdX"
 
 IMAGE_MODE=false
 if [ "$TARGET" = "image" ]; then
@@ -42,42 +31,32 @@ fi
 
 # ── Verify Build ──
 
-KERNEL="$PROJECT_DIR/target/x86_64-unknown-none/release/karte-os-kernel"
-SHELL_ELF="$PROJECT_DIR/user/shell.elf"
+EFI_LOADER="$PROJECT_DIR/target/x86_64-unknown-uefi/release/efi-loader.efi"
 
-[ ! -f "$KERNEL" ] && error "Kernel not found. Run 'make build-x86' first."
-[ ! -f "$SHELL_ELF" ] && error "shell.elf not found. Run 'cd user && make ARCH=x86_64' first."
+[ ! -f "$EFI_LOADER" ] && error "EFI loader not found. Run 'make uefi-x86' first."
+[ ! -f "$PROJECT_DIR/user/shell.elf" ] && error "shell.elf not found. Run 'cd user && make ARCH=x86_64' first."
 
-info "Kernel: $KERNEL"
-info "Shell:  $SHELL_ELF"
+info "EFI loader: $EFI_LOADER ($(du -h "$EFI_LOADER" | cut -f1))"
 
-# ── Build user programs for x86_64 ──
-
+# ── Build user programs ──
 info "Building user programs..."
-cd "$PROJECT_DIR/user" && make ARCH=x86_64 > /dev/null 2>&1 || true
+cd "$PROJECT_DIR/user" && make ARCH=x86_64 > /dev/null 2>&1 || warn "Some user programs failed to build"
 
-# ── Create Image or Use Device ──
+# ── Create or Use Device ──
 
 if $IMAGE_MODE; then
-    info "Creating ${USB_SIZE_MB}MB USB image: $TARGET"
+    info "Creating ${USB_SIZE_MB}MB UEFI USB image: $TARGET"
     dd if=/dev/zero of="$TARGET" bs=1M count="$USB_SIZE_MB" status=progress
     LOOP_DEV=$(losetup --find --show --partscan "$TARGET")
     info "Loop device: $LOOP_DEV"
     BLOCK_DEV="$LOOP_DEV"
 else
-    # Real device
-    if [ ! -b "$TARGET" ]; then
-        error "$TARGET is not a block device"
-    fi
+    [ ! -b "$TARGET" ] && error "$TARGET is not a block device"
     BLOCK_DEV="$TARGET"
     info "Target device: $BLOCK_DEV"
-    
-    # Safety check
     if [ "$(lsblk -no MOUNTPOINTS "$BLOCK_DEV" 2>/dev/null | grep -c '/')" -gt 0 ]; then
-        error "Device $BLOCK_DEV has mounted partitions! Unmount first."
+        error "Device has mounted partitions! Unmount first."
     fi
-    
-    # Confirm
     echo -e "${YELLOW}WARNING: This will ERASE ALL DATA on $BLOCK_DEV${NC}"
     read -p "Type 'YES' to continue: " confirm
     [ "$confirm" = "YES" ] || error "Aborted."
@@ -85,195 +64,96 @@ fi
 
 cleanup() {
     if $IMAGE_MODE && [ -n "$LOOP_DEV" ]; then
-        info "Detaching loop device..."
         losetup -d "$LOOP_DEV" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
 
-# ── Partition ──
+# ── Partition (GPT for UEFI) ──
 
-info "Partitioning $BLOCK_DEV..."
+info "Partitioning ($BLOCK_DEV) with GPT..."
+sgdisk --clear \
+    --new=1:2048:+128M --typecode=1:EF00 --change-name=1:"EFI System" \
+    --new=2:0:0        --typecode=2:8300 --change-name=2:"KarteOS Root" \
+    "$BLOCK_DEV" 2>/dev/null || error "Partitioning failed (need sgdisk)"
 
-# Create partition table: GPT for modern UEFI + BIOS compatibility
-# Actually use MBR (DOS) for maximum GRUB compatibility on real hardware
-sfdisk "$BLOCK_DEV" <<EOF || error "Partitioning failed"
-label: dos
-unit: sectors
+sleep 1; partprobe "$BLOCK_DEV" 2>/dev/null || true; sleep 1
 
-${BLOCK_DEV}p1 : start=2048, size=131072, type=0c, bootable
-${BLOCK_DEV}p2 : start=133120, type=83
-EOF
-
-# Wait for kernel to recognize partitions
-sleep 1
-partprobe "$BLOCK_DEV" 2>/dev/null || true
-sleep 1
-
-# Determine partition devices
 if $IMAGE_MODE; then
-    PART1="${LOOP_DEV}p1"
-    PART2="${LOOP_DEV}p2"
+    PART1="${LOOP_DEV}p1"; PART2="${LOOP_DEV}p2"
 else
-    # Try with and without 'p' prefix
     if [ -b "${BLOCK_DEV}1" ]; then
-        PART1="${BLOCK_DEV}1"
-        PART2="${BLOCK_DEV}2"
+        PART1="${BLOCK_DEV}1"; PART2="${BLOCK_DEV}2"
     elif [ -b "${BLOCK_DEV}p1" ]; then
-        PART1="${BLOCK_DEV}p1"
-        PART2="${BLOCK_DEV}p2"
-    else
-        error "Cannot find partition devices"
+        PART1="${BLOCK_DEV}p1"; PART2="${BLOCK_DEV}p2"
+    else error "Cannot find partition devices"
     fi
 fi
 
-info "Partition 1 (boot): $PART1"
-info "Partition 2 (root): $PART2"
+info "ESP:  $PART1"
+info "Root: $PART2"
 
 # ── Format ──
 
-info "Formatting partitions..."
-mkfs.fat -F 32 -n "KARTEOS_BOOT" "$PART1" || error "Failed to format FAT32"
-mkfs.ext4 -F -L "KARTEOS_ROOT" "$PART2" || error "Failed to format ext4"
+info "Formatting ESP (FAT32)..."
+mkfs.fat -F 32 -n "KARTEBOOT" "$PART1" 2>/dev/null || error "FAT32 format failed"
+
+info "Formatting root (ext4)..."
+mkfs.ext4 -F -L "KARTEOS" "$PART2" 2>/dev/null || error "ext4 format failed"
 
 # ── Mount ──
 
-BOOT_MNT=$(mktemp -d)
-ROOT_MNT=$(mktemp -d)
-
-mount "$PART1" "$BOOT_MNT" || error "Failed to mount boot partition"
-mount "$PART2" "$ROOT_MNT" || { umount "$BOOT_MNT"; error "Failed to mount root partition"; }
+ESP_MNT=$(mktemp -d); ROOT_MNT=$(mktemp -d)
+mount "$PART1" "$ESP_MNT" || error "Failed to mount ESP"
+mount "$PART2" "$ROOT_MNT" || { umount "$ESP_MNT"; error "Failed to mount root"; }
 
 cleanup_mount() {
-    umount "$BOOT_MNT" 2>/dev/null || true
+    umount "$ESP_MNT" 2>/dev/null || true
     umount "$ROOT_MNT" 2>/dev/null || true
-    rmdir "$BOOT_MNT" "$ROOT_MNT" 2>/dev/null || true
+    rmdir "$ESP_MNT" "$ROOT_MNT" 2>/dev/null || true
     cleanup
 }
 trap cleanup_mount EXIT
 
-# ── Install GRUB ──
+# ── Install EFI Loader ──
 
-info "Installing GRUB bootloader..."
-mkdir -p "$BOOT_MNT/boot/grub"
- cat > "$BOOT_MNT/boot/grub/grub.cfg" << 'GRUBCFG'
-set timeout=3
-set default=0
-insmod all_video
-insmod gfxterm
-set gfxmode=auto
-set gfxpayload=text
-terminal_output gfxterm
+info "Installing EFI bootloader..."
+mkdir -p "$ESP_MNT/EFI/BOOT"
+cp "$EFI_LOADER" "$ESP_MNT/EFI/BOOT/BOOTX64.EFI"
+info "  BOOTX64.EFI ($(du -h "$EFI_LOADER" | cut -f1))"
 
-menuentry "KarteOS" {
-   multiboot2 /boot/karte-os-kernel
-   boot
-}
+# ── Install User Programs ──
 
-menuentry "KarteOS (verbose)" {
-    multiboot2 /boot/karte-os-kernel
-    boot
-}
+info "Installing user programs..."
+mkdir -p "$ROOT_MNT/bin" "$ROOT_MNT/etc" "$ROOT_MNT/dev" "$ROOT_MNT/tmp" "$ROOT_MNT/home"
 
-menuentry "Reboot" {
-    reboot
-}
-
-menuentry "Shutdown" {
-    halt
-}
-GRUBCFG
-
-# Install kernel
-cp "$KERNEL" "$BOOT_MNT/boot/karte-os-kernel"
-info "Kernel installed ($(du -h "$KERNEL" | cut -f1))"
-
-# Install GRUB for BIOS (MBR) boot
-grub-install --target=i386-pc --boot-directory="$BOOT_MNT/boot" "$BLOCK_DEV" 2>/dev/null || {
-    warn "grub-install failed. You may need to install GRUB manually."
-    warn "Try: sudo grub-install --target=i386-pc --boot-directory=$BOOT_MNT/boot $BLOCK_DEV"
-}
-
-# ── Install Root Filesystem ──
-
-info "Installing root filesystem..."
-
-# Copy user programs to ext4 root (without .elf extension)
 for elf in "$PROJECT_DIR/user/"*.elf; do
     [ -f "$elf" ] || continue
     name=$(basename "$elf" .elf)
     cp "$elf" "$ROOT_MNT/$name"
-    info "  Installed: $name"
-done
-
-# Create essential directories
-mkdir -p "$ROOT_MNT/bin"
-mkdir -p "$ROOT_MNT/etc"
-mkdir -p "$ROOT_MNT/dev"
-mkdir -p "$ROOT_MNT/tmp"
-mkdir -p "$ROOT_MNT/home"
-
-# Copy programs to /bin as well
-for elf in "$PROJECT_DIR/user/"*.elf; do
-    [ -f "$elf" ] || continue
-    name=$(basename "$elf" .elf)
     cp "$elf" "$ROOT_MNT/bin/$name"
+    info "  $name"
 done
 
-# Create /etc/init.sh (basic startup script)
-cat > "$ROOT_MNT/etc/init.sh" << 'INIT'
-#!/bin/sh
-# KarteOS initialization script
-echo "Welcome to KarteOS!"
-echo ""
-INIT
-
-# Create /etc/hostname
-echo "karteos" > "$ROOT_MNT/etc/hostname"
-
-# Create /etc/motd
-cat > "$ROOT_MNT/etc/motd" << 'MOTD'
-  _        _   ___  ____
- | |      / \ / _ \/ ___|
- | |     / _ \ | | \___ \
- | |___ / ___ \ |_| |___) |
- |_____/_/   \_\___/|____/
-
-  KarteOS v0.2.0 — A modern dual-architecture OS
-
-  Type 'help' for available commands.
-MOTD
-
-info "Root filesystem populated"
-
-# ── Show Summary ──
+# ── Summary ──
 
 echo ""
-info "══════════════════════════════════════════"
-info "  USB image created successfully!"
-info "══════════════════════════════════════════"
-echo ""
-info "Boot partition: $(du -sh "$BOOT_MNT" | cut -f1) used"
-info "Root partition: $(du -sh "$ROOT_MNT" | cut -f1) used"
+info "=========================================="
+info "  UEFI USB created successfully!"
+info "=========================================="
+info "ESP:  $(du -sh "$ESP_MNT" | cut -f1) used"
+info "Root: $(du -sh "$ROOT_MNT" | cut -f1) used"
 echo ""
 
 if $IMAGE_MODE; then
-    info "Image file: $TARGET"
-    info "To write to USB: dd if=$TARGET of=/dev/sdX bs=4M status=progress"
-    info "  (replace /dev/sdX with your USB device)"
+    info "Image: $TARGET ($(ls -lh "$TARGET" | awk '{print $5}'))"
+    echo ""
+    info "Write to USB:"
+    info "  sudo dd if=$TARGET of=/dev/sdX bs=4M status=progress"
+    info "  (replace /dev/sdX with your USB device — use lsblk to find it)"
 else
-    info "USB drive $BLOCK_DEV is ready to boot!"
+    info "USB drive $BLOCK_DEV is ready!"
 fi
-
 echo ""
-info "Boot your PC from this USB drive (may need to change"
-info "boot order in BIOS/UEFI settings). GRUB will show a"
-info "menu to boot KarteOS."
-echo ""
-
-# ── Cleanup ──
-umount "$BOOT_MNT"
-umount "$ROOT_MNT"
-rmdir "$BOOT_MNT" "$ROOT_MNT"
-
-info "Done!"
+info "Boot: Insert USB → Power on → Select USB boot (F12/F2/Esc)"
+info "      Ensure UEFI mode is enabled in BIOS (not Legacy/CSM)"

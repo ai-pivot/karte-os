@@ -100,9 +100,18 @@ pub fn get_syscall_ksp() -> u64 {
 
 pub fn cache_kernel_cr3() {
     unsafe {
-        let kernel_cr3 = crate::mm::vmm::kernel_cr3();
-        KERNEL_CR3 = kernel_cr3;
-        KERNEL_CR3_PHYS = kernel_cr3;
+        if crate::mm::vmm::is_initialized() {
+            let kernel_cr3 = crate::mm::vmm::kernel_cr3();
+            KERNEL_CR3 = kernel_cr3;
+            KERNEL_CR3_PHYS = kernel_cr3;
+        } else {
+            // VMM not initialized yet — read current CR3 directly.
+            // Called from idt::init() before vmm::init().
+            let cr3: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, preserves_flags));
+            KERNEL_CR3 = cr3;
+            KERNEL_CR3_PHYS = cr3;
+        }
     }
 }
 

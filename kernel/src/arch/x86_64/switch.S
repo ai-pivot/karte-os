@@ -51,7 +51,7 @@ __switch:
     mov rax, rsp            # rax = current RSP (before alignment)
     and rsp, ~0xF           # align to 16 bytes (may move 0 or 8 bytes down)
     sub rsp, 512            # make room for fxsave area (16-byte aligned)
-    fxsave64 [rsp]          # ✓ RSP is 16-byte aligned
+    fxsave64 [rsp]
 
     # Save original RSP above fxsave area so restore path can find it
     mov [rsp + 512], rax
