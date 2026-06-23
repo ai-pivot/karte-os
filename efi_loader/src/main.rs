@@ -820,8 +820,8 @@ unsafe fn setup_page_tables() {
         let pml4_idx = (fb >> 39) & 0x1FF;
         let pdp_idx = (fb >> 30) & 0x1FF;
         let pdp_high = core::ptr::addr_of_mut!(PDP_HIGH).cast::<u64>();
-        *pml4.add(pml4_idx) = pdp_high as u64 | 0x03;
+        *pml4.add(pml4_idx as usize) = pdp_high as u64 | 0x03;
         let huge_base = ((fb as u64) >> 30) << 30;
-        *pdp_high.add(pdp_idx) = huge_base | HUGE_PAGE_FLAGS;
+        *pdp_high.add(pdp_idx as usize) = huge_base | HUGE_PAGE_FLAGS;
     }
 }
