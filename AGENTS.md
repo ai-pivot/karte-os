@@ -266,6 +266,10 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **VGA raw mode flag**: `vga::is_raw_mode()` returns true when TTY is in raw mode. `console::print()` checks this and suppresses kernel console output from VGA (UART + kernel log still get output). This prevents kernel log messages from corrupting TUI layouts. Set by `tty::set_mode(Raw)`, cleared by `tty::set_mode(Canonical)`.
 - **Socket syscall numbers in dispatch_linux_syscall**: The Linux x86_64 socket syscall numbers MUST match the standard ABI: socket=41, connect=42, accept=43, sendto=44, recvfrom=45, sendmsg=46, recvmsg=47, shutdown=48, bind=49, listen=50, getsockname=51, getpeername=52, socketpair=53, setsockopt=54, getsockopt=55. Previous code had bind at 46, shutdown at 55, setsockopt at 53 — all wrong.
 - **Batch user copy**: `user_read_bytes()` and `user_write_bytes()` use bulk `ptr::copy_nonoverlapping` with a single CR3 check, NOT per-byte `user_read_u8`/`user_write_u8`. The per-byte approach was 10-100x slower for large I/O.
+- **UEFI boot (x86_64)**: Uses dual-binary approach — `efi_loader` (PE) loads kernel (ELF). CR3 values MUST be physical addresses (`virt_to_phys()`), NOT high-half virtual. `cache_kernel_cr3()` is called before VMM init — must handle null `KERNEL_PAGE_TABLE` by reading CR3 directly. GOP framebuffer can be at any physical address (0x80000000 on QEMU, 0x4000000000 on AMD GPUs) — always identity-map dynamically.
+- **UEFI ExitBootServices**: Must call GetMemoryMap immediately before EBS — NO UEFI service calls (including ConOut) in between. Only retry on `EFI_INVALID_PARAMETER`. Disable watchdog timer first.
+- **UEFI global_asm! jump**: On `x86_64-unknown-uefi` target, `global_asm!` IS safe for indirect jumps (`jmp r8`). Unlike inline `asm!`, it is NOT affected by LLVM's SEH `ud2` replacement.
+- **fb_console font**: Only has 128 ASCII glyphs. Non-ASCII characters cause out-of-bounds panic. Must mask character index: `c as usize & 0x7F`.
 - **Pre-zeroed page pool**: `pmm::alloc_zeroed_frame()` returns pre-zeroed frames from a 32-frame pool, refilled during idle loop. PF handler uses this instead of alloc_frame + write_bytes(0, 4096). Saves ~4KB memset per anonymous PF. x86_64-only.
 - **ext4 dcache**: `DCACHE` BTreeMap caches `(dir_inode, name) → child_inode` with 512-entry capacity. Checked before expensive `dir_get_entries` + linear scan. Flushed on file/dir creation and unlink.
 - **Conditional network polling**: `NetStack::poll()` checks `ACTIVE_SOCKETS` atomic counter first — returns immediately if 0. Saves ~200 instructions per timer tick when no sockets exist.
@@ -291,6 +295,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 | `docs/agent/smp.md` | SMP hart management, BSP/secondary init, SBI hart_start |
 | `docs/agent/conventions.md` | Rust 2024 patterns, coding style, error handling |
 | `docs/agent/network.md` | smoltcp network stack, Device adapter, socket syscalls, QEMU net config |
+| `docs/agent/uefi-boot.md` | UEFI boot architecture, EFI loader, GOP, ExitBootServices, gotchas |
 
 ## Testing
 
