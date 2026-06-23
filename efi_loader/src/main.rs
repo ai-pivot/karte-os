@@ -283,6 +283,12 @@ static mut PML4: PageTable = PageTable([0; 512]);
 static mut PDP_IDENTITY: PageTable = PageTable([0; 512]);
 static mut PDP_DIRECT: PageTable = PageTable([0; 512]);
 
+/// Additional PDP table for identity-mapping high framebuffer addresses
+/// (e.g., AMD GPUs at 0x4000000000 = 256GB, beyond the 0-8GB identity map).
+#[repr(C, align(4096))]
+struct PdpHigh([u64; 512]);
+static mut PDP_HIGH: PdpHigh = PdpHigh([0; 512]);
+
 const HUGE_PAGE_FLAGS: u64 = 0x83; // Present | Writable | PS
 
 // ─── Minimal GDT ────────────────────────────────────────────────────────
@@ -805,4 +811,17 @@ unsafe fn setup_page_tables() {
     // Direct map: DIRECT_MAP_BASE covers 0-2 GB
     *pdp_direct.add(510) = HUGE_PAGE_FLAGS; // phys 0
     *pdp_direct.add(511) = 0x40000000u64 | HUGE_PAGE_FLAGS; // phys 1 GB
+
+    // Identity-map the GOP framebuffer if it's above 8GB.
+    // On modern GPUs (AMD/NVIDIA), the framebuffer can be at very high
+    // physical addresses (e.g., 0x4000000000 = 256GB).
+    let fb = unsafe { FB_ADDR };
+    if fb > 0x2_0000_0000 { // 8GB
+        let pml4_idx = (fb >> 39) & 0x1FF;
+        let pdp_idx = (fb >> 30) & 0x1FF;
+        let pdp_high = core::ptr::addr_of_mut!(PDP_HIGH).cast::<u64>();
+        *pml4.add(pml4_idx) = pdp_high as u64 | 0x03;
+        let huge_base = ((fb as u64) >> 30) << 30;
+        *pdp_high.add(pdp_idx) = huge_base | HUGE_PAGE_FLAGS;
+    }
 }

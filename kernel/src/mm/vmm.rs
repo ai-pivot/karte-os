@@ -433,6 +433,15 @@ pub fn direct_map_2mb(root: &mut PageTable, phys_start: usize, phys_end: usize, 
     );
 }
 
+/// Ensure a physical address range is identity-mapped in the kernel page table.
+/// Used for high-address GPU framebuffers (e.g., AMD at 0x4000000000 = 256GB).
+pub fn identity_map_region(phys_start: usize, size: usize) {
+    let root = get_kernel_page_table();
+    let start = phys_start & !0x1F_FFFF; // 2MB align down
+    let end = (phys_start + size + 0x1F_FFFF) & !0x1F_FFFF; // 2MB align up
+    identity_map_2mb(root, start, end, PTEFlags::KRW);
+}
+
 /// RISC-V fallback: no 2MB huge pages, delegate to regular identity_map.
 #[cfg(not(target_arch = "x86_64"))]
 pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: PTEFlags) {
