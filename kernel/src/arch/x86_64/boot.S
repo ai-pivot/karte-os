@@ -209,37 +209,30 @@ trampoline_gdt:
 trampoline_gdt_end:
 
 .code64
+.globl _start64
 _start64:
-    movw $0x10, %ax
-    movw %ax, %ds
-    movw %ax, %es
-    movw %ax, %fs
-    movw %ax, %gs
-    movw %ax, %ss
+    # When booted via EFI stub, UEFI's GDT is still active and valid.
+    # No need to reload segment registers — UEFI's flat segments work fine.
+    # The kernel's own GDT will be loaded later by kmain -> arch::init.
 
-    movw $0x3FD, %dx
-1:  inb %dx, %al
-    testb $0x20, %al
-    jz 1b
+    # Direct COM1 output — no wait loop
     movw $0x3F8, %dx
     movb $'K', %al
     outb %al, %dx
 
-    # Set up boot stack (in .data.boot at identity address, within RIP range)
+    # Set up boot stack
     lea boot_stack_top(%rip), %rsp
 
     # Load multiboot2 magic and info pointer from fixed low memory
     movl 0x8000, %edi
     movl 0x8004, %esi
-    # Clean upper 32 bits
     movl %edi, %edi
     movl %esi, %esi
 
-    # ── Jump to kmain at its high-half VMA ──
+    # Jump to kmain at its high-half VMA
     movabs $kmain, %rax
     call *%rax
 
-    # kmain should never return, but just in case:
     cli
 1:  hlt
     jmp 1b

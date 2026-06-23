@@ -11,6 +11,9 @@ pub mod keyboard;
 pub mod ahci;
 
 #[cfg(target_arch = "x86_64")]
+pub mod xhci;
+
+#[cfg(target_arch = "x86_64")]
 pub mod nvme;
 
 pub mod p9;

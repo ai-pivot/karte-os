@@ -581,6 +581,13 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
         crate::net::iface::NetStack::poll();
     }
 
+    // Poll USB keyboard (XHCI)
+    if crate::driver::xhci::is_available() {
+        if let Some(key) = crate::driver::xhci::poll_keyboard() {
+            crate::driver::tty::feed_byte(key);
+        }
+    }
+
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if !from_user {
         return;

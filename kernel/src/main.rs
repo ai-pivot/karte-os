@@ -36,10 +36,37 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::arch::uart::init_uart();
         crate::driver::vga::init();
 
+        // Check for EFI stub BootInfo first (magic 0x474F5046 at 0x10000)
+        let efi_stub_booted = unsafe {
+            core::ptr::read_volatile(0x10000usize as *const u32) == 0x474F5046
+        };
+
         // Parse multiboot2 info to get RAM size and framebuffer.
-        // kmain params: EDI=multiboot2_magic, ESI=multiboot2_info_addr
         let (_mb2_magic, mb2_info) = (hartid, dtb_ptr);
-        let (mem_lower, mem_upper_kb, fb_info) = crate::arch::multiboot2::parse_mbi(mb2_info);
+        let limine_booted = !crate::arch::limine::FRAMEBUFFER_REQUEST.response.is_null();
+
+        let (mem_lower, mem_upper_kb, fb_info, efi_st_ptr) = if efi_stub_booted {
+            // EFI stub boot — use default memory (512MB), framebuffer from BootInfo
+            (0u32, 524288u32, None, None) // 512MB as upper memory KB
+        } else if limine_booted {
+            // Limine native boot — get memory from Limine memmap request
+            let resp = unsafe { &*crate::arch::limine::MEMMAP_REQUEST.response };
+            let mut total_mem: u64 = 0;
+            if resp.entry_count > 0 && !resp.entries.is_null() {
+                for i in 0..resp.entry_count {
+                    let entry = unsafe { &**resp.entries.add(i as usize) };
+                    if entry.entry_type == 0 { // USABLE
+                        total_mem += entry.length;
+                    }
+                }
+            }
+            let upper_kb = if total_mem > 0x100000 { ((total_mem - 0x100000) / 1024) as u32 } else { 0 };
+            (0u32, upper_kb, None, None)
+        } else {
+            // Multiboot2 fallback
+            let (ml, mu, fb, efi) = crate::arch::multiboot2::parse_mbi(mb2_info);
+            (ml, mu, fb, efi)
+        };
         let _ = mem_lower;
         if mem_upper_kb > 0 {
             let total_ram = 1024 * 1024 + (mem_upper_kb as usize) * 1024;
@@ -52,13 +79,39 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             mm::pmm::init();
         }
 
-        // Initialize framebuffer console from GOP (UEFI without CSM fallback)
-        if let Some(fb) = fb_info {
-            crate::arch::fb_console::init(fb.addr, fb.pitch, fb.width, fb.height, fb.bpp);
-            crate::arch::fb_console::write_str(
-                "FB console ready\n",
-            );
-        }
+        // Initialize framebuffer console: Limine → multiboot2 → EFI GOP → BootInfo
+        let _fb_initialized = if crate::arch::limine::init_framebuffer() {
+            crate::console_println!("[gop] Using Limine framebuffer");
+            true
+        } else {
+            crate::console_println!("[gop] multiboot2 fb_info={} efi_st_ptr={}",
+                if fb_info.is_some() { "yes" } else { "no" },
+                if efi_st_ptr.is_some() { "yes" } else { "no" });
+            if let Some(fb) = fb_info.or_else(|| {
+                efi_st_ptr.and_then(|st| crate::arch::multiboot2::gop_from_efi(st))
+            }) {
+                crate::arch::fb_console::init(fb.addr, fb.pitch, fb.width, fb.height, fb.bpp);
+                true
+            } else {
+                // Check for BootInfo from EFI stub (magic 0x474F5046 at phys 0x10000)
+                let bi_ptr = 0x10000usize as *const u32;
+                let magic = unsafe { core::ptr::read_volatile(bi_ptr) };
+                if magic == 0x474F5046 {
+                    let fb_addr = unsafe { core::ptr::read_volatile(bi_ptr.add(2) as *const u64) } as usize;
+                    let fb_width = unsafe { core::ptr::read_volatile(bi_ptr.add(4) as *const u32) };
+                    let fb_height = unsafe { core::ptr::read_volatile(bi_ptr.add(5) as *const u32) };
+                    let fb_stride = unsafe { core::ptr::read_volatile(bi_ptr.add(6) as *const u32) };
+                    if fb_addr != 0 {
+                        crate::arch::fb_console::init(fb_addr, fb_stride, fb_width, fb_height, 32);
+                        crate::console_println!("[gop] EFI stub FB at {:#x} {}x{} stride={}", fb_addr, fb_width, fb_height, fb_stride);
+                        true
+                    } else { false }
+                } else {
+                    crate::console_println!("[gop] No framebuffer found");
+                    false
+                }
+            }
+        };
     }
 
     crate::console_println!("=== KarteOS v0.2.0 ===");
@@ -219,6 +272,14 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             // Initialize PS/2 keyboard
             crate::console_println!("[init] Initializing PS/2 keyboard...");
             crate::driver::keyboard::init();
+
+            // Initialize XHCI USB keyboard (real USB, not legacy emulation)
+            crate::console_println!("[init] Initializing XHCI USB...");
+            if let Err(e) = crate::driver::xhci::init() {
+                crate::console_println!("[init] XHCI: {}", e);
+            } else {
+                crate::driver::xhci::enumerate_keyboard();
+            }
 
             // Try NVMe first (fastest), then AHCI (SATA), then VirtIO block
             if let Some(nvme_dev) = arch::pci::find_nvme() {

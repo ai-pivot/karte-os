@@ -296,6 +296,23 @@ pub fn find_e1000() -> Option<PciDevice> {
     None
 }
 
+/// Find an XHCI (USB 3.0) host controller.
+/// PCI class 0x0C (Serial Bus), subclass 0x03 (USB), progif 0x30 (XHCI).
+pub fn find_xhci() -> Option<PciDevice> {
+    for device in 0..32 {
+        let header_type = pci_read(0, device, 0, 0x0C);
+        let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
+        for function in 0..max_fn {
+            if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
+                if dev.class_code == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30 {
+                    return Some(dev);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Initialize PCI and try to find block devices.
 pub fn init() {
     crate::console_println!("[pci] Enumerating PCI devices...");

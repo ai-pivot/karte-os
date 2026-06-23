@@ -194,3 +194,18 @@ pub fn init() {
 
     crate::console_println!("[keyboard] PS/2 driver initialized");
 }
+
+/// Poll for keyboard input (non-interrupt).
+/// Reads PS/2 status port 0x64, if bit 0 is set, reads data port 0x60.
+/// This works with USB Legacy emulation even when IOAPIC routing is wrong.
+pub fn poll() {
+    unsafe {
+        let status: u8;
+        core::arch::asm!("in al, dx", in("dx") 0x64u16, out("al") status);
+        if status & 1 != 0 {
+            let data: u8;
+            core::arch::asm!("in al, dx", in("dx") 0x60u16, out("al") data);
+            handle_scancode(data);
+        }
+    }
+}

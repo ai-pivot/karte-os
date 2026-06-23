@@ -27,6 +27,7 @@ pub mod switch;
 pub mod trap;
 pub mod e1000;
 pub mod fb_console;
+pub mod limine;
 pub mod uart;
 pub mod user_return;
 pub mod virtio_blk;
