@@ -220,31 +220,6 @@ _start64:
     movb $'K', %al
     outb %al, %dx
 
-    # ── Diagnostic: draw WHITE 50x50 square at (180, 0) ──
-    # Reads fb_addr / fb_stride from BootInfo at 0x10000 and draws
-    # directly, BEFORE any Rust code runs.  This is the quickest way
-    # to confirm the kernel entered and the framebuffer is accessible.
-    movabs $0x10000, %rax
-    movq 8(%rax), %rbx           # rbx = fb_addr (u64 at offset 8)
-    testq %rbx, %rbx
-    jz 3f
-    movl 24(%rax), %r9d          # r9d = fb_stride (u32 at offset 24)
-    testl %r9d, %r9d
-    jz 3f
-    # rbx = fb_addr + 180*4 = fb_addr + 720  (start of row 0, col 180)
-    addq $720, %rbx
-    movl $50, %r8d               # r8d = row counter
-1:  movl $50, %ecx               # ecx = column counter (loop uses ecx)
-    movq %rbx, %rdi              # rdi = current pixel pointer
-2:  movl $0xFFFFFFFF, (%rdi)     # write white pixel
-    addq $4, %rdi                # next pixel
-    decl %ecx
-    jnz 2b
-    addq %r9, %rbx               # advance fb_addr to next row
-    decl %r8d
-    jnz 1b
-3:
-
     # Zero .bss section.
     # EFI stub loads a flat binary (objcopy -O binary) which has no ELF
     # headers — there is no loader to zero .bss for us.  QEMU memory
