@@ -707,19 +707,63 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     let start64_offset = get_start64_offset();
     let entry_high_half = (DIRECT_MAP_BASE + KERNEL_PHYS_BASE + start64_offset) as u64;
 
-    // Exit Boot Services — ConOut dies after this
+    // Exit Boot Services — must use correct MapKey from GetMemoryMap.
+    // key=0 works on QEMU but NOT on real firmware → triple fault.
+    // Use UEFI AllocatePool for the buffer (static arrays in .data may
+    // be read-only on some firmware).
     unsafe { screen_print("EXIT\n"); }
 
-    // Simple EBS: just call with key=0. This worked on real hardware before.
-    // The GetMemoryMap loop was causing crashes on some firmware.
     if !system_table.is_null() {
         let st = unsafe { &*system_table };
         if !st.boot_services.is_null() {
             let bs = unsafe { &*st.boot_services };
-            // Disable watchdog
+
+            // Disable watchdog timer
             (bs.set_watchdog_timer)(0, 0, 0, core::ptr::null());
-            // Direct EBS call
-            (bs.exit_boot_services)(image_handle, 0);
+
+            // AllocatePool for memory map buffer
+            // AllocatePool is at offset 64 in EfiBootServices
+            let bs_ptr = bs as *const EfiBootServices as *const u8;
+            let allocate_pool: extern "C" fn(usize, usize, *mut *mut c_void) -> usize =
+                unsafe { core::mem::transmute((bs_ptr.add(64) as *const usize).read()) };
+
+            let mut map_buf_ptr: *mut c_void = core::ptr::null_mut();
+            let alloc_status = allocate_pool(0, 65536, &mut map_buf_ptr); // 0=EFI_LOADER_DATA
+
+            if alloc_status == EFI_SUCCESS && !map_buf_ptr.is_null() {
+                // GetMemoryMap + ExitBootServices loop (Linux efi_exit_boot_services pattern)
+                loop {
+                    let mut map_size: usize = 65536;
+                    let mut map_key: usize = 0;
+                    let mut desc_size: usize = 0;
+                    let mut desc_version: u32 = 0;
+
+                    let mm_status = (bs.get_memory_map)(
+                        &mut map_size,
+                        map_buf_ptr as *mut u8,
+                        &mut map_key,
+                        &mut desc_size,
+                        &mut desc_version,
+                    );
+
+                    if mm_status != EFI_SUCCESS {
+                        break;
+                    }
+
+                    // IMMEDIATELY call EBS — no UEFI calls between GetMemoryMap and EBS
+                    let ebs_status = (bs.exit_boot_services)(image_handle, map_key);
+
+                    if ebs_status == EFI_SUCCESS {
+                        break;
+                    }
+
+                    // EBS failed — map changed. Loop back to retry.
+                    // (Linux retries indefinitely; we break after implicit re-loop)
+                }
+            } else {
+                // AllocatePool failed — fall back to key=0
+                (bs.exit_boot_services)(image_handle, 0);
+            }
         }
     }
 
