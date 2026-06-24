@@ -32,11 +32,12 @@ pub mod pte_flags {
 pub fn activate_page_table(root_paddr: usize) {
     let phys = PhysAddr::new(root_paddr as u64);
     let new_frame = PhysFrame::containing_address(phys);
-    let (current_frame, _) = Cr3::read();
-    if current_frame != new_frame {
-        unsafe {
-            Cr3::write(new_frame, x86_64::registers::control::Cr3Flags::empty());
-        }
+    // Always write CR3 — even if the frame number matches the current
+    // value, the page-table *contents* may have been rebuilt (e.g.
+    // vmm::init replaces the EFI loader's identity map with new 2 MB
+    // entries).  Skipping the write leaves stale TLB entries.
+    unsafe {
+        Cr3::write(new_frame, x86_64::registers::control::Cr3Flags::empty());
     }
 }
 
