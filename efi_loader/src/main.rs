@@ -15,57 +15,9 @@
 #![no_std]
 #![no_main]
 
-use core::arch::global_asm;
 use core::ffi::c_void;
 
-// ─── Boot transition assembly ────────────────────────────────────────────
-//
-// Like Linux's startup_64: loads GDT, switches CR3 to dual-mapping page
-// tables, sets up stack, then jumps to _start64 at high-half VMA.
-// We use global_asm! to avoid PE inline-asm label issues.
 
-global_asm!(
-    ".global {sym}",
-    "{sym}:",
-    "    cli",
-    // Debug: 'L' = loading GDT
-    "    mov dx, 0x3F8",
-    "    mov al, 0x4C",
-    "    out dx, al",
-    "    lgdt [r9]",
-    "    mov ax, 0x10",
-    "    mov ds, ax",
-    "    mov es, ax",
-    "    mov fs, ax",
-    "    mov gs, ax",
-    "    mov ss, ax",
-    // Debug: 'C' = CR3 switch
-    "    mov dx, 0x3F8",
-    "    mov al, 0x43",
-    "    out dx, al",
-    "    mov cr3, rcx",
-    // Debug: 'S' = stack
-    "    mov dx, 0x3F8",
-    "    mov al, 0x53",
-    "    out dx, al",
-    "    mov rsp, rdx",
-    "    xor ebp, ebp",
-    "    cld",
-    // Pass multiboot2-like args: eax=0x36d76289 magic, ebx=0 (no mb2 info)
-    // _start64 reads from 0x8000/0x8004, we set those before calling
-    "    xor edi, edi",
-    "    xor esi, esi",
-    // Debug: 'K' = jump to kernel
-    "    mov dx, 0x3F8",
-    "    mov al, 0x4B",
-    "    out dx, al",
-    "    jmp r8",
-    sym = sym boot_transition,
-);
-
-unsafe extern "C" {
-    fn boot_transition(pml4_phys: u64, stack_top: u64, entry_addr: u64, gdt_desc: u64) -> !;
-}
 
 // ─── UEFI Types ──────────────────────────────────────────────────────────
 
@@ -794,17 +746,34 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
         for y in 0..50 { for x in 0..50 { *fb.add(y * p + (120 + x)) = 0x0000FF00; } }
     }
 
-    // Jump to kernel
+    // Jump to kernel — inline asm avoids calling-convention ambiguity.
+    // The EFI PE target may use either System V (rdi/rsi/rdx/rcx) or
+    // Microsoft x64 (rcx/rdx/r8/r9) depending on compiler version.
+    // Inline asm with named registers is unambiguous.
     unsafe {
-        boot_transition(
-            pml4_phys,
-            stack_top,
-            entry_high_half,
-            core::ptr::addr_of!(BOOT_GDT_DESC) as u64,
+        core::arch::asm!(
+            "cli",
+            "lgdt [{gdt}]",
+            "mov ax, 0x10",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov fs, ax",
+            "mov gs, ax",
+            "mov ss, ax",
+            "mov cr3, {cr3}",
+            "mov rsp, {rsp}",
+            "xor ebp, ebp",
+            "cld",
+            "xor edi, edi",
+            "xor esi, esi",
+            "jmp {entry}",
+            cr3 = in(reg) pml4_phys,
+            rsp = in(reg) stack_top,
+            entry = in(reg) entry_high_half,
+            gdt = in(reg) core::ptr::addr_of!(BOOT_GDT_DESC),
+            options(noreturn),
         );
     }
-    // unreachable: boot_transition is -> !
-    loop { unsafe { core::arch::asm!("hlt"); } }
 }
 
 /// _start64 offset within kernel.bin, computed at build time from the
