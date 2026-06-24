@@ -794,13 +794,25 @@ unsafe fn setup_page_tables() {
     // Identity-map the GOP framebuffer if it's above 8GB.
     // On modern GPUs (AMD/NVIDIA), the framebuffer can be at very high
     // physical addresses (e.g., 0x4000000000 = 256GB).
+    // Must add to BOTH our static PML4 (for after boot_transition) AND
+    // UEFI's active PML4 (for fb_print before CR3 switch).
     let fb = unsafe { FB_ADDR };
     if fb > 0x2_0000_0000 { // 8GB
         let pml4_idx = (fb >> 39) & 0x1FF;
         let pdp_idx = (fb >> 30) & 0x1FF;
         let pdp_high = core::ptr::addr_of_mut!(PDP_HIGH).cast::<u64>();
-        *pml4.add(pml4_idx as usize) = pdp_high as u64 | 0x03;
         let huge_base = ((fb as u64) >> 30) << 30;
         *pdp_high.add(pdp_idx as usize) = huge_base | HUGE_PAGE_FLAGS;
+
+        // Add to our static PML4 (used after boot_transition CR3 switch)
+        *pml4.add(pml4_idx as usize) = pdp_high as u64 | 0x03;
+
+        // Also add to UEFI's active PML4 (used by fb_print before CR3 switch)
+        let uefi_cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) uefi_cr3, options(nomem, preserves_flags));
+        let uefi_pml4 = uefi_cr3 as *mut u64;
+        *uefi_pml4.add(pml4_idx as usize) = pdp_high as u64 | 0x03;
+        // Flush TLB: the old PML4 entry (if any) might be cached
+        core::arch::asm!("mov cr3, {}", in(reg) uefi_cr3, options(nomem, preserves_flags));
     }
 }
