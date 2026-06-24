@@ -305,6 +305,22 @@ pub fn init() {
             dev.bus, dev.device, dev.function,
             dev.vendor_id, dev.device_id, dev.class_code, dev.subclass
         );
+
+        // Identity-map BARs above 4 GB.  The kernel's new page tables
+        // (set up by vmm::init) only identity-map 0-4 GB.  On real
+        // hardware, XHCI, AHCI, NVMe and GPU BARs are often placed at
+        // high physical addresses (32 GB+).  Without an explicit
+        // identity mapping, the first MMIO access to these BARs
+        // triggers a page fault.
+        for i in 0..6 {
+            let bar = dev.bar_address(i);
+            // Memory BARs are ≥ 4 KB; skip I/O BARs (< 64 KB) and zero
+            if bar >= 0x1000 {
+                // Map 2 MB (minimum huge-page size), aligned down
+                let base = (bar as usize) & !0x1F_FFFF;
+                crate::mm::vmm::identity_map_region(base, 0x20_0000);
+            }
+        }
     }
     crate::console_println!("[pci] Found {} devices", devices.len());
 }
