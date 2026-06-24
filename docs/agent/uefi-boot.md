@@ -112,6 +112,7 @@ tools/mkusb.sh /dev/sdX  # Write directly to USB
 - **CR3 requires physical address, not high-half virtual**: `user_cr3` MUST be `virt_to_phys()` of the user page table pointer.
 - **`cache_kernel_cr3()` is called before VMM init**: Must handle null `KERNEL_PAGE_TABLE` by reading CR3 directly.
 - **GOP framebuffer can be at any physical address**: 0x80000000 on QEMU/Intel, 0x4000000000 on AMD. Always identity-map dynamically.
+- **UEFI PML4 is READ-ONLY on real firmware**: Do NOT write to UEFI's active CR3 page tables. QEMU allows this but real hardware marks firmware page tables as read-only, triggering a page fault → hang. Only modify your own static PML4 (used after `boot_transition `  `mov cr3 `).
 - **PE/COFF `jmp r8` in global_asm! is safe**: Unlike inline asm, `global_asm!` on UEFI target is NOT affected by LLVM's SEH `ud2` replacement.
 - **Map key for ExitBootServices**: Must call GetMemoryMap immediately before EBS. No UEFI service calls (including ConOut) in between.
 - **`.bss` zeroing**: GRUB zeroes `.bss` automatically from ELF headers. Our EFI loader copies a flat binary → `.bss` must be zeroed in `_start64` (already done in `boot.S`).
