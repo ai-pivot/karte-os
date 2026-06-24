@@ -25,6 +25,10 @@ pub mod sync;
 pub mod syscall;
 pub mod test;
 
+#[cfg(target_arch = "x86_64")]
+static SAVED_FB_ADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // ── Common init (both normal & test mode) ──
@@ -56,6 +60,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             let mem_kb    = unsafe { core::ptr::read_volatile(bi.add(7) as *const u32) };
 
             if fb_addr != 0 {
+                SAVED_FB_ADDR.store(fb_addr as u64, core::sync::atomic::Ordering::Relaxed);
                 crate::arch::fb_console::init(fb_addr, fb_stride, fb_width, fb_height, 32);
                 crate::console_println!(
                     "[gop] EFI stub FB at {:#x} {}x{} stride={}",
@@ -145,6 +150,20 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     mm::pmm::init();
     // x86_64 pmm init is done earlier (via multiboot2 or fallback)
     mm::vmm::init();
+
+    // Identity-map GOP framebuffer.  vmm::init() also attempts this
+    // internally by re-reading BootInfo @ 0x10000, but at that point
+    // the page tables are freshly switched and may be in an
+    // intermediate state.  Doing it here — at the same maturity as
+    // PCI BAR mappings — gives identical timing to the successful
+    // XHCI/AHCI BAR identity maps.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fb = SAVED_FB_ADDR.load(core::sync::atomic::Ordering::Relaxed) as usize;
+        if fb != 0 {
+            crate::mm::vmm::identity_map_region(fb, 16 * 1024 * 1024); // 16 MB
+        }
+    }
 
     // Re-cache kernel CR3 now that VMM is initialized (the first cache
     // during idt::init() captured 0 because KERNEL_PAGE_TABLE was null).
