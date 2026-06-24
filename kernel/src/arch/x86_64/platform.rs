@@ -116,6 +116,9 @@ pub fn console_putchar(c: u8) {
 
     // VGA text mode output (if initialized)
     crate::driver::vga::putchar(c);
+
+    // GOP framebuffer console (primary display on UEFI without CSM)
+    crate::arch::fb_console::putchar(c);
 }
 
 /// Write a batch of bytes to the console efficiently.
@@ -125,6 +128,7 @@ pub fn console_write_batch(data: &[u8]) {
     // Process all bytes through VGA first (sequential for ANSI state machine)
     for &byte in data {
         crate::driver::vga::putchar(byte);
+        crate::arch::fb_console::putchar(byte);
     }
     // Batch-write to UART (single code path, efficient port I/O)
     let mut uart = crate::arch::uart::ComPort::new(0x3F8);
