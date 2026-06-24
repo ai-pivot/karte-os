@@ -44,15 +44,29 @@ pub mod x86_64 {
     pub const KERNEL_VMA: usize = DIRECT_MAP_BASE + KERNEL_PHYS_BASE;
 
     /// Convert a physical address to its virtual alias in the direct map.
+    /// Physical addresses below 2 GB use the high-half direct map
+    /// (PML4[511], vaddr = DIRECT_MAP_BASE + paddr).
+    /// Addresses >= 2 GB would overflow DIRECT_MAP_BASE — they are
+    /// returned as identity-mapped addresses (vaddr = paddr), relying
+    /// on the identity map that vmm::init() extends to total_memory().
     #[inline]
     pub const fn phys_to_virt(paddr: usize) -> usize {
-        paddr + DIRECT_MAP_BASE
+        if paddr < 0x8000_0000 {
+            DIRECT_MAP_BASE + paddr
+        } else {
+            paddr
+        }
     }
 
-    /// Convert a direct-map virtual address back to its physical address.
+    /// Convert a direct-map or identity-mapped virtual address back
+    /// to its physical address.
     #[inline]
     pub const fn virt_to_phys(vaddr: usize) -> usize {
-        vaddr - DIRECT_MAP_BASE
+        if vaddr >= DIRECT_MAP_BASE {
+            vaddr - DIRECT_MAP_BASE
+        } else {
+            vaddr
+        }
     }
 
     /// MMIO base addresses (identity-mapped in kernel page tables).

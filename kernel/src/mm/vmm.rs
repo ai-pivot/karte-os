@@ -512,21 +512,18 @@ pub fn init() {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Direct-map physical memory at DIRECT_MAP_BASE (PML4[511]).
-        // CRITICAL: DIRECT_MAP_BASE = 0xFFFF_FFFF_8000_0000 leaves only
-        // 2 GB of virtual-address headroom.  phys_to_virt(paddr) =
-        // DIRECT_MAP_BASE + paddr overflows for paddr >= 2 GB, wrapping
-        // into low addresses and corrupting the identity map (PML4[0]).
-        // Cap the direct-map range to 2 GB.  Memory beyond 2 GB is
-        // accessed via temporary identity mappings (see identity_map_region).
-        use core::cmp::min;
-        let direct_end = min(pmm::total_memory(), 0x8000_0000usize); // 2 GB
-        direct_map_2mb(root, 0x0, direct_end, PTEFlags::KRWX);
-        // Identity-map low memory for boot stack and legacy device access.
-        // The boot stack is at identity address ~1 MB; this mapping keeps it
-        // alive after CR3 switch.  User memory is NEVER accessed via this
-        // identity mapping — all user buffer access goes through phys_to_virt().
-        identity_map_2mb(root, 0x0, 0x1_0000_0000, PTEFlags::KRWX);
+        // Direct-map 0-2 GB at DIRECT_MAP_BASE for kernel convenience.
+        // Physical addresses >= 2 GB would overflow DIRECT_MAP_BASE;
+        // they are served via the identity map (see platform.rs).
+        direct_map_2mb(root, 0x0, 0x8000_0000usize, PTEFlags::KRWX);
+
+        // Identity-map ALL physical memory.  The EFI loader provides a
+        // 128 GB identity map, but vmm::init() rebuilds page tables from
+        // scratch.  phys_to_virt() routes addrs >= 2 GB to the identity
+        // map, so we must cover the full PMM-managed range.
+        let total = pmm::total_memory();
+        identity_map_2mb(root, 0x0, total, PTEFlags::KRWX);
+
         // Identity-map MMIO regions (device drivers use identity addresses).
         identity_map_2mb(root, 0xFE000000, 0xFF000000, PTEFlags::KRW);
     }
