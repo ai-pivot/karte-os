@@ -804,15 +804,9 @@ unsafe fn setup_page_tables() {
         let huge_base = ((fb as u64) >> 30) << 30;
         *pdp_high.add(pdp_idx as usize) = huge_base | HUGE_PAGE_FLAGS;
 
-        // Add to our static PML4 (used after boot_transition CR3 switch)
+        // Add to our static PML4 (used after boot_transition CR3 switch).
+        // NOTE: do NOT write to UEFI's active PML4 — it's read-only on
+        // real firmware and causes a page fault → hang.
         *pml4.add(pml4_idx as usize) = pdp_high as u64 | 0x03;
-
-        // Also add to UEFI's active PML4 (used by fb_print before CR3 switch)
-        let uefi_cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) uefi_cr3, options(nomem, preserves_flags));
-        let uefi_pml4 = uefi_cr3 as *mut u64;
-        *uefi_pml4.add(pml4_idx as usize) = pdp_high as u64 | 0x03;
-        // Flush TLB: the old PML4 entry (if any) might be cached
-        core::arch::asm!("mov cr3, {}", in(reg) uefi_cr3, options(nomem, preserves_flags));
     }
 }
