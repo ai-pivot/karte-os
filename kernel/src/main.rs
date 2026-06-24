@@ -146,6 +146,26 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // x86_64 pmm init is done earlier (via multiboot2 or fallback)
     mm::vmm::init();
 
+    // Identity-map the GOP framebuffer again.  vmm::init() also does
+    // this internally, but on systems with very high GPU BARs
+    // (256 GB+), the BootInfo read inside vmm::init() may race with
+    // page-table setup.  An explicit call here ensures the framebuffer
+    // is mapped after the CR3 switch and before any console output.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let bi = 0x10000usize as *const u32;
+        let magic = unsafe { core::ptr::read_volatile(bi) };
+        if magic == 0x474F5046 {
+            let fb_addr = unsafe { core::ptr::read_volatile(bi.add(2) as *const u64) } as usize;
+            if fb_addr != 0 {
+                let fb_stride = unsafe { core::ptr::read_volatile(bi.add(6) as *const u32) } as usize;
+                let fb_height = unsafe { core::ptr::read_volatile(bi.add(5) as *const u32) } as usize;
+                let fb_size = fb_height.max(1080) * fb_stride.max(4096);
+                crate::mm::vmm::identity_map_region(fb_addr, fb_size);
+            }
+        }
+    }
+
     // Re-cache kernel CR3 now that VMM is initialized (the first cache
     // during idt::init() captured 0 because KERNEL_PAGE_TABLE was null).
     #[cfg(target_arch = "x86_64")]
