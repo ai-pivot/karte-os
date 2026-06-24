@@ -717,10 +717,6 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     unsafe {
         *(0x8000 as *mut u32) = 0;
         *(0x8004 as *mut u32) = 0;
-        // Store framebuffer address at 0x9000 so _start64 can draw
-        // diagnostics BEFORE any kernel initialization (Rust, PMM, VMM).
-        *(0x9000 as *mut u64) = FB_ADDR;
-        *(0x9008 as *mut u64) = FB_PITCH;
     }
 
     // Fill the GDT descriptor in a static so its address remains valid
