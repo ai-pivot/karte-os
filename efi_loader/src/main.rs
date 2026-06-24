@@ -687,12 +687,10 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     }
     unsafe { screen_print("OK\n"); }
 
-    // ── Set up page tables (BEFORE EBS, ConOut still works) ──
-    unsafe { screen_print("1"); }
+    // Set up page tables
     unsafe { setup_page_tables(); }
-    unsafe { screen_print("2"); }
 
-    // ── Prepare boot args ──
+    // Prepare boot args
     unsafe {
         *(0x8000 as *mut u32) = 0;
         *(0x8004 as *mut u32) = 0;
@@ -709,9 +707,8 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     let start64_offset = get_start64_offset();
     let entry_high_half = (DIRECT_MAP_BASE + KERNEL_PHYS_BASE + start64_offset) as u64;
 
-    unsafe { screen_print("3"); }
-    // Exit Boot Services
-    unsafe { screen_print("X\n"); }
+    // Exit Boot Services — ConOut dies after this, use fb_print for output
+    unsafe { screen_print("EXIT\n"); }
 
     let mut ebs_succeeded = false;
     if !system_table.is_null() {
@@ -751,30 +748,12 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     }
 
     if !ebs_succeeded {
-        // EBS failed — firmware still in control. boot_transition would
-        // triple-fault. Instead, halt cleanly.
-        unsafe { screen_print("FATAL: EBS failed\n"); }
+        // EBS failed — firmware still in control. Halt cleanly.
+        unsafe { fb_print("FATAL: EBS failed\n"); }
         loop { unsafe { core::arch::asm!("cli; hlt"); } }
     }
 
-    // EBS succeeded — safe to take over the machine
-
-    // Clear framebuffer (remove UEFI logo)
-    if unsafe { FB_ADDR != 0 && FB_PITCH != 0 } {
-        unsafe {
-            let fb = FB_ADDR as *mut u32;
-            let pitch_u32 = FB_PITCH as usize / 4;
-            let h = FB_HEIGHT as usize;
-            let w = FB_WIDTH as usize;
-            for y in 0..h {
-                for x in 0..w {
-                    *fb.add(y * pitch_u32 + x) = 0x00000000; // black
-                }
-            }
-        }
-    }
-
-    // Jump to kernel
+    // EBS succeeded — jump to kernel
     unsafe {
         boot_transition(
             pml4_phys,
