@@ -748,8 +748,7 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     }
 
     if !ebs_succeeded {
-        // EBS failed — firmware still in control. Halt cleanly.
-        unsafe { fb_print("FATAL: EBS failed\n"); }
+        // EBS failed. Can't print (no working display). Just halt.
         loop { unsafe { core::arch::asm!("cli; hlt"); } }
     }
 
