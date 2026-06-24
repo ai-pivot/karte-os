@@ -187,133 +187,114 @@ impl PciDevice {
     }
 }
 
-/// Enumerate all PCI devices on bus 0.
-pub fn enumerate() -> Vec<PciDevice> {
-    let mut devices = Vec::new();
+/// Recursively enumerate PCI devices on all buses reachable from `bus`.
+/// Scans functions 0-7 on multi-function devices and follows
+/// PCI-to-PCI bridges into secondary buses.
+fn enumerate_bus(bus: u8, devices: &mut Vec<PciDevice>, scanned_buses: &mut [bool; 256]) {
+    if scanned_buses[bus as usize] {
+        return;
+    }
+    scanned_buses[bus as usize] = true;
 
     for device in 0..32 {
         // Check function 0 first
-        if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, 0) {
-            // Check if multi-function device
-            let header_type = pci_read(0, device, 0, 0x0C);
-            let multi_function = (header_type >> 23) & 1 == 1;
+        if let Some(dev) = PciDevice::from_bus_dev_fn(bus, device, 0) {
+            let header_type_raw = pci_read(bus, device, 0, 0x0C);
+            let header_type = ((header_type_raw >> 16) & 0x7F) as u8;
+            let multi_function = (header_type_raw >> 23) & 1 == 1;
 
             devices.push(dev);
 
+            // If this is a PCI-to-PCI bridge, scan its secondary bus
+            if header_type == 0x01 {
+                let secondary = ((pci_read(bus, device, 0, 0x18) >> 8) & 0xFF) as u8;
+                if secondary != 0 && secondary != bus {
+                    enumerate_bus(secondary, devices, scanned_buses);
+                }
+            }
+
             if multi_function {
                 for function in 1..8 {
-                    if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function) {
+                    if let Some(dev) = PciDevice::from_bus_dev_fn(bus, device, function) {
+                        let ht = ((pci_read(bus, device, function, 0x0C) >> 16) & 0x7F) as u8;
                         devices.push(dev);
+
+                        if ht == 0x01 {
+                            let secondary = ((pci_read(bus, device, function, 0x18) >> 8) & 0xFF) as u8;
+                            if secondary != 0 && secondary != bus {
+                                enumerate_bus(secondary, devices, scanned_buses);
+                            }
+                        }
                     }
                 }
             }
         }
     }
+}
 
+/// Enumerate all PCI devices on all buses (recursive bridge traversal).
+pub fn enumerate() -> Vec<PciDevice> {
+    let mut devices = Vec::new();
+    let mut scanned = [false; 256];
+    enumerate_bus(0, &mut devices, &mut scanned);
     devices
 }
 
-/// Find the first VirtIO block device.
+/// Find the first VirtIO block device on any bus.
 pub fn find_virtio_blk() -> Option<PciDevice> {
-    for device in 0..32 {
-        if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, 0) {
-            if dev.vendor_id == PCI_VENDOR_VIRTIO
-                && (dev.device_id == PCI_DEVICE_VIRTIO_BLK
-                    || dev.device_id == PCI_DEVICE_VIRTIO_BLK_MODERN)
-            {
-                return Some(dev);
-            }
-        }
-    }
-    None
+    enumerate().into_iter().find(|dev| {
+        dev.vendor_id == PCI_VENDOR_VIRTIO
+            && (dev.device_id == PCI_DEVICE_VIRTIO_BLK
+                || dev.device_id == PCI_DEVICE_VIRTIO_BLK_MODERN)
+    })
 }
 
 /// Find the first VirtIO Net device (legacy 0x1000 or modern 0x1041).
 pub fn find_virtio_net() -> Option<PciDevice> {
-    for device in 0..32 {
-        let header_type = pci_read(0, device, 0, 0x0C);
-        let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
-        for function in 0..max_fn {
-            if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
-                if dev.vendor_id == PCI_VENDOR_VIRTIO
-                    && (dev.device_id == PCI_DEVICE_VIRTIO_NET
-                        || dev.device_id == PCI_DEVICE_VIRTIO_NET_MODERN)
-                {
-                    return Some(dev);
-                }
-            }
-        }
-    }
-    None
+    enumerate().into_iter().find(|dev| {
+        dev.vendor_id == PCI_VENDOR_VIRTIO
+            && (dev.device_id == PCI_DEVICE_VIRTIO_NET
+                || dev.device_id == PCI_DEVICE_VIRTIO_NET_MODERN)
+    })
 }
 
-/// Find the first AHCI (SATA) controller.
+/// Find the first AHCI (SATA) controller on any bus.
 /// AHCI: class_code = 0x01 (Mass Storage), subclass = 0x06 (SATA), prog_if = 0x01 (AHCI 1.0).
 pub fn find_ahci() -> Option<PciDevice> {
-    for device in 0..32 {
-        // Check all functions
-        let header_type = pci_read(0, device, 0, 0x0C);
-        let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
-        for function in 0..max_fn {
-            if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
-                if dev.class_code == 0x01 && dev.subclass == 0x06 && dev.prog_if == 0x01 {
-                    return Some(dev);
-                }
-            }
-        }
-    }
-    None
+    enumerate().into_iter().find(|dev| {
+        dev.class_code == 0x01 && dev.subclass == 0x06 && dev.prog_if == 0x01
+    })
 }
 
-/// Find an Intel E1000 series network card.
+/// Find an Intel E1000 series network card on any bus.
 /// Supports 82540EM (QEMU default) and common I2xx variants.
 pub fn find_e1000() -> Option<PciDevice> {
     const E1000_IDS: &[u16] = &[
-        0x100E, // 82540EM
-        0x100F, // 82544EI/GC
-        0x10EA, // 82577LM
-        0x1502, // 82579LM
-        0x1503, // 82579V
-        0x153A, // I217-LM
-        0x153B, // I217-V
-        0x15B8, // I219-V
-        0x15B7, // I219-LM
-        0x15F3, // I225-V
+        0x100E, 0x100F, 0x10EA, 0x1502, 0x1503,
+        0x153A, 0x153B, 0x15B8, 0x15B7, 0x15F3,
     ];
     const INTEL_VENDOR: u16 = 0x8086;
-
-    for device in 0..32 {
-        let header_type = pci_read(0, device, 0, 0x0C);
-        let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
-        for function in 0..max_fn {
-            if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
-                if dev.vendor_id == INTEL_VENDOR && E1000_IDS.contains(&dev.device_id) {
-                    return Some(dev);
-                }
-            }
-        }
-    }
-    None
+    enumerate().into_iter().find(|dev| {
+        dev.vendor_id == INTEL_VENDOR && E1000_IDS.contains(&dev.device_id)
+    })
 }
 
-/// Find an XHCI (USB 3.0) host controller.
+/// Find an XHCI (USB 3.0) host controller on any bus.
 /// PCI class 0x0C (Serial Bus), subclass 0x03 (USB), progif 0x30 (XHCI).
 pub fn find_xhci() -> Option<PciDevice> {
-    for device in 0..32 {
-        let header_type = pci_read(0, device, 0, 0x0C);
-        let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
-        for function in 0..max_fn {
-            if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
-                if dev.class_code == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30 {
-                    return Some(dev);
-                }
-            }
-        }
-    }
-    None
+    enumerate().into_iter().find(|dev| {
+        dev.class_code == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30
+    })
 }
 
-/// Initialize PCI and try to find block devices.
+/// Find an NVMe controller on any bus.
+pub fn find_nvme() -> Option<PciDevice> {
+    enumerate().into_iter().find(|dev| {
+        dev.class_code == 0x01 && dev.subclass == 0x08 && dev.prog_if == 0x02
+    })
+}
+
+/// Initialize PCI and find block / network devices.
 pub fn init() {
     crate::console_println!("[pci] Enumerating PCI devices...");
     let devices = enumerate();
@@ -321,32 +302,10 @@ pub fn init() {
     for dev in &devices {
         crate::console_println!(
             "[pci] {:02x}:{:02x}.{:x} vendor={:#x} device={:#x} class={:#x}/{:#x}",
-            dev.bus,
-            dev.device,
-            dev.function,
-            dev.vendor_id,
-            dev.device_id,
-            dev.class_code,
-            dev.subclass
+            dev.bus, dev.device, dev.function,
+            dev.vendor_id, dev.device_id, dev.class_code, dev.subclass
         );
     }
-
     crate::console_println!("[pci] Found {} devices", devices.len());
 }
 
-/// Find an NVMe controller on the PCI bus.
-/// NVMe: class_code = 0x01 (Mass Storage), subclass = 0x08 (NVM), prog_if = 0x02 (NVMe).
-pub fn find_nvme() -> Option<PciDevice> {
-    for device in 0..32 {
-        let header_type = pci_read(0, device, 0, 0x0C);
-        let max_fn = if (header_type >> 23) & 1 == 1 { 8 } else { 1 };
-        for function in 0..max_fn {
-            if let Some(dev) = PciDevice::from_bus_dev_fn(0, device, function as u8) {
-                if dev.class_code == 0x01 && dev.subclass == 0x08 && dev.prog_if == 0x02 {
-                    return Some(dev);
-                }
-            }
-        }
-    }
-    None
-}

@@ -117,9 +117,10 @@ impl RamFileSystem {
         fs.write_static("init", include_bytes!("../../../user/shell.elf"))
             .unwrap();
 
-        // xbot CLI for AI assistant features
-        fs.write_static("xbot-cli", include_bytes!("../../../user/xbot-cli"))
-            .unwrap();
+        // xbot-cli is NOT embedded — 69MB binary makes EFI loader too large
+        // for real UEFI firmware. Load from ext4 disk instead.
+        // fs.write_static("xbot-cli", include_bytes!("../../../user/xbot-cli"))
+        //     .unwrap();
 
         fs
     }

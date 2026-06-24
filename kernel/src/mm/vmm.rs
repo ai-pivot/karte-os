@@ -536,10 +536,11 @@ pub fn init() {
         let magic = unsafe { core::ptr::read_volatile(bi) };
         if magic == 0x474F5046 {
             let fb_addr = unsafe { core::ptr::read_volatile(bi.add(2) as *const u64) } as usize;
-            let fb_width = unsafe { core::ptr::read_volatile(bi.add(4) as *const u32) };
+            let _fb_width = unsafe { core::ptr::read_volatile(bi.add(4) as *const u32) };
+            let fb_height = unsafe { core::ptr::read_volatile(bi.add(5) as *const u32) };
             let fb_stride = unsafe { core::ptr::read_volatile(bi.add(6) as *const u32) };
             if fb_addr != 0 && fb_stride != 0 {
-                let fb_size = (fb_width as usize) * (fb_stride as usize); // rough over-estimate
+                let fb_size = (fb_height as usize) * (fb_stride as usize);
                 identity_map_region(fb_addr, fb_size);
             }
         }

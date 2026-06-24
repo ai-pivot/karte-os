@@ -8,8 +8,50 @@
 
 use x86_64::VirtAddr;
 
-/// IOAPIC default physical base address (QEMU pc machine).
+// ── IOAPIC address constants ─────────────────────────────────────────────
+
+/// Fallback physical base address (QEMU pc machine default).
 const IOAPIC_BASE_PHYS: u64 = 0xFEC00000;
+
+/// IOAPIC physical base addresses to probe at boot.
+///
+/// The default QEMU address is 0xFEC00000, but real chipsets may place
+/// the IOAPIC elsewhere (0xFEC01000, 0xFEC80000, etc.).  We probe each
+/// candidate by reading the IOAPIC version register; a valid response
+/// (version > 0 && version < 0xFF) confirms the device.
+const IOAPIC_CANDIDATES: &[u64] = &[
+    0xFEC00000, // QEMU / common Intel / AMD
+    0xFEC01000, // alternate
+    0xFEC80000, // some Intel PCH variants
+];
+
+/// Returns the first IOAPIC physical base address that responds to a
+/// version-register read, or falls back to 0xFEC00000.
+fn probe_ioapic_address() -> u64 {
+    for &addr in IOAPIC_CANDIDATES {
+        // The IOAPIC ID register is at offset 0x00; version is at 0x01.
+        // Write 0x01 to IOREGSEL (offset 0), read IOWIN (offset 0x10).
+        let base = addr;
+        // Verify the region is identity-mapped before touching it
+        unsafe {
+            core::ptr::write_volatile(base as *mut u32, 0x01u32); // select version reg
+            let ver = core::ptr::read_volatile((base + 0x10) as *const u32);
+            let version = ver & 0xFF;
+            if version > 0 && version < 0xFF {
+                crate::console_println!("[ioapic] found at {:#x} version={}", base, version);
+                return base;
+            }
+        }
+    }
+    // Fallback to default
+    crate::console_println!("[ioapic] using default {:#x}", IOAPIC_BASE_PHYS);
+    IOAPIC_BASE_PHYS
+}
+
+/// IOAPIC base address discovered at init time.
+/// Lazily initialised on first access.
+static IOAPIC_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// IOAPIC register offsets (MMIO).
 const REG_IOREGSEL: u64 = 0x00; // I/O Register Select (write-only)
@@ -54,8 +96,13 @@ impl IoApic {
     /// Create a new IOAPIC instance at the default physical address.
     /// Assumes identity mapping is set up for the MMIO range.
     pub fn new() -> Self {
+        let addr = if IOAPIC_BASE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+            IOAPIC_BASE_PHYS
+        } else {
+            IOAPIC_BASE.load(core::sync::atomic::Ordering::Relaxed)
+        };
         Self {
-            base: VirtAddr::new(IOAPIC_BASE_PHYS),
+            base: VirtAddr::new(addr),
         }
     }
 
@@ -230,6 +277,10 @@ impl IoApic {
 
 /// Global IOAPIC initialization.
 pub fn init() {
+    IOAPIC_BASE.store(
+        probe_ioapic_address(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let ioapic = IoApic::new();
     ioapic.init();
 }

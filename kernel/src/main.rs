@@ -36,18 +36,53 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::arch::uart::init_uart();
         crate::driver::vga::init();
 
-        // Check for EFI stub BootInfo first (magic 0x474F5046 at 0x10000)
+        // ── Read EFI BootInfo at 0x10000 (one read, early) ──
+        // Framebuffer MUST be initialised before any console_println!
+        // call, otherwise all early boot messages are silently dropped
+        // (fb_console::putchar checks FB_READY which starts false).
         let efi_stub_booted = unsafe {
             core::ptr::read_volatile(0x10000usize as *const u32) == 0x474F5046
         };
 
-        // Parse multiboot2 info to get RAM size and framebuffer.
+        let mut efi_mem_upper_kb: u32 = 524288; // fallback 512 MB
+
+        if efi_stub_booted {
+            let bi = 0x10000usize as *const u32;
+            let fb_addr =
+                unsafe { core::ptr::read_volatile(bi.add(2) as *const u64) } as usize;
+            let fb_width  = unsafe { core::ptr::read_volatile(bi.add(4) as *const u32) };
+            let fb_height = unsafe { core::ptr::read_volatile(bi.add(5) as *const u32) };
+            let fb_stride = unsafe { core::ptr::read_volatile(bi.add(6) as *const u32) };
+            let mem_kb    = unsafe { core::ptr::read_volatile(bi.add(7) as *const u32) };
+
+            if fb_addr != 0 {
+                crate::arch::fb_console::init(fb_addr, fb_stride, fb_width, fb_height, 32);
+                crate::console_println!(
+                    "[gop] EFI stub FB at {:#x} {}x{} stride={}",
+                    fb_addr, fb_width, fb_height, fb_stride
+                );
+
+                // Diagnostic cyan square — proves kernel writes to framebuffer
+                let fb = fb_addr as *mut u32;
+                let pp = fb_stride as usize / 4;
+                for y in 0..50 {
+                    for x in 0..50 {
+                        unsafe { *fb.add(y * pp + (240 + x)) = 0xFFFFFF00u32; }
+                    }
+                }
+            }
+
+            if mem_kb > 0 && mem_kb < 0xFFFF_FFFF {
+                efi_mem_upper_kb = mem_kb;
+            }
+        }
+
+        // ── Memory ──
         let (_mb2_magic, mb2_info) = (hartid, dtb_ptr);
         let limine_booted = !crate::arch::limine::FRAMEBUFFER_REQUEST.response.is_null();
 
         let (mem_lower, mem_upper_kb, fb_info, efi_st_ptr) = if efi_stub_booted {
-            // EFI stub boot — use default memory (512MB), framebuffer from BootInfo
-            (0u32, 524288u32, None, None) // 512MB as upper memory KB
+            (0u32, efi_mem_upper_kb, None, None)
         } else if limine_booted {
             // Limine native boot — get memory from Limine memmap request
             let resp = unsafe { &*crate::arch::limine::MEMMAP_REQUEST.response };
@@ -79,41 +114,21 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             mm::pmm::init();
         }
 
-        // Initialize framebuffer console: Limine → multiboot2 → EFI GOP → BootInfo
-        let _fb_initialized = if crate::arch::limine::init_framebuffer() {
-            crate::console_println!("[gop] Using Limine framebuffer");
-            true
-        } else {
-            crate::console_println!("[gop] multiboot2 fb_info={} efi_st_ptr={}",
-                if fb_info.is_some() { "yes" } else { "no" },
-                if efi_st_ptr.is_some() { "yes" } else { "no" });
-            if let Some(fb) = fb_info.or_else(|| {
+        // Framebuffer console — for non-EFI paths (EFI was done above)
+        if !efi_stub_booted {
+            let _fb_initialized = if crate::arch::limine::init_framebuffer() {
+                crate::console_println!("[gop] Using Limine framebuffer");
+                true
+            } else if let Some(fb) = fb_info.or_else(|| {
                 efi_st_ptr.and_then(|st| crate::arch::multiboot2::gop_from_efi(st))
             }) {
                 crate::arch::fb_console::init(fb.addr, fb.pitch, fb.width, fb.height, fb.bpp);
                 true
             } else {
-                // Check for BootInfo from EFI stub (magic 0x474F5046 at phys 0x10000)
-                let bi_ptr = 0x10000usize as *const u32;
-                let magic = unsafe { core::ptr::read_volatile(bi_ptr) };
-                if magic == 0x474F5046 {
-                    let fb_addr = unsafe { core::ptr::read_volatile(bi_ptr.add(2) as *const u64) } as usize;
-                    let fb_width = unsafe { core::ptr::read_volatile(bi_ptr.add(4) as *const u32) };
-                    let fb_height = unsafe { core::ptr::read_volatile(bi_ptr.add(5) as *const u32) };
-                    let fb_stride = unsafe { core::ptr::read_volatile(bi_ptr.add(6) as *const u32) };
-                    if fb_addr != 0 {
-                        crate::arch::fb_console::init(fb_addr, fb_stride, fb_width, fb_height, 32);
-                        let fb_size = (fb_height * fb_stride) as usize;
-                        crate::mm::vmm::identity_map_region(fb_addr, fb_size);
-                        crate::console_println!("[gop] EFI stub FB at {:#x} {}x{} stride={}", fb_addr, fb_width, fb_height, fb_stride);
-                        true
-                    } else { false }
-                } else {
-                    crate::console_println!("[gop] No framebuffer found");
-                    false
-                }
-            }
-        };
+                crate::console_println!("[gop] No framebuffer found");
+                false
+            };
+        }
     }
 
     crate::console_println!("=== KarteOS v0.2.0 ===");
