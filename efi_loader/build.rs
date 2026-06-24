@@ -72,21 +72,17 @@ fn compute_start64_offset(elf_path: &std::path::Path) -> usize {
 
     match start64_addr {
         Some(addr) => {
-            // nm returns the link-time VMA, which is
-            //   DIRECT_MAP_BASE + KERNEL_PHYS_BASE + text_offset
-            // e.g. 0xFFFF_FFFF_8010_01D8.
-            // To get the flat-binary offset we subtract the kernel's
-            // VMA base (DIRECT_MAP_BASE + KERNEL_PHYS_BASE), NOT just
-            // the physical base.  Subtracting only KERNEL_PHYS_BASE
-            // from a VMA leaves DIRECT_MAP_BASE in the result → huge
-            // offset → wrong jump target → _start64 never reached.
+            // nm may return either a high-half VMA
+            //   (0xFFFF_FFFF_8010_01D8 = DIRECT_MAP_BASE + KERNEL_PHYS_BASE + off)
+            // or a low physical address (0x1001D8 = KERNEL_PHYS_BASE + off)
+            // depending on how the kernel ELF is linked.  Handle both.
             const DIRECT_MAP_BASE: usize = 0xFFFF_FFFF_8000_0000;
             const KERNEL_PHYS_BASE: usize = 0x10_0000;
-            let kernel_vma_base = DIRECT_MAP_BASE + KERNEL_PHYS_BASE;
-            let offset = if addr >= kernel_vma_base {
-                addr - kernel_vma_base
+            let offset = if addr >= DIRECT_MAP_BASE {
+                addr - (DIRECT_MAP_BASE + KERNEL_PHYS_BASE)
+            } else if addr >= KERNEL_PHYS_BASE {
+                addr - KERNEL_PHYS_BASE
             } else {
-                eprintln!("cargo:warning=_start64 address {:#x} < vma base {:#x}, using raw value", addr, kernel_vma_base);
                 addr
             };
             eprintln!("cargo:info=_start64 offset={:#x} (addr={:#x})", offset, addr);
