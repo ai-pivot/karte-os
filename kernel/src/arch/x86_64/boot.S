@@ -220,6 +220,32 @@ _start64:
     movb $'K', %al
     outb %al, %dx
 
+    # ── MAGENTA diagnostic square at (300,0) ──
+    # Uses fb_addr/fb_pitch stored by EFI loader at physical 0x9000.
+    # This runs BEFORE .bss clearing and with the EFI loader's page
+    # tables (which we KNOW work for the framebuffer — colored
+    # squares proved it).  If MAGENTA doesn't appear, _start64 is
+    # never reached or the framebuffer became inaccessible.
+    movabs $0x9000, %rax
+    movq (%rax), %rbx            # rbx = fb_addr
+    testq %rbx, %rbx
+    jz 3f
+    movq 8(%rax), %r9            # r9 = fb_pitch
+    testq %r9, %r9
+    jz 3f
+    addq $1200, %rbx             # rbx = fb_addr + 300*4 (col 300)
+    movl $50, %r8d               # row counter
+1:  movl $50, %ecx               # column counter
+    movq %rbx, %rdi
+2:  movl $0xFFFF00FF, (%rdi)     # magenta = 0xAA RR GG BB → FF 00 FF
+    addq $4, %rdi
+    decl %ecx
+    jnz 2b
+    addq %r9, %rbx               # next row
+    decl %r8d
+    jnz 1b
+3:
+
     # Zero .bss section.
     # EFI stub loads a flat binary (objcopy -O binary) which has no ELF
     # headers — there is no loader to zero .bss for us.  QEMU memory
