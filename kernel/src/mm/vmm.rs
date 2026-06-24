@@ -443,10 +443,10 @@ pub fn direct_map_2mb(root: &mut PageTable, phys_start: usize, phys_end: usize, 
     );
 }
 
-/// Ensure a physical address range is identity-mapped in the kernel page table.
+/// Ensure a physical address range is identity-mapped in the given page table.
 /// Used for high-address GPU framebuffers (e.g., AMD at 0x4000000000 = 256GB).
-pub fn identity_map_region(phys_start: usize, size: usize) {
-    let root = get_kernel_page_table();
+/// Accepts `root` as an explicit parameter to avoid `&mut` aliasing UB.
+pub fn identity_map_region(root: &mut PageTable, phys_start: usize, size: usize) {
     let start = phys_start & !0x1F_FFFF; // 2MB align down
     let end = (phys_start + size + 0x1F_FFFF) & !0x1F_FFFF; // 2MB align up
     identity_map_2mb(root, start, end, PTEFlags::KRW);
@@ -553,7 +553,7 @@ pub fn init() {
             let fb_stride = unsafe { core::ptr::read_volatile(bi.add(6) as *const u32) };
             if fb_addr != 0 && fb_stride != 0 {
                 let fb_size = (fb_height as usize) * (fb_stride as usize);
-                identity_map_region(fb_addr, fb_size);
+                identity_map_region(root, fb_addr, fb_size);
             }
         }
     }
