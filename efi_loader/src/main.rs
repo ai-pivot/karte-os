@@ -707,52 +707,23 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     let start64_offset = get_start64_offset();
     let entry_high_half = (DIRECT_MAP_BASE + KERNEL_PHYS_BASE + start64_offset) as u64;
 
-    // Exit Boot Services — ConOut dies after this, use fb_print for output
+    // Exit Boot Services — ConOut dies after this
     unsafe { screen_print("EXIT\n"); }
 
-    let mut ebs_succeeded = false;
+    // Simple EBS: just call with key=0. This worked on real hardware before.
+    // The GetMemoryMap loop was causing crashes on some firmware.
     if !system_table.is_null() {
         let st = unsafe { &*system_table };
         if !st.boot_services.is_null() {
             let bs = unsafe { &*st.boot_services };
-
+            // Disable watchdog
             (bs.set_watchdog_timer)(0, 0, 0, core::ptr::null());
-
-            let map_buf = unsafe { &mut MAP_BUF[..] };
-
-            for _attempt in 0..2 {
-                let mut map_size = map_buf.len();
-                let mut map_key = 0usize;
-                let mut desc_size = 0usize;
-                let mut desc_version = 0u32;
-
-                if (bs.get_memory_map)(
-                    &mut map_size, map_buf.as_mut_ptr(),
-                    &mut map_key, &mut desc_size, &mut desc_version,
-                ) != EFI_SUCCESS { continue; }
-
-                let s = (bs.exit_boot_services)(image_handle, map_key);
-                if s == EFI_SUCCESS {
-                    ebs_succeeded = true;
-                    break;
-                }
-                // Only retry once on EFI_INVALID_PARAMETER (Linux behavior)
-                if s != 2 { break; }
-            }
-            if !ebs_succeeded {
-                // Last resort: key=0 (some firmware accepts this)
-                let s = (bs.exit_boot_services)(image_handle, 0);
-                ebs_succeeded = (s == EFI_SUCCESS);
-            }
+            // Direct EBS call
+            (bs.exit_boot_services)(image_handle, 0);
         }
     }
 
-    if !ebs_succeeded {
-        // EBS failed. Can't print (no working display). Just halt.
-        loop { unsafe { core::arch::asm!("cli; hlt"); } }
-    }
-
-    // EBS succeeded — jump to kernel
+    // EBS done — jump to kernel
     unsafe {
         boot_transition(
             pml4_phys,
