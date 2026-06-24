@@ -295,32 +295,35 @@ const EFI_LOADER_DATA: u32 = 2;
 //
 // UEFI firmware typically sets CS to 0x38 (selector index 7) before
 // calling efi_main.  Our GDT must have at least 8 entries so that
-// the limit (8*8-1=63) covers CS=0x38.  Otherwise `lgdt` followed by
-// any segment-reload (far jump, interrupt, exception) triggers #GP.
+// the limit (8*8-1=63) covers CS=0x38.
 //
-// We use #[repr(C, align(8))] instead of packed — the x86 lgdt
-// instruction needs the descriptor operand to be naturally aligned.
+// CRITICAL: GdtDesc MUST be #[repr(C, packed)].  The `lgdt` instruction
+// reads exactly 10 consecutive bytes: 2 bytes limit + 8 bytes base.
+// Without `packed`, the compiler inserts 6 bytes of implicit padding
+// between limit (u16) and base (u64).  `lgdt` interprets those padding
+// bytes as the high 6 bytes of the GDT base → garbage GDT → #GP on
+// segment reload → double fault → triple fault → system hang.
+// DO NOT add `align` or `_pad` to this struct.
 
-#[repr(C, align(8))]
+#[repr(C, packed)]
 struct GdtDesc {
     limit: u16,
     base: u64,
-    _pad: [u8; 6], // pad to 16 bytes for alignment
 }
 
 static BOOT_GDT: [u64; 8] = [
     0,                  // 0x00: null
     0x00209A0000000000, // 0x08: 64-bit code
     0x0000920000000000, // 0x10: data
-    0, 0, 0, 0, 0,     // 0x18–0x38: unused (covers UEFI CS=0x38=selector 7)
+    0x0000920000000000, // 0x18: data (cover UEFI segment selectors)
+    0x0000920000000000, // 0x20: data
+    0x0000920000000000, // 0x28: data
+    0x00209A0000000000, // 0x30: 64-bit code
+    0x00209A0000000000, // 0x38: 64-bit code (cover UEFI CS=0x38)
 ];
 
-/// GDT descriptor stored in a static so its address survives the CR3
-/// switch (stack variables may not be identity-mapped after CR3 change).
-static mut BOOT_GDT_DESC: GdtDesc = GdtDesc {
-    limit: 0, base: 0,
-    _pad: [0u8; 6],
-};
+/// GDT descriptor in a static so `lgdt` can read it after CR3 switch.
+static mut BOOT_GDT_DESC: GdtDesc = GdtDesc { limit: 0, base: 0 };
 
 // ─── Boot stack ─────────────────────────────────────────────────────────
 
@@ -725,7 +728,6 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
         BOOT_GDT_DESC = GdtDesc {
             limit: (BOOT_GDT.len() * 8 - 1) as u16,
             base: core::ptr::addr_of!(BOOT_GDT) as u64,
-            _pad: [0u8; 6],
         };
     }
 
