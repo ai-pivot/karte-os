@@ -102,12 +102,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     let fb_height = unsafe { core::ptr::read_volatile(bi_ptr.add(5) as *const u32) };
                     let fb_stride = unsafe { core::ptr::read_volatile(bi_ptr.add(6) as *const u32) };
                     if fb_addr != 0 {
-                        // Ensure the GPU framebuffer is identity-mapped.
-                        // On modern GPUs the framebuffer can be at very high
-                        // physical addresses (e.g., 0x4000000000 = 256GB).
+                        crate::arch::fb_console::init(fb_addr, fb_stride, fb_width, fb_height, 32);
                         let fb_size = (fb_height * fb_stride) as usize;
                         crate::mm::vmm::identity_map_region(fb_addr, fb_size);
-                        crate::arch::fb_console::init(fb_addr, fb_stride, fb_width, fb_height, 32);
                         crate::console_println!("[gop] EFI stub FB at {:#x} {}x{} stride={}", fb_addr, fb_width, fb_height, fb_stride);
                         true
                     } else { false }

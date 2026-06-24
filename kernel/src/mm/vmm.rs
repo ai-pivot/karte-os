@@ -527,6 +527,22 @@ pub fn init() {
     #[cfg(target_arch = "x86_64")]
     {
         crate::arch::trap::activate_page_table(root_addr);
+
+        // Read GOP framebuffer address from EFI BootInfo.
+        // On GPUs with high physical addresses (0x4000000000 on RTX 4070S),
+        // the framebuffer isn't covered by the standard identity map and must
+        // be mapped here BEFORE any console output.
+        let bi = 0x10000usize as *const u32;
+        let magic = unsafe { core::ptr::read_volatile(bi) };
+        if magic == 0x474F5046 {
+            let fb_addr = unsafe { core::ptr::read_volatile(bi.add(2) as *const u64) } as usize;
+            let fb_width = unsafe { core::ptr::read_volatile(bi.add(4) as *const u32) };
+            let fb_stride = unsafe { core::ptr::read_volatile(bi.add(6) as *const u32) };
+            if fb_addr != 0 && fb_stride != 0 {
+                let fb_size = (fb_width as usize) * (fb_stride as usize); // rough over-estimate
+                identity_map_region(fb_addr, fb_size);
+            }
+        }
     }
 
     crate::console_println!("[vmm] Page table activated at {:#x}", root_addr);
