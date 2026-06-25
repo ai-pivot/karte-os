@@ -305,17 +305,19 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 }
             }
 
-            // Initialize PS/2 keyboard
-            crate::console_println!("[init] Initializing PS/2 keyboard...");
-            crate::driver::keyboard::init();
-
-            // Initialize XHCI USB keyboard (real USB, not legacy emulation)
+            // Initialize XHCI USB first — taking over the controller may
+            // disable BIOS legacy PS/2 emulation.  We then re-check PS/2.
             crate::console_println!("[init] Initializing XHCI USB...");
             if let Err(e) = crate::driver::xhci::init() {
                 crate::console_println!("[init] XHCI: {}", e);
             } else {
                 crate::driver::xhci::enumerate_keyboard();
             }
+
+            // Initialize PS/2 keyboard AFTER XHCI.  If XHCI took over
+            // the USB controller, legacy PS/2 emulation may be gone.
+            crate::console_println!("[init] Initializing PS/2 keyboard...");
+            crate::driver::keyboard::init();
 
             // Try NVMe first (fastest), then AHCI (SATA), then VirtIO block
             if let Some(nvme_dev) = arch::pci::find_nvme() {

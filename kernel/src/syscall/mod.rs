@@ -2222,6 +2222,9 @@ fn linux_exit_group(code: i32) -> isize {
 
 /// Syscall 2: Write to file descriptor.
 fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
+    if fd == 1 || fd == 2 {
+        crate::console_println!("[syscall] write fd={} len={}", fd, len);
+    }
     if buf == 0 || len == 0 || len > 1048576 {
         return ERR_INVAL;
     }
@@ -2396,14 +2399,15 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             return ERR_INVAL; // can't read from write end
         }
         Some((FdType::Stdio, _, _)) => {
-            // Stdio stdin (fd 0 default): blocking read from TTY.
-            // Check O_NONBLOCK flag — Go's netpoller requires -EAGAIN when
-            // no data is available, otherwise the entire Go runtime deadlocks.
-            let nonblock = crate::process::with_fd_table(|fdt| {
-                fdt.get(fd as usize)
-                    .map(|d| (d.flags & O_NONBLOCK) != 0)
-                    .unwrap_or(false)
-            });
+             // Stdio stdin (fd 0 default): blocking read from TTY.
+             // Check O_NONBLOCK flag — Go's netpoller requires -EAGAIN when
+             // no data is available, otherwise the entire Go runtime deadlocks.
+             let nonblock = crate::process::with_fd_table(|fdt| {
+               fdt.get(fd as usize)
+                  .map(|d| (d.flags & O_NONBLOCK) != 0)
+                  .unwrap_or(false)
+             });
+             crate::console_println!("[syscall] read fd={} len={} nonblock={}", fd, len, nonblock);
             let mut kbuf = alloc::vec![0u8; len];
             loop {
                 let result = crate::driver::tty::read(kbuf.as_mut_ptr() as usize, len);
