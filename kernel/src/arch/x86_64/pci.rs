@@ -300,28 +300,36 @@ pub fn init() {
     let devices = enumerate();
 
     for dev in &devices {
-        crate::console_println!(
-            "[pci] {:02x}:{:02x}.{:x} vendor={:#x} device={:#x} class={:#x}/{:#x}",
-            dev.bus, dev.device, dev.function,
-            dev.vendor_id, dev.device_id, dev.class_code, dev.subclass
-        );
+    crate::console_println!(
+           "[pci] {:02x}:{:02x}.{:x} vendor={:#x} device={:#x} class={:#x}/{:#x}",
+           dev.bus, dev.device, dev.function,
+           dev.vendor_id, dev.device_id, dev.class_code, dev.subclass
+    );
 
-        // Identity-map BARs above 4 GB.  The kernel's new page tables
-        // (set up by vmm::init) only identity-map 0-4 GB.  On real
-        // hardware, XHCI, AHCI, NVMe and GPU BARs are often placed at
-        // high physical addresses (32 GB+).  Without an explicit
-        // identity mapping, the first MMIO access to these BARs
-        // triggers a page fault.
-        for i in 0..6 {
-            let bar = dev.bar_address(i);
-            // Memory BARs are ≥ 4 KB; skip I/O BARs (< 64 KB) and zero
-            if bar >= 0x1000 {
-                // Map 2 MB (minimum huge-page size), aligned down
-                let base = (bar as usize) & !0x1F_FFFF;
-                let root = crate::mm::vmm::get_kernel_page_table();
-                crate::mm::vmm::identity_map_region(root, base, 0x20_0000);
-            }
-        }
+    // Identity-map BARs only if they lie beyond the range already
+    // identity-mapped by vmm::init() (0 … total_memory()).
+    // Most BARs (AHCI, XHCI, etc.) are below total_ram; mapping them
+    // again rewrites live PTEs without TLB invalidation, and on real
+    // hardware this causes the CPU page-structure cache to become
+    // inconsistent — frame-buffer accesses then require cold page
+    // walks, which makes console output crawl to ~1 line / second.
+    let total_ram = crate::mm::pmm::total_memory();
+    // Skip 64-bit BAR upper halves (indices 1,3,5 on a 64-bit BAR).
+    // bar_address() treats the upper 32 bits as a separate BAR,
+    // returning garbage addresses that would map wrong memory.
+    let mut skip_next = false;
+    for i in 0..6 {
+           if skip_next { skip_next = false; continue; }
+           let bar = dev.bar_address(i);
+           if bar < 0x1000 { continue; }          // I/O BAR or zero
+           if bar >= total_ram as u64 {           // only map BARs above RAM
+                  let base = (bar as usize) & !0x1F_FFFF;
+                  let root = crate::mm::vmm::get_kernel_page_table();
+                  crate::mm::vmm::identity_map_region(root, base, 0x20_0000);
+           }
+           // Check if this is a 64-bit BAR (bits 2:1 == 0b10)
+           if (bar & 0x6) == 0x4 { skip_next = true; }
+    }
     }
     crate::console_println!("[pci] Found {} devices", devices.len());
 }

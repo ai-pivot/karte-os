@@ -420,6 +420,14 @@ fn map_2mb_internal(
         let ppn = paddr >> 12;
         let huge_flags = flags.bits() | PTEFlags::PS.bits();
         p2.entries[vpn] = PTE(((ppn as u64) << 12) | huge_flags);
+        // Flush TLB for this virtual address.  Without this, the CPU
+        // may use stale TLB entries or out-of-date page-structure
+        // caches, causing subsequent accesses through the modified
+        // page tables to be extremely slow (full cold page walk).
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+        }
         paddr += HUGE_PAGE_SIZE;
     }
 }
