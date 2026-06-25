@@ -80,26 +80,27 @@ impl ComPort {
         }
     }
 
-    /// Write a batch of bytes to the UART efficiently.
-    /// Checks LSR once per FIFO-sized batch (16 bytes) instead of per byte.
-    /// Significantly reduces port I/O overhead for large writes.
+    /// Write a batch of bytes to the UART (Linux-style).
+    /// Waits for TX FIFO to drain once per 16-byte chunk, not per byte.
+    /// Per-byte spin with inb() on real hardware costs hundreds of cycles;
+    /// batching reduces this by 16x and is how the 8250 serial driver works.
     pub fn write_batch(&mut self, data: &[u8]) {
+        if data.is_empty() { return; }
         unsafe {
             let mut lsr = Port::<u8>::new(self.base + 5);
             let mut thr = Port::<u8>::new(self.base);
-            for &byte in data {
-                // Check LSR every byte (16550 FIFO may be full)
-                // In QEMU, THR is always empty so this check completes immediately
-                let mut timeout = 1_000_000u32;
-                while lsr.read() & 0x20 == 0 {
-                    timeout -= 1;
-                    if timeout == 0 {
-                        return;
-                    }
-                    core::hint::spin_loop();
+
+            for chunk in data.chunks(16) {
+                // Drain before each 16-byte burst
+                let mut tout: u32 = 0xFFFF;
+                while lsr.read() & 0x20 == 0 { tout -= 1; if tout == 0 { break; } }
+                for &byte in chunk {
+                    thr.write(byte);
                 }
-                thr.write(byte);
             }
+            // Final drain
+            let mut tout: u32 = 0xFFFF;
+            while lsr.read() & 0x20 == 0 { tout -= 1; if tout == 0 { break; } }
         }
     }
 
