@@ -215,10 +215,11 @@ core::arch::global_asm!(
     "push r15",
     // Timer can interrupt user mode while CR3 is still a user page table.
     // Switch before calling Rust: the handler may touch kernel heap/logging.
-    // REMOVED: unconditional CR3 switch to KERNEL_CR3_PHYS.  vmm::init()
-    // already set the correct kernel CR3; reloading on every tick just
-    // flushes the TLB, and on real hardware the cold page walks for the
-    // GOP framebuffer (256 GB) make console output crawl.
+    "mov rax, [rip + KERNEL_CR3_PHYS]",
+    "cmp rax, 0",
+    "je 4f",
+    "mov cr3, rax",
+    "4:",
     // Align stack for System V ABI (RSP % 16 == 0 before call)
     "sub rsp, 8",
     // Call handler. No fxsave/fxrstor: __switch() already saves/restores

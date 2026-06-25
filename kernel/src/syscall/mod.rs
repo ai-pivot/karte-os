@@ -2222,9 +2222,6 @@ fn linux_exit_group(code: i32) -> isize {
 
 /// Syscall 2: Write to file descriptor.
 fn sys_write(fd: i32, buf: usize, len: usize) -> isize {
-    if fd == 1 || fd == 2 {
-        crate::console_println!("[syscall] write fd={} len={}", fd, len);
-    }
     if buf == 0 || len == 0 || len > 1048576 {
         return ERR_INVAL;
     }
