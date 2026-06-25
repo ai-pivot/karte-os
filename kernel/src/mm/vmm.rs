@@ -55,11 +55,6 @@ bitflags! {
         const KRWX = Self::PRESENT.bits() | Self::WRITABLE.bits();
         const KRW  = Self::PRESENT.bits() | Self::WRITABLE.bits();
         const KRX  = Self::PRESENT.bits(); // executable by default (no NX)
-        /// MMIO regions (LAPIC, IOAPIC, PCI BARs) must be uncached.
-        /// Without PCD|PWT the CPU may cache MMIO reads/writes,
-        /// causing stale register values and dropped writes.
-        const KRW_MMIO = Self::PRESENT.bits() | Self::WRITABLE.bits()
-                       | Self::PCD.bits() | Self::PWT.bits();
         const URWX = Self::PRESENT.bits() | Self::WRITABLE.bits() | Self::USER.bits();
         const URW  = Self::PRESENT.bits() | Self::WRITABLE.bits() | Self::USER.bits();
         const UR   = Self::PRESENT.bits() | Self::USER.bits(); // read-only user
@@ -451,10 +446,10 @@ pub fn direct_map_2mb(root: &mut PageTable, phys_start: usize, phys_end: usize, 
 /// Ensure a physical address range is identity-mapped in the given page table.
 /// Used for high-address GPU framebuffers (e.g., AMD at 0x4000000000 = 256GB).
 /// Accepts `root` as an explicit parameter to avoid `&mut` aliasing UB.
-pub fn identity_map_region(root: &mut PageTable, phys_start: usize, size: usize, flags: PTEFlags) {
+pub fn identity_map_region(root: &mut PageTable, phys_start: usize, size: usize) {
     let start = phys_start & !0x1F_FFFF; // 2MB align down
     let end = (phys_start + size + 0x1F_FFFF) & !0x1F_FFFF; // 2MB align up
-    identity_map_2mb(root, start, end, flags);
+    identity_map_2mb(root, start, end, PTEFlags::KRW);
 }
 
 /// RISC-V fallback: no 2MB huge pages, delegate to regular identity_map.
@@ -530,7 +525,7 @@ pub fn init() {
         identity_map_2mb(root, 0x0, total, PTEFlags::KRWX);
 
         // Identity-map MMIO regions (device drivers use identity addresses).
-        identity_map_2mb(root, 0xFE000000, 0xFF000000, PTEFlags::KRW_MMIO);
+        identity_map_2mb(root, 0xFE000000, 0xFF000000, PTEFlags::KRW);
     }
 
     let ppn = root_addr >> 12;
@@ -558,7 +553,7 @@ pub fn init() {
             let fb_stride = unsafe { core::ptr::read_volatile(bi.add(6) as *const u32) };
             if fb_addr != 0 && fb_stride != 0 {
                 let fb_size = (fb_height as usize) * (fb_stride as usize);
-                identity_map_region(root, fb_addr, fb_size, PTEFlags::KRW_MMIO);
+                identity_map_region(root, fb_addr, fb_size);
             }
         }
     }

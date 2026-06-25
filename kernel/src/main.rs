@@ -161,7 +161,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         let fb = EARLY_FB_ADDR.load(core::sync::atomic::Ordering::Relaxed) as usize;
         if fb != 0 {
             let root = crate::mm::vmm::get_kernel_page_table();
-            crate::mm::vmm::identity_map_region(root, fb, 64 * 1024 * 1024, crate::mm::vmm::PTEFlags::KRW_MMIO); // 64 MB
+            crate::mm::vmm::identity_map_region(root, fb, 64 * 1024 * 1024); // 64 MB
         }
     }
 

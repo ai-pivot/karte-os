@@ -149,21 +149,12 @@ impl FrameAllocator {
             *word = 0;
         }
 
-        let mut allocator = Self {
+        let allocator = Self {
             start: managed_start,
             bitmap,
             total_frames: managed_frames,
             next_free: 0,
         };
-
-        // Reserve MMIO regions to prevent allocating frames that overlap
-        // with hardware registers (LAPIC @ 0xFEE00000, IOAPIC @ 0xFEC00000).
-        // On systems with >4 GB RAM the PMM-managed range includes these
-        // addresses; a PageTable::zeroed() allocation landing on LAPIC
-        // would zero the timer registers — mid-boot timer slowdown.
-        allocator.reserve_range(0xFEC0_0000, 0xFED0_0000); // IOAPIC + HPET
-        allocator.reserve_range(0xFEE0_0000, 0xFEF0_0000); // LAPIC
-
         allocator.debug_init_info(kernel_end, start, managed_start, end);
         allocator
     }
@@ -187,24 +178,6 @@ impl FrameAllocator {
     }
     #[cfg(not(debug_assertions))]
     fn debug_init_info(&self, _a: usize, _b: usize, _c: usize, _d: usize) {}
-
-    /// Mark a physical address range as used in the bitmap, preventing
-    /// PMM from allocating frames that overlap MMIO registers.
-    fn reserve_range(&mut self, range_start: usize, range_end: usize) {
-        let s = if range_start < self.start { self.start } else { range_start };
-        let e = if range_end > self.start + self.total_frames * PAGE_SIZE {
-            self.start + self.total_frames * PAGE_SIZE
-        } else {
-            range_end
-        };
-        let first = (s - self.start) / PAGE_SIZE;
-        let last = (e - self.start + PAGE_SIZE - 1) / PAGE_SIZE;
-        for i in first..last.min(self.total_frames) {
-            let word = i / 64;
-            let bit = i % 64;
-            self.bitmap[word] |= 1u64 << bit;
-        }
-    }
 
     fn alloc(&mut self) -> Option<usize> {
         // Search from next_free
