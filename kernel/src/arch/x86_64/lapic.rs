@@ -170,16 +170,10 @@ pub fn local_eoi() {
 /// timer frequency at boot.  This avoids the hard-coded 1 GHz assumption
 /// that only matches QEMU's LAPIC emulation.
 pub fn enable_timer() {
-    let initial_count = calibrate_timer();
-
     unsafe {
-        // Divide by 16
-        lapic_write(reg::TIMER_DIVIDE, 0x03);
-
-        // Set the calibrated initial count for ~100 Hz (10 ms) ticks
-        lapic_write(reg::TIMER_INITIAL_COUNT, initial_count);
-
-        // LVT timer: periodic mode + vector
+        // Hard-coded fast count — no PIT reliance on UEFI.
+        lapic_write(reg::TIMER_DIVIDE, 0x0A); // divide by 128
+        lapic_write(reg::TIMER_INITIAL_COUNT, 10_000u32);
         lapic_write(
             reg::LVT_TIMER,
             TIMER_MODE_PERIODIC | super::idt::TIMER_VECTOR as u32,
