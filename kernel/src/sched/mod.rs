@@ -830,6 +830,11 @@ pub fn start_first_task() -> ! {
         next
     };
     crate::console_println!("[sched] Switching to next task: {}", next);
+    // Diagnostic
+    {
+        let cr3 = crate::process::get_page_table_root(next);
+        crate::console_println!("[sched]   cr3={:#x}", cr3);
+    }
     switch_to(IDLE_SLOT, next);
     idle_loop()
 }
