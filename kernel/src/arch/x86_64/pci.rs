@@ -319,7 +319,7 @@ pub fn init() {
                 // Map 2 MB (minimum huge-page size), aligned down
                 let base = (bar as usize) & !0x1F_FFFF;
                 let root = crate::mm::vmm::get_kernel_page_table();
-                crate::mm::vmm::identity_map_region(root, base, 0x20_0000);
+                crate::mm::vmm::identity_map_region(root, base, 0x20_0000, crate::mm::vmm::PTEFlags::KRW_MMIO);
             }
         }
     }
