@@ -166,18 +166,17 @@ pub fn local_eoi() {
 }
 
 /// Enable the LAPIC timer for periodic interrupts.
-/// Uses a fixed initial count calibrated for ~100 Hz at typical
-/// LAPIC bus frequencies (100 MHz–1 GHz).  The PIT-based calibration
-/// is unreliable on UEFI systems that may not initialise the 8253.
+/// Uses the TSC (always available on x86_64) to calibrate the LAPIC
+/// timer frequency, avoiding the 8253 PIT which UEFI may not initialise.
 pub fn enable_timer() {
+    let initial_count = calibrate_timer();
+
     unsafe {
-        // Divide by 16.  At 1 GHz LAPIC bus this gives 62.5 MHz.
+        // Divide by 16
         lapic_write(reg::TIMER_DIVIDE, 0x03);
 
-        // Fixed initial count: 625000 @ 1 GHz → 100 Hz.
-        // Even on slow LAPIC buses (100 MHz) this gives ~10 Hz,
-        // which is perfectly usable.
-        lapic_write(reg::TIMER_INITIAL_COUNT, 625_000u32);
+        // Set the calibrated initial count for ~100 Hz (10 ms) ticks
+        lapic_write(reg::TIMER_INITIAL_COUNT, initial_count);
 
         // LVT timer: periodic mode + vector
         lapic_write(
@@ -187,51 +186,27 @@ pub fn enable_timer() {
     }
 }
 
-/// Calibrate the LAPIC timer against the 8253 PIT.
-///
-/// The PIT runs at a fixed 1.193182 MHz regardless of CPU / chipset,
-/// making it an ideal reference clock.  We measure how many LAPIC timer
-/// ticks elapse in one PIT period (~10 ms) and return the initial count
-/// needed for a 100 Hz periodic interrupt.
+/// Calibrate the LAPIC timer against the TSC (Time Stamp Counter).
+/// The TSC runs at the CPU's base clock and requires no firmware setup.
 fn calibrate_timer() -> u32 {
-    use x86_64::instructions::port::{Port, PortWriteOnly, PortReadOnly};
+    use core::arch::x86_64::_rdtsc;
 
-    const PIT_CH0: u16 = 0x40;
-    const PIT_CMD: u16 = 0x43;
-    const PIT_FREQ: u64 = 1_193_182; // Hz
-    const CALIBRATION_MS: u64 = 10;   // 10 ms
-    const PIT_COUNT: u16 = ((PIT_FREQ * CALIBRATION_MS) / 1000) as u16;
+    const TSC_WAIT: u64 = 30_000_000; // ≈ 10 ms at 3 GHz; enough for calibration
 
     unsafe {
-        // Program PIT channel 0 as one-shot (mode 0, lobyte+hibyte)
-        let mut cmd: PortWriteOnly<u8> = PortWriteOnly::new(PIT_CMD);
-        cmd.write(0x30u8); // channel 0, access lobyte/hibyte, mode 0
-
-        let mut ch0: PortWriteOnly<u8> = PortWriteOnly::new(PIT_CH0);
-        ch0.write((PIT_COUNT & 0xFF) as u8);
-        ch0.write((PIT_COUNT >> 8) as u8);
-
-        // Start LAPIC timer with maximum count
+        // Set LAPIC timer to max count
         lapic_write(reg::TIMER_DIVIDE, 0x03); // divide by 16
         lapic_write(reg::TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
 
-        // Poll PIT status until output goes high (count reached 0)
-        let mut pit_cmd: PortWriteOnly<u8> = PortWriteOnly::new(PIT_CMD);
-        let mut pit_ch0: PortReadOnly<u8> = PortReadOnly::new(PIT_CH0);
-        loop {
-            pit_cmd.write(0xE2u8); // read-back command for channel 0
-            let status: u8 = pit_ch0.read();
-            if status & 0x80 != 0 {
-                break; // OUT pin high → count expired
-            }
+        let tsc_start = _rdtsc();
+        while _rdtsc() < tsc_start + TSC_WAIT {
             core::hint::spin_loop();
         }
 
-        // Read remaining LAPIC count and compute elapsed ticks
         let remaining = lapic_read(reg::TIMER_CURRENT_COUNT);
         let elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining);
 
-        // Clamp to reasonable range (prevents insane values if calibration fails)
+        // Clamp to reasonable range (prevents insane values)
         elapsed.clamp(100_000, 10_000_000)
     }
 }
