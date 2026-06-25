@@ -189,7 +189,7 @@ pub fn init() -> Result<(), &'static str> {
         (*cr_trb) = Trb { parameter: cr_phys as u64, status: 0, control: TRB_LINK | TRB_CYCLE_BIT };
 
         // Power on all ports
-        for p in 0..(ports as usize) {
+        for p in 1..=(ports as usize) {
             let sc = port_read(p);
             if sc & PORT_PP == 0 {
                 port_write(p, PORT_PP);
