@@ -243,6 +243,15 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
         // These high physical addresses don't overlap user ELF segments.
         vmm::identity_map_2mb(user_pt, 0xFE000000, 0xFF000000, vmm::PTEFlags::KRW);
 
+        // Map GOP framebuffer into user page tables as supervisor-only memory.
+        // Syscalls and trap handlers run with the interrupted task's user CR3,
+        // and console output writes to the framebuffer from Ring 0. Without this
+        // mapping, the first user sys_write/prompt can page-fault after iretq on
+        // real UEFI boots where the framebuffer is outside the standard MMIO range.
+        if let Some((fb_addr, fb_size)) = crate::arch::fb_console::framebuffer_region() {
+            vmm::identity_map_region(user_pt, fb_addr, fb_size);
+        }
+
         // Kernel stack pages are already covered by the shared direct map
         // (DIRECT_MAP_BASE + phys). No explicit mapping needed.
 

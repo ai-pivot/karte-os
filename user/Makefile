@@ -27,7 +27,7 @@ else
 ASM_TARGETS =
 endif
 
-RUST_TARGETS = shell.elf ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf \
+RUST_TARGETS = minimal.elf shell.elf ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf \
  grep.elf sed.elf wc.elf head.elf tail.elf tui-demo.elf dmesg.elf ext4_write_test.elf ext4_sparse_test.elf
 
 TARGETS = $(ASM_TARGETS) $(RUST_TARGETS)

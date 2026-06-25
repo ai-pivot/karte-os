@@ -28,6 +28,21 @@ global_asm!(
     ".global {sym}",
     "{sym}:",
     "    cli",
+    // ── Enable FPU/SSE (required for fxsave64/fxrstor64 in __switch) ──
+    // Debug: 'F' = FPU/SSE init
+    "    mov dx, 0x3F8",
+    "    mov al, 0x46",
+    "    out dx, al",
+    // CR4: set OSFXSR(9) + OSXMMEXCPT(10), clear CET(23)
+    "    mov rax, cr4",
+    "    or rax, ((1 << 9) | (1 << 10))",
+    "    and rax, ~(1 << 23)",
+    "    mov cr4, rax",
+    // CR0: set MP(1), clear EM(2) + TS(3)
+    "    mov rax, cr0",
+    "    or rax, (1 << 1)",
+    "    and rax, ~((1 << 2) | (1 << 3))",
+    "    mov cr0, rax",
     // Debug: 'L' = loading GDT
     "    mov dx, 0x3F8",
     "    mov al, 0x4C",

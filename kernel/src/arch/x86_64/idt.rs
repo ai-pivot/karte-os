@@ -70,6 +70,8 @@ pub static mut KERNEL_CR3_PHYS: u64 = 0;
 /// Get kernel CR3 physical address. Safe to call from trap handlers.
 /// Global tick counter for timekeeping
 static TICK_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TIMER_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Get current tick count (incremented by timer ISR ~100Hz)
 pub fn get_tick_count() -> usize {
@@ -553,6 +555,19 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
         // Stack layout (from stub push order):
         //   [0] rax (syscall nr)  [1] rax (placeholder)  [2] rdi
         //   [3] rsi  [4] rdx  [5] r8  [6] r9  [7] r10  [8] r11
+
+        // DIAG: ring the first int 0x80 syscall so we can see whether shell
+        // ever reaches user mode and issues syscalls. Uses kernel CR3 by now.
+        static FIRST: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::arch::fb_console::fb_debug_square(23, 0x0040FF00);
+            crate::console_println!("[diag] first syscall nr={}", syscall_nr);
+        }
+        if !TIMER_STARTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::arch::lapic::enable_timer();
+        }
+
         let a0 = *s.add(2) as usize; // rdi
         let a1 = *s.add(3) as usize; // rsi
         let a2 = *s.add(4) as usize; // rdx
@@ -579,22 +594,8 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     let interrupted_cs = unsafe { *((stack_ptr + 136) as *const u64) };
     let from_user = interrupted_cs & 0x3 != 0;
     super::lapic::local_eoi();
-    crate::driver::tty::poll_uart();
     crate::arch::platform::tick_uptime();
     crate::sched::tick_sleep_queue();
-
-    // Poll network stack. Safe now: Timer ISR asm stub already switched to
-    // KERNEL_CR3, and IDT is relocated above ELF range (no IDT conflict).
-    if crate::net::iface::NetStack::is_initialized() {
-        crate::net::iface::NetStack::poll();
-    }
-
-    // Poll USB keyboard (XHCI)
-    if crate::driver::xhci::is_available() {
-        if let Some(key) = crate::driver::xhci::poll_keyboard() {
-            crate::driver::tty::feed_byte(key);
-        }
-    }
 
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if !from_user {
@@ -750,6 +751,8 @@ extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _error_code: u64) -> ! {
+    // DIAG 24: double fault
+    crate::arch::fb_console::fb_debug_square(24, 0xFFFF0000);
     // Switch to kernel CR3 for reliable output
     let kcr3 = crate::mm::vmm::kernel_cr3();
     if kcr3 != 0 {
@@ -772,6 +775,8 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _erro
 }
 
 extern "x86-interrupt" fn gp_fault_handler(frame: InterruptStackFrame, err: u64) {
+    // DIAG 25: general protection fault
+    crate::arch::fb_console::fb_debug_square(25, 0xFF8000FF);
     let from_user = frame.code_segment.0 as u64 & 0x3 != 0;
     let rip = frame.instruction_pointer.as_u64();
     let rsp = frame.stack_pointer.as_u64();
@@ -1137,6 +1142,8 @@ pub fn clear_write_watchpoint() {
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn page_fault_handler_raw(stack_ptr: *const u64) {
+    // DIAG 26: page fault
+    crate::arch::fb_console::fb_debug_square(26, 0xFF800000);
     let sp = stack_ptr as usize;
     // Read user CR3 from stub save area (at offset 512 — after fxsave, before GPRs).
     // The PF stub already switched to kernel CR3, so reading CR3 directly would give kernel CR3.
@@ -1614,7 +1621,14 @@ unsafe extern "C" fn invalid_opcode_isr_stub() {
         "test ax, 3",
         "jz 2f",               // kernel mode → halt
 
-        // User mode: kill the process
+        // User mode: draw square (27 = #UD from user) then kill
+        "push rdi",
+        "push rsi",
+        "mov rdi, 27",
+        "mov rsi, 0xFFFF8000",
+        "call {fb_sq}",
+        "pop rsi",
+        "pop rdi",
         "mov rdi, 1",          // exit code 1
         "call {exit}",
 
@@ -1625,6 +1639,7 @@ unsafe extern "C" fn invalid_opcode_isr_stub() {
         "jmp 2b",              // infinite halt loop
 
         exit = sym crate::syscall::sys_exit,
+        fb_sq = sym crate::arch::fb_console::fb_debug_square,
         options(noreturn)
     );
 }

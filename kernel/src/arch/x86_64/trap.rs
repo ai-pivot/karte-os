@@ -165,21 +165,23 @@ pub fn trap_return_user_addr() -> usize {
 pub unsafe extern "C" fn trap_return_user() {
     unsafe {
         core::arch::naked_asm!(
+            // ── DIAGNOSTIC 18: trap_return_user entered (kernel CR3) ──
+            "mov rdi, 18",
+            "mov rsi, 0x00000080",      // dark red
+            "call {fb_sq}",
+
             // ── Do ALL kernel housekeeping BEFORE restoring GP registers ──
             // These operations clobber RAX, RCX, RDX. They must happen before
             // the pop sequence so user-mode register values are preserved.
 
             // ── Disable interrupts before ANY kernel housekeeping ──
-            // This prevents Timer ISR from firing between FS_BASE wrmsr and
-            // iretq, which would corrupt TASK_FS_BASE with stale MSR values.
             "cli",
 
             // ── Restore FS_BASE for TLS ──
-            // schedule() sets PENDING_FS_BASE before __switch.
             "mov rax, [rip + {pending_fs_base}]",
             "test rax, rax",
             "jz 4f",
-            "mov rcx, 0xC0000100",  // IA32_FS_BASE MSR
+            "mov rcx, 0xC0000100",
             "mov rdx, rax",
             "shr rdx, 32",
             "mov eax, eax",
@@ -189,14 +191,11 @@ pub unsafe extern "C" fn trap_return_user() {
             "4:",
 
             // ── Set DS/ES from ss field before pops clobber rsp-relative offsets ──
-            // ss is at rsp + 120 + 32 = rsp + 0x98
             "mov ax, [rsp + 0x98]",
             "mov ds, ax",
             "mov es, ax",
 
             // ── Update TSS.RSP0 and SYSCALL_KSP ──
-            // kernel_sp is at rsp + 160 = rsp + 0xA0
-            // user_cr3  is at rsp + 168 = rsp + 0xA8
             "mov rax, [rsp + 0xA0]",
             "cmp rax, 0",
             "je 3f",
@@ -207,13 +206,53 @@ pub unsafe extern "C" fn trap_return_user() {
             "mov [rip + {syscall_ksp}], rax",
             "3:",
 
+            // ── DIAGNOSTIC 19: FS_BASE + DS/ES + TSS.RSP0 done ──
+            "mov rdi, 19",
+            "mov rsi, 0x0000FFFF",      // yellow
+            "call {fb_sq}",
+
             // ── Switch to user page table if user_cr3 is set ──
-            // Interrupts already disabled (cli above).
             "cmp qword ptr [rsp + 0xA8], 0",
             "je 2f",
+
+            // ── DIAGNOSTIC 20: about to mov cr3 ──
+            "mov rdi, 20",
+            "mov rsi, 0x0000FF00",      // green
+            "call {fb_sq}",
+
             "mov rax, [rsp + 0xA8]",
             "mov cr3, rax",
+
+            // ── DIAGNOSTIC 21: mov cr3 done (now in user page table) ──
+            "mov rdi, 21",
+            "mov rsi, 0x00FF0000",      // blue
+            "call {fb_sq}",
             "2:",
+
+            // ── DIAGNOSTIC 22: about to pop regs + iretq (last visible checkpoint) ──
+            "mov rdi, 22",
+            "mov rsi, 0x00FFFFFF",      // white
+            "call {fb_sq}",
+
+            // ── DIAGNOSTIC 22.5: verify iretq frame rip == 0x1000 ──
+            // After 15 pops, rsp will point to iretq frame. Check the rip field
+            // now (at rsp + 0x78 = 15*8) before popping.
+            "mov rax, [rsp + 0x78]",   // rip
+            "cmp rax, 0x1000",
+            "je 5f",
+            // rip != 0x1000 → draw red square at slot 17 (warning)
+            "mov rdi, 17",
+            "mov rsi, 0x000000FF",     // red
+            "call {fb_sq}",
+            "5:",
+            // Also verify cs has RPL=3
+            "mov rax, [rsp + 0x80]",   // cs
+            "test rax, 3",
+            "jnz 6f",
+            "mov rdi, 17",
+            "mov rsi, 0x00FF0000",     // blue (cs has no RPL=3)
+            "call {fb_sq}",
+            "6:",
 
             // ── Restore general-purpose registers ──
             "pop rax",
@@ -232,20 +271,13 @@ pub unsafe extern "C" fn trap_return_user() {
             "pop r14",
             "pop r15",
             // After 15 pops, rsp now points to the iretq frame (rip field).
-            // Layout from rsp:
-            //   +0:  rip        (+0x00)
-            //   +8:  cs         (+0x08)
-            //   +16: rflags     (+0x10)
-            //   +24: rsp        (+0x18)
-            //   +32: ss         (+0x20)
-            //   +40: kernel_sp  (+0x28)  ← already consumed above
-            //   +48: user_cr3   (+0x30)  ← already consumed above
 
             // ── Return to Ring 3 ──
             "iretq",
             tss_rsp0_addr = sym super::super::gdt::TSS_RSP0_ADDR,
             syscall_ksp = sym super::super::idt::SYSCALL_KSP,
             pending_fs_base = sym PENDING_FS_BASE,
+            fb_sq = sym crate::arch::fb_console::fb_debug_square,
         );
     }
 }
@@ -260,8 +292,10 @@ pub fn init() {
     // IOAPIC routes external IRQs to LAPIC vectors.
     // Must come after LAPIC init so the LAPIC can accept the redirected IRQs.
     super::ioapic::init();
-    // Enable LAPIC timer last — now both LAPIC and IOAPIC are ready.
-    super::lapic::enable_timer();
+    // Do not enable the LAPIC timer here. On real hardware a pending timer
+    // interrupt can fire immediately after the first iretq enables IF, before
+    // user code executes its first syscall. The syscall path enables the timer
+    // after proving Ring 3 entry works.
 }
 
 /// Enable timer interrupts via LAPIC.

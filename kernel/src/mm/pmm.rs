@@ -267,7 +267,7 @@ pub fn init_with_size(mem_size: usize) {
     unsafe {
         MEMORY_SIZE = mem_size;
     }
-    let allocator = FrameAllocator::new();
+    let mut allocator = FrameAllocator::new();
     let available_mb = allocator.total_frames * PAGE_SIZE / 1024 / 1024;
     *FRAME_ALLOCATOR.lock() = Some(allocator);
     crate::console_println!(
@@ -275,6 +275,167 @@ pub fn init_with_size(mem_size: usize) {
         available_mb,
         mem_size / 1024 / 1024
     );
+    // On UEFI boots, mark non-conventional memory regions as used so PMM
+    // never hands out frames that overlap firmware/MMIO/reserved areas.
+    // Without this, real hardware may allocate a frame whose physical
+    // address points to ACPI/firmware memory → silent corruption when the
+    // ELF loader or page-table allocator writes to it. QEMU's UEFI has a
+    // simple map (0..512MB all conventional) so the bug is invisible there.
+    mark_efi_reserved();
+}
+
+/// EFI memory descriptor (UEFI spec §7.2 "Memory Descriptor").
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EfiMemoryDescriptor {
+    entry_type: u32,
+    _pad: u32,
+    phys_start: u64,
+    virt_start: u64,
+    num_pages: u64,
+    attribute: u64,
+}
+
+const EFI_CONVENTIONAL_MEMORY: u32 = 7;
+const EFI_BOOT_SERVICES_CODE: u32 = 5;
+const EFI_BOOT_SERVICES_DATA: u32 = 6;
+const EFI_LOADER_CODE: u32 = 2;
+const EFI_LOADER_DATA: u32 = 3;
+
+/// Walk the UEFI memory map (if present at 0x20000) and mark every region
+/// that is NOT conventional/boot-services/loader memory as allocated in the
+/// PMM bitmap. This prevents the frame allocator from returning frames that
+/// overlap ACPI, MMIO, runtime, or reserved firmware memory on real hardware.
+#[cfg(target_arch = "x86_64")]
+fn mark_efi_reserved() {
+    // BootInfo at 0x10000, layout (u32 offsets):
+    //   [0]=magic  [8]=memmap_present  [9..10]=memmap_size
+    //   [11]=desc_size  [12]=desc_ver
+    let bi = 0x10000usize as *const u32;
+    let magic = unsafe { core::ptr::read_volatile(bi) };
+    if magic != 0x474F5046 {
+        return; // Not EFI stub booted
+    }
+    let memmap_present = unsafe { core::ptr::read_volatile(bi.add(8)) };
+    if memmap_present == 0 {
+        return; // No memory map captured
+    }
+    let memmap_size = unsafe {
+        let lo = core::ptr::read_volatile(bi.add(9) as *const u32) as u64;
+        let hi = core::ptr::read_volatile(bi.add(10) as *const u32) as u64;
+        (hi << 32) | lo
+    } as usize;
+    let desc_size = unsafe { core::ptr::read_volatile(bi.add(11)) } as usize;
+
+    if desc_size == 0 || memmap_size == 0 {
+        return;
+    }
+
+    let desc_count = memmap_size / desc_size;
+    let map_base = 0x20000usize;
+
+    let mut marked = 0usize;
+    let mut conventional = 0usize;
+
+    crate::console_println!(
+        "[pmm] EFI memmap: {} descriptors, desc_size={}",
+        desc_count,
+        desc_size
+    );
+
+    for i in 0..desc_count {
+        let desc_ptr = (map_base + i * desc_size) as *const EfiMemoryDescriptor;
+        let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
+        let is_usable = desc.entry_type == EFI_CONVENTIONAL_MEMORY
+            || desc.entry_type == EFI_BOOT_SERVICES_CODE
+            || desc.entry_type == EFI_BOOT_SERVICES_DATA
+            || desc.entry_type == EFI_LOADER_CODE
+            || desc.entry_type == EFI_LOADER_DATA;
+
+        // Dump first 16 + last 4 descriptors to see the full memory layout
+        // without flooding the console on firmware with 500+ entries.
+        if i < 16 || i >= desc_count.saturating_sub(4) {
+            let type_name = match desc.entry_type {
+                0 => "Reserved",
+                1 => "LoaderCode",
+                2 => "LoaderData",
+                3 => "BS_Code",
+                4 => "BS_Data",
+                5 => "RT_Code",
+                6 => "RT_Data",
+                7 => "Conv",
+                8 => "Unusable",
+                9 => "ACPI_Recl",
+                10 => "ACPI_NVS",
+                11 => "MMIO",
+                12 => "MMIO_Port",
+                13 => "PalCode",
+                14 => "Persistent",
+                _ => "Unknown",
+            };
+            let kb = (desc.num_pages as usize) * PAGE_SIZE / 1024;
+            crate::console_println!(
+                "  [{:>3}] {:>10} {:#012x}-{:#012x} ({} KB){}",
+                i,
+                type_name,
+                desc.phys_start,
+                desc.phys_start + desc.num_pages * 4096,
+                kb,
+                if is_usable { "" } else { " <- reserved" }
+            );
+        } else if i == 16 {
+            crate::console_println!("  ... ({} more entries) ...", desc_count - 20);
+        }
+
+        if is_usable {
+            conventional += 1;
+            continue;
+        }
+        // Mark every 4KB frame in this region as used in the PMM bitmap.
+        let region_start = desc.phys_start as usize;
+        let region_end = region_start + (desc.num_pages as usize) * PAGE_SIZE;
+        marked += mark_range_used(region_start, region_end);
+    }
+
+    crate::console_println!(
+        "[pmm] EFI memmap: {} conventional, marked {} reserved frames ({} KB)",
+        conventional,
+        marked,
+        marked * PAGE_SIZE / 1024
+    );
+}
+
+/// Mark all frames in [phys_start, phys_end) as used in the PMM bitmap.
+/// Returns the number of frames marked. Frames outside the managed range
+/// are silently skipped (they were never allocatable anyway).
+#[cfg(target_arch = "x86_64")]
+fn mark_range_used(phys_start: usize, phys_end: usize) -> usize {
+    let mut alloc = FRAME_ALLOCATOR.lock();
+    let allocator = match alloc.as_mut() {
+        Some(a) => a,
+        None => return 0,
+    };
+    let page_start = (phys_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let page_end = phys_end & !(PAGE_SIZE - 1);
+    if page_end <= page_start {
+        return 0;
+    }
+    let mut count = 0;
+    let mut pa = page_start;
+    while pa < page_end {
+        let idx: i64 = (pa as i64 - allocator.start as i64) / PAGE_SIZE as i64;
+        if idx >= 0 && (idx as usize) < allocator.total_frames {
+            let i = idx as usize;
+            let word = i / 64;
+            let bit = i % 64;
+            if allocator.bitmap[word] & (1u64 << bit) == 0 {
+                allocator.bitmap[word] |= 1u64 << bit;
+                count += 1;
+            }
+        }
+        pa += PAGE_SIZE;
+    }
+    count
 }
 
 /// Track frame allocation to detect double-mapping bugs.

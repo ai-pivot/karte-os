@@ -2015,6 +2015,7 @@ fn sys_debug_print(buf: usize, len: usize) -> isize {
 
 /// Syscall 1: Exit the current process.
 pub fn sys_exit(code: i32) -> isize {
+    crate::console_println!("[sys_exit] user process exited, code={}", code);
     #[cfg(target_arch = "riscv64")]
     {}
     // ═══════════════════════════════════════════════════════════════

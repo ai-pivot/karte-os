@@ -397,8 +397,8 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             #[cfg(target_arch = "x86_64")]
             {
                 process::Process::from_elf(
-                    include_bytes!("../../user/target/x86_64/shell.elf"),
-                    alloc::vec![b"shell".to_vec()],
+                    include_bytes!("../../user/minimal.elf"),
+                    alloc::vec![b"minimal".to_vec()],
                     alloc::vec![],
                 )
                 .unwrap()
@@ -432,7 +432,36 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                             as *mut crate::mm::vmm::PageTable)
                     };
                     let page_addr = proc.entry & !0xFFF;
-                    if crate::mm::vmm::translate_user(user_pt, page_addr).is_none() {
+                    if let Some(frame) = crate::mm::vmm::translate_user(user_pt, page_addr) {
+                        // Read first 16 bytes of user code via the direct map
+                        let code_ptr = crate::mm::vmm::phys_to_virt(frame) as *const u8;
+                        let b0 = unsafe { code_ptr.read_volatile() };
+                        let b1 = unsafe { code_ptr.add(1).read_volatile() };
+                        let b2 = unsafe { code_ptr.add(2).read_volatile() };
+                        let b3 = unsafe { code_ptr.add(3).read_volatile() };
+                        let b4 = unsafe { code_ptr.add(4).read_volatile() };
+                        let b5 = unsafe { code_ptr.add(5).read_volatile() };
+                        let b6 = unsafe { code_ptr.add(6).read_volatile() };
+                        let b7 = unsafe { code_ptr.add(7).read_volatile() };
+                        crate::console_println!(
+                            "[init] entry {:#x} mapped to frame {:#x}, code: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            page_addr,
+                            frame,
+                            b0, b1, b2, b3, b4, b5, b6, b7
+                        );
+                        // Also dump the raw PTE for the entry page
+                        if let Some(raw_pte) = crate::mm::vmm::debug_pte(user_pt, page_addr) {
+                            crate::console_println!(
+                                "[init] PTE for {:#x} = {:#x} (P={} W={} U={} NX={})",
+                                page_addr,
+                                raw_pte,
+                                raw_pte & 1 != 0,
+                                raw_pte & 2 != 0,
+                                raw_pte & 4 != 0,
+                                raw_pte & (1u64 << 63) != 0,
+                            );
+                        }
+                    } else {
                         crate::console_println!(
                             "[init] WARNING: entry {:#x} NOT mapped!",
                             page_addr

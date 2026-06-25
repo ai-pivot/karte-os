@@ -36,6 +36,17 @@ __switch:
     # ─── CRITICAL: Disable interrupts during context switch ───
     cli
 
+    # DIAG 12: __switch entered
+    push rdi
+    push rsi
+    sub rsp, 8
+    mov edi, 12
+    mov esi, 0x00FF8000
+    call fb_debug_square
+    add rsp, 8
+    pop rsi
+    pop rdi
+
     # ─── SAVE path (current task) ────────────────────────────
     # Save callee-saved registers
     push rbp
@@ -51,7 +62,30 @@ __switch:
     mov rax, rsp            # rax = current RSP (before alignment)
     and rsp, ~0xF           # align to 16 bytes (may move 0 or 8 bytes down)
     sub rsp, 512            # make room for fxsave area (16-byte aligned)
+
+    # DIAG 13: before fxsave64
+    push rdi
+    push rsi
+    sub rsp, 8
+    mov edi, 13
+    mov esi, 0x008000FF
+    call fb_debug_square
+    add rsp, 8
+    pop rsi
+    pop rdi
+
     fxsave64 [rsp]
+
+    # DIAG 14: after fxsave64
+    push rdi
+    push rsi
+    sub rsp, 8
+    mov edi, 14
+    mov esi, 0x000080FF
+    call fb_debug_square
+    add rsp, 8
+    pop rsi
+    pop rdi
 
     # Save original RSP above fxsave area so restore path can find it
     mov [rsp + 512], rax
@@ -63,8 +97,30 @@ __switch:
     # Load next task's frame pointer
     mov rsp, [rsi]
 
+    # DIAG 15: before fxrstor64
+    push rdi
+    push rsi
+    sub rsp, 8
+    mov edi, 15
+    mov esi, 0x0000FF80
+    call fb_debug_square
+    add rsp, 8
+    pop rsi
+    pop rdi
+
     # Restore FPU/SSE state (rsp is 16-byte aligned, set during save path)
     fxrstor64 [rsp]
+
+    # DIAG 16: after fxrstor64
+    push rdi
+    push rsi
+    sub rsp, 8
+    mov edi, 16
+    mov esi, 0x0080FF00
+    call fb_debug_square
+    add rsp, 8
+    pop rsi
+    pop rdi
 
     # Recover original RSP (the value before alignment was applied)
     mov rsp, [rsp + 512]

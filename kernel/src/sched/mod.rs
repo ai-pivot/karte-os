@@ -288,9 +288,19 @@ pub fn user_return_state_for_slot(slot: usize) -> crate::arch::user_return::User
 }
 
 fn switch_to(current: usize, next: usize) {
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::fb_console::fb_debug_square(6, 0x00FF00FF); // magenta: switch_to entered
+
     save_fs_base(current);
+
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::fb_console::fb_debug_square(7, 0x0000FFFF); // yellow: save_fs_base done
+
     CURRENT_RUNNING.store(next, Ordering::Relaxed);
     set_current_process_for_slot(next);
+
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::fb_console::fb_debug_square(8, 0x00FFFFFF); // white: process state set
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -306,14 +316,18 @@ fn switch_to(current: usize, next: usize) {
             }
         };
         if effective_kcr3 != 0 {
+            crate::arch::fb_console::fb_debug_square(9, 0x0000FF00); // green: about to restore kernel CR3
             unsafe {
                 core::arch::asm!("mov cr3, {}", in(reg) effective_kcr3);
             }
+            crate::arch::fb_console::fb_debug_square(10, 0x00FF0000); // blue: kernel CR3 restored
         }
     }
 
     let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
     let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::fb_console::fb_debug_square(11, 0x000000FF); // red: about to call __switch
     unsafe {
         __switch(cur_ptr, nxt_ptr);
     }
@@ -759,6 +773,28 @@ fn allocate_user_slot(
 
 pub fn spawn_user_task(proc_idx: usize, init: UserTaskInit) -> Result<usize, SchedError> {
     let initial_sp = build_initial_stack(init);
+    // Diagnostic: dump the TrapContext that __switch will pop into + iretq from.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
+        let switch_frame_size: usize = 8 * 8 + 512;
+        let trap_ctx_base = initial_sp + switch_frame_size;
+        let ctx = unsafe {
+            &*(trap_ctx_base as *const crate::arch::trap::TrapContext)
+        };
+        crate::console_println!(
+            "[spawn] slot ctx @ {:#x}: rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x} ksp={:#x} ucr3={:#x} tfu={}",
+            trap_ctx_base,
+            ctx.rip,
+            ctx.cs,
+            ctx.rflags,
+            ctx.rsp,
+            ctx.ss,
+            ctx.kernel_sp,
+            ctx.user_cr3,
+            ctx.trap_from_user,
+        );
+    }
     allocate_user_slot(proc_idx, init.kernel_stack_top, initial_sp)
 }
 

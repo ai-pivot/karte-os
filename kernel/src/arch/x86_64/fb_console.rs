@@ -5,7 +5,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Framebuffer state — initialized once from multiboot2
-static FB_ADDR:   AtomicU64 = AtomicU64::new(0);
+pub(crate) static FB_ADDR:   AtomicU64 = AtomicU64::new(0);
 static FB_PITCH:  AtomicU64 = AtomicU64::new(0);
 static FB_WIDTH:  AtomicU64 = AtomicU64::new(0);
 static FB_HEIGHT: AtomicU64 = AtomicU64::new(0);
@@ -37,6 +37,51 @@ pub fn init(addr: usize, pitch: u32, width: u32, height: u32, bpp: u8) {
 
 pub fn is_ready() -> bool {
     FB_READY.load(Ordering::Relaxed)
+}
+
+/// Draw a visible 32x32 diagnostic square near the top of the screen.
+/// Used when serial output is unavailable on real hardware.
+#[unsafe(no_mangle)]
+pub extern "C" fn fb_debug_square(slot: usize, color: u32) {
+    if !FB_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    let addr = FB_ADDR.load(Ordering::Relaxed) as usize;
+    let pitch = FB_PITCH.load(Ordering::Relaxed) as usize;
+    let bpp = (FB_BPP.load(Ordering::Relaxed) / 8) as usize;
+    let width = FB_WIDTH.load(Ordering::Relaxed) as usize;
+    if addr == 0 || pitch == 0 || bpp < 4 || width == 0 {
+        return;
+    }
+
+    let size = 32usize;
+    let gap = 6usize;
+    let x0 = 16 + slot * (size + gap);
+    if x0 + size >= width {
+        return;
+    }
+    for y in 0..size {
+        for x in 0..size {
+            let offset = y * pitch + (x0 + x) * bpp;
+            unsafe {
+                core::ptr::write_volatile((addr + offset) as *mut u32, color);
+            }
+        }
+    }
+}
+
+pub fn framebuffer_region() -> Option<(usize, usize)> {
+    if !FB_READY.load(Ordering::Relaxed) {
+        return None;
+    }
+    let addr = FB_ADDR.load(Ordering::Relaxed) as usize;
+    let pitch = FB_PITCH.load(Ordering::Relaxed) as usize;
+    let height = FB_HEIGHT.load(Ordering::Relaxed) as usize;
+    let bpp = (FB_BPP.load(Ordering::Relaxed) as usize) / 8;
+    if addr == 0 || pitch == 0 || height == 0 || bpp == 0 {
+        return None;
+    }
+    Some((addr, pitch * height))
 }
 
 pub fn cols() -> usize {
