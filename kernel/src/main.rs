@@ -490,7 +490,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 };
 
                 #[cfg(target_arch = "x86_64")]
-                let user_page_table = 0usize; // TEST: use kernel CR3
+                let user_page_table = proc.page_table_root << 12;
 
                 crate::console_println!("[init] Entering user mode...");
 
