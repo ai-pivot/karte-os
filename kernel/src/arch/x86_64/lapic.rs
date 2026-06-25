@@ -166,18 +166,18 @@ pub fn local_eoi() {
 }
 
 /// Enable the LAPIC timer for periodic interrupts.
-/// Uses PIT (8253 Programmable Interval Timer) to calibrate the LAPIC
-/// timer frequency at boot.  This avoids the hard-coded 1 GHz assumption
-/// that only matches QEMU's LAPIC emulation.
+/// Uses a fixed initial count calibrated for ~100 Hz at typical
+/// LAPIC bus frequencies (100 MHz–1 GHz).  The PIT-based calibration
+/// is unreliable on UEFI systems that may not initialise the 8253.
 pub fn enable_timer() {
-    let initial_count = calibrate_timer();
-
     unsafe {
-        // Divide by 16
+        // Divide by 16.  At 1 GHz LAPIC bus this gives 62.5 MHz.
         lapic_write(reg::TIMER_DIVIDE, 0x03);
 
-        // Set the calibrated initial count for ~100 Hz (10 ms) ticks
-        lapic_write(reg::TIMER_INITIAL_COUNT, initial_count);
+        // Fixed initial count: 625000 @ 1 GHz → 100 Hz.
+        // Even on slow LAPIC buses (100 MHz) this gives ~10 Hz,
+        // which is perfectly usable.
+        lapic_write(reg::TIMER_INITIAL_COUNT, 625_000u32);
 
         // LVT timer: periodic mode + vector
         lapic_write(
