@@ -332,5 +332,17 @@ pub fn init() {
     }
     }
     crate::console_println!("[pci] Found {} devices", devices.len());
+
+    // After identity-mapping PCI BARs, the CPU's paging-structure
+    // cache may be inconsistent — BAR mappings that share a PML4/PDP
+    // entry with the GOP framebuffer cause full-cache evictions.
+    // A global TLB flush resets everything so subsequent framebuffer
+    // accesses don't require cold 4-level page walks.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
 }
 
