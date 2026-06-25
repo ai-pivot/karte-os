@@ -1908,7 +1908,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_EXEC => sys_exec(args[0], args[1], args[2], args[3]),
         SYS_EXEC_FD => sys_exec_fd(args[0], args[1], args[2] as i32, args[3] as i32),
         SYS_WAITPID => sys_waitpid(args[0]),
-        SYS_LS => sys_ls(args[0], args[1]),
+        SYS_LS => sys_ls(args[0], args[1], args[2], args[3]),
         SYS_MKDIR => sys_mkdir(args[0], args[1]),
         SYS_UNLINK => sys_unlink(args[0], args[1]),
         SYS_SETENV => sys_setenv(args[0], args[1], args[2], args[3]),
@@ -3789,19 +3789,29 @@ fn sys_chdir(path: usize, path_len: usize) -> isize {
 }
 
 /// Syscall 40: List filesystem contents.
-/// Lists the current working directory (CWD).
+/// If path_len > 0, lists the given directory (relative to CWD or absolute).
+/// Otherwise lists the current working directory (CWD).
 /// Writes a formatted listing to the user buffer (name + size per line).
 /// Returns total bytes written, or error.
-fn sys_ls(buf: usize, len: usize) -> isize {
+fn sys_ls(buf: usize, len: usize, path_ptr: usize, path_len: usize) -> isize {
     if buf == 0 || len == 0 {
         return ERR_INVAL;
     }
 
-    // Get the directory path to list: resolve CWD to a path relative to root
-    let cwd = crate::env::get("CWD").unwrap_or_else(|| alloc::string::String::from("/"));
-    let dir_path = cwd.trim_start_matches('/');
+    // Resolve the directory path to list
+    let dir_path: alloc::string::String;
+    if path_len > 0 && path_ptr != 0 {
+        let path_bytes = user_read_bytes(path_ptr, path_len.min(512));
+        let user_path = core::str::from_utf8(&path_bytes).unwrap_or("/");
+        let user_path = user_path.trim_end_matches('\0');
+        dir_path = resolve_path(user_path);
+    } else {
+        let cwd = crate::env::get("CWD").unwrap_or_else(|| alloc::string::String::from("/"));
+        dir_path = cwd;
+    }
+    let dir_key = dir_path.trim_start_matches('/');
 
-    let files = crate::driver::fs::list_directory(dir_path);
+    let files = crate::driver::fs::list_directory(dir_key);
 
     let mut written: usize = 0;
     for (name, size) in files {

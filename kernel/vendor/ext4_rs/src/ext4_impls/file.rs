@@ -391,7 +391,6 @@ impl Ext4 {
                 };
 
                 let new_block = fs.balloc_alloc_block(inode_ref, goal)?;
-                #[cfg(target_arch = "x86_64")]
                 let mut newex = Ext4Extent::default();
                 newex.first_block = lblock;
                 newex.store_pblock(new_block);

@@ -204,3 +204,11 @@ pub fn winsize() -> (usize, usize) {
         (80, 25) // default
     }
 }
+
+/// List a directory (or CWD if path is empty). Returns raw listing bytes, -1 on error.
+/// Uses sys_ls(buf, len, path, path_len).
+pub unsafe fn ls_dir(path: &[u8], buf: &mut [u8]) -> isize {
+    let path_ptr = if path.is_empty() { 0 } else { path.as_ptr() as usize };
+    let path_len = path.len();
+    syscall4(SYS_LS, buf.as_ptr() as usize, buf.len(), path_ptr, path_len)
+}

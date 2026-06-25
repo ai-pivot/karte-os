@@ -118,9 +118,62 @@ unsafe fn read_line(buf: &mut [u8]) -> usize {
                 }
             }
             0x09 => {
-                // Tab — basic echo of newline + re-prompt
-                print(b"\r\n$ ");
-                print(&buf[..pos]);
+                // Tab completion — list matching files in CWD
+                // Extract the last word being typed
+                let mut word_start = pos;
+                while word_start > 0 && buf[word_start - 1] != b' ' && buf[word_start - 1] != b'|' && buf[word_start - 1] != b'<' && buf[word_start - 1] != b'>' { word_start -= 1; }
+                let prefix = &buf[word_start..pos];
+
+                // Get directory listing
+                let mut listing = [0u8; 4096];
+                let n = ls_dir(&[], &mut listing);
+                if n <= 0 { print(b"\x07"); break; }
+                let listing = &listing[..n as usize];
+
+                // Find matches by prefix
+                let mut matches: [[u8; 64]; 16] = [[0; 64]; 16];
+                let mut match_count: usize = 0;
+                let mut i = 0;
+                while i < listing.len() && match_count < 16 {
+                    let mut end = i;
+                    while end < listing.len() && listing[end] != b'\t' && listing[end] != b'\n' { end += 1; }
+                    let name = &listing[i..end];
+                    if !name.is_empty() && prefix.is_empty() || (name.len() >= prefix.len() && {
+                        let mut ok = true;
+                        for k in 0..prefix.len() { if name[k] != prefix[k] { ok = false; break; } }
+                        ok
+                    }) {
+                        let l = name.len().min(63);
+                        matches[match_count][..l].copy_from_slice(&name[..l]);
+                        match_count += 1;
+                    }
+                    while end < listing.len() && (listing[end] == b'\t' || listing[end] == b'\n') { end += 1; }
+                    i = end;
+                }
+
+                if match_count == 0 {
+                    print(b"\x07"); // bell
+                } else if match_count == 1 {
+                    // Single match: complete it
+                    let name = &matches[0];
+                    let name_len = name.iter().position(|&b| b == 0).unwrap_or(64);
+                    let suffix = &name[prefix.len()..name_len];
+                    for &b in suffix {
+                        if pos < buf.len() - 1 { buf[pos] = b; pos += 1; print(&[b]); }
+                    }
+                    // Add trailing space for directories (heuristic: no dot in last component)
+                    if pos < buf.len() - 1 { buf[pos] = b' '; pos += 1; print(b" "); }
+                } else {
+                    // Multiple matches: show list
+                    print(b"\r\n");
+                    for m in 0..match_count {
+                        let name = &matches[m];
+                        let name_len = name.iter().position(|&b| b == 0).unwrap_or(64);
+                        if name_len > 0 { print(&name[..name_len]); print(b"  "); }
+                    }
+                    print(b"\r\n$ ");
+                    print(&buf[..pos]);
+                }
             }
             0x20..=0x7E => {
                 if pos < buf.len() - 1 {
