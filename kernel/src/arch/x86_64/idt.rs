@@ -594,8 +594,21 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     let interrupted_cs = unsafe { *((stack_ptr + 136) as *const u64) };
     let from_user = interrupted_cs & 0x3 != 0;
     super::lapic::local_eoi();
+    crate::driver::tty::poll_uart();
     crate::arch::platform::tick_uptime();
     crate::sched::tick_sleep_queue();
+
+    // Poll network stack. Uses is_initialized() guard internally.
+    if crate::net::iface::NetStack::is_initialized() {
+        crate::net::iface::NetStack::poll();
+    }
+
+    // Poll USB keyboard (XHCI). Uses is_available() guard internally.
+    if crate::driver::xhci::is_available() {
+        if let Some(key) = crate::driver::xhci::poll_keyboard() {
+            crate::driver::tty::feed_byte(key);
+        }
+    }
 
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if !from_user {

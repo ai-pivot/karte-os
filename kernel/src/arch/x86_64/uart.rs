@@ -129,19 +129,62 @@ impl ComPort {
 /// Global COM1 instance (protected by a spin lock for concurrent access).
 static COM1: spin::Mutex<ComPort> = spin::Mutex::new(ComPort::new(COM1_BASE));
 
+/// Whether a real UART hardware is present at COM1_BASE.
+/// Determined once during init_uart(); false on systems without serial hardware.
+static UART_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Initialize COM1 UART.
 pub fn init_uart() {
-    COM1.lock().init();
+    let present = uart_probe();
+    UART_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+    if present {
+        COM1.lock().init();
+    }
+}
+
+/// Probe whether a real UART is present at COM1_BASE.
+/// Standard 8250/16550 probe: write 0 to IER (Interrupt Enable Register at base+1),
+/// then read it back. On a real UART the upper 4 bits are always 0. If reads back
+/// all-ones (0xFF), the port is unconnected (open bus).
+fn uart_probe() -> bool {
+    unsafe {
+        let ier_port: u16 = COM1_BASE + 1;
+        // Read current IER
+        let ier: u8;
+        core::arch::asm!("in al, dx", out("al") ier, in("dx") ier_port);
+        // Upper nibble must be 0 on a real 8250/16550
+        if ier & 0xF0 != 0 {
+            return false;
+        }
+        // Write 0 and read back — must stay 0 in lower nibble
+        core::arch::asm!("out dx, al", in("dx") ier_port, in("al") 0u8);
+        let ier2: u8;
+        core::arch::asm!("in al, dx", out("al") ier2, in("dx") ier_port);
+        if ier2 & 0xF0 != 0 || ier2 != 0 {
+            // After writing 0, IER should read as 0 on a real UART.
+            // But some hardware might have RX interrupt enabled by firmware.
+            // Accept any value where upper nibble is 0.
+            return ier2 & 0xF0 == 0;
+        }
+        true
+    }
 }
 
 /// Write a byte to COM1 (console output).
 pub fn putchar(c: u8) {
+    if !UART_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     COM1.lock().put_char(c);
 }
 
 /// Read a byte from COM1 (non-blocking).
 /// Returns `None` if no data is available.
 pub fn getchar() -> Option<u8> {
+    if !UART_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     unsafe {
         // Read LSR directly via inline assembly to bypass any Port abstraction issues
         let lsr: u8;
@@ -158,6 +201,9 @@ pub fn getchar() -> Option<u8> {
 
 /// Check if COM1 has incoming data.
 pub fn has_data() -> bool {
+    if !UART_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     unsafe {
         let lsr: u8;
         core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1_BASE + 5u16);
