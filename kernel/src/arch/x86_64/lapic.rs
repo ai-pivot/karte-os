@@ -169,45 +169,13 @@ pub fn local_eoi() {
 /// Uses the TSC (always available on x86_64) to calibrate the LAPIC
 /// timer frequency, avoiding the 8253 PIT which UEFI may not initialise.
 pub fn enable_timer() {
-    let initial_count = calibrate_timer();
-
     unsafe {
-        // Divide by 16
-        lapic_write(reg::TIMER_DIVIDE, 0x03);
-
-        // Set the calibrated initial count for ~100 Hz (10 ms) ticks
-        lapic_write(reg::TIMER_INITIAL_COUNT, initial_count);
-
-        // LVT timer: periodic mode + vector
+        lapic_write(reg::TIMER_DIVIDE, 0x0A); // divide by 128
+        lapic_write(reg::TIMER_INITIAL_COUNT, 10_000u32);
         lapic_write(
             reg::LVT_TIMER,
             TIMER_MODE_PERIODIC | super::idt::TIMER_VECTOR as u32,
         );
-    }
-}
-
-/// Calibrate the LAPIC timer against the TSC (Time Stamp Counter).
-/// The TSC runs at the CPU's base clock and requires no firmware setup.
-fn calibrate_timer() -> u32 {
-    use core::arch::x86_64::_rdtsc;
-
-    const TSC_WAIT: u64 = 30_000_000; // ≈ 10 ms at 3 GHz; enough for calibration
-
-    unsafe {
-        // Set LAPIC timer to max count
-        lapic_write(reg::TIMER_DIVIDE, 0x03); // divide by 16
-        lapic_write(reg::TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
-
-        let tsc_start = _rdtsc();
-        while _rdtsc() < tsc_start + TSC_WAIT {
-            core::hint::spin_loop();
-        }
-
-        let remaining = lapic_read(reg::TIMER_CURRENT_COUNT);
-        let elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining);
-
-        // Clamp to reasonable range (prevents insane values)
-        elapsed.clamp(100_000, 10_000_000)
     }
 }
 
