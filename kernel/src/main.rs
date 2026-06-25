@@ -111,7 +111,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         if mem_upper_kb > 0 {
             let total_ram = 1024 * 1024 + (mem_upper_kb as usize) * 1024;
             crate::console_println!(
-                "[init] Multiboot2 memory: {} MB total",
+                "\x1b[92m[  OK  ]\x1b[0m Memory: {} MB total",
                 total_ram / 1024 / 1024
             );
             mm::pmm::init_with_size(total_ram - 0x0020_0000);
@@ -136,8 +136,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         }
     }
 
-    crate::console_println!("=== KarteOS v0.2.0 ===");
-    crate::console_println!("  Booting on hart {}", hartid);
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::fb_console::boot_splash();
+    crate::console_println!("\x1b[96m[ KarteOS ]\x1b[0m \x1b[1m v0.6 \x1b[0m — \x1b[90mhart {}\x1b[0m", hartid);
 
     // Initialize kernel logger before any subsystem that uses `log::`
     crate::kernel_log::init();

@@ -1,5 +1,5 @@
-//! Framebuffer text console using GOP framebuffer.
-//! 8x16 ASCII font + 16x16 CJK font, UTF-8, double-width, 4K auto-scaling.
+//! Framebuffer text console with ANSI colors, CJK, 4K scaling.
+//! 16-color VGA palette, SGR escape code parsing, boot splash.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -18,6 +18,35 @@ const CHAR_WIDE_W: usize = 16;
 const CHAR_H: usize = 16;
 static SCALE: AtomicU64 = AtomicU64::new(1);
 
+// ─── ANSI color state ──────────────────────────────────────────
+static FG_COLOR: AtomicU64 = AtomicU64::new(7);  // default: white
+static BG_COLOR: AtomicU64 = AtomicU64::new(0);  // default: black
+static IN_ESC:   AtomicBool = AtomicBool::new(false);
+static CSI_BUF:  [AtomicU64; 8] = [
+    AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),
+    AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),AtomicU64::new(0),
+];
+static CSI_COUNT: AtomicU64 = AtomicU64::new(0);
+static CSI_ACCUM: AtomicU64 = AtomicU64::new(0);
+static CSI_Q:     AtomicBool = AtomicBool::new(false);
+
+/// 16-color VGA palette (RGB 8-bit per channel)
+const PALETTE: [[u8; 3]; 16] = [
+    [0x00,0x00,0x00], [0xAA,0x00,0x00], [0x00,0xAA,0x00], [0xAA,0x55,0x00],
+    [0x00,0x00,0xAA], [0xAA,0x00,0xAA], [0x00,0xAA,0xAA], [0xAA,0xAA,0xAA],
+    [0x55,0x55,0x55], [0xFF,0x55,0x55], [0x55,0xFF,0x55], [0xFF,0xFF,0x55],
+    [0x55,0x55,0xFF], [0xFF,0x55,0xFF], [0x55,0xFF,0xFF], [0xFF,0xFF,0xFF],
+];
+
+fn palette_rgb(idx: u8) -> u32 {
+    let p = &PALETTE[(idx & 0x0F) as usize];
+    ((p[2] as u32) << 16) | ((p[1] as u32) << 8) | (p[0] as u32)
+}
+
+fn fg_rgb() -> u32 { palette_rgb(FG_COLOR.load(Ordering::Relaxed) as u8) }
+fn bg_rgb() -> u32 { palette_rgb(BG_COLOR.load(Ordering::Relaxed) as u8) }
+
+// ─── Fonts ─────────────────────────────────────────────────────
 static FONT: &[u8; 2048] = include_bytes!("font8x16.bin");
 static CJK_FONT: &[u8] = include_bytes!("font16x16_cjk.bin");
 const CJK_START: u32 = 0x4E00;
@@ -33,8 +62,7 @@ fn is_wide(cp: u32) -> bool {
     || cp >= 0x2E80 && cp <= 0xA4CF
     || cp >= 0xAC00 && cp <= 0xD7A3
     || cp >= 0xF900 && cp <= 0xFAFF
-    || cp >= 0xFE10 && cp <= 0xFE1F
-    || cp >= 0xFE30 && cp <= 0xFE6F
+    || cp >= 0xFE10 && cp <= 0xFE6F
     || cp >= 0xFF01 && cp <= 0xFF60
     || cp >= 0xFFE0 && cp <= 0xFFE6
 }
@@ -50,26 +78,19 @@ fn utf8_decode(byte: u8) -> Option<u32> {
     if byte & 0xC0 == 0x80 {
         if remaining == 0 { return None; }
         let new_cp = (codepoint << 6) | (byte as u32 & 0x3F);
-        if remaining == 1 {
-            UTF8_STATE.store(0, Ordering::Relaxed);
-            return Some(new_cp);
-        }
+        if remaining == 1 { UTF8_STATE.store(0, Ordering::Relaxed); return Some(new_cp); }
         UTF8_STATE.store(((remaining as u64 - 1) << 32) | new_cp as u64, Ordering::Relaxed);
         return None;
     }
-    let (rem, cp) = if byte & 0xE0 == 0xC0 {
-        (1u32, (byte as u32 & 0x1F))
-    } else if byte & 0xF0 == 0xE0 {
-        (2u32, (byte as u32 & 0x0F))
-    } else if byte & 0xF8 == 0xF0 {
-        (3u32, (byte as u32 & 0x07))
-    } else {
-        return None;
-    };
+    let (rem, cp) = if byte & 0xE0 == 0xC0 { (1u32, (byte as u32 & 0x1F)) }
+    else if byte & 0xF0 == 0xE0 { (2u32, (byte as u32 & 0x0F)) }
+    else if byte & 0xF8 == 0xF0 { (3u32, (byte as u32 & 0x07)) }
+    else { return None; };
     UTF8_STATE.store(((rem as u64 - 1) << 32) | cp as u64, Ordering::Relaxed);
     None
 }
 
+// ─── Public API ────────────────────────────────────────────────
 pub fn init(addr: usize, pitch: u32, width: u32, height: u32, bpp: u8) {
     FB_ADDR.store(addr as u64, Ordering::Relaxed);
     FB_PITCH.store(pitch as u64, Ordering::Relaxed);
@@ -78,6 +99,8 @@ pub fn init(addr: usize, pitch: u32, width: u32, height: u32, bpp: u8) {
     FB_BPP.store(bpp as u64, Ordering::Relaxed);
     let s: u64 = if width >= 3840 || height >= 2160 { 2 } else { 1 };
     SCALE.store(s, Ordering::Relaxed);
+    FG_COLOR.store(7, Ordering::Relaxed);
+    BG_COLOR.store(0, Ordering::Relaxed);
     FB_READY.store(true, Ordering::Relaxed);
 }
 
@@ -93,7 +116,26 @@ pub fn framebuffer_region() -> Option<(usize, usize)> {
 
 pub fn cols() -> usize { (FB_WIDTH.load(Ordering::Relaxed) as usize) / (CHAR_W * scale()) }
 pub fn rows() -> usize { (FB_HEIGHT.load(Ordering::Relaxed) as usize) / (CHAR_H * scale()) }
+pub fn cur_row() -> usize { CURSOR_Y.load(Ordering::Relaxed) as usize }
 
+/// Clear screen with current background color.
+pub fn clear_screen() {
+    let addr = FB_ADDR.load(Ordering::Relaxed) as usize;
+    let total = FB_PITCH.load(Ordering::Relaxed) as usize * FB_HEIGHT.load(Ordering::Relaxed) as usize;
+    let bpp = FB_BPP.load(Ordering::Relaxed) as usize / 8;
+    let bg = bg_rgb();
+    // Fill all pixels with background color
+    for y in 0..FB_HEIGHT.load(Ordering::Relaxed) as usize {
+        let row_start = addr + y * FB_PITCH.load(Ordering::Relaxed) as usize;
+        for x in 0..FB_WIDTH.load(Ordering::Relaxed) as usize {
+            unsafe { core::ptr::write_volatile((row_start + x * bpp) as *mut u32, bg); }
+        }
+    }
+    CURSOR_X.store(0, Ordering::Relaxed);
+    CURSOR_Y.store(0, Ordering::Relaxed);
+}
+
+// ─── Rendering ─────────────────────────────────────────────────
 fn scroll_up() {
     let addr = FB_ADDR.load(Ordering::Relaxed) as usize;
     let pitch = FB_PITCH.load(Ordering::Relaxed) as usize;
@@ -114,17 +156,17 @@ fn put_pixel_s(px: usize, py: usize, color: u32) {
     let pitch = FB_PITCH.load(Ordering::Relaxed) as usize;
     let bpp = (FB_BPP.load(Ordering::Relaxed) / 8) as usize;
     let s = scale();
-    let py_base = py * s;
-    let px_base = px * s;
+    let pyb = py * s;
+    let pxb = px * s;
     for dy in 0..s {
         for dx in 0..s {
-            let offset = (py_base + dy) * pitch + (px_base + dx) * bpp;
+            let offset = (pyb + dy) * pitch + (pxb + dx) * bpp;
             unsafe { core::ptr::write_volatile((addr + offset) as *mut u32, color); }
         }
     }
 }
 
-fn draw_glyph_16(glyph_idx: usize, px: usize, py: usize) {
+fn draw_glyph_16(glyph_idx: usize, px: usize, py: usize, fg: u32, bg: u32) {
     if glyph_idx >= CJK_COUNT as usize { return; }
     let glyph = &CJK_FONT[glyph_idx * 32..][..32];
     for y in 0..CHAR_H {
@@ -132,35 +174,34 @@ fn draw_glyph_16(glyph_idx: usize, px: usize, py: usize) {
             let byte_idx = y * 2 + x / 8;
             let bit_idx = 7 - (x % 8);
             let pixel = (glyph[byte_idx] >> bit_idx) & 1;
-            let color: u32 = if pixel != 0 { 0xFFFFFFFF } else { 0x00000000 };
-            put_pixel_s(px + x, py + y, color);
+            put_pixel_s(px + x, py + y, if pixel != 0 { fg } else { bg });
         }
     }
 }
 
-fn draw_glyph_8(glyph_idx: usize, px: usize, py: usize) {
+fn draw_glyph_8(glyph_idx: usize, px: usize, py: usize, fg: u32, bg: u32) {
     let glyph = &FONT[glyph_idx * CHAR_H..][..CHAR_H];
     for y in 0..CHAR_H {
         let line = glyph[y];
         for x in 0..CHAR_W {
             let bit = (line >> (7 - x)) & 1;
-            put_pixel_s(px + x, py + y, if bit != 0 { 0xFFFFFFFF } else { 0x00000000 });
+            put_pixel_s(px + x, py + y, if bit != 0 { fg } else { bg });
         }
     }
 }
 
-fn draw_char_cp(cp: u32, col: usize, row: usize) {
+fn draw_char_cp(cp: u32, col: usize, row: usize, fg: u32, bg: u32) {
     let s = scale();
     let px = col * CHAR_W * s;
     let py = row * CHAR_H * s;
     if is_wide(cp) {
         if cp >= CJK_START && cp < CJK_START + CJK_COUNT {
-            draw_glyph_16((cp - CJK_START) as usize, px, py);
+            draw_glyph_16((cp - CJK_START) as usize, px, py, fg, bg);
         } else {
-            draw_glyph_8(b'?' as usize & 0x7F, px, py);
+            draw_glyph_8(b'?' as usize & 0x7F, px, py, fg, bg);
         }
     } else {
-        draw_glyph_8((cp as usize) & 0x7F, px, py);
+        draw_glyph_8((cp as usize) & 0x7F, px, py, fg, bg);
     }
 }
 
@@ -176,8 +217,92 @@ fn advance_cursor(adv: usize) {
     CURSOR_Y.store(y as u64, Ordering::Relaxed);
 }
 
+// ─── ANSI CSI parser ───────────────────────────────────────────
+fn csi_dispatch(c: u8) {
+    match c {
+        b'm' => {
+            let count = CSI_COUNT.load(Ordering::Relaxed) as usize;
+            for i in 0..count {
+                let v = CSI_BUF[i].load(Ordering::Relaxed) as u8;
+                match v {
+                    0  => { FG_COLOR.store(7, Ordering::Relaxed); BG_COLOR.store(0, Ordering::Relaxed); }
+                    1  => { /* bold = bright */ }
+                    30..=37 => FG_COLOR.store((v - 30) as u64, Ordering::Relaxed),
+                    40..=47 => BG_COLOR.store((v - 40) as u64, Ordering::Relaxed),
+                    90..=97 => FG_COLOR.store((v - 90 + 8) as u64, Ordering::Relaxed),
+                    100..=107 => BG_COLOR.store((v - 100 + 8) as u64, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+        }
+        b'J' => {
+            // CSI 2J = clear screen
+            let v = CSI_BUF[0].load(Ordering::Relaxed);
+            if v == 2 { clear_screen(); }
+        }
+        b'H' => {
+            // CSI row;col H = cursor position
+            let r = CSI_BUF[0].load(Ordering::Relaxed) as usize;
+            let c = CSI_BUF[1].load(Ordering::Relaxed) as usize;
+            CURSOR_X.store((if c > 0 { c - 1 } else { 0 }) as u64, Ordering::Relaxed);
+            CURSOR_Y.store((if r > 0 { r - 1 } else { 0 }) as u64, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    CSI_COUNT.store(0, Ordering::Relaxed);
+    CSI_ACCUM.store(0, Ordering::Relaxed);
+    IN_ESC.store(false, Ordering::Relaxed);
+}
+
+/// Process one byte through ANSI escape code parser. Returns true if byte was consumed.
+fn ansi_feed(byte: u8) -> bool {
+    if !IN_ESC.load(Ordering::Relaxed) && byte != 0x1B { return false; }
+    // Start ESC sequence
+    if byte == 0x1B {
+        IN_ESC.store(true, Ordering::Relaxed);
+        CSI_COUNT.store(0, Ordering::Relaxed);
+        CSI_ACCUM.store(0, Ordering::Relaxed);
+        CSI_Q.store(false, Ordering::Relaxed);
+        return true;
+    }
+    if !IN_ESC.load(Ordering::Relaxed) { return false; }
+
+    if byte == b'[' {
+        return true;
+    }
+
+    if (b'0'..=b'9').contains(&byte) {
+        let v = CSI_ACCUM.load(Ordering::Relaxed) * 10 + (byte - b'0') as u64;
+        CSI_ACCUM.store(v, Ordering::Relaxed);
+        return true;
+    }
+
+    if byte == b';' {
+        let idx = CSI_COUNT.fetch_add(1, Ordering::Relaxed) as usize;
+        if idx < 8 { CSI_BUF[idx].store(CSI_ACCUM.swap(0, Ordering::Relaxed), Ordering::Relaxed); }
+        return true;
+    }
+
+    if byte == b'?' {
+        CSI_Q.store(true, Ordering::Relaxed);
+        return true;
+    }
+
+    // Final byte: dispatch
+    let idx = CSI_COUNT.load(Ordering::Relaxed) as usize;
+    if idx < 8 { CSI_BUF[idx].store(CSI_ACCUM.swap(0, Ordering::Relaxed), Ordering::Relaxed); }
+    CSI_COUNT.fetch_add(1, Ordering::Relaxed);
+    csi_dispatch(byte);
+    true
+}
+
+// ─── putchar ───────────────────────────────────────────────────
 pub fn putchar(byte: u8) {
     if !FB_READY.load(Ordering::Relaxed) { return; }
+
+    // ANSI escape parsing
+    if ansi_feed(byte) { return; }
+
     let max_rows = rows();
     match byte {
         b'\n' => {
@@ -192,7 +317,9 @@ pub fn putchar(byte: u8) {
             if let Some(cp) = utf8_decode(byte) {
                 let x = CURSOR_X.load(Ordering::Relaxed) as usize;
                 let y = CURSOR_Y.load(Ordering::Relaxed) as usize;
-                draw_char_cp(cp, x, y);
+                let fg = fg_rgb();
+                let bg = bg_rgb();
+                draw_char_cp(cp, x, y, fg, bg);
                 advance_cursor(if is_wide(cp) { 2 } else { 1 });
             }
         }
@@ -201,6 +328,66 @@ pub fn putchar(byte: u8) {
 
 pub fn write_str(s: &str) { for &b in s.as_bytes() { putchar(b); } }
 
+/// Print a string centered horizontally on the current row.
+pub fn centered(s: &str) {
+    let w = s.len(); // rough (ASCII only)
+    let col = cols();
+    let pad = if col > w { (col - w) / 2 } else { 0 };
+    for _ in 0..pad { putchar(b' '); }
+    write_str(s);
+    putchar(b'\n');
+}
+
+/// Draw a horizontal line of `ch` characters at the current row.
+pub fn hline(ch: u8, w: usize) {
+    let total = w.min(cols());
+    for _ in 0..total { putchar(ch); }
+    putchar(b'\n');
+}
+
+// ─── Boot splash ───────────────────────────────────────────────
+pub fn boot_splash() {
+    if !FB_READY.load(Ordering::Relaxed) { return; }
+    let w = cols();
+    clear_screen();
+
+    // ── Top decorative bar ──
+    FG_COLOR.store(0, Ordering::Relaxed); // text: black
+    BG_COLOR.store(7, Ordering::Relaxed); // bg: bright white
+    for _ in 0..w { putchar(b' '); } // fill row
+    CURSOR_X.store(0, Ordering::Relaxed);
+
+    // ── Brand line ──
+    BG_COLOR.store(0, Ordering::Relaxed); // bg: black
+    FG_COLOR.store(15, Ordering::Relaxed); // bright white
+    CURSOR_Y.store(2, Ordering::Relaxed);
+    centered("╔══════════════════════════════════════╗");
+    centered("║       K a r t e O S    v 0 . 6      ║");
+    centered("║    modern microkernel · Rust 2024    ║");
+    centered("╚══════════════════════════════════════╝");
+
+    // ── Decorative separator ──
+    CURSOR_Y.store((CURSOR_Y.load(Ordering::Relaxed) + 1) as u64, Ordering::Relaxed);
+    FG_COLOR.store(8, Ordering::Relaxed); // dark gray
+    hline(b'-', w);
+
+    // ── Reset to default white on black ──
+    FG_COLOR.store(7, Ordering::Relaxed);
+    BG_COLOR.store(0, Ordering::Relaxed);
+    putchar(b'\n');
+}
+
+/// Print a boot log line: colored prefix + message.
+pub fn boot_log(prefix: &str, prefix_color: u8, msg: &str) {
+    FG_COLOR.store(prefix_color as u64, Ordering::Relaxed);
+    write_str(prefix);
+    FG_COLOR.store(7, Ordering::Relaxed); // white
+    write_str(" ");
+    write_str(msg);
+    putchar(b'\n');
+}
+
+// ─── Debug square ──────────────────────────────────────────────
 #[unsafe(no_mangle)]
 pub extern "C" fn fb_debug_square(slot: usize, color: u32) {
     if !FB_READY.load(Ordering::Relaxed) { return; }

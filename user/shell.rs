@@ -171,7 +171,7 @@ unsafe fn read_line(buf: &mut [u8]) -> usize {
                         let name_len = name.iter().position(|&b| b == 0).unwrap_or(64);
                         if name_len > 0 { print(&name[..name_len]); print(b"  "); }
                     }
-                    print(b"\r\n$ ");
+                    print(b"\r\n\x1b[1;36m$\x1b[0m ");
                     print(&buf[..pos]);
                 }
             }
@@ -681,7 +681,7 @@ unsafe extern "C" fn _start() -> ! {
     let mut line_buf = [0u8; LINE_BUF_SIZE];
 
     loop {
-        print(b"$ ");
+        print(b"[1;36m$[0m ");
         let len = read_line(&mut line_buf);
         if len == 0 { continue; }
 
