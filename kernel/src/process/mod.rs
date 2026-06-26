@@ -249,7 +249,7 @@ pub(crate) fn copy_kernel_mappings(user_pt: &mut vmm::PageTable, kernel_stack_to
         // mapping, the first user sys_write/prompt can page-fault after iretq on
         // real UEFI boots where the framebuffer is outside the standard MMIO range.
         if let Some((fb_addr, fb_size)) = crate::arch::fb_console::framebuffer_region() {
-            vmm::identity_map_region(user_pt, fb_addr, fb_size);
+            vmm::identity_map_framebuffer_wc(user_pt, fb_addr, fb_size);
         }
 
         // Kernel stack pages are already covered by the shared direct map

@@ -78,8 +78,12 @@ pub struct LimineMemmapRequest {
 #[used]
 #[unsafe(link_section = ".limine_reqs")]
 pub static FRAMEBUFFER_REQUEST: LimineFramebufferRequest = LimineFramebufferRequest {
-    id: [LIMINE_COMMON_MAGIC[0], LIMINE_COMMON_MAGIC[1],
-         LIMINE_FRAMEBUFFER_MAGIC[0], LIMINE_FRAMEBUFFER_MAGIC[1]],
+    id: [
+        LIMINE_COMMON_MAGIC[0],
+        LIMINE_COMMON_MAGIC[1],
+        LIMINE_FRAMEBUFFER_MAGIC[0],
+        LIMINE_FRAMEBUFFER_MAGIC[1],
+    ],
     revision: 0,
     response: core::ptr::null_mut(),
 };
@@ -88,8 +92,12 @@ pub static FRAMEBUFFER_REQUEST: LimineFramebufferRequest = LimineFramebufferRequ
 #[used]
 #[unsafe(link_section = ".limine_reqs")]
 pub static MEMMAP_REQUEST: LimineMemmapRequest = LimineMemmapRequest {
-    id: [LIMINE_COMMON_MAGIC[0], LIMINE_COMMON_MAGIC[1],
-         LIMINE_MEMMAP_MAGIC[0], LIMINE_MEMMAP_MAGIC[1]],
+    id: [
+        LIMINE_COMMON_MAGIC[0],
+        LIMINE_COMMON_MAGIC[1],
+        LIMINE_MEMMAP_MAGIC[0],
+        LIMINE_MEMMAP_MAGIC[1],
+    ],
     revision: 0,
     response: core::ptr::null_mut(),
 };
@@ -111,11 +119,17 @@ pub fn has_framebuffer() -> bool {
 
 /// Get the first Limine framebuffer
 pub fn get_framebuffer() -> Option<&'static LimineFramebuffer> {
-    if FRAMEBUFFER_REQUEST.response.is_null() { return None; }
+    if FRAMEBUFFER_REQUEST.response.is_null() {
+        return None;
+    }
     let resp = unsafe { &*FRAMEBUFFER_REQUEST.response };
-    if resp.framebuffer_count == 0 || resp.framebuffers.is_null() { return None; }
+    if resp.framebuffer_count == 0 || resp.framebuffers.is_null() {
+        return None;
+    }
     let fb = unsafe { &**resp.framebuffers };
-    if fb.address.is_null() { return None; }
+    if fb.address.is_null() {
+        return None;
+    }
     Some(fb)
 }
 
@@ -131,7 +145,11 @@ pub fn init_framebuffer() -> bool {
         );
         crate::console_println!(
             "[limine] FB at {:#x} {}x{} pitch={} bpp={}",
-            fb.address as usize, fb.width, fb.height, fb.pitch, fb.bpp
+            fb.address as usize,
+            fb.width,
+            fb.height,
+            fb.pitch,
+            fb.bpp
         );
         FRAMEBUFFER_READY.store(true, Ordering::Relaxed);
         true

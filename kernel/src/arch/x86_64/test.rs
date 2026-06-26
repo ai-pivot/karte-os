@@ -36,6 +36,16 @@ pub fn run_tests() {
     test_vma_fork_clone();
     test_vma_stack_scratch_bound();
     test_restore_zero_fs_base();
+    test_usb_descriptor_parser();
+    test_usb_setup_packet_encoding();
+    test_usb_rejects_truncated_descriptors();
+    test_usb_find_hid_keyboard();
+    test_usb_proto0_not_boot_keyboard_without_report();
+    test_usb_hid_report_keyboard_detection();
+    test_xhci_interrupt_interval_encoding();
+    test_hid_letters_shift_caps();
+    test_hid_digits_shift_symbols();
+    test_hid_control_keys();
 }
 
 fn test_trap_context_size() {
@@ -548,5 +558,200 @@ fn test_restore_zero_fs_base() {
         crate::sched::set_task_fs_base(slot, orig_task);
 
         restored == 0
+    });
+}
+
+// ─── USB core / HID tests ──────────────────────────────────────────────
+
+fn sample_keyboard_config() -> [u8; 34] {
+    [
+        // Configuration descriptor
+        0x09,
+        crate::driver::usb::USB_DESC_CONFIGURATION,
+        0x22,
+        0x00,
+        0x01,
+        0x01,
+        0x00,
+        0x80,
+        0x32,
+        // Interface descriptor (HID, boot, keyboard)
+        0x09,
+        crate::driver::usb::USB_DESC_INTERFACE,
+        0x00,
+        0x00,
+        0x01,
+        crate::driver::usb::USB_CLASS_HID,
+        0x01,
+        0x01,
+        0x00,
+        // HID descriptor
+        0x09,
+        crate::driver::usb::USB_DESC_HID,
+        0x11,
+        0x01,
+        0x00,
+        0x01,
+        crate::driver::usb::USB_DESC_HID_REPORT,
+        0x41,
+        0x00,
+        // Endpoint descriptor (IN, EP1, interrupt)
+        0x07,
+        crate::driver::usb::USB_DESC_ENDPOINT,
+        0x81,
+        crate::driver::usb::USB_ENDPOINT_XFER_INT,
+        0x08,
+        0x00,
+        0x0A,
+    ]
+}
+
+fn test_usb_descriptor_parser() {
+    run_test("usb config descriptor parse", || {
+        let blob = sample_keyboard_config();
+        let parsed = match crate::driver::usb::ParsedConfiguration::parse(&blob) {
+            Some(p) => p,
+            None => return false,
+        };
+        parsed.interfaces.len() == 1
+            && parsed.interfaces[0].endpoints.len() == 1
+            && parsed.interfaces[0].hid.is_some()
+    });
+}
+
+fn test_usb_find_hid_keyboard() {
+    run_test("usb find_hid_keyboard", || {
+        let blob = sample_keyboard_config();
+        let parsed = match crate::driver::usb::ParsedConfiguration::parse(&blob) {
+            Some(p) => p,
+            None => return false,
+        };
+        match parsed.find_hid_keyboard() {
+            Some((iface, ep)) => {
+                iface.iface.b_interface_class == crate::driver::usb::USB_CLASS_HID
+                    && iface.iface.b_interface_protocol == 0x01
+                    && ep.number() == 1
+                    && ep.direction_in()
+                    && ep.transfer_type() == crate::driver::usb::USB_ENDPOINT_XFER_INT
+                    && ep.max_packet_size() == 8
+            }
+            None => false,
+        }
+    });
+}
+
+fn test_usb_proto0_not_boot_keyboard_without_report() {
+    run_test("usb proto0 not boot keyboard", || {
+        let mut blob = sample_keyboard_config();
+        blob[16] = 0x00;
+        let parsed = match crate::driver::usb::ParsedConfiguration::parse(&blob) {
+            Some(p) => p,
+            None => return false,
+        };
+        parsed.find_hid_keyboard().is_none()
+    });
+}
+
+fn test_usb_hid_report_keyboard_detection() {
+    run_test("usb hid report keyboard detection", || {
+        let keyboard_report = [
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x06, // Usage (Keyboard)
+            0xA1, 0x01, // Collection (Application)
+            0x05, 0x07, // Usage Page (Keyboard/Keypad)
+            0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+            0xC0,
+        ];
+        let mouse_report = [
+            0x05, 0x01, // Usage Page (Generic Desktop)
+            0x09, 0x02, // Usage (Mouse)
+            0xA1, 0x01, // Collection (Application)
+            0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
+            0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0xC0, 0xC0,
+        ];
+        crate::driver::usb::hid_report_has_keyboard_usage(&keyboard_report)
+            && !crate::driver::usb::hid_report_has_keyboard_usage(&mouse_report)
+    });
+}
+
+fn test_xhci_interrupt_interval_encoding() {
+    run_test("xhci interrupt interval encoding", || {
+        use crate::driver::usb::{UsbSpeed, xhci};
+        xhci::xhci_interrupt_interval(UsbSpeed::High, 7) == 6
+            && xhci::xhci_interrupt_interval(UsbSpeed::Full, 10) == 6
+            && xhci::xhci_interrupt_interval(UsbSpeed::Low, 1) == 3
+    });
+}
+
+fn test_usb_setup_packet_encoding() {
+    run_test("usb setup packet encode", || {
+        let s = crate::driver::usb::SetupPacket::new(
+            crate::driver::usb::USB_DIR_IN
+                | crate::driver::usb::USB_TYPE_STANDARD
+                | crate::driver::usb::USB_RECIP_DEVICE,
+            crate::driver::usb::USB_REQ_GET_DESCRIPTOR,
+            (crate::driver::usb::USB_DESC_DEVICE as u16) << 8,
+            0,
+            18,
+        );
+        let p = s.encode_trb_parameter();
+        (p & 0xFF) == s.bm_request_type as u64
+            && ((p >> 8) & 0xFF) == s.b_request as u64
+            && ((p >> 16) & 0xFFFF) == s.w_value as u64
+            && ((p >> 32) & 0xFFFF) == s.w_index as u64
+            && ((p >> 48) & 0xFFFF) == s.w_length as u64
+    });
+}
+
+fn test_usb_rejects_truncated_descriptors() {
+    run_test("usb rejects truncated descriptors", || {
+        use crate::driver::usb::{
+            ConfigDescriptor, DeviceDescriptor, EndpointDescriptor, HidDescriptor,
+            InterfaceDescriptor,
+        };
+        DeviceDescriptor::parse(&[0x12, crate::driver::usb::USB_DESC_DEVICE, 0]).is_none()
+            && ConfigDescriptor::parse(&[0x09, crate::driver::usb::USB_DESC_CONFIGURATION])
+                .is_none()
+            && InterfaceDescriptor::parse(&[0x09, crate::driver::usb::USB_DESC_INTERFACE, 0])
+                .is_none()
+            && EndpointDescriptor::parse(&[0x07, crate::driver::usb::USB_DESC_ENDPOINT]).is_none()
+            && HidDescriptor::parse(&[0x09, crate::driver::usb::USB_DESC_HID]).is_none()
+    });
+}
+
+fn test_hid_letters_shift_caps() {
+    run_test("hid letters shift/caps", || {
+        use crate::driver::usb::hid;
+        // Reset caps state first.
+        hid::set_caps_for_test(false);
+        let a_lower = hid::hid_to_ascii(0x04, 0) == b'a';
+        let a_upper_shift = hid::hid_to_ascii(0x04, 0x02) == b'A';
+        hid::set_caps_for_test(true);
+        let a_upper_caps = hid::hid_to_ascii(0x04, 0) == b'A';
+        let a_lower_caps_shift = hid::hid_to_ascii(0x04, 0x02) == b'a';
+        hid::set_caps_for_test(false);
+        a_lower && a_upper_shift && a_upper_caps && a_lower_caps_shift
+    });
+}
+
+fn test_hid_digits_shift_symbols() {
+    run_test("hid digits shift to symbols", || {
+        use crate::driver::usb::hid;
+        hid::set_caps_for_test(false);
+        hid::hid_to_ascii(0x1E, 0) == b'1'
+            && hid::hid_to_ascii(0x1E, 0x02) == b'!'
+            && hid::hid_to_ascii(0x27, 0) == b'0'
+            && hid::hid_to_ascii(0x27, 0x02) == b')'
+    });
+}
+
+fn test_hid_control_keys() {
+    run_test("hid control keys map", || {
+        use crate::driver::usb::hid;
+        hid::set_caps_for_test(false);
+        hid::hid_to_ascii(0x28, 0) == b'\n'
+            && hid::hid_to_ascii(0x2B, 0) == b'\t'
+            && hid::hid_to_ascii(0x2A, 0) == 0x7F
+            && hid::hid_to_ascii(0x2C, 0) == b' '
     });
 }

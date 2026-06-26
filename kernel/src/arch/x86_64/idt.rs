@@ -15,6 +15,10 @@ pub const KEYBOARD_VECTOR: u8 = IRQ_BASE + 1;
 pub const COM1_VECTOR: u8 = IRQ_BASE + 4;
 pub const SPURIOUS_VECTOR: u8 = IRQ_BASE + 7;
 pub const PAGE_FAULT_VECTOR: u8 = 14; // CPU exception vector for #PF
+/// XHCI USB host-controller interrupt vector. We pin it to IRQ 11 (a common
+/// PCI INTx line for USB controllers); `install_xhci_vector` patches the IDT
+/// entry at `IRQ_BASE + irq_line` if the firmware assigns a different line.
+pub const XHCI_VECTOR: u8 = IRQ_BASE + 11;
 
 // ─── MSR constants for SYSCALL/SYSRET ─────────────────────────
 const MSR_EFER: u32 = 0xC000_0080;
@@ -70,8 +74,7 @@ pub static mut KERNEL_CR3_PHYS: u64 = 0;
 /// Get kernel CR3 physical address. Safe to call from trap handlers.
 /// Global tick counter for timekeeping
 static TICK_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static TIMER_STARTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static TIMER_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Get current tick count (incremented by timer ISR ~100Hz)
 pub fn get_tick_count() -> usize {
@@ -558,8 +561,7 @@ unsafe extern "C" fn syscall_handler_impl(state_ptr: *const u64) -> u64 {
 
         // DIAG: ring the first int 0x80 syscall so we can see whether shell
         // ever reaches user mode and issues syscalls. Uses kernel CR3 by now.
-        static FIRST: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
+        static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         if !FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
             crate::arch::fb_console::fb_debug_square(23, 0x0040FF00);
             crate::console_println!("[diag] first syscall nr={}", syscall_nr);
@@ -603,13 +605,6 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
         crate::net::iface::NetStack::poll();
     }
 
-    // Poll USB keyboard (XHCI). Uses is_available() guard internally.
-    if crate::driver::xhci::is_available() {
-        if let Some(key) = crate::driver::xhci::poll_keyboard() {
-            crate::driver::tty::feed_byte(key);
-        }
-    }
-
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if !from_user {
         return;
@@ -627,7 +622,6 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
         super::trap::activate_page_table(kernel_pt as *const _ as usize);
     }
 
-    // ── Restore FS_BASE for the current task ──
     let fs_base = super::trap::PENDING_FS_BASE.load(core::sync::atomic::Ordering::Relaxed);
     if fs_base != 0 {
         let high = (fs_base >> 32) as u32;
@@ -1812,6 +1806,66 @@ unsafe extern "C" fn com1_isr_stub() -> ! {
     );
 }
 
+/// XHCI USB host-controller ISR. Saves full GP register state (it can
+/// interrupt user code right after a syscall returns), switches to the
+/// kernel CR3, calls the Rust handler that only advances the event ring,
+/// sends EOI, and returns. No blocking work runs here.
+#[unsafe(naked)]
+unsafe extern "C" fn xhci_isr_stub() -> ! {
+    core::arch::naked_asm!(
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbp",
+        "push rbx",
+        "push rax",
+        // Switch to kernel CR3 if user CR3 is active.
+        "mov rax, cr3",
+        "push rax",
+        "mov rax, [rip + {kernel_cr3}]",
+        "cmp rax, 0",
+        "je 4f",
+        "mov cr3, rax",
+        "4:",
+        "sub rsp, 520",
+        "fxsave64 [rsp]",
+        "call {handle}",
+        "call {eoi}",
+        "fxrstor64 [rsp]",
+        "add rsp, 520",
+        "pop rax",
+        "mov cr3, rax",
+        "pop rax",
+        "pop rbx",
+        "pop rbp",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "iretq",
+        handle = sym crate::driver::usb::xhci::handle_irq,
+        eoi = sym super::lapic::local_eoi,
+        kernel_cr3 = sym KERNEL_CR3_PHYS,
+    );
+}
+
 extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
 
 // ─── IDT init ─────────────────────────────────────────────────
@@ -1857,6 +1911,37 @@ fn set_naked_handler(
 /// Same as `set_naked_handler` but takes a raw `*mut u128` for flexibility.
 unsafe fn set_naked_handler_raw(entry: *mut u128, addr: usize, attr: u64, ist_index: u16) {
     write_idt_entry(entry as *mut u64, addr, attr, ist_index);
+}
+
+/// Install the XHCI ISR at IDT vector `IRQ_BASE + irq_line`, using the XHCI
+/// IST stack. Called from `driver::usb::xhci::init` after the PCI device's
+/// `irq_line` is known. If `irq_line` matches the default `XHCI_VECTOR` the
+/// entry is already set up; otherwise this patches the entry at the new
+/// vector so the IOAPIC route delivers to the right handler.
+pub fn install_xhci_vector(irq_line: u8) {
+    let vector = IRQ_BASE + irq_line;
+    if vector == XHCI_VECTOR {
+        return; // already installed during IDT init
+    }
+    let idt = IDT.get().expect("IDT not initialized");
+    // SAFETY: the IDT is a static, single-owner structure initialized once
+    // at boot. We patch one entry at a vector that no other code touches
+    // concurrently (IRQs are still masked at the IOAPIC for this line until
+    // `route_pci_intx` runs). The 16-byte write is observed by the CPU as a
+    // gate descriptor. We go through a raw `*mut u8` to avoid the Rust 2024
+    // `&T as &mut T` UB diagnostic, which is the idiomatic pattern for
+    // patching a `Once`-owned static table.
+    unsafe {
+        let base = idt as *const _ as *mut u8;
+        let entry_size = core::mem::size_of::<u128>();
+        let entry_ptr = base.add(vector as usize * entry_size) as *mut u128;
+        set_naked_handler_raw(
+            entry_ptr,
+            xhci_isr_stub as *const () as usize,
+            0x8E00,
+            super::gdt::XHCI_IST_INDEX,
+        );
+    }
 }
 
 /// Patch the IST index in an IDT entry (bits 32..34 of the low 64-bit word).
@@ -1960,6 +2045,16 @@ pub fn init() {
             com1_isr_stub as *const () as usize,
             0x8E00,
             super::gdt::COM1_IST_INDEX, // Software IST index 4
+        );
+
+        // XHCI USB (default IRQ11): naked ISR with IST[6]. The actual IRQ line
+        // is patched at runtime by `install_xhci_vector` once the PCI device's
+        // irq_line is known.
+        set_naked_handler(
+            &mut idt[XHCI_VECTOR],
+            xhci_isr_stub as *const () as usize,
+            0x8E00,
+            super::gdt::XHCI_IST_INDEX,
         );
 
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);

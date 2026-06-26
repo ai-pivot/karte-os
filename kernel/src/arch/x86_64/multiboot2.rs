@@ -61,7 +61,9 @@ pub fn parse_mbi(mbi_addr: usize) -> (u32, u32, Option<FramebufferInfo>, Option<
     let mut fb: Option<FramebufferInfo> = None;
     let mut efi_st: Option<usize> = None;
 
-    if mbi_addr == 0 { return (0, 0, None, None); }
+    if mbi_addr == 0 {
+        return (0, 0, None, None);
+    }
 
     let mbi = unsafe { &*(mbi_addr as *const MbiHeader) };
     let total_size = mbi.total_size as usize;
@@ -69,7 +71,9 @@ pub fn parse_mbi(mbi_addr: usize) -> (u32, u32, Option<FramebufferInfo>, Option<
 
     while offset + 8 <= total_size {
         let tag = unsafe { &*((mbi_addr + offset) as *const TagHeader) };
-        if tag.tag_type == TAG_TYPE_END { break; }
+        if tag.tag_type == TAG_TYPE_END {
+            break;
+        }
 
         if tag.tag_type == TAG_TYPE_BASIC_MEMINFO {
             let t = unsafe { &*((mbi_addr + offset) as *const BasicMeminfoTag) };
@@ -79,26 +83,18 @@ pub fn parse_mbi(mbi_addr: usize) -> (u32, u32, Option<FramebufferInfo>, Option<
 
         // Memory map tag: accumulate available RAM
         if tag.tag_type == TAG_TYPE_MMAP {
-            let entry_size = unsafe {
-                core::ptr::read_volatile((mbi_addr + offset + 8) as *const u32)
-            } as usize;
-            let entry_version = unsafe {
-                core::ptr::read_volatile((mbi_addr + offset + 12) as *const u32)
-            };
+            let entry_size =
+                unsafe { core::ptr::read_volatile((mbi_addr + offset + 8) as *const u32) } as usize;
+            let entry_version =
+                unsafe { core::ptr::read_volatile((mbi_addr + offset + 12) as *const u32) };
             if entry_version == 0 && entry_size >= 20 {
                 let data_start = mbi_addr + offset + 16;
                 let data_end = mbi_addr + offset + tag.size as usize;
                 let mut pos = data_start;
                 while pos + entry_size <= data_end {
-                    let base = unsafe {
-                        core::ptr::read_volatile(pos as *const u64)
-                    };
-                    let len = unsafe {
-                        core::ptr::read_volatile((pos + 8) as *const u64)
-                    };
-                    let mtype = unsafe {
-                        core::ptr::read_volatile((pos + 16) as *const u32)
-                    };
+                    let base = unsafe { core::ptr::read_volatile(pos as *const u64) };
+                    let len = unsafe { core::ptr::read_volatile((pos + 8) as *const u64) };
+                    let mtype = unsafe { core::ptr::read_volatile((pos + 16) as *const u32) };
                     // Type 1 = available RAM
                     if mtype == 1 {
                         mem_from_map += len;
@@ -112,21 +108,26 @@ pub fn parse_mbi(mbi_addr: usize) -> (u32, u32, Option<FramebufferInfo>, Option<
             let t = unsafe { &*((mbi_addr + offset) as *const FramebufferTag) };
             if t.fb_type == 1 && t.addr != 0 {
                 fb = Some(FramebufferInfo {
-                    addr: t.addr as usize, pitch: t.pitch,
-                    width: t.width, height: t.height, bpp: t.bpp,
+                    addr: t.addr as usize,
+                    pitch: t.pitch,
+                    width: t.width,
+                    height: t.height,
+                    bpp: t.bpp,
                 });
             }
         }
 
         if tag.tag_type == TAG_TYPE_EFI_SYSTAB64 && efi_st.is_none() {
-            let ptr = unsafe {
-                core::ptr::read_volatile((mbi_addr + offset + 8) as *const u64)
-            };
-            if ptr != 0 { efi_st = Some(ptr as usize); }
+            let ptr = unsafe { core::ptr::read_volatile((mbi_addr + offset + 8) as *const u64) };
+            if ptr != 0 {
+                efi_st = Some(ptr as usize);
+            }
         }
 
         let next = (offset + tag.size as usize + 7) & !7;
-        if next <= offset { break; }
+        if next <= offset {
+            break;
+        }
         offset = next;
     }
 
@@ -134,7 +135,8 @@ pub fn parse_mbi(mbi_addr: usize) -> (u32, u32, Option<FramebufferInfo>, Option<
     if mem_from_map > 0 {
         // Convert bytes to KB for mem_upper
         let map_kb = (mem_from_map / 1024) as u32;
-        if map_kb > 1024 { // more than 1MB
+        if map_kb > 1024 {
+            // more than 1MB
             mem_upper = map_kb - 1024; // minus the first 1MB
         } else {
             mem_upper = map_kb;
@@ -146,12 +148,21 @@ pub fn parse_mbi(mbi_addr: usize) -> (u32, u32, Option<FramebufferInfo>, Option<
 
 // EFI structures for GOP lookup
 #[repr(C)]
-struct EfiGuid { data1: u32, data2: u16, data3: u16, data4: [u8; 8] }
+struct EfiGuid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
 
 /// Try to extract GOP framebuffer from EFI System Table.
 pub fn gop_from_efi(efi_system_table: usize) -> Option<FramebufferInfo> {
-    let gop_guid = EfiGuid { data1: 0x9042a9de, data2: 0x23dc, data3: 0x4a38,
-        data4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a] };
+    let gop_guid = EfiGuid {
+        data1: 0x9042a9de,
+        data2: 0x23dc,
+        data3: 0x4a38,
+        data4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+    };
 
     unsafe {
         let st = efi_system_table as *const u8;
@@ -159,33 +170,57 @@ pub fn gop_from_efi(efi_system_table: usize) -> Option<FramebufferInfo> {
         let num_entries = core::ptr::read_volatile(st.add(104) as *const u64) as usize;
         let ct_ptr = core::ptr::read_volatile(st.add(112) as *const u64) as usize;
 
-        crate::console_println!("[gop-efi] st={:#x} entries={} ct={:#x}", efi_system_table, num_entries, ct_ptr);
+        crate::console_println!(
+            "[gop-efi] st={:#x} entries={} ct={:#x}",
+            efi_system_table,
+            num_entries,
+            ct_ptr
+        );
 
-        if ct_ptr == 0 || num_entries == 0 { return None; }
+        if ct_ptr == 0 || num_entries == 0 {
+            return None;
+        }
 
         for i in 0..num_entries {
             let entry = (ct_ptr + i * 16) as *const u8;
             let guid = &*(entry as *const EfiGuid);
-            if guid.data1 == gop_guid.data1 && guid.data2 == gop_guid.data2
-                && guid.data3 == gop_guid.data3 && guid.data4 == gop_guid.data4
+            if guid.data1 == gop_guid.data1
+                && guid.data2 == gop_guid.data2
+                && guid.data3 == gop_guid.data3
+                && guid.data4 == gop_guid.data4
             {
                 crate::console_println!("[gop-efi] Found GOP GUID at entry {}", i);
                 let gop_ptr = core::ptr::read_volatile(entry.add(16) as *const u64) as usize;
-                if gop_ptr == 0 { continue; }
+                if gop_ptr == 0 {
+                    continue;
+                }
                 // GOP protocol: QueryMode(8)+SetMode(8)+Blt(8)+*Mode(8)@24
                 let mode_ptr = core::ptr::read_volatile((gop_ptr + 24) as *const u64) as usize;
-                if mode_ptr == 0 { continue; }
+                if mode_ptr == 0 {
+                    continue;
+                }
                 // GopMode: Max(4)+Mode(4)+*Info(8)+SizeOfInfo(8)+*FbBase(8)@24+FbSize(8)@32
                 let fb_base = core::ptr::read_volatile((mode_ptr + 24) as *const u64) as usize;
                 let info_ptr = core::ptr::read_volatile((mode_ptr + 8) as *const u64) as usize;
-                if info_ptr == 0 || fb_base == 0 { continue; }
+                if info_ptr == 0 || fb_base == 0 {
+                    continue;
+                }
                 let hres = core::ptr::read_volatile(info_ptr as *const u32);
                 let vres = core::ptr::read_volatile((info_ptr + 4) as *const u32);
                 let scanline = core::ptr::read_volatile((info_ptr + 12) as *const u32);
-                crate::console_println!("[gop-efi] fb={:#x} {}x{} scanline={}", fb_base, hres, vres, scanline);
+                crate::console_println!(
+                    "[gop-efi] fb={:#x} {}x{} scanline={}",
+                    fb_base,
+                    hres,
+                    vres,
+                    scanline
+                );
                 return Some(FramebufferInfo {
-                    addr: fb_base, pitch: scanline * 4,
-                    width: hres, height: vres, bpp: 32,
+                    addr: fb_base,
+                    pitch: scanline * 4,
+                    width: hres,
+                    height: vres,
+                    bpp: 32,
                 });
             }
         }

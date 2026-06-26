@@ -20,11 +20,17 @@ fn main() {
         kernel_bin
     } else {
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-        PathBuf::from(manifest_dir).parent().unwrap().join(&kernel_bin)
+        PathBuf::from(manifest_dir)
+            .parent()
+            .unwrap()
+            .join(&kernel_bin)
     };
 
     if !abs_bin.exists() {
-        panic!("KERNEL_BIN_PATH '{}' does not exist. Build the kernel first.", abs_bin.display());
+        panic!(
+            "KERNEL_BIN_PATH '{}' does not exist. Build the kernel first.",
+            abs_bin.display()
+        );
     }
 
     // Derive the ELF path from the flat binary path.
@@ -85,7 +91,10 @@ fn compute_start64_offset(elf_path: &std::path::Path) -> usize {
             } else {
                 addr
             };
-            eprintln!("cargo:info=_start64 offset={:#x} (addr={:#x})", offset, addr);
+            eprintln!(
+                "cargo:info=_start64 offset={:#x} (addr={:#x})",
+                offset, addr
+            );
             offset
         }
         None => {

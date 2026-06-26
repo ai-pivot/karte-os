@@ -26,8 +26,7 @@ pub mod syscall;
 pub mod test;
 
 #[cfg(target_arch = "x86_64")]
-static EARLY_FB_ADDR: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static EARLY_FB_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
@@ -44,27 +43,28 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         // Framebuffer MUST be initialised before any console_println!
         // call, otherwise all early boot messages are silently dropped
         // (fb_console::putchar checks FB_READY which starts false).
-        let efi_stub_booted = unsafe {
-            core::ptr::read_volatile(0x10000usize as *const u32) == 0x474F5046
-        };
+        let efi_stub_booted =
+            unsafe { core::ptr::read_volatile(0x10000usize as *const u32) == 0x474F5046 };
 
         let mut efi_mem_upper_kb: u32 = 524288; // fallback 512 MB
 
         if efi_stub_booted {
             let bi = 0x10000usize as *const u32;
-            let fb_addr =
-                unsafe { core::ptr::read_volatile(bi.add(2) as *const u64) } as usize;
-            let fb_width  = unsafe { core::ptr::read_volatile(bi.add(4) as *const u32) };
+            let fb_addr = unsafe { core::ptr::read_volatile(bi.add(2) as *const u64) } as usize;
+            let fb_width = unsafe { core::ptr::read_volatile(bi.add(4) as *const u32) };
             let fb_height = unsafe { core::ptr::read_volatile(bi.add(5) as *const u32) };
             let fb_stride = unsafe { core::ptr::read_volatile(bi.add(6) as *const u32) };
-            let mem_kb    = unsafe { core::ptr::read_volatile(bi.add(7) as *const u32) };
+            let mem_kb = unsafe { core::ptr::read_volatile(bi.add(7) as *const u32) };
 
             if fb_addr != 0 {
                 EARLY_FB_ADDR.store(fb_addr as u64, core::sync::atomic::Ordering::Relaxed);
                 crate::arch::fb_console::init(fb_addr, fb_stride, fb_width, fb_height, 32);
                 crate::console_println!(
                     "[gop] EFI stub FB at {:#x} {}x{} stride={}",
-                    fb_addr, fb_width, fb_height, fb_stride
+                    fb_addr,
+                    fb_width,
+                    fb_height,
+                    fb_stride
                 );
 
                 // Diagnostic cyan square — proves kernel writes to framebuffer
@@ -72,7 +72,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 let pp = fb_stride as usize / 4;
                 for y in 0..50 {
                     for x in 0..50 {
-                        unsafe { *fb.add(y * pp + (240 + x)) = 0xFFFFFF00u32; }
+                        unsafe {
+                            *fb.add(y * pp + (240 + x)) = 0xFFFFFF00u32;
+                        }
                     }
                 }
             }
@@ -95,12 +97,17 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             if resp.entry_count > 0 && !resp.entries.is_null() {
                 for i in 0..resp.entry_count {
                     let entry = unsafe { &**resp.entries.add(i as usize) };
-                    if entry.entry_type == 0 { // USABLE
+                    if entry.entry_type == 0 {
+                        // USABLE
                         total_mem += entry.length;
                     }
                 }
             }
-            let upper_kb = if total_mem > 0x100000 { ((total_mem - 0x100000) / 1024) as u32 } else { 0 };
+            let upper_kb = if total_mem > 0x100000 {
+                ((total_mem - 0x100000) / 1024) as u32
+            } else {
+                0
+            };
             (0u32, upper_kb, None, None)
         } else {
             // Multiboot2 fallback
@@ -124,9 +131,9 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             let _fb_initialized = if crate::arch::limine::init_framebuffer() {
                 crate::console_println!("[gop] Using Limine framebuffer");
                 true
-            } else if let Some(fb) = fb_info.or_else(|| {
-                efi_st_ptr.and_then(|st| crate::arch::multiboot2::gop_from_efi(st))
-            }) {
+            } else if let Some(fb) = fb_info
+                .or_else(|| efi_st_ptr.and_then(|st| crate::arch::multiboot2::gop_from_efi(st)))
+            {
                 crate::arch::fb_console::init(fb.addr, fb.pitch, fb.width, fb.height, fb.bpp);
                 true
             } else {
@@ -138,7 +145,10 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
     #[cfg(target_arch = "x86_64")]
     crate::arch::fb_console::boot_splash();
-    crate::console_println!("\x1b[96m[ KarteOS ]\x1b[0m \x1b[1m v0.6 \x1b[0m — \x1b[90mhart {}\x1b[0m", hartid);
+    crate::console_println!(
+        "\x1b[96m[ KarteOS ]\x1b[0m \x1b[1m v0.6 \x1b[0m — \x1b[90mhart {}\x1b[0m",
+        hartid
+    );
 
     // Initialize kernel logger before any subsystem that uses `log::`
     crate::kernel_log::init();
@@ -162,7 +172,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         let fb = EARLY_FB_ADDR.load(core::sync::atomic::Ordering::Relaxed) as usize;
         if fb != 0 {
             let root = crate::mm::vmm::get_kernel_page_table();
-            crate::mm::vmm::identity_map_region(root, fb, 64 * 1024 * 1024); // 64 MB
+            crate::mm::vmm::identity_map_framebuffer_wc(root, fb, 64 * 1024 * 1024); // 64 MB
         }
     }
 
@@ -308,11 +318,24 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
             // Initialize XHCI USB first — taking over the controller may
             // disable BIOS legacy PS/2 emulation.  We then re-check PS/2.
+            //
+            // The new USB stack lives in `driver::usb::xhci`. It is gated by
+            // the `XHCI_ENABLE_ENUM` compile-time breaker below: when false
+            // (the safe default) the controller is brought up but no device
+            // enumeration runs, so real-hardware boot cannot regress.
             crate::console_println!("[init] Initializing XHCI USB...");
-            if let Err(e) = crate::driver::xhci::init() {
+            // Breaker: only enumerate devices when explicitly enabled.
+            // QEMU smoke tests enable this via the `xhci_enum` feature;
+            // real-hardware boots keep it off until verified stage by stage.
+            const XHCI_ENABLE_ENUM: bool = cfg!(feature = "xhci_enum");
+            if XHCI_ENABLE_ENUM {
+                if let Err(e) = crate::driver::usb::xhci::init_all_and_enumerate() {
+                    crate::console_println!("[init] XHCI: {}", e);
+                }
+            } else if let Err(e) = crate::driver::usb::xhci::init() {
                 crate::console_println!("[init] XHCI: {}", e);
             } else {
-                crate::driver::xhci::enumerate_keyboard();
+                crate::console_println!("[xhci] enumeration disabled (breaker)");
             }
 
             // Initialize PS/2 keyboard AFTER XHCI.  If XHCI took over
@@ -448,7 +471,14 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                             "[init] entry {:#x} mapped to frame {:#x}, code: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
                             page_addr,
                             frame,
-                            b0, b1, b2, b3, b4, b5, b6, b7
+                            b0,
+                            b1,
+                            b2,
+                            b3,
+                            b4,
+                            b5,
+                            b6,
+                            b7
                         );
                         // Also dump the raw PTE for the entry page
                         if let Some(raw_pte) = crate::mm::vmm::debug_pte(user_pt, page_addr) {

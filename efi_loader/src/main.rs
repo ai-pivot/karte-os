@@ -135,10 +135,10 @@ struct EfiBootServices {
     _pad0: [u8; 16], // offset 24: raise_tpl, restore_tpl
     // offset 40 (0x28): AllocatePages — returns physical address
     allocate_pages: extern "C" fn(
-        u32,        // Type: 0=AllocateAnyPages
-        u32,        // MemoryType: 2=EfiLoaderData
-        usize,      // Pages (count of 4 KiB pages)
-        *mut u64,   // Memory (out: physical address)
+        u32,      // Type: 0=AllocateAnyPages
+        u32,      // MemoryType: 2=EfiLoaderData
+        usize,    // Pages (count of 4 KiB pages)
+        *mut u64, // Memory (out: physical address)
     ) -> usize,
     // offset 48 (0x30): FreePages
     free_pages: extern "C" fn(u64, usize) -> usize,
@@ -159,11 +159,11 @@ struct EfiBootServices {
     _pad8: [u8; 16], // offset 184
     _pad9: [u8; 32], // offset 200
     exit_boot_services: extern "C" fn(EfiHandle, usize) -> usize, // offset 232
-    _pad10: [u8; 16],                                     // offset 240: GetMonotonicCount + Stall
+    _pad10: [u8; 16], // offset 240: GetMonotonicCount + Stall
     set_watchdog_timer: extern "C" fn(usize, u64, u64, *const c_void) -> usize, // offset 256
-    _pad11: [u8; 16],                                     // offset 264: Connect/DisconnectController
-    _pad12: [u8; 24],                                     // offset 280
-    _pad13: [u8; 16],                                     // offset 304
+    _pad11: [u8; 16], // offset 264: Connect/DisconnectController
+    _pad12: [u8; 24], // offset 280
+    _pad13: [u8; 16], // offset 304
     locate_protocol: extern "C" fn(*const EfiGuid, *const c_void, *mut *const c_void) -> usize,
 }
 
@@ -206,7 +206,7 @@ const _GMI: () = {
     assert!(offset_of!(EfiGopModeInfo, vres) == 0x08);
     assert!(offset_of!(EfiGopModeInfo, pixel_format) == 0x0C);
     assert!(offset_of!(EfiGopModeInfo, pixel_info) == 0x10); // EFI_PIXEL_BITMASK = 16 bytes
-    assert!(offset_of!(EfiGopModeInfo, scanline) == 0x20);   // PixelsPerScanLine at 32
+    assert!(offset_of!(EfiGopModeInfo, scanline) == 0x20); // PixelsPerScanLine at 32
 };
 
 #[repr(C)]
@@ -544,9 +544,13 @@ unsafe fn fb_print(s: &str) {
 #[inline]
 unsafe fn fb_pixel(x: usize, y: usize, color: u32) {
     let addr = FB_ADDR;
-    if addr == 0 { return; }
+    if addr == 0 {
+        return;
+    }
     let p = FB_PITCH as usize / 4;
-    if p == 0 { return; }
+    if p == 0 {
+        return;
+    }
     *(addr as *mut u32).add(y * p + x) = color;
 }
 
@@ -642,11 +646,11 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     let bi = BOOT_INFO_ADDR as *mut u32;
     unsafe {
         *bi.add(0) = BOOT_INFO_MAGIC;
-        *bi.add(1) = 0;  // has_fb = 0 initially
+        *bi.add(1) = 0; // has_fb = 0 initially
         *(bi.add(2) as *mut u64) = 0; // fb_addr
-        *bi.add(4) = 0;  // fb_width
-        *bi.add(5) = 0;  // fb_height
-        *bi.add(6) = 0;  // fb_stride
+        *bi.add(4) = 0; // fb_width
+        *bi.add(5) = 0; // fb_height
+        *bi.add(6) = 0; // fb_stride
     }
 
     if !system_table.is_null() {
@@ -683,25 +687,38 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
                         }
                         unsafe {
                             screen_print("GOP: fb=0x");
-                            let mut b = [0u8; 33]; let mut pos = 0;
+                            let mut b = [0u8; 33];
+                            let mut pos = 0;
                             for i in (0..16).rev() {
-                                let nib = ((m.fb_base >> (i*4)) & 0xF) as u8;
-                                b[pos] = if nib < 10 { b'0'+nib } else { b'a'+nib-10 }; pos += 1;
+                                let nib = ((m.fb_base >> (i * 4)) & 0xF) as u8;
+                                b[pos] = if nib < 10 {
+                                    b'0' + nib
+                                } else {
+                                    b'a' + nib - 10
+                                };
+                                pos += 1;
                             }
-                            b[pos] = b' '; pos += 1;
+                            b[pos] = b' ';
+                            pos += 1;
                             // pixel format number
                             let fmt = inf.pixel_format;
-                            b[pos] = b'f'; b[pos+1] = b'm'; b[pos+2] = b't'; b[pos+3] = b'='; pos += 4;
-                            b[pos] = b'0' + fmt as u8; b[pos+1] = b'\n'; b[pos+2] = 0;
-                            screen_print(core::str::from_utf8_unchecked(&b[..pos+2]));
+                            b[pos] = b'f';
+                            b[pos + 1] = b'm';
+                            b[pos + 2] = b't';
+                            b[pos + 3] = b'=';
+                            pos += 4;
+                            b[pos] = b'0' + fmt as u8;
+                            b[pos + 1] = b'\n';
+                            b[pos + 2] = 0;
+                            screen_print(core::str::from_utf8_unchecked(&b[..pos + 2]));
                         }
                     }
                 }
             } else {
                 unsafe {
                     screen_print("GOP: NOT found!\n");
+                }
             }
-        }
         }
     }
 
@@ -709,14 +726,30 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     unsafe {
         screen_print("KERNEL: copying ");
         // print size
-        let mut buf = [0u8; 32]; let mut pos = 0;
+        let mut buf = [0u8; 32];
+        let mut pos = 0;
         let sz = KERNEL_BIN.len() as u64;
-        if sz == 0 { buf[0] = b'0'; pos = 1; }
-        else { let mut n = sz; let mut tmp = [0u8; 20]; let mut i = 0;
-            while n > 0 { tmp[i] = b'0' + (n % 10) as u8; n /= 10; i += 1; }
-            while i > 0 { i -= 1; buf[pos] = tmp[i]; pos += 1; } }
-        buf[pos] = b'\n'; buf[pos+1] = 0;
-        screen_print(core::str::from_utf8_unchecked(&buf[..pos+1]));
+        if sz == 0 {
+            buf[0] = b'0';
+            pos = 1;
+        } else {
+            let mut n = sz;
+            let mut tmp = [0u8; 20];
+            let mut i = 0;
+            while n > 0 {
+                tmp[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                i += 1;
+            }
+            while i > 0 {
+                i -= 1;
+                buf[pos] = tmp[i];
+                pos += 1;
+            }
+        }
+        buf[pos] = b'\n';
+        buf[pos + 1] = 0;
+        screen_print(core::str::from_utf8_unchecked(&buf[..pos + 1]));
     }
     unsafe {
         let dst = KERNEL_PHYS_BASE as *mut u8;
@@ -725,7 +758,9 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
             *dst.add(i) = *src.add(i);
         }
     }
-    unsafe { screen_print("OK\n"); }
+    unsafe {
+        screen_print("OK\n");
+    }
 
     // Set up page tables using UEFI AllocatePages (get true physical addresses)
     let bs = unsafe { &*(*system_table).boot_services };
@@ -767,7 +802,10 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
         fill_bootinfo_and_exit_boot_services(
             system_table,
             image_handle,
-            FB_ADDR, FB_PITCH as u32, FB_WIDTH as u32, FB_HEIGHT as u32,
+            FB_ADDR,
+            FB_PITCH as u32,
+            FB_WIDTH as u32,
+            FB_HEIGHT as u32,
         )
     };
 
@@ -786,7 +824,11 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     unsafe {
         let fb = FB_ADDR as *mut u32;
         let p = FB_PITCH as usize / 4;
-        for y in 0..50 { for x in 0..50 { *fb.add(y * p + x) = 0x00FF0000; } }
+        for y in 0..50 {
+            for x in 0..50 {
+                *fb.add(y * p + x) = 0x00FF0000;
+            }
+        }
     }
 
     if !ebs_ok {
@@ -798,14 +840,22 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
             core::arch::asm!("cli", options(nomem, preserves_flags));
             let fb = FB_ADDR as *mut u32;
             let p = FB_PITCH as usize / 4;
-            for y in 0..50 { for x in 0..50 { *fb.add(y * p + (60 + x)) = 0x00FFFF00; } }
+            for y in 0..50 {
+                for x in 0..50 {
+                    *fb.add(y * p + (60 + x)) = 0x00FFFF00;
+                }
+            }
         }
     } else {
         // B: blue 50x50 square at (60,0) = EBS succeeded
         unsafe {
             let fb = FB_ADDR as *mut u32;
             let p = FB_PITCH as usize / 4;
-            for y in 0..50 { for x in 0..50 { *fb.add(y * p + (60 + x)) = 0x000000FF; } }
+            for y in 0..50 {
+                for x in 0..50 {
+                    *fb.add(y * p + (60 + x)) = 0x000000FF;
+                }
+            }
         }
     }
 
@@ -813,7 +863,11 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
     unsafe {
         let fb = FB_ADDR as *mut u32;
         let p = FB_PITCH as usize / 4;
-        for y in 0..50 { for x in 0..50 { *fb.add(y * p + (120 + x)) = 0x0000FF00; } }
+        for y in 0..50 {
+            for x in 0..50 {
+                *fb.add(y * p + (120 + x)) = 0x0000FF00;
+            }
+        }
     }
 
     // Jump to kernel
@@ -826,7 +880,11 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
         );
     }
     // unreachable: boot_transition is -> !
-    loop { unsafe { core::arch::asm!("hlt"); } }
+    loop {
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
 }
 
 /// _start64 offset within kernel.bin, computed at build time from the
@@ -843,12 +901,12 @@ fn get_start64_offset() -> usize {
 /// EFI Memory Descriptor (UEFI spec §7.2)
 #[repr(C)]
 struct EfiMemoryDescriptor {
-    entry_type: u32,       // Type of memory region
-    _pad: u32,             // padding for alignment
-    phys_start: u64,       // Physical address start
-    virt_start: u64,       // Virtual address start (unused before SetVirtualAddressMap)
-    num_pages: u64,        // Number of 4 KiB pages
-    attribute: u64,        // Memory attributes
+    entry_type: u32, // Type of memory region
+    _pad: u32,       // padding for alignment
+    phys_start: u64, // Physical address start
+    virt_start: u64, // Virtual address start (unused before SetVirtualAddressMap)
+    num_pages: u64,  // Number of 4 KiB pages
+    attribute: u64,  // Memory attributes
 }
 
 // EFI memory types
@@ -863,13 +921,20 @@ const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 unsafe fn fill_bootinfo_and_exit_boot_services(
     system_table: *const EfiSystemTable,
     image_handle: EfiHandle,
-    fb_addr: u64, fb_stride: u32, fb_width: u32, fb_height: u32,
+    fb_addr: u64,
+    fb_stride: u32,
+    fb_width: u32,
+    fb_height: u32,
 ) -> bool {
     if system_table.is_null() {
         return false;
     }
     let st = &*system_table;
-    let bs = if st.boot_services.is_null() { return false; } else { &*st.boot_services };
+    let bs = if st.boot_services.is_null() {
+        return false;
+    } else {
+        &*st.boot_services
+    };
 
     // Disable watchdog timer before EBS
     (bs.set_watchdog_timer)(0, 0, 0, core::ptr::null());
@@ -886,14 +951,22 @@ unsafe fn fill_bootinfo_and_exit_boot_services(
     let mut map_key: usize = 0;
     let mut desc_size: usize = 0;
     let mut desc_version: u32 = 0;
-    (bs.get_memory_map)(&mut map_size, core::ptr::null_mut(),
-                         &mut map_key, &mut desc_size, &mut desc_version);
+    (bs.get_memory_map)(
+        &mut map_size,
+        core::ptr::null_mut(),
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
 
     // Allocate buffer with some headroom
     let alloc_size = (map_size + desc_size * 8).max(65536).min(MEMMAP_MAX_SIZE);
     let mut map_buf_ptr: *mut u8 = core::ptr::null_mut();
-    let status = allocate_pool(EFI_LOADER_DATA as u32, // 2 = EfiLoaderData (NOT 0 = Reserved!)
-                               alloc_size, &mut map_buf_ptr);
+    let status = allocate_pool(
+        EFI_LOADER_DATA as u32, // 2 = EfiLoaderData (NOT 0 = Reserved!)
+        alloc_size,
+        &mut map_buf_ptr,
+    );
 
     // Use the allocated buffer, or fall back to static MAP_BUF.
     // CRITICAL: when falling back, cap map_size to the actual buffer size
@@ -910,8 +983,11 @@ unsafe fn fill_bootinfo_and_exit_boot_services(
     let actual_buf_size = map_buf.len();
     map_size = actual_buf_size;
     let mm_status = (bs.get_memory_map)(
-        &mut map_size, map_buf.as_mut_ptr(),
-        &mut map_key, &mut desc_size, &mut desc_version,
+        &mut map_size,
+        map_buf.as_mut_ptr(),
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
     );
 
     if mm_status != 0 {
@@ -924,7 +1000,7 @@ unsafe fn fill_bootinfo_and_exit_boot_services(
         *bi.add(5) = fb_height;
         *bi.add(6) = fb_stride;
         *bi.add(7) = 524288; // fallback: 512 MB
-        *bi.add(8) = 0;      // no memmap
+        *bi.add(8) = 0; // no memmap
         return false;
     }
 
@@ -960,7 +1036,7 @@ unsafe fn fill_bootinfo_and_exit_boot_services(
     *bi.add(5) = fb_height;
     *bi.add(6) = fb_stride;
     *bi.add(7) = mem_upper_kb as u32;
-    *bi.add(8) = 1;              // memmap_present
+    *bi.add(8) = 1; // memmap_present
     *(bi.add(9) as *mut u64) = (desc_count * desc_size) as u64;
     *bi.add(11) = desc_size as u32;
     *bi.add(12) = desc_version;
@@ -990,8 +1066,14 @@ unsafe fn fill_bootinfo_and_exit_boot_services(
         }
         // Map changed — re-acquire
         map_size = map_buf.len();
-        if (bs.get_memory_map)(&mut map_size, map_buf.as_mut_ptr(),
-                               &mut map_key, &mut desc_size, &mut desc_version) != 0 {
+        if (bs.get_memory_map)(
+            &mut map_size,
+            map_buf.as_mut_ptr(),
+            &mut map_key,
+            &mut desc_size,
+            &mut desc_version,
+        ) != 0
+        {
             break;
         }
     }
@@ -1030,7 +1112,11 @@ unsafe fn setup_page_tables(bs: &EfiBootServices) -> u64 {
     if pml4_pa == 0 || pdp_id_pa == 0 || pdp_dir_pa == 0 || pdp_high_pa == 0 {
         // Cannot continue — page table allocation failed.
         fb_print("FATAL: AllocatePages failed\n");
-        loop { unsafe { core::arch::asm!("hlt"); } }
+        loop {
+            unsafe {
+                core::arch::asm!("hlt");
+            }
+        }
     }
 
     let pml4 = pml4_pa as *mut u64;
@@ -1076,7 +1162,8 @@ unsafe fn setup_page_tables(bs: &EfiBootServices) -> u64 {
     // PML4[0] already points to PDP_IDENTITY which covers 0-512 GB.
     // Instead, add the huge-page entry directly into PDP_IDENTITY.
     let fb = unsafe { FB_ADDR };
-    if fb >= 0x20_0000_0000 { // 128 GB — beyond the identity map
+    if fb >= 0x20_0000_0000 {
+        // 128 GB — beyond the identity map
         let pml4_idx = (fb >> 39) & 0x1FF;
         let pdp_idx = (fb >> 30) & 0x1FF;
         let huge_base = ((fb as u64) >> 30) << 30;

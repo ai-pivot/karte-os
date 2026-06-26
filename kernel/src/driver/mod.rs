@@ -10,8 +10,11 @@ pub mod keyboard;
 #[cfg(target_arch = "x86_64")]
 pub mod ahci;
 
+// The legacy `driver/xhci.rs` prototype has been replaced by the full
+// `driver::usb::xhci` implementation. The old file is removed from the
+// module tree to avoid duplicate symbols; callers use `driver::usb::xhci`.
 #[cfg(target_arch = "x86_64")]
-pub mod xhci;
+pub mod usb;
 
 #[cfg(target_arch = "x86_64")]
 pub mod nvme;

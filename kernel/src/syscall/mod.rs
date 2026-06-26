@@ -2397,17 +2397,18 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
             return ERR_INVAL; // can't read from write end
         }
         Some((FdType::Stdio, _, _)) => {
-             // Stdio stdin (fd 0 default): blocking read from TTY.
-             // Check O_NONBLOCK flag — Go's netpoller requires -EAGAIN when
-             // no data is available, otherwise the entire Go runtime deadlocks.
-             let nonblock = crate::process::with_fd_table(|fdt| {
-               fdt.get(fd as usize)
-                  .map(|d| (d.flags & O_NONBLOCK) != 0)
-                  .unwrap_or(false)
-             });
-             crate::console_println!("[syscall] read fd={} len={} nonblock={}", fd, len, nonblock);
+            // Stdio stdin (fd 0 default): blocking read from TTY.
+            // Check O_NONBLOCK flag — Go's netpoller requires -EAGAIN when
+            // no data is available, otherwise the entire Go runtime deadlocks.
+            let nonblock = crate::process::with_fd_table(|fdt| {
+                fdt.get(fd as usize)
+                    .map(|d| (d.flags & O_NONBLOCK) != 0)
+                    .unwrap_or(false)
+            });
             let mut kbuf = alloc::vec![0u8; len];
             loop {
+                #[cfg(target_arch = "x86_64")]
+                crate::driver::usb::xhci::poll_keyboard();
                 let result = crate::driver::tty::read(kbuf.as_mut_ptr() as usize, len);
                 if result > 0 {
                     let user_buf = UserSliceMut::new(buf, len).unwrap();
@@ -2425,6 +2426,8 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> isize {
                 let proc_idx = crate::process::current_index();
                 crate::driver::tty::set_input_waiter(proc_idx);
                 crate::driver::tty::poll_uart();
+                #[cfg(target_arch = "x86_64")]
+                crate::driver::usb::xhci::poll_keyboard();
                 // Check again after poll — poll_uart may have delivered data
                 let result2 = crate::driver::tty::read(kbuf.as_mut_ptr() as usize, len);
                 if result2 > 0 {

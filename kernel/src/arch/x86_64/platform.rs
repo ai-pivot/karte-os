@@ -94,25 +94,8 @@ pub fn shutdown() -> ! {
 ///
 /// On x86_64, output goes to both COM1 serial port and VGA text buffer.
 pub fn console_putchar(c: u8) {
-    // COM1 serial output (with timeout protection)
-    unsafe {
-        let mut lsr: x86_64::instructions::port::Port<u8> =
-            x86_64::instructions::port::Port::new(0x3FD);
-
-        // Wait until THR is empty (bit 5 of LSR), with timeout
-        let mut timeout = 1_000_000u32;
-        while lsr.read() & 0x20 == 0 {
-            timeout -= 1;
-            if timeout == 0 {
-                break; // Prevent infinite deadlock
-            }
-            core::hint::spin_loop();
-        }
-
-        let mut data: x86_64::instructions::port::Port<u8> =
-            x86_64::instructions::port::Port::new(0x3F8);
-        data.write(c);
-    }
+    // COM1 serial output (if real UART probe succeeded).
+    crate::arch::uart::putchar(c);
 
     // VGA text mode output (if initialized)
     crate::driver::vga::putchar(c);
@@ -130,9 +113,8 @@ pub fn console_write_batch(data: &[u8]) {
         crate::driver::vga::putchar(byte);
         crate::arch::fb_console::putchar(byte);
     }
-    // Batch-write to UART (single code path, efficient port I/O)
-    let mut uart = crate::arch::uart::ComPort::new(0x3F8);
-    uart.write_batch(data);
+    // Batch-write to UART only when a real UART is present.
+    crate::arch::uart::write_batch(data);
 }
 
 /// Execute the HLT instruction — halt until the next interrupt.

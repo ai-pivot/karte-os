@@ -10,59 +10,59 @@ const NET_MAX_PACKET: usize = 1536; // enough for standard ethernet frame
 
 // ─── Register offsets ──────────────────────────────────────────────────
 
-const REG_CTRL:    usize = 0x0000;
-const REG_STATUS:  usize = 0x0008;
-const REG_CTRL_EXT:usize = 0x0018;
-const REG_IMS:     usize = 0x00D0;  // Interrupt Mask Set
-const REG_RCTL:    usize = 0x0100;
-const REG_TCTL:    usize = 0x0400;
-const REG_TIPG:    usize = 0x0410;
+const REG_CTRL: usize = 0x0000;
+const REG_STATUS: usize = 0x0008;
+const REG_CTRL_EXT: usize = 0x0018;
+const REG_IMS: usize = 0x00D0; // Interrupt Mask Set
+const REG_RCTL: usize = 0x0100;
+const REG_TCTL: usize = 0x0400;
+const REG_TIPG: usize = 0x0410;
 
 // Receive descriptor registers
-const REG_RDBAL:   usize = 0x2800;
-const REG_RDBAH:   usize = 0x2804;
-const REG_RDLEN:   usize = 0x2808;
-const REG_RDH:     usize = 0x2810;
-const REG_RDT:     usize = 0x2818;
+const REG_RDBAL: usize = 0x2800;
+const REG_RDBAH: usize = 0x2804;
+const REG_RDLEN: usize = 0x2808;
+const REG_RDH: usize = 0x2810;
+const REG_RDT: usize = 0x2818;
 
 // Transmit descriptor registers
-const REG_TDBAL:   usize = 0x3800;
-const REG_TDBAH:   usize = 0x3804;
-const REG_TDLEN:   usize = 0x3808;
-const REG_TDH:     usize = 0x3810;
-const REG_TDT:     usize = 0x3818;
+const REG_TDBAL: usize = 0x3800;
+const REG_TDBAH: usize = 0x3804;
+const REG_TDLEN: usize = 0x3808;
+const REG_TDH: usize = 0x3810;
+const REG_TDT: usize = 0x3818;
 
 // MAC address registers
-const REG_RAL0:    usize = 0x5400;
-const REG_RAH0:    usize = 0x5404;
+const REG_RAL0: usize = 0x5400;
+const REG_RAH0: usize = 0x5404;
 
 // ─── CTRL bits ─────────────────────────────────────────────────────────
-const CTRL_FD:     u32 = 0x0010_0000; // Full Duplex
+const CTRL_FD: u32 = 0x0010_0000; // Full Duplex
 const CTRL_SPEED_1000: u32 = 0x0040_0000;
-const CTRL_SPEED_100:  u32 = 0x2000_0000;
-const CTRL_SLU:    u32 = 0x0000_0040; // Set Link Up
-const CTRL_RST:    u32 = 0x0400_0000; // Device Reset
-const CTRL_PHY_RST:u32 = 0x8000_0000;
+const CTRL_SPEED_100: u32 = 0x2000_0000;
+const CTRL_SLU: u32 = 0x0000_0040; // Set Link Up
+const CTRL_RST: u32 = 0x0400_0000; // Device Reset
+const CTRL_PHY_RST: u32 = 0x8000_0000;
 
 // ─── RCTL bits ─────────────────────────────────────────────────────────
-const RCTL_EN:     u32 = 0x0000_0002;
-const RCTL_SBP:    u32 = 0x0000_0004; // Store Bad Packets
-const RCTL_UPE:    u32 = 0x0000_0008; // Unicast Promiscuous
-const RCTL_MPE:    u32 = 0x0000_0010; // Multicast Promiscuous
-const RCTL_LPE:    u32 = 0x0000_0020; // Long Packet Enable
-const RCTL_BAM:    u32 = 0x0000_8000; // Broadcast Accept Mode
-const RCTL_BSIZE_2048: u32 = 0x0000_0000;  // Buffer size 2048
-const RCTL_SECRC:  u32 = 0x0400_0000; // Strip CRC
+const RCTL_EN: u32 = 0x0000_0002;
+const RCTL_SBP: u32 = 0x0000_0004; // Store Bad Packets
+const RCTL_UPE: u32 = 0x0000_0008; // Unicast Promiscuous
+const RCTL_MPE: u32 = 0x0000_0010; // Multicast Promiscuous
+const RCTL_LPE: u32 = 0x0000_0020; // Long Packet Enable
+const RCTL_BAM: u32 = 0x0000_8000; // Broadcast Accept Mode
+const RCTL_BSIZE_2048: u32 = 0x0000_0000; // Buffer size 2048
+const RCTL_SECRC: u32 = 0x0400_0000; // Strip CRC
 
 // ─── TCTL bits ─────────────────────────────────────────────────────────
-const TCTL_EN:     u32 = 0x0000_0002;
-const TCTL_PSP:    u32 = 0x0000_0008; // Pad Short Packets
+const TCTL_EN: u32 = 0x0000_0002;
+const TCTL_PSP: u32 = 0x0000_0008; // Pad Short Packets
 const TCTL_CT_SHIFT: usize = 4;
 
 // ─── TX descriptor CMD bits ────────────────────────────────────────────
-const TX_CMD_EOP:  u8 = 0x01; // End of Packet
+const TX_CMD_EOP: u8 = 0x01; // End of Packet
 const TX_CMD_IFCS: u8 = 0x02; // Insert FCS
-const TX_CMD_RS:   u8 = 0x08; // Report Status
+const TX_CMD_RS: u8 = 0x08; // Report Status
 
 const TX_STATUS_DD: u8 = 0x01; // Descriptor Done
 
@@ -139,11 +139,7 @@ pub fn send_raw(data: &[u8]) {
         let buf_addr = tx_base + tx_desc_off + DESC_COUNT * 16 + tx_idx * NET_MAX_PACKET;
 
         // Copy packet data to TX buffer
-        core::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            buf_addr as *mut u8,
-            data.len(),
-        );
+        core::ptr::copy_nonoverlapping(data.as_ptr(), buf_addr as *mut u8, data.len());
 
         // Set up TX descriptor
         (*desc_addr).buffer_addr = buf_addr as u64;
@@ -189,11 +185,7 @@ pub fn recv_raw(buf: &mut [u8]) -> Option<usize> {
 
         // Copy from RX buffer
         let buf_src = rx_base + DESC_COUNT * 16 + next_idx * NET_MAX_PACKET;
-        core::ptr::copy_nonoverlapping(
-            buf_src as *const u8,
-            buf.as_mut_ptr(),
-            pkt_len,
-        );
+        core::ptr::copy_nonoverlapping(buf_src as *const u8, buf.as_mut_ptr(), pkt_len);
 
         // Return descriptor to device
         (*desc_addr).status = 0;
@@ -212,13 +204,19 @@ pub fn init_net_device() -> Option<[u8; 6]> {
     let dev = crate::arch::x86_64::pci::find_e1000()?;
     crate::console_println!(
         "[e1000] Found PCI device did={:#x} at {:02x}:{:02x}.{}",
-        dev.device_id, dev.bus, dev.device, dev.function
+        dev.device_id,
+        dev.bus,
+        dev.device,
+        dev.function
     );
 
     // Enable Bus Master, Memory Space, I/O Space
     let cmd = crate::arch::x86_64::pci::pci_read(dev.bus, dev.device, dev.function, 0x04);
     crate::arch::x86_64::pci::pci_write(
-        dev.bus, dev.device, dev.function, 0x04,
+        dev.bus,
+        dev.device,
+        dev.function,
+        0x04,
         cmd | 0x7, // Bus Master + Mem + IO
     );
 
@@ -236,7 +234,9 @@ pub fn init_net_device() -> Option<[u8; 6]> {
     let mac = unsafe {
         // ── Reset device ──
         reg_write(REG_CTRL, CTRL_RST);
-        for _ in 0..100_000 { core::hint::spin_loop(); }
+        for _ in 0..100_000 {
+            core::hint::spin_loop();
+        }
 
         // ── Read MAC address ──
         let ral = reg_read(REG_RAL0);
@@ -251,7 +251,12 @@ pub fn init_net_device() -> Option<[u8; 6]> {
         ];
         crate::console_println!(
             "[e1000] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
 
         // ── Allocate DMA buffers ──
@@ -295,14 +300,11 @@ pub fn init_net_device() -> Option<[u8; 6]> {
         }
 
         reg_write(REG_IMS, 0);
-        reg_write(REG_RCTL,
-            RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE
-            | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2048
+        reg_write(
+            REG_RCTL,
+            RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | RCTL_BSIZE_2048,
         );
-        reg_write(REG_TCTL,
-            TCTL_EN | TCTL_PSP
-            | (0x0F << TCTL_CT_SHIFT)
-        );
+        reg_write(REG_TCTL, TCTL_EN | TCTL_PSP | (0x0F << TCTL_CT_SHIFT));
 
         let ctrl = reg_read(REG_CTRL);
         reg_write(REG_CTRL, ctrl | CTRL_SLU | CTRL_SPEED_1000 | CTRL_FD);

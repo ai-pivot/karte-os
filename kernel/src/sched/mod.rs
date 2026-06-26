@@ -379,7 +379,17 @@ pub fn schedule_block() {
             task.state = TaskState::Blocked;
         }
 
-        let next = find_next_ready_user(&sched, current).unwrap_or(IDLE_SLOT);
+        let Some(next) = find_next_ready_user(&sched, current) else {
+            // If the current task is the only user task (common for init shell
+            // blocking on stdin), do not switch to IDLE. The caller will retry
+            // its blocking condition, while timer/IRQ paths can still make
+            // progress and wake it later. Switching the sole user task to idle
+            // here leaves no runnable user task to return to.
+            if let Some(ref mut task) = sched.tasks[current] {
+                task.state = TaskState::Running;
+            }
+            return;
+        };
         if let Some(ref mut task) = sched.tasks[next] {
             task.state = TaskState::Running;
         }
@@ -779,9 +789,7 @@ pub fn spawn_user_task(proc_idx: usize, init: UserTaskInit) -> Result<usize, Sch
         let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
         let switch_frame_size: usize = 8 * 8 + 512;
         let trap_ctx_base = initial_sp + switch_frame_size;
-        let ctx = unsafe {
-            &*(trap_ctx_base as *const crate::arch::trap::TrapContext)
-        };
+        let ctx = unsafe { &*(trap_ctx_base as *const crate::arch::trap::TrapContext) };
         crate::console_println!(
             "[spawn] slot ctx @ {:#x}: rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x} ksp={:#x} ucr3={:#x} tfu={}",
             trap_ctx_base,

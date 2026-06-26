@@ -8,6 +8,10 @@ default = []
 test_mode = []
 klog_trace = []
 klog_debug = []
+# XHCI device-enumeration breaker. When enabled, the kernel runs the full
+# USB/HID enumeration path at boot. Keep OFF for real-hardware boots until
+# each stage is verified in QEMU; ON is the QEMU smoke-test default.
+xhci_enum = []
 
 [dependencies]
 linked_list_allocator = "0.10"

@@ -47,7 +47,7 @@ bitflags! {
         const PCD      = 1 << 4;    // Page Cache Disable
         const ACCESSED = 1 << 5;    // A
         const DIRTY    = 1 << 6;    // D
-        const PS       = 1 << 7;    // Page Size (huge page)
+        const PS       = 1 << 7;    // Page Size (huge page); PAT bit on 4KB leaf PTEs
         const GLOBAL   = 1 << 8;    // G
         const NX       = 1 << 63;   // No Execute
 
@@ -397,7 +397,9 @@ fn map_2mb_internal(
         assert!(
             vaddr >= vaddr_offset,
             "direct_map_2mb overflow: phys {:#x} + offset {:#x} = {:#x} — cap phys_end at 0x8000_0000",
-            paddr, vaddr_offset, vaddr
+            paddr,
+            vaddr_offset,
+            vaddr
         );
         let p4_idx = PageTable::vpn(vaddr, 3);
         if !root.entries[p4_idx].is_valid() {
@@ -460,6 +462,18 @@ pub fn identity_map_region(root: &mut PageTable, phys_start: usize, size: usize)
     identity_map_2mb(root, start, end, PTEFlags::KRW);
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn identity_map_framebuffer_wc(root: &mut PageTable, phys_start: usize, size: usize) {
+    let start = phys_start & !0x1F_FFFF; // 2MB align down
+    let end = (phys_start + size + 0x1F_FFFF) & !0x1F_FFFF; // 2MB align up
+    identity_map_2mb(root, start, end, PTEFlags::KRW | PTEFlags::PWT);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn identity_map_framebuffer_wc(root: &mut PageTable, phys_start: usize, size: usize) {
+    identity_map_region(root, phys_start, size);
+}
+
 /// RISC-V fallback: no 2MB huge pages, delegate to regular identity_map.
 #[cfg(not(target_arch = "x86_64"))]
 pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: PTEFlags) {
@@ -467,6 +481,31 @@ pub fn identity_map_2mb(root: &mut PageTable, start: usize, end: usize, flags: P
 }
 
 static mut KERNEL_PAGE_TABLE: *mut PageTable = core::ptr::null_mut();
+
+#[cfg(target_arch = "x86_64")]
+fn configure_pat_for_framebuffer_wc() {
+    const IA32_PAT: u32 = 0x277;
+    const PAT_WC: u64 = 0x01;
+
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!("rdmsr", in("ecx") IA32_PAT, out("eax") lo, out("edx") hi);
+        let mut pat = ((hi as u64) << 32) | (lo as u64);
+
+        // PAT index = PAT*4 + PCD*2 + PWT. For 2MB framebuffer PDEs we keep
+        // PAT=0, PCD=0, PWT=1, so index 1 must be WC.
+        pat = (pat & !(0xFFu64 << 8)) | (PAT_WC << 8);
+
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_PAT,
+            in("eax") pat as u32,
+            in("edx") (pat >> 32) as u32,
+        );
+        core::arch::asm!("wbinvd");
+    }
+}
 
 /// Kernel SATP value for trap_entry.S to switch to on U-mode traps.
 /// This ensures all S-mode code runs with the kernel page table,
@@ -520,6 +559,8 @@ pub fn init() {
 
     #[cfg(target_arch = "x86_64")]
     {
+        configure_pat_for_framebuffer_wc();
+
         // Direct-map 0-2 GB at DIRECT_MAP_BASE for kernel convenience.
         // Physical addresses >= 2 GB would overflow DIRECT_MAP_BASE;
         // they are served via the identity map (see platform.rs).
@@ -561,7 +602,7 @@ pub fn init() {
             let fb_stride = unsafe { core::ptr::read_volatile(bi.add(6) as *const u32) };
             if fb_addr != 0 && fb_stride != 0 {
                 let fb_size = (fb_height as usize) * (fb_stride as usize);
-                identity_map_region(root, fb_addr, fb_size);
+                identity_map_framebuffer_wc(root, fb_addr, fb_size);
             }
         }
     }

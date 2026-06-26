@@ -50,8 +50,7 @@ fn probe_ioapic_address() -> u64 {
 
 /// IOAPIC base address discovered at init time.
 /// Lazily initialised on first access.
-static IOAPIC_BASE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static IOAPIC_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// IOAPIC register offsets (MMIO).
 const REG_IOREGSEL: u64 = 0x00; // I/O Register Select (write-only)
@@ -289,4 +288,23 @@ pub fn init() {
 pub fn unmask_external_irqs() {
     let ioapic = IoApic::new();
     ioapic.unmask_external_irqs();
+}
+
+/// Route a PCI device's INTx line to a CPU vector and unmask it.
+///
+/// PCI INTx interrupts are level-triggered and (on most chipsets/QEMU)
+/// active-low. The `irq` is the IOAPIC input pin (typically the device's
+/// `irq_line` field). The handler at `vector` must already be installed in
+/// the IDT (see `idt::install_xhci_vector`). Destination is the BSP.
+pub fn route_pci_intx(irq: u8, vector: u8) {
+    let ioapic = IoApic::new();
+    let bsp_id = crate::arch::lapic::lapic_id();
+    ioapic.set_irq_with_dest(irq, vector, false, true, true, bsp_id);
+    ioapic.unmask_irq(irq);
+    crate::console_println!(
+        "[ioapic] Routed PCI INTx irq={} -> v{} (level, active-low, dest={})",
+        irq,
+        vector,
+        bsp_id
+    );
 }

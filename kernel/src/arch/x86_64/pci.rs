@@ -46,7 +46,7 @@ pub fn pci_write(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
 }
 
 /// PCI device information.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PciDevice {
     pub bus: u8,
     pub device: u8,
@@ -220,7 +220,8 @@ fn enumerate_bus(bus: u8, devices: &mut Vec<PciDevice>, scanned_buses: &mut [boo
                         devices.push(dev);
 
                         if ht == 0x01 {
-                            let secondary = ((pci_read(bus, device, function, 0x18) >> 8) & 0xFF) as u8;
+                            let secondary =
+                                ((pci_read(bus, device, function, 0x18) >> 8) & 0xFF) as u8;
                             if secondary != 0 && secondary != bus {
                                 enumerate_bus(secondary, devices, scanned_buses);
                             }
@@ -261,37 +262,44 @@ pub fn find_virtio_net() -> Option<PciDevice> {
 /// Find the first AHCI (SATA) controller on any bus.
 /// AHCI: class_code = 0x01 (Mass Storage), subclass = 0x06 (SATA), prog_if = 0x01 (AHCI 1.0).
 pub fn find_ahci() -> Option<PciDevice> {
-    enumerate().into_iter().find(|dev| {
-        dev.class_code == 0x01 && dev.subclass == 0x06 && dev.prog_if == 0x01
-    })
+    enumerate()
+        .into_iter()
+        .find(|dev| dev.class_code == 0x01 && dev.subclass == 0x06 && dev.prog_if == 0x01)
 }
 
 /// Find an Intel E1000 series network card on any bus.
 /// Supports 82540EM (QEMU default) and common I2xx variants.
 pub fn find_e1000() -> Option<PciDevice> {
     const E1000_IDS: &[u16] = &[
-        0x100E, 0x100F, 0x10EA, 0x1502, 0x1503,
-        0x153A, 0x153B, 0x15B8, 0x15B7, 0x15F3,
+        0x100E, 0x100F, 0x10EA, 0x1502, 0x1503, 0x153A, 0x153B, 0x15B8, 0x15B7, 0x15F3,
     ];
     const INTEL_VENDOR: u16 = 0x8086;
-    enumerate().into_iter().find(|dev| {
-        dev.vendor_id == INTEL_VENDOR && E1000_IDS.contains(&dev.device_id)
-    })
+    enumerate()
+        .into_iter()
+        .find(|dev| dev.vendor_id == INTEL_VENDOR && E1000_IDS.contains(&dev.device_id))
 }
 
 /// Find an XHCI (USB 3.0) host controller on any bus.
 /// PCI class 0x0C (Serial Bus), subclass 0x03 (USB), progif 0x30 (XHCI).
 pub fn find_xhci() -> Option<PciDevice> {
-    enumerate().into_iter().find(|dev| {
-        dev.class_code == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30
-    })
+    enumerate()
+        .into_iter()
+        .find(|dev| dev.class_code == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30)
+}
+
+/// Find all XHCI host controllers on any bus.
+pub fn find_xhci_all() -> Vec<PciDevice> {
+    enumerate()
+        .into_iter()
+        .filter(|dev| dev.class_code == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30)
+        .collect()
 }
 
 /// Find an NVMe controller on any bus.
 pub fn find_nvme() -> Option<PciDevice> {
-    enumerate().into_iter().find(|dev| {
-        dev.class_code == 0x01 && dev.subclass == 0x08 && dev.prog_if == 0x02
-    })
+    enumerate()
+        .into_iter()
+        .find(|dev| dev.class_code == 0x01 && dev.subclass == 0x08 && dev.prog_if == 0x02)
 }
 
 /// Initialize PCI and find block / network devices.
@@ -300,36 +308,49 @@ pub fn init() {
     let devices = enumerate();
 
     for dev in &devices {
-    crate::console_println!(
-           "[pci] {:02x}:{:02x}.{:x} vendor={:#x} device={:#x} class={:#x}/{:#x}",
-           dev.bus, dev.device, dev.function,
-           dev.vendor_id, dev.device_id, dev.class_code, dev.subclass
-    );
+        crate::console_println!(
+            "[pci] {:02x}:{:02x}.{:x} vendor={:#x} device={:#x} class={:#x}/{:#x}",
+            dev.bus,
+            dev.device,
+            dev.function,
+            dev.vendor_id,
+            dev.device_id,
+            dev.class_code,
+            dev.subclass
+        );
 
-    // Identity-map BARs only if they lie beyond the range already
-    // identity-mapped by vmm::init() (0 … total_memory()).
-    // Most BARs (AHCI, XHCI, etc.) are below total_ram; mapping them
-    // again rewrites live PTEs without TLB invalidation, and on real
-    // hardware this causes the CPU page-structure cache to become
-    // inconsistent — frame-buffer accesses then require cold page
-    // walks, which makes console output crawl to ~1 line / second.
-    let total_ram = crate::mm::pmm::total_memory();
-    // Skip 64-bit BAR upper halves (indices 1,3,5 on a 64-bit BAR).
-    // bar_address() treats the upper 32 bits as a separate BAR,
-    // returning garbage addresses that would map wrong memory.
-    let mut skip_next = false;
-    for i in 0..6 {
-           if skip_next { skip_next = false; continue; }
-           let bar = dev.bar_address(i);
-           if bar < 0x1000 { continue; }          // I/O BAR or zero
-           if bar >= total_ram as u64 {           // only map BARs above RAM
-                  let base = (bar as usize) & !0x1F_FFFF;
-                  let root = crate::mm::vmm::get_kernel_page_table();
-                  crate::mm::vmm::identity_map_region(root, base, 0x20_0000);
-           }
-           // Check if this is a 64-bit BAR (bits 2:1 == 0b10)
-           if (bar & 0x6) == 0x4 { skip_next = true; }
-    }
+        // Identity-map BARs only if they lie beyond the range already
+        // identity-mapped by vmm::init() (0 … total_memory()).
+        // Most BARs (AHCI, XHCI, etc.) are below total_ram; mapping them
+        // again rewrites live PTEs without TLB invalidation, and on real
+        // hardware this causes the CPU page-structure cache to become
+        // inconsistent — frame-buffer accesses then require cold page
+        // walks, which makes console output crawl to ~1 line / second.
+        let total_ram = crate::mm::pmm::total_memory();
+        // Skip 64-bit BAR upper halves (indices 1,3,5 on a 64-bit BAR).
+        // bar_address() treats the upper 32 bits as a separate BAR,
+        // returning garbage addresses that would map wrong memory.
+        let mut skip_next = false;
+        for i in 0..6 {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            let bar = dev.bar_address(i);
+            if bar < 0x1000 {
+                continue;
+            } // I/O BAR or zero
+            if bar >= total_ram as u64 {
+                // only map BARs above RAM
+                let base = (bar as usize) & !0x1F_FFFF;
+                let root = crate::mm::vmm::get_kernel_page_table();
+                crate::mm::vmm::identity_map_region(root, base, 0x20_0000);
+            }
+            // Check if this is a 64-bit BAR (bits 2:1 == 0b10)
+            if (bar & 0x6) == 0x4 {
+                skip_next = true;
+            }
+        }
     }
     crate::console_println!("[pci] Found {} devices", devices.len());
 
@@ -345,4 +366,3 @@ pub fn init() {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
     }
 }
-

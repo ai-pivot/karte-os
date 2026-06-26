@@ -188,12 +188,12 @@ pub fn enable_timer() {
 /// ticks elapse in one PIT period (~10 ms) and return the initial count
 /// needed for a 100 Hz periodic interrupt.
 fn calibrate_timer() -> u32 {
-    use x86_64::instructions::port::{Port, PortWriteOnly, PortReadOnly};
+    use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
 
     const PIT_CH0: u16 = 0x40;
     const PIT_CMD: u16 = 0x43;
     const PIT_FREQ: u64 = 1_193_182; // Hz
-    const CALIBRATION_MS: u64 = 10;   // 10 ms
+    const CALIBRATION_MS: u64 = 10; // 10 ms
     const PIT_COUNT: u16 = ((PIT_FREQ * CALIBRATION_MS) / 1000) as u16;
 
     unsafe {

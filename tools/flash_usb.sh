@@ -38,7 +38,7 @@ step "Step 1: Build kernel + EFI loader"
 cd "$PROJ"
 (cd user && make ARCH=x86_64 >/dev/null 2>&1) || true
 cargo +nightly build --release --target x86_64-unknown-none \
-    -p karte-os-kernel -Z build-std=core,alloc 2>&1 | tail -1
+    -p karte-os-kernel -Z build-std=core,alloc --features xhci_enum 2>&1 | tail -1
 objcopy -O binary "$KERNEL_ELF" "$KERNEL_BIN"
 KERNEL_BIN_PATH="$KERNEL_BIN" cargo +nightly build --release \
     --target x86_64-unknown-uefi -p efi-loader -Z build-std=core 2>&1 | tail -1

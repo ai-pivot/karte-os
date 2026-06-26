@@ -85,7 +85,9 @@ impl ComPort {
     /// Per-byte spin with inb() on real hardware costs hundreds of cycles;
     /// batching reduces this by 16x and is how the 8250 serial driver works.
     pub fn write_batch(&mut self, data: &[u8]) {
-        if data.is_empty() { return; }
+        if data.is_empty() {
+            return;
+        }
         unsafe {
             let mut lsr = Port::<u8>::new(self.base + 5);
             let mut thr = Port::<u8>::new(self.base);
@@ -93,14 +95,24 @@ impl ComPort {
             for chunk in data.chunks(16) {
                 // Drain before each 16-byte burst
                 let mut tout: u32 = 0xFFFF;
-                while lsr.read() & 0x20 == 0 { tout -= 1; if tout == 0 { break; } }
+                while lsr.read() & 0x20 == 0 {
+                    tout -= 1;
+                    if tout == 0 {
+                        break;
+                    }
+                }
                 for &byte in chunk {
                     thr.write(byte);
                 }
             }
             // Final drain
             let mut tout: u32 = 0xFFFF;
-            while lsr.read() & 0x20 == 0 { tout -= 1; if tout == 0 { break; } }
+            while lsr.read() & 0x20 == 0 {
+                tout -= 1;
+                if tout == 0 {
+                    break;
+                }
+            }
         }
     }
 
@@ -131,8 +143,7 @@ static COM1: spin::Mutex<ComPort> = spin::Mutex::new(ComPort::new(COM1_BASE));
 
 /// Whether a real UART hardware is present at COM1_BASE.
 /// Determined once during init_uart(); false on systems without serial hardware.
-static UART_PRESENT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static UART_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Initialize COM1 UART.
 pub fn init_uart() {
@@ -153,20 +164,33 @@ fn uart_probe() -> bool {
         // Read current IER
         let ier: u8;
         core::arch::asm!("in al, dx", out("al") ier, in("dx") ier_port);
-        // Upper nibble must be 0 on a real 8250/16550
-        if ier & 0xF0 != 0 {
+        // Open bus usually reads 0xFF; upper nibble must be 0 on a real UART.
+        if ier == 0xFF || ier & 0xF0 != 0 {
             return false;
         }
         // Write 0 and read back — must stay 0 in lower nibble
         core::arch::asm!("out dx, al", in("dx") ier_port, in("al") 0u8);
         let ier2: u8;
         core::arch::asm!("in al, dx", out("al") ier2, in("dx") ier_port);
+        if ier2 == 0xFF {
+            return false;
+        }
         if ier2 & 0xF0 != 0 || ier2 != 0 {
             // After writing 0, IER should read as 0 on a real UART.
             // But some hardware might have RX interrupt enabled by firmware.
             // Accept any value where upper nibble is 0.
             return ier2 & 0xF0 == 0;
         }
+        // Scratch register loopback test. A real 16550 echoes SCR writes;
+        // random LPC/open-bus decodes do not.
+        let scr_port: u16 = COM1_BASE + 7;
+        core::arch::asm!("out dx, al", in("dx") scr_port, in("al") 0x5Au8);
+        let scr: u8;
+        core::arch::asm!("in al, dx", out("al") scr, in("dx") scr_port);
+        if scr != 0x5A {
+            return false;
+        }
+        core::arch::asm!("out dx, al", in("dx") scr_port, in("al") 0u8);
         true
     }
 }
@@ -179,6 +203,14 @@ pub fn putchar(c: u8) {
     COM1.lock().put_char(c);
 }
 
+/// Write a batch to COM1 if a real UART is present.
+pub fn write_batch(data: &[u8]) {
+    if !UART_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    COM1.lock().write_batch(data);
+}
+
 /// Read a byte from COM1 (non-blocking).
 /// Returns `None` if no data is available.
 pub fn getchar() -> Option<u8> {
@@ -189,9 +221,15 @@ pub fn getchar() -> Option<u8> {
         // Read LSR directly via inline assembly to bypass any Port abstraction issues
         let lsr: u8;
         core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1_BASE + 5u16);
+        if lsr == 0xFF {
+            return None;
+        }
         if lsr & 0x01 != 0 {
             let data: u8;
             core::arch::asm!("in al, dx", out("al") data, in("dx") COM1_BASE);
+            if data == 0xFF {
+                return None;
+            }
             Some(data)
         } else {
             None

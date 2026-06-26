@@ -45,8 +45,12 @@ pub const COM1_IST_INDEX: u16 = 4;
 /// so that kernel data structures are accessible during page fault handling.
 pub const PAGE_FAULT_IST_INDEX: u16 = 5;
 
+/// IST index for XHCI USB host-controller interrupt. Separate stack so the
+/// ISR cannot clobber the timer/keyboard IST frames if it nests.
+pub const XHCI_IST_INDEX: u16 = 6;
+
 /// Number of IST entries we actually use.
-const NUM_IST: usize = 6;
+const NUM_IST: usize = 7;
 
 const IST_STACK_SIZE: usize = 4096 * 8; // 32KB per IST stack
 
@@ -146,6 +150,13 @@ pub fn init_for_cpu(cpu_id: usize) {
                     + IST_STACKS[cpu_id * NUM_IST + 5].len() as u64,
             );
             PER_CPU_TSS[cpu_id].interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = pf_stack_top;
+
+            // IST[6]: XHCI USB interrupt handler
+            let xhci_stack_top = VirtAddr::new(
+                IST_STACKS[cpu_id * NUM_IST + 6].as_ptr() as u64
+                    + IST_STACKS[cpu_id * NUM_IST + 6].len() as u64,
+            );
+            PER_CPU_TSS[cpu_id].interrupt_stack_table[XHCI_IST_INDEX as usize] = xhci_stack_top;
 
             if cpu_id == 0 {
                 let rsp0_ptr = core::ptr::addr_of_mut!(PER_CPU_TSS[0].privilege_stack_table[0]);

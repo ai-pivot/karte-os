@@ -4,7 +4,8 @@
         iso-riscv iso-x86 setup-riscv setup-x86 \
         share-riscv share-x86 usb-image usb-write \
         uefi-x86 run-uefi-x86 shell-uefi-x86 uefi-usb uefi-usb-write \
-        release release-riscv release-x86 release-all
+        release release-riscv release-x86 release-all \
+        test-xhci
 
 # ═══════════════════════════════════════════════════════════════
 #  KarteOS — Dual-Architecture Makefile
@@ -203,6 +204,10 @@ test:
 ## Run x86_64 integration tests (103 tests)
 test-x86:
 	@bash scripts/run-tests-x86_64.sh
+
+## Run XHCI/USB HID keyboard smoke test (qemu-xhci + usb-kbd)
+test-xhci:
+	@bash scripts/run-xhci-smoke.sh
 
 ## Run ALL tests (RISC-V + x86_64)
 test-all: test test-x86
@@ -410,6 +415,7 @@ help:
 	@echo "  Testing (199 tests total):"
 	@echo "    make test           Run RISC-V integration tests (96)"
 	@echo "    make test-x86       Run x86_64 integration tests (103)"
+	@echo "    make test-xhci      Run XHCI/USB HID keyboard smoke test (QEMU)"
 	@echo "    make test-all       Run both architectures"
 	@echo "    make boot-test      Verify boot reaches shell"
 	@echo "    make smp-test       Test 4-core SMP"
