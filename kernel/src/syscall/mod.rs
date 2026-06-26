@@ -2084,11 +2084,6 @@ pub fn sys_exit(code: i32) -> isize {
     }
 
     // 4. Switch to kernel CR3 before context switch.
-    //    When called from PF/exception handlers (IST stack), CR3 may still be
-    //    the dying process's user page table. Go's mmap lazy allocation can
-    //    overwrite identity mapping entries in the user page table, causing
-    //    __switch to read corrupted data from other tasks' kernel stacks.
-    //    Kernel CR3 has a complete, untampered identity mapping.
     #[cfg(target_arch = "x86_64")]
     {
         let kcr3 = crate::mm::vmm::kernel_cr3();

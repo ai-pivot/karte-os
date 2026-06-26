@@ -117,6 +117,38 @@ impl RamFileSystem {
         fs.write_static("init", include_bytes!("../../../user/shell.elf"))
             .unwrap();
 
+        // Core user utilities — embedded for all architectures so that
+        // USB-booted systems (no ext4/FAT32 block device) have basic commands.
+        // These are stripped Rust binaries (~4-25 KB each, ~130 KB total).
+        fs.write_static("ls", include_bytes!("../../../user/ls.elf"))
+            .unwrap();
+        fs.write_static("cat", include_bytes!("../../../user/cat.elf"))
+            .unwrap();
+        fs.write_static("echo", include_bytes!("../../../user/echo.elf"))
+            .unwrap();
+        fs.write_static("mkdir", include_bytes!("../../../user/mkdir.elf"))
+            .unwrap();
+        fs.write_static("rm", include_bytes!("../../../user/rm.elf"))
+            .unwrap();
+        fs.write_static("env", include_bytes!("../../../user/env.elf"))
+            .unwrap();
+        fs.write_static("pwd", include_bytes!("../../../user/pwd.elf"))
+            .unwrap();
+        fs.write_static("grep", include_bytes!("../../../user/grep.elf"))
+            .unwrap();
+        fs.write_static("sed", include_bytes!("../../../user/sed.elf"))
+            .unwrap();
+        fs.write_static("wc", include_bytes!("../../../user/wc.elf"))
+            .unwrap();
+        fs.write_static("head", include_bytes!("../../../user/head.elf"))
+            .unwrap();
+        fs.write_static("tail", include_bytes!("../../../user/tail.elf"))
+            .unwrap();
+        fs.write_static("dmesg", include_bytes!("../../../user/dmesg.elf"))
+            .unwrap();
+        fs.write_static("tui-demo", include_bytes!("../../../user/tui-demo.elf"))
+            .unwrap();
+
         // xbot-cli is NOT embedded — 69MB binary makes EFI loader too large
         // for real UEFI firmware. Load from ext4 disk instead.
         // fs.write_static("xbot-cli", include_bytes!("../../../user/xbot-cli"))

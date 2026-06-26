@@ -504,6 +504,28 @@ impl Process {
         argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
         envp: alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)>,
     ) -> Result<Self, &'static str> {
+        // CRITICAL: Run the entire user-page-table setup under kernel CR3.
+        //
+        // All phys_to_virt(frame) writes below use the direct map (PML4[511])
+        // which is always reachable from kernel CR3. Running with a user CR3
+        // (e.g. the shell's) would require every frame address to have an
+        // identity-mapping PTE in the *user* page table, which is not built
+        // for high physical frames (>= 2 GB on x86_64) — leading to a
+        // KERN FATAL page fault during stack init.
+        #[cfg(target_arch = "x86_64")]
+        return crate::arch::trap::with_kernel_cr3(|| {
+            Self::from_elf_inner(elf_data, argv, envp)
+        });
+
+        #[cfg(not(target_arch = "x86_64"))]
+        Self::from_elf_inner(elf_data, argv, envp)
+    }
+
+    fn from_elf_inner(
+        elf_data: &[u8],
+        argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+        envp: alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)>,
+    ) -> Result<Self, &'static str> {
         // 1. Parse ELF
         let elf = elf::ElfFile::parse(elf_data)?;
 
@@ -541,11 +563,29 @@ impl Process {
 
             for vaddr in (page_start..page_end).step_by(page_size) {
                 let frame = if let Some(f) = vmm::translate_user(user_pt, vaddr) {
-                    // Multiple PT_LOAD segments may share one page. Keep
-                    // the physical frame and merge page-level permissions.
-                    let merged_flags = merge_page_flags(user_pt, vaddr, pte_flags);
-                    vmm::map_user(user_pt, vaddr, f, merged_flags);
-                    f
+                    // Identity-mapped frames (frame == vaddr) come from
+                    // copy_kernel_mappings. Reusing them would corrupt
+                    // kernel data structures at that physical address.
+                    // Allocate a fresh frame instead.
+                    if f == vaddr {
+                        let new_f = pmm::alloc_frame()
+                            .ok_or("Out of memory for ELF segment")?;
+                        vmm::map_user(user_pt, vaddr, new_f, pte_flags);
+                        unsafe {
+                            core::ptr::write_bytes(
+                                vmm::phys_to_virt(new_f) as *mut u8,
+                                0,
+                                page_size,
+                            );
+                        }
+                        new_f
+                    } else {
+                        // Multiple PT_LOAD segments may share one page. Keep
+                        // the physical frame and merge page-level permissions.
+                        let merged_flags = merge_page_flags(user_pt, vaddr, pte_flags);
+                        vmm::map_user(user_pt, vaddr, f, merged_flags);
+                        f
+                    }
                 } else {
                     let f = pmm::alloc_frame().ok_or("Out of memory for ELF segment")?;
                     vmm::map_user(user_pt, vaddr, f, pte_flags);

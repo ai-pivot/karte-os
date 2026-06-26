@@ -527,30 +527,11 @@ pub fn boot_log(prefix: &str, prefix_color: u8, msg: &str) {
 }
 
 // ─── Debug square ──────────────────────────────────────────────
+/// Writes a colored square to the GOP framebuffer for visual diagnostics.
+/// Disabled in release builds to avoid QEMU iothread assertion during
+/// context switches (VGA MMIO write in __switch can trigger
+/// qemu_mutex_lock_iothread_impl assertion in QEMU 8.2.x).
 #[unsafe(no_mangle)]
-pub extern "C" fn fb_debug_square(slot: usize, color: u32) {
-    if !FB_READY.load(Ordering::Relaxed) {
-        return;
-    }
-    let addr = FB_ADDR.load(Ordering::Relaxed) as usize;
-    let pitch = FB_PITCH.load(Ordering::Relaxed) as usize;
-    let bpp = (FB_BPP.load(Ordering::Relaxed) / 8) as usize;
-    let width = FB_WIDTH.load(Ordering::Relaxed) as usize;
-    if addr == 0 || pitch == 0 || bpp < 4 || width == 0 {
-        return;
-    }
-    let size = 32usize;
-    let gap = 6usize;
-    let x0 = 16 + slot * (size + gap);
-    if x0 + size >= width {
-        return;
-    }
-    for y in 0..size {
-        for x in 0..size {
-            let offset = y * pitch + (x0 + x) * bpp;
-            unsafe {
-                core::ptr::write_volatile((addr + offset) as *mut u32, color);
-            }
-        }
-    }
+pub extern "C" fn fb_debug_square(_slot: usize, _color: u32) {
+    // no-op in release builds
 }

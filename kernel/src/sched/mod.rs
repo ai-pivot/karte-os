@@ -316,11 +316,9 @@ fn switch_to(current: usize, next: usize) {
             }
         };
         if effective_kcr3 != 0 {
-            crate::arch::fb_console::fb_debug_square(9, 0x0000FF00); // green: about to restore kernel CR3
             unsafe {
                 core::arch::asm!("mov cr3, {}", in(reg) effective_kcr3);
             }
-            crate::arch::fb_console::fb_debug_square(10, 0x00FF0000); // blue: kernel CR3 restored
         }
     }
 

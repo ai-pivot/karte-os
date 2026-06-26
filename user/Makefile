@@ -18,7 +18,7 @@ OBJCOPY = $(CROSS)objcopy
 # (otherwise `make build` / CI fails after `make clean`).
 RUSTC = rustc
 RUSTFLAGS_USER = --edition 2024 --target $(RUSTC_TARGET) \
-	-C panic=abort -C opt-level=2 -C relocation-model=static -C link-arg=-T$(LD_SCRIPT) --crate-type bin
+	-C panic=abort -C opt-level=2 -C relocation-model=static -C strip=symbols -C link-arg=-T$(LD_SCRIPT) --crate-type bin
 
 # Assembly programs (RISC-V only)
 ifeq ($(ARCH),riscv64)
