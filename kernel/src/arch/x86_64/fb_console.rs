@@ -135,18 +135,9 @@ pub fn init(addr: usize, pitch: u32, width: u32, height: u32, bpp: u8) {
     FB_WIDTH.store(width as u64, Ordering::Relaxed);
     FB_HEIGHT.store(height as u64, Ordering::Relaxed);
     FB_BPP.store(bpp as u64, Ordering::Relaxed);
-    // Auto-detect scale factor based on screen width so text is readable
-    // on high-DPI displays without manual configuration:
-    //   width >= 3840 (4K)     → scale 3  (24×48 px per char, ~160 cols)
-    //   width >= 2560 (1440p)  → scale 2  (16×32 px per char)
-    //   otherwise              → scale 1  ( 8×16 px per char)
-    let s: u64 = if width >= 3840 {
-        3
-    } else if width >= 2560 {
-        2
-    } else {
-        1
-    };
+    // Use 1:1 pixel-perfect rendering — larger screens naturally show
+    // smaller text with more columns/rows. No HDPI scaling.
+    let s: u64 = 1;
     SCALE.store(s, Ordering::Relaxed);
     FG_COLOR.store(7, Ordering::Relaxed);
     BG_COLOR.store(0, Ordering::Relaxed);
