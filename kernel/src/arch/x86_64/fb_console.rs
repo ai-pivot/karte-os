@@ -409,7 +409,7 @@ fn ansi_feed(byte: u8) -> bool {
 }
 
 // ─── putchar ───────────────────────────────────────────────────
-pub fn putchar(byte: u8) {
+pub(crate) fn putchar(byte: u8) {
     if !FB_READY.load(Ordering::Relaxed) {
         return;
     }

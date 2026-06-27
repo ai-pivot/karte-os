@@ -804,7 +804,7 @@ pub fn clear_screen() {
 /// - Control characters (\n, \r, \t, \x08, \x07)
 /// - ANSI escape sequences (\033[...X)
 /// - Printable ASCII → display character with current attributes
-pub fn putchar(c: u8) {
+pub(crate) fn putchar(c: u8) {
     if !VGA_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }

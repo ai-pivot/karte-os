@@ -398,7 +398,7 @@ fn read_available(buf: usize, len: usize) -> isize {
     count
 }
 
-/// Echo bytes to UART + VGA output.
+/// Echo bytes to console output (VGA + GOP framebuffer + UART).
 fn echo(bytes: &[u8]) {
     #[cfg(target_arch = "riscv64")]
     {
@@ -409,13 +409,6 @@ fn echo(bytes: &[u8]) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // Process VGA + GOP framebuffer sequentially (ANSI parser needs per-byte state)
-        for &b in bytes {
-            crate::driver::vga::putchar(b);
-            crate::arch::fb_console::putchar(b);
-        }
-        // Batch UART output for efficiency
-        let mut uart = crate::arch::uart::ComPort::new(0x3F8);
-        uart.write_batch(bytes);
+        crate::arch::platform::console_write_batch(bytes);
     }
 }
