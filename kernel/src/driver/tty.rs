@@ -409,9 +409,10 @@ fn echo(bytes: &[u8]) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // Process VGA sequentially (ANSI parser needs per-byte state)
+        // Process VGA + GOP framebuffer sequentially (ANSI parser needs per-byte state)
         for &b in bytes {
             crate::driver::vga::putchar(b);
+            crate::arch::fb_console::putchar(b);
         }
         // Batch UART output for efficiency
         let mut uart = crate::arch::uart::ComPort::new(0x3F8);
