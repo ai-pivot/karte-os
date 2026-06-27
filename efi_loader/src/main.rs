@@ -668,6 +668,56 @@ pub extern "C" fn efi_main(image_handle: EfiHandle, system_table: *const EfiSyst
                 let g = unsafe { &*(gop as *const EfiGop) };
                 if !g.mode.is_null() {
                     let m = unsafe { &*g.mode };
+
+                    // ── Enumerate all GOP modes, pick highest resolution ──
+                    // UEFI firmware often defaults to a low resolution
+                    // (e.g. 1024×768).  On a 4K display this makes the
+                    // 8×16 font appear stretched and huge.  Walk every mode,
+                    // choose the one with the largest area and prefer
+                    // PixelBlueGreenRedReserved8BitPerColor (format 1).
+                    let max_mode = m.max_mode;
+                    let mut best_mode: u32 = m.mode; // fallback to current
+                    let mut best_w: u32 = 0;
+                    let mut best_h: u32 = 0;
+                    if max_mode > 0 && max_mode <= 64 {
+                        unsafe {
+                            // query_mode and set_mode are UEFI function pointers stored as
+                            // raw addresses.  Transmute to the correct signature.
+                            let query: extern "C" fn(
+                                *const EfiGop,
+                                u32,
+                                *mut usize,
+                                *mut *const EfiGopModeInfo,
+                            ) -> usize = core::mem::transmute(g.query_mode);
+                            let set: extern "C" fn(
+                                *const EfiGop,
+                                u32,
+                            ) -> usize = core::mem::transmute(g.set_mode);
+
+                            for mode_num in 0..max_mode {
+                                let mut size: usize = 0;
+                                let mut info_ptr: *const EfiGopModeInfo = core::ptr::null();
+                                let s = query(gop as *const EfiGop, mode_num, &mut size, &mut info_ptr);
+                                if s == EFI_SUCCESS && !info_ptr.is_null() && size >= 44 {
+                                    let inf = &*info_ptr;
+                                    let area = (inf.hres as u64) * (inf.vres as u64);
+                                    let current_area = (best_w as u64) * (best_h as u64);
+                                    let fmt_bonus = if inf.pixel_format == 1 { 1u64 << 32 } else { 0 };
+                                    if area + fmt_bonus > current_area {
+                                        best_mode = mode_num;
+                                        best_w = inf.hres;
+                                        best_h = inf.vres;
+                                    }
+                                }
+                            }
+
+                            if best_mode != m.mode {
+                                let _ = set(gop as *const EfiGop, best_mode);
+                            }
+                        }
+                    }
+
+                    let m = unsafe { &*g.mode }; // re-read after possible mode switch
                     if !m.info.is_null() {
                         let inf = unsafe { &*m.info };
                         unsafe {
