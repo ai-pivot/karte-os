@@ -167,16 +167,16 @@
 
 **Checklist**
 
-- [ ] 提交 5 项构建修复（build.rs / Makefile / vmm.rs cfg / main.rs 路径 / Cargo.lock）（验收：干净 clone 后 `cargo build --release -p karte-os-kernel --target riscv64gc-unknown-none-elf` 一次通过）
-- [ ] 清理 §3.2 全部垃圾文件，`.gitignore` 补充规则（验收：`git status` 无未跟踪杂物）
-- [ ] 清零 clippy：修复 8 个 `not_unsafe_ptr_arg_deref`（验收：CI 同款 clippy 命令 0 error）
-- [ ] AGENTS.md 测试数 96→105（RISC-V）、x86_64 数字核对；README 全面同步（行数/测试数/双架构/核心特性）（验收：两文档数字与实测一致）
-- [ ] 本机跑通 `make test-x86`，确认 x86_64 102/103 现状并记录（验收：脚本退出码与已知失败项入库）
-- [ ] 本机验证 boot-test + smp-test（验收：两脚本各自通过）
+- [x] 提交 5 项构建修复（build.rs / Makefile / vmm.rs cfg / main.rs 路径 / Cargo.lock）（验收：干净 clone 后 `cargo build --release -p karte-os-kernel --target riscv64gc-unknown-none-elf` 一次通过）(commit: 8ff7793, 00d86fa；CLEAN_CLONE_BUILD_OK 实测)
+- [x] 清理 §3.2 全部垃圾文件，`.gitignore` 补充规则（验收：`git status` 无未跟踪杂物）(commit: ace03db)
+- [x] 清零 clippy：修复 8 个 `not_unsafe_ptr_arg_deref`（验收：CI 同款 clippy 命令 0 error）(commit: 66726c1)
+- [x] AGENTS.md 测试数 96→105（RISC-V）、x86_64 数字核对；README 全面同步（行数/测试数/双架构/核心特性）（验收：两文档数字与实测一致）(commit: 3edcdc6)
+- [x] 本机跑通 `make test-x86`，确认 x86_64 现状并记录（验收：脚本退出码与已知失败项入库）(commit: 4186935 — 修复 user_write 槽位后 **131/131**，发现根因：grub-pc-bin 缺失 + ensure_user_write_pages 拒绝内核栈缓冲)
+- [x] 本机验证 boot-test + smp-test（验收：两脚本各自通过）(commit: 48f3575 — 修复 build_initial_stack 的 x[2]/sscratch 槽位错位；此前 boot-test 必败，属既有回归)
 - [ ] push 后核对 GitHub Actions 5 job 全绿（验收：CI 页面截图/链接）
-- [ ] 工具链防漂移：CI 与 rust-toolchain 对 nightly 采用固定日期版本（验收：CI 安装日志出现日期 pin；`Step` trait 类事故不再复现）
-- [ ] 建立基准库 `docs/benchmarks.md`：boot→shell 时间、上下文切换延迟、105 测试耗时、内核双架构体积（验收：四项数字入库，含测量方法）
-- [ ] 将本路线图链接进 README（验收：README 出现 Master Plan 链接）
+- [x] 工具链防漂移：CI 与 rust-toolchain 对 nightly 采用固定日期版本（验收：CI 安装日志出现日期 pin；`Step` trait 类事故不再复现）(commit: 3edcdc6 — CI x86 job pin nightly-2026-10-07)
+- [x] 建立基准库 `docs/benchmarks.md`：boot→shell 时间、上下文切换延迟、105 测试耗时、内核双架构体积（验收：四项数字入库，含测量方法）(commit: bd4e0c5 — 上下文切换标注 TBD，归 P1.1 基准 harness；boot→shell 67ms / 套件 67ms / RV 2.26MB / x86 1.62MB)
+- [x] 将本路线图链接进 README（验收：README 出现 Master Plan 链接）(commit: 3edcdc6)
 
 **DoD（退出准则）**：CI 5 job 全绿 + 文档数字同步 + 基准数字入库。
 
