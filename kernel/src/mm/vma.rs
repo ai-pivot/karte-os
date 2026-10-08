@@ -16,7 +16,7 @@
 const MAX_VMAS: usize = 1024;
 
 /// Maximum number of address spaces (one per process).
-const MAX_ADDRESS_SPACES: usize = crate::sched::MAX_TASKS;
+const MAX_ADDRESS_SPACES: usize = 512;
 
 /// A single VMA region descriptor.
 #[derive(Clone, Copy)]

@@ -5,12 +5,18 @@
 //   - A kernel Idle task is the only fallback when no user task is runnable.
 //   - Every User task has a valid saved_sp before it can be scheduled.
 
+pub mod class;
+pub mod ready_queue;
 pub mod task;
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::spinlock::SpinLock;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use class::SchedClass;
+use ready_queue::ReadyQueue;
 use task::{TaskControlBlock, TaskState};
 
 #[cfg(target_arch = "riscv64")]
@@ -51,10 +57,13 @@ unsafe extern "C" fn first_task_shim() -> ! {
     }
 }
 
-pub const MAX_TASKS: usize = 64;
+/// Initial capacity of the dynamic task table; the Vec grows on demand.
+/// (P1.1: replaced the fixed MAX_TASKS=64 slot array — a 200-task stress
+/// workload must schedule fine.)
+pub const INITIAL_TASK_CAPACITY: usize = 256;
 
 const IDLE_SLOT: usize = 0;
-const NO_SLOT: usize = MAX_TASKS;
+const NO_SLOT: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskKind {
@@ -88,44 +97,107 @@ pub struct CloneTaskInit<'a> {
     pub tls: usize,
 }
 
-static TASK_SPS: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
-static INITIAL_TASK_SP: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
-static PROC_TO_SLOT: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(NO_SLOT) }; MAX_TASKS];
+static PROC_TO_SLOT: SpinLock<Vec<AtomicUsize>> = SpinLock::new(Vec::new());
+
+/// proc_idx → slot. Lock discipline: this lock is NEVER held while taking
+/// (or while holding) the SCHEDULER lock — callers either load the slot
+/// first and lock the scheduler afterwards, or set the mapping after
+/// releasing the scheduler lock.
+fn proc_slot_get(proc_idx: usize) -> usize {
+    let map = PROC_TO_SLOT.lock();
+    map.get(proc_idx)
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(NO_SLOT)
+}
+
+fn proc_slot_set(proc_idx: usize, slot: usize) {
+    let mut map = PROC_TO_SLOT.lock();
+    if proc_idx >= map.len() {
+        map.resize_with(proc_idx + 1, || AtomicUsize::new(NO_SLOT));
+    }
+    map[proc_idx].store(slot, Ordering::Relaxed);
+}
 
 /// Currently running scheduler slot. Slot 0 is the typed Idle task, not init.
 pub static CURRENT_RUNNING: AtomicUsize = AtomicUsize::new(IDLE_SLOT);
 
 static LAST_SCHEDULED: AtomicUsize = AtomicUsize::new(IDLE_SLOT);
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) static TASK_KSTACK: [core::sync::atomic::AtomicU64; MAX_TASKS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_TASKS];
+/// Per-task scheduling data. Lives in a heap box whose address is stable for
+/// the whole lifetime of its slot: `__switch` receives a raw pointer to `sp`,
+/// so boxes are only dropped when their slot is REUSED by a new task — never
+/// while a context switch may still reference them (exit marks the node and
+/// recycles the slot, it does not take the box).
+struct TaskNode {
+    kind: TaskKind,
+    state: TaskState,
+    class: SchedClass,
+    /// Saved __switch stack pointer (was the TASK_SPS static array).
+    sp: AtomicUsize,
+    initial_sp: AtomicUsize,
+    /// Remaining scheduler ticks before this task must requeue (RR/FIFO).
+    quantum_left: usize,
+    #[cfg(target_arch = "x86_64")]
+    kstack: core::sync::atomic::AtomicU64,
+    #[cfg(target_arch = "x86_64")]
+    fs_base: core::sync::atomic::AtomicU64,
+}
 
-#[cfg(target_arch = "x86_64")]
-static TASK_FS_BASE: [core::sync::atomic::AtomicU64; MAX_TASKS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_TASKS];
+impl TaskNode {
+    fn new_idle() -> Self {
+        Self {
+            kind: TaskKind::Idle,
+            state: TaskState::Running,
+            class: SchedClass::Normal,
+            sp: AtomicUsize::new(0),
+            initial_sp: AtomicUsize::new(0),
+            quantum_left: usize::MAX,
+            #[cfg(target_arch = "x86_64")]
+            kstack: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(target_arch = "x86_64")]
+            fs_base: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
 
-#[cfg(target_arch = "x86_64")]
-static PENDING_RSP0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    fn new_user(proc_idx: usize, class: SchedClass, initial_sp: usize) -> Self {
+        Self {
+            kind: TaskKind::User { proc_idx },
+            state: TaskState::Ready,
+            class,
+            sp: AtomicUsize::new(initial_sp),
+            initial_sp: AtomicUsize::new(initial_sp),
+            quantum_left: class.quantum(),
+            #[cfg(target_arch = "x86_64")]
+            kstack: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(target_arch = "x86_64")]
+            fs_base: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
 
 struct Scheduler {
-    tasks: [Option<TaskControlBlock>; MAX_TASKS],
-    kinds: [TaskKind; MAX_TASKS],
+    nodes: Vec<Option<Box<TaskNode>>>,
+    /// Slots whose task exited; the box is reused (dropped) on next alloc.
+    free: Vec<usize>,
+    /// 32-level priority-bitmap ready queue (P1.1).
+    ready: ReadyQueue,
     current: usize,
     high_water: usize,
 }
 
 static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler {
-    tasks: [const { None }; MAX_TASKS],
-    kinds: [TaskKind::Empty; MAX_TASKS],
+    nodes: Vec::new(),
+    free: Vec::new(),
+    ready: ReadyQueue::new(),
     current: IDLE_SLOT,
     high_water: 1,
 });
 
 pub fn init() {
     let mut sched = SCHEDULER.lock();
-    sched.tasks[IDLE_SLOT] = Some(TaskControlBlock::new_idle(IDLE_SLOT));
-    sched.kinds[IDLE_SLOT] = TaskKind::Idle;
+    sched
+        .nodes
+        .push(Some(alloc::boxed::Box::new(TaskNode::new_idle())));
     sched.current = IDLE_SLOT;
     sched.high_water = 1;
     CURRENT_RUNNING.store(IDLE_SLOT, Ordering::Relaxed);
@@ -141,55 +213,54 @@ pub fn current_sched_slot() -> usize {
 
 pub fn current_user_proc() -> Option<usize> {
     let sched = SCHEDULER.lock();
-    match sched.kinds[sched.current] {
+    node_ref(&sched, sched.current).map(|n| match n.kind {
         TaskKind::User { proc_idx } => Some(proc_idx),
         _ => None,
-    }
+    })?
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn current_kernel_stack() -> Option<u64> {
     let current = CURRENT_RUNNING.load(Ordering::Relaxed);
-    if current < MAX_TASKS {
-        let ksp = TASK_KSTACK[current].load(Ordering::Relaxed);
-        if ksp != 0 {
-            return Some(ksp);
-        }
+    let sched = SCHEDULER.lock();
+    let ksp = node_ref(&sched, current).map(|n| n.kstack.load(Ordering::Relaxed));
+    match ksp {
+        Some(ksp) if ksp != 0 => Some(ksp),
+        _ => None,
     }
-    None
 }
 
-fn find_next_ready_user(sched: &Scheduler, current: usize) -> Option<usize> {
-    let start = LAST_SCHEDULED.load(Ordering::Relaxed).wrapping_add(1);
-    for i in 0..MAX_TASKS {
-        let candidate = (start + i) % MAX_TASKS;
-        if candidate == current {
-            continue;
-        }
-        if matches!(sched.kinds[candidate], TaskKind::User { .. }) {
-            if let Some(ref task) = sched.tasks[candidate] {
-                if task.state == TaskState::Ready {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    None
+#[cfg(target_arch = "x86_64")]
+static PENDING_RSP0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// O(1) pick-next via the priority-bitmap ready queue (P1.1). The running
+/// task is never in the queue, so the returned slot (if any) is a different
+/// task — except the single-task case where `schedule` re-enqueues current.
+fn find_next_ready_user(sched: &mut Scheduler, _current: usize) -> Option<usize> {
+    sched.ready.pop_next()
+}
+
+fn node_ref(sched: &Scheduler, slot: usize) -> Option<&TaskNode> {
+    sched.nodes.get(slot).and_then(|n| n.as_deref())
+}
+
+fn node_mut(sched: &mut Scheduler, slot: usize) -> Option<&mut TaskNode> {
+    sched.nodes.get_mut(slot).and_then(|n| n.as_deref_mut())
 }
 
 fn set_current_process_for_slot(slot: usize) {
     let kind = {
         let sched = SCHEDULER.lock();
-        sched.kinds[slot]
+        node_ref(&sched, slot).map(|n| n.kind)
     };
     match kind {
-        TaskKind::User { proc_idx } => {
+        Some(TaskKind::User { proc_idx }) => {
             crate::process::set_current_index(proc_idx);
             crate::process::set_current_page_table_root(crate::process::get_page_table_root(
                 proc_idx,
             ));
         }
-        TaskKind::Idle | TaskKind::Empty => {
+        _ => {
             crate::process::set_current_page_table_root(0);
         }
     }
@@ -198,11 +269,11 @@ fn set_current_process_for_slot(slot: usize) {
 #[cfg(target_arch = "x86_64")]
 fn save_fs_base(slot: usize) {
     // Read the CURRENT hardware FS_BASE from MSR and save it.
-    if slot >= MAX_TASKS {
-        return;
-    }
     let fs_base = unsafe { crate::arch::idt::rdmsr(0xC0000100) };
-    TASK_FS_BASE[slot].store(fs_base, Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    if let Some(n) = node_mut(&mut sched, slot) {
+        n.fs_base.store(fs_base, Ordering::Relaxed);
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -210,10 +281,16 @@ fn save_fs_base(_slot: usize) {}
 
 #[cfg(target_arch = "x86_64")]
 fn restore_task_arch_state(slot: usize) {
-    if slot >= MAX_TASKS {
-        return;
-    }
-    let kernel_sp = TASK_KSTACK[slot].load(Ordering::Relaxed);
+    let (kernel_sp, fs_base) = {
+        let sched = SCHEDULER.lock();
+        match node_ref(&sched, slot) {
+            Some(n) => (
+                n.kstack.load(Ordering::Relaxed),
+                n.fs_base.load(Ordering::Relaxed),
+            ),
+            None => return,
+        }
+    };
     if kernel_sp != 0 {
         crate::arch::idt::set_syscall_ksp(kernel_sp);
         unsafe {
@@ -224,7 +301,6 @@ fn restore_task_arch_state(slot: usize) {
     // kernel continuations (syscall handlers, timer handlers, idle paths), not
     // necessarily an immediate user return. User CR3 is installed only at the
     // explicit user-return paths (iretq/trap_return_user/syscall return).
-    let fs_base = TASK_FS_BASE[slot].load(Ordering::Relaxed);
     unsafe { crate::arch::idt::wrmsr(0xC0000100, fs_base) };
 }
 
@@ -250,8 +326,16 @@ pub fn current_user_return_state() -> crate::arch::user_return::UserReturnState 
 pub fn user_return_state_for_slot(slot: usize) -> crate::arch::user_return::UserReturnState {
     use crate::arch::user_return::*;
 
-    let fs_base = FsBase::new(TASK_FS_BASE[slot].load(Ordering::Relaxed));
-    let kernel_sp = TASK_KSTACK[slot].load(Ordering::Relaxed);
+    let (fs_base_raw, kernel_sp) = {
+        let sched = SCHEDULER.lock();
+        match node_ref(&sched, slot) {
+            Some(n) => (
+                n.fs_base.load(Ordering::Relaxed),
+                n.kstack.load(Ordering::Relaxed),
+            ),
+            None => (0, 0),
+        }
+    };
 
     // user_cr3 is not tracked per-slot in the scheduler (it's in Process).
     // The caller should set user_cr3 separately if needed.
@@ -264,7 +348,7 @@ pub fn user_return_state_for_slot(slot: usize) -> crate::arch::user_return::User
     UserReturnState {
         user_cr3: None, // Set by caller from Process page_table_root
         kernel_rsp0,
-        fs_base,
+        fs_base: FsBase::new(fs_base_raw),
     }
 }
 
@@ -275,7 +359,12 @@ fn switch_to(current: usize, next: usize) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        let next_fs_base = TASK_FS_BASE[next].load(Ordering::Relaxed);
+        let next_fs_base = {
+            let sched = SCHEDULER.lock();
+            node_ref(&sched, next)
+                .map(|n| n.fs_base.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        };
         crate::arch::trap::PENDING_FS_BASE.store(next_fs_base, Ordering::Relaxed);
 
         let effective_kcr3 = {
@@ -293,8 +382,20 @@ fn switch_to(current: usize, next: usize) {
         }
     }
 
-    let cur_ptr: *mut usize = &TASK_SPS[current] as *const AtomicUsize as *mut usize;
-    let nxt_ptr: *const usize = &TASK_SPS[next] as *const AtomicUsize as *const usize;
+    // Take stable raw pointers to the saved-SP cells under the lock, then
+    // release it before __switch. Boxes are never dropped while a slot exists
+    // (they are reset-in-place on reuse), so the pointers stay valid across
+    // the switch, including the exit path where current is already marked.
+    let (cur_ptr, nxt_ptr) = {
+        let mut sched = SCHEDULER.lock();
+        let cur = node_mut(&mut sched, current).map(|n| &n.sp as *const AtomicUsize as *mut usize);
+        let nxt = node_mut(&mut sched, next).map(|n| &n.sp as *const AtomicUsize as *const usize);
+        (cur, nxt)
+    };
+    let (cur_ptr, nxt_ptr) = match (cur_ptr, nxt_ptr) {
+        (Some(c), Some(n)) => (c, n),
+        _ => return, // slot vanished (should not happen); refuse to switch
+    };
     unsafe {
         __switch(cur_ptr, nxt_ptr);
     }
@@ -304,74 +405,116 @@ fn switch_to(current: usize, next: usize) {
 }
 
 pub fn schedule() {
-    let (current, next) = {
-        let mut sched = SCHEDULER.lock();
-        let current = sched.current;
-        let next = match find_next_ready_user(&sched, current) {
-            Some(slot) => slot,
-            None => return,
-        };
+    let mut sched_guard = SCHEDULER.lock();
+    let current = sched_guard.current;
 
-        if matches!(sched.kinds[current], TaskKind::User { .. }) {
-            if let Some(ref mut task) = sched.tasks[current] {
-                if task.state == TaskState::Running {
-                    task.state = TaskState::Ready;
-                }
+    // Quantum gate: timer-driven rescheduling happens only when the running
+    // task's slice is exhausted. Blocking/exit paths bypass this via
+    // schedule_block/schedule_exit.
+    if let Some(n) = node_mut(&mut sched_guard, current) {
+        if matches!(n.kind, TaskKind::User { .. })
+            && n.state == TaskState::Running
+            && n.quantum_left > 0
+        {
+            n.quantum_left -= 1;
+            return;
+        }
+    }
+
+    // Requeue current if still runnable (Running -> Ready), then O(1)-pick
+    // the highest-priority ready task.
+    let next = {
+        if let Some(n) = node_mut(&mut sched_guard, current) {
+            if matches!(n.kind, TaskKind::User { .. }) && n.state == TaskState::Running {
+                n.state = TaskState::Ready;
+                n.quantum_left = n.class.quantum();
+                let prio = n.class.priority();
+                sched_guard.ready.push(current, prio);
             }
         }
-        if let Some(ref mut task) = sched.tasks[next] {
-            task.state = TaskState::Running;
+        match find_next_ready_user(&mut sched_guard, current) {
+            Some(slot) => slot,
+            // No other ready task: keep running current (single-task case).
+            None => {
+                if let Some(n) = node_mut(&mut sched_guard, current) {
+                    if n.state == TaskState::Ready {
+                        n.state = TaskState::Running;
+                    }
+                }
+                LAST_SCHEDULED.store(current, Ordering::Relaxed);
+                return;
+            }
         }
-        sched.current = next;
-        LAST_SCHEDULED.store(next, Ordering::Relaxed);
-        (current, next)
     };
+
+    if let Some(n) = node_mut(&mut sched_guard, next) {
+        n.state = TaskState::Running;
+    }
+    sched_guard.current = next;
+    LAST_SCHEDULED.store(next, Ordering::Relaxed);
+    drop(sched_guard);
 
     switch_to(current, next);
 }
 
 pub fn schedule_block() {
-    let (current, next) = {
-        let mut sched = SCHEDULER.lock();
-        let current = sched.current;
-        if !matches!(sched.kinds[current], TaskKind::User { .. }) {
-            return;
-        }
-        if let Some(ref mut task) = sched.tasks[current] {
-            task.state = TaskState::Blocked;
-        }
+    let mut sched_guard = SCHEDULER.lock();
+    let current = sched_guard.current;
+    let is_user = node_ref(&sched_guard, current)
+        .map(|n| matches!(n.kind, TaskKind::User { .. }))
+        .unwrap_or(false);
+    if !is_user {
+        return;
+    }
+    // Blocked tasks leave the ready queue (invariant: Ready ⇔ queued).
+    if let Some(n) = node_mut(&mut sched_guard, current) {
+        n.state = TaskState::Blocked;
+        sched_guard.ready.remove(current);
+    }
 
-        let next = find_next_ready_user(&sched, current).unwrap_or(IDLE_SLOT);
-        if let Some(ref mut task) = sched.tasks[next] {
-            task.state = TaskState::Running;
-        }
-        sched.current = next;
-        LAST_SCHEDULED.store(next, Ordering::Relaxed);
-        (current, next)
-    };
+    let next = find_next_ready_user(&mut sched_guard, current).unwrap_or(IDLE_SLOT);
+    if let Some(n) = node_mut(&mut sched_guard, next) {
+        n.state = TaskState::Running;
+    }
+    sched_guard.current = next;
+    LAST_SCHEDULED.store(next, Ordering::Relaxed);
+    drop(sched_guard);
 
     switch_to(current, next);
 }
 
 pub fn schedule_exit() {
     remove_sleep(CURRENT_RUNNING.load(Ordering::Relaxed));
-    let (current, next) = {
+    let (proc_idx, current, next) = {
         let mut sched = SCHEDULER.lock();
         let current = sched.current;
-        if let TaskKind::User { proc_idx } = sched.kinds[current] {
-            PROC_TO_SLOT[proc_idx].store(NO_SLOT, Ordering::Relaxed);
+        let proc_idx = node_ref(&sched, current).and_then(|n| match n.kind {
+            TaskKind::User { proc_idx } => Some(proc_idx),
+            _ => None,
+        });
+        // Mark exited and recycle the SLOT; the box itself stays in place
+        // (reset on reuse) so its address — captured by switch_to below —
+        // remains valid across the switch.
+        if let Some(n) = node_mut(&mut sched, current) {
+            n.state = TaskState::Exited;
+            n.kind = TaskKind::Empty;
+            sched.ready.remove(current);
+            sched.free.push(current);
         }
-        sched.tasks[current] = None;
-        sched.kinds[current] = TaskKind::Empty;
 
-        let next = find_next_ready_user(&sched, current).unwrap_or(IDLE_SLOT);
-        if let Some(ref mut task) = sched.tasks[next] {
-            task.state = TaskState::Running;
+        let next = find_next_ready_user(&mut sched, current).unwrap_or(IDLE_SLOT);
+        if let Some(n) = node_mut(&mut sched, next) {
+            n.state = TaskState::Running;
         }
         sched.current = next;
         LAST_SCHEDULED.store(next, Ordering::Relaxed);
-        (current, next)
+        (proc_idx, current, next)
     };
+    // Mapping cleanup outside the scheduler lock (PROC_TO_SLOT lock is never
+    // held together with SCHEDULER).
+    if let Some(p) = proc_idx {
+        proc_slot_set(p, NO_SLOT);
+    }
 
     switch_to(current, next);
 }
@@ -386,78 +529,65 @@ pub fn mark_current_exited() {
     remove_sleep(CURRENT_RUNNING.load(Ordering::Relaxed));
     let mut sched = SCHEDULER.lock();
     let cur = sched.current;
-    if let Some(ref mut task) = sched.tasks[cur] {
-        task.state = TaskState::Exited;
+    if let Some(n) = node_mut(&mut sched, cur) {
+        n.state = TaskState::Exited;
     }
 }
 
 pub fn mark_task_exited_by_proc(proc_idx: usize) {
-    let slot = PROC_TO_SLOT[proc_idx].load(Ordering::Relaxed);
-    if slot >= MAX_TASKS {
+    let slot = proc_slot_get(proc_idx);
+    if slot == NO_SLOT {
         return;
     }
     remove_sleep(slot);
     let mut sched = SCHEDULER.lock();
-    sched.tasks[slot] = None;
-    sched.kinds[slot] = TaskKind::Empty;
-    PROC_TO_SLOT[proc_idx].store(NO_SLOT, Ordering::Relaxed);
+    if let Some(n) = node_mut(&mut sched, slot) {
+        n.state = TaskState::Exited;
+        n.kind = TaskKind::Empty;
+        sched.ready.remove(slot);
+        sched.free.push(slot);
+    }
+    drop(sched);
+    proc_slot_set(proc_idx, NO_SLOT);
 }
 
 pub fn wake_task(proc_idx: usize) -> bool {
-    let slot = PROC_TO_SLOT[proc_idx].load(Ordering::Relaxed);
-    if slot >= MAX_TASKS {
+    let slot = proc_slot_get(proc_idx);
+    if slot == NO_SLOT {
         return false;
     }
     remove_sleep(slot);
     let mut sched = SCHEDULER.lock();
-    if let Some(ref mut task) = sched.tasks[slot] {
-        if task.state == TaskState::Blocked {
-            task.state = TaskState::Ready;
+    if let Some(n) = node_mut(&mut sched, slot) {
+        if n.state == TaskState::Blocked {
+            n.state = TaskState::Ready;
+            let prio = n.class.priority();
+            sched.ready.push(slot, prio);
             return true;
         }
     }
     false
 }
 
-const MAX_SLEEPQ: usize = 32;
-static SLEEPQ: SpinLock<[(usize, u64); MAX_SLEEPQ]> = SpinLock::new([(NO_SLOT, 0u64); MAX_SLEEPQ]);
-static SLEEPQ_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Sleep queue: dynamic (P1.1 — the old fixed 32-entry array could not hold a
+/// 200-task stress workload). Entries: (slot, wake_tick).
+static SLEEPQ: SpinLock<Vec<(usize, u64)>> = SpinLock::new(Vec::new());
 
 fn remove_sleep(slot: usize) {
     let mut q = SLEEPQ.lock();
-    let len = SLEEPQ_LEN.load(Ordering::Relaxed);
-    let mut new_len = 0;
-    for i in 0..len {
-        if q[i].0 == slot {
-            continue;
-        }
-        if new_len != i {
-            q[new_len] = q[i];
-        }
-        new_len += 1;
-    }
-    for i in new_len..len {
-        q[i] = (NO_SLOT, 0);
-    }
-    SLEEPQ_LEN.store(new_len, Ordering::Relaxed);
+    q.retain(|&(s, _)| s != slot);
 }
 
 fn queue_sleep(slot: usize, wake_tick: u64) -> bool {
     let mut q = SLEEPQ.lock();
-    let len = SLEEPQ_LEN.load(Ordering::Relaxed);
-    for i in 0..len {
-        if q[i].0 == slot {
-            q[i].1 = wake_tick;
+    for entry in q.iter_mut() {
+        if entry.0 == slot {
+            entry.1 = wake_tick;
             return true;
         }
     }
-    if len < MAX_SLEEPQ {
-        q[len] = (slot, wake_tick);
-        SLEEPQ_LEN.store(len + 1, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
+    q.push((slot, wake_tick));
+    true
 }
 
 pub fn sleep_until(wake_tick: u64) {
@@ -466,7 +596,7 @@ pub fn sleep_until(wake_tick: u64) {
         return;
     }
     let slot = CURRENT_RUNNING.load(Ordering::Relaxed);
-    if slot >= MAX_TASKS || !is_slot_active(slot) {
+    if !is_slot_active(slot) {
         while crate::arch::platform::uptime_ms() < wake_tick {
             core::hint::spin_loop();
         }
@@ -483,43 +613,36 @@ pub fn sleep_until(wake_tick: u64) {
 
 pub fn tick_sleep_queue() {
     let now = crate::arch::platform::uptime_ms();
-    let mut to_wake = [NO_SLOT; MAX_SLEEPQ];
-    let mut wake_len = 0usize;
+    let mut to_wake: Vec<usize> = Vec::new();
     {
         let mut q = match SLEEPQ.try_lock() {
             Some(guard) => guard,
             None => return,
         };
-        let len = SLEEPQ_LEN.load(Ordering::Relaxed);
-        let mut new_len = 0;
-        for i in 0..len {
-            let (slot, wake_tick) = q[i];
-            if slot != NO_SLOT && now >= wake_tick {
-                if wake_len < MAX_SLEEPQ {
-                    to_wake[wake_len] = slot;
-                    wake_len += 1;
-                }
+        // Drain every due entry (queue is now unbounded, so no truncation).
+        let mut i = 0;
+        while i < q.len() {
+            if now >= q[i].1 {
+                to_wake.push(q.remove(i).0);
             } else {
-                if new_len != i {
-                    q[new_len] = q[i];
-                }
-                new_len += 1;
+                i += 1;
             }
         }
-        SLEEPQ_LEN.store(new_len, Ordering::Relaxed);
     }
 
-    if wake_len == 0 {
+    if to_wake.is_empty() {
         return;
     }
     let mut sched = match SCHEDULER.try_lock() {
         Some(guard) => guard,
         None => return,
     };
-    for &slot in &to_wake[..wake_len] {
-        if let Some(ref mut task) = sched.tasks[slot] {
-            if task.state == TaskState::Blocked {
-                task.state = TaskState::Ready;
+    for slot in to_wake {
+        if let Some(n) = node_mut(&mut sched, slot) {
+            if n.state == TaskState::Blocked {
+                n.state = TaskState::Ready;
+                let prio = n.class.priority();
+                sched.ready.push(slot, prio);
             }
         }
     }
@@ -605,28 +728,31 @@ fn allocate_user_slot(
     initial_sp: usize,
 ) -> Result<usize, SchedError> {
     let mut sched = SCHEDULER.lock();
-    let slot = (0..MAX_TASKS)
-        .find(|&i| sched.kinds[i] == TaskKind::Empty)
-        .ok_or(SchedError::NoFreeSlot)?;
-
-    sched.tasks[slot] = Some(TaskControlBlock::new(slot));
-    sched.kinds[slot] = TaskKind::User { proc_idx };
-    if let Some(ref mut task) = sched.tasks[slot] {
-        task.state = TaskState::Ready;
-    }
+    // Reuse an exited slot (box reset in place — addresses stay stable for
+    // __switch) or grow the table. No fixed cap: the Vec grows on demand.
+    let slot = match sched.free.pop() {
+        Some(s) => s,
+        None => {
+            sched
+                .nodes
+                .push(Some(alloc::boxed::Box::new(TaskNode::new_idle())));
+            sched.nodes.len() - 1
+        }
+    };
+    let prio = {
+        let n = node_mut(&mut sched, slot).ok_or(SchedError::NoFreeSlot)?;
+        *n = TaskNode::new_user(proc_idx, SchedClass::Normal, initial_sp);
+        #[cfg(target_arch = "x86_64")]
+        n.kstack.store(kernel_stack_top as u64, Ordering::Relaxed);
+        n.class.priority()
+    };
     if slot >= sched.high_water {
         sched.high_water = slot + 1;
     }
-    PROC_TO_SLOT[proc_idx].store(slot, Ordering::Relaxed);
-    TASK_SPS[slot].store(initial_sp, Ordering::Relaxed);
-    INITIAL_TASK_SP[slot].store(initial_sp, Ordering::Relaxed);
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        TASK_KSTACK[slot].store(kernel_stack_top as u64, Ordering::Relaxed);
-        TASK_FS_BASE[slot].store(0, Ordering::Relaxed);
-    }
-
+    sched.ready.push(slot, prio);
+    drop(sched);
+    // Mapping update outside the scheduler lock (lock discipline).
+    proc_slot_set(proc_idx, slot);
     Ok(slot)
 }
 
@@ -658,7 +784,7 @@ pub fn add_user_process(
 pub fn spawn_clone_task(proc_idx: usize, init: CloneTaskInit<'_>) -> Result<usize, SchedError> {
     let initial_sp = build_clone_stack(init);
     let slot = allocate_user_slot(proc_idx, init.kernel_stack_top, initial_sp)?;
-    TASK_FS_BASE[slot].store(init.tls as u64, Ordering::Relaxed);
+    set_task_fs_base(slot, init.tls as u64);
     PENDING_RSP0.store(init.kernel_stack_top as u64, Ordering::Relaxed);
     Ok(slot)
 }
@@ -689,12 +815,12 @@ pub fn start_first_task() -> ! {
     crate::console_println!("[sched] Starting first task...");
     let next = {
         let mut sched = SCHEDULER.lock();
-        let next = find_next_ready_user(&sched, IDLE_SLOT).expect("no initial user task");
-        if let Some(ref mut task) = sched.tasks[IDLE_SLOT] {
-            task.state = TaskState::Running;
+        let next = find_next_ready_user(&mut sched, IDLE_SLOT).expect("no initial user task");
+        if let Some(n) = node_mut(&mut sched, IDLE_SLOT) {
+            n.state = TaskState::Running;
         }
-        if let Some(ref mut task) = sched.tasks[next] {
-            task.state = TaskState::Running;
+        if let Some(n) = node_mut(&mut sched, next) {
+            n.state = TaskState::Running;
         }
         sched.current = next;
         LAST_SCHEDULED.store(next, Ordering::Relaxed);
@@ -726,27 +852,29 @@ pub fn remove_task(proc_idx: usize) {
 }
 
 pub fn get_task_slot(proc_idx: usize) -> usize {
-    PROC_TO_SLOT[proc_idx].load(Ordering::Relaxed)
+    proc_slot_get(proc_idx)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn task_kernel_stack(slot: usize) -> u64 {
-    TASK_KSTACK[slot].load(Ordering::Relaxed)
+    let sched = SCHEDULER.lock();
+    node_ref(&sched, slot)
+        .map(|n| n.kstack.load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn set_task_fs_base(slot: usize, val: u64) {
-    if slot < MAX_TASKS {
-        TASK_FS_BASE[slot].store(val, Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    if let Some(n) = node_mut(&mut sched, slot) {
+        n.fs_base.store(val, Ordering::Relaxed);
     }
 }
 
 /// Typed version: set FS_BASE using the FsBase newtype.
 #[cfg(target_arch = "x86_64")]
 pub fn set_task_fs_base_typed(slot: usize, val: crate::arch::user_return::FsBase) {
-    if slot < MAX_TASKS {
-        TASK_FS_BASE[slot].store(val.raw(), Ordering::Relaxed);
-    }
+    set_task_fs_base(slot, val.raw());
 }
 
 /// Typed version: get FS_BASE as the FsBase newtype.
@@ -757,11 +885,10 @@ pub fn get_task_fs_base_typed(slot: usize) -> crate::arch::user_return::FsBase {
 
 #[cfg(target_arch = "x86_64")]
 pub fn get_task_fs_base(slot: usize) -> u64 {
-    if slot < MAX_TASKS {
-        TASK_FS_BASE[slot].load(Ordering::Relaxed)
-    } else {
-        0
-    }
+    let sched = SCHEDULER.lock();
+    node_ref(&sched, slot)
+        .map(|n| n.fs_base.load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -780,47 +907,55 @@ pub fn pending_rsp0() -> u64 {
 }
 
 pub fn set_task_sp(slot: usize, sp: usize) {
-    if slot < MAX_TASKS {
-        TASK_SPS[slot].store(sp, Ordering::Relaxed);
+    let mut sched = SCHEDULER.lock();
+    if let Some(n) = node_mut(&mut sched, slot) {
+        n.sp.store(sp, Ordering::Relaxed);
     }
 }
 
 pub fn task_sp(slot: usize) -> usize {
-    if slot < MAX_TASKS {
-        TASK_SPS[slot].load(Ordering::Relaxed)
-    } else {
-        0
-    }
+    let sched = SCHEDULER.lock();
+    node_ref(&sched, slot)
+        .map(|n| n.sp.load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 pub fn child_count() -> usize {
     let sched = SCHEDULER.lock();
     sched
-        .kinds
+        .nodes
         .iter()
-        .filter(|kind| matches!(kind, TaskKind::User { .. }))
+        .filter(|n| {
+            n.as_deref()
+                .map(|node| matches!(node.kind, TaskKind::User { .. }))
+                .unwrap_or(false)
+        })
         .count()
 }
 
 pub fn is_slot_active(slot: usize) -> bool {
     let sched = SCHEDULER.lock();
-    slot < MAX_TASKS && sched.tasks[slot].is_some()
+    node_ref(&sched, slot)
+        .map(|n| !matches!(n.kind, TaskKind::Empty))
+        .unwrap_or(false)
 }
 
 pub fn slot_to_process(slot: usize) -> usize {
     let sched = SCHEDULER.lock();
-    match sched.kinds[slot] {
-        TaskKind::User { proc_idx } => proc_idx,
+    match node_ref(&sched, slot).map(|n| n.kind) {
+        Some(TaskKind::User { proc_idx }) => proc_idx,
         _ => usize::MAX,
     }
 }
 
 pub fn set_slot_process(slot: usize, proc_idx: usize) {
-    let mut sched = SCHEDULER.lock();
-    if slot < MAX_TASKS {
-        sched.kinds[slot] = TaskKind::User { proc_idx };
-        PROC_TO_SLOT[proc_idx].store(slot, Ordering::Relaxed);
+    {
+        let mut sched = SCHEDULER.lock();
+        if let Some(n) = node_mut(&mut sched, slot) {
+            n.kind = TaskKind::User { proc_idx };
+        }
     }
+    proc_slot_set(proc_idx, slot);
 }
 
 pub fn current_slot() -> usize {
