@@ -190,6 +190,12 @@ pub fn init() -> bool {
             continue; // 1 = net
         }
         unsafe { DEV_BASE = base };
+        uart_puts("[net32] dev version=");
+        uart_dec(rd(base, REG_VERSION));
+        uart_puts(" qmax(rq0)=");
+        wr(base, REG_QUEUE_SEL, 0);
+        uart_dec(rd(base, REG_QUEUE_NUM_MAX));
+        uart_puts("\n");
         wr(base, REG_STATUS, S_ACK);
         wr(base, REG_STATUS, S_ACK | S_DRIVER);
         // 不协商任何 feature（0）：最小驱动，帧不带 offload
