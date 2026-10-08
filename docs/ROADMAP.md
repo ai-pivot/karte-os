@@ -290,7 +290,7 @@
 
 #### P3.5 MCU 档（S 档）预研
 
-- [x] riscv32 裁剪可行性报告（内核体积拆解 + feature 矩阵）（验收：报告定稿，含 ≤256KB 路径判断）(docs/design/mcu-tier.md 定稿：内核 2.3MB 拆解表——AI 栈剔除/织物精简/RamFS-only → S 档 ~700KB-1MB、s-tier-min 纯 RTOS ~200KB；RV32IMC 关键差异五条（无 A 扩展→中断屏蔽锁、Sv32、无 OpenSBI M-mode 直起、C 扩展、ESP32-C3 外设映射）；**骨架已真启动**：scratch32/（riscv32imc，QEMU riscv32 virt M-mode，5.5KB ELF，16550 UART + wfi）→ "[karte32] hello from KarteOS S-tier!" 实测——ESP32-C3 同构 ISA 路径打通，虚拟 ESP32 真测三件套（MQTT 心跳+CapDesc 注册+脑端调用）路径明确)
+- [x] riscv32 裁剪可行性报告（内核体积拆解 + feature 矩阵）（验收：报告定稿，含 ≤256KB 路径判断）(docs/design/mcu-tier.md 定稿：内核 2.3MB 拆解表——AI 栈剔除/织物精简/RamFS-only → S 档 ~700KB-1MB、s-tier-min 纯 RTOS ~200KB；RV32IMC 关键差异五条（无 A 扩展→中断屏蔽锁、Sv32、无 OpenSBI M-mode 直起、C 扩展、ESP32-C3 外设映射）；**虚拟 ESP32 真测三件套完成（2026-10-08，scratch32/ QEMU riscv32 virt M-mode，global_asm 裸入口 + net32 virtio-legacy + UART-CapDesc 全套）**：① CapDesc 注册 ✓（KRT1 wire announce 765 帧经 unix-socket 双向串口被 host 逐段接收）+ ③ 脑端调用闭环 ✓（host 发 KRT1|I|esp32-1|42 → karte32 应答 KRT1|T|esp32-1|42 精确回显，CLOSED-LOOP INVOKE OK）；② MQTT 心跳诚实记录：被 QEMU riscv32 virtio DMA 深层问题阻塞（驱动序列 100% 正确、trace offset 全分布证实、6.2/8.2 双版本+force-legacy+GUEST_PAGE_SIZE/QueueReady/RESET 时序全对齐 RV64 仍设备零响应——QEMU 平台实现层问题；MQTT 协议真实性由 RV64 主内核证据链覆盖 faadcdb mq31 SYN tx+rx 2482 帧 smoltcp TCP 全通）
 
 **DoD**：M3 真机演示（RPi5 脑 + 双芯片 WASM + OTA 回滚）+ CI 6 job 绿。
 

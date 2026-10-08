@@ -142,6 +142,9 @@ extern "C" fn kmain32() -> ! {
                     break; // LSR.DATA 无数据
                 }
                 let b = read_volatile(UART0 as *const u8);
+                uart_puts("[uart-rx] ");
+                uart_dec(b as u32);
+                uart_puts("\n");
                 if b == b'\n' || b == b'\r' || ilen >= inv.len() {
                     break;
                 }
@@ -153,9 +156,16 @@ extern "C" fn kmain32() -> ! {
             uart_puts("[karte32] invoke via UART: ");
             print_bytes(&inv[..ilen]);
             uart_puts("\n");
-            // 应答闭环：KRT1|T|esp32-1|<原 seq 回显>
+            // 应答闭环：KRT1|T|esp32-1|<invoke 的最后一段（seq）回显>
+            let mut tail = ilen;
+            for i in (0..ilen).rev() {
+                if inv[i] == b'|' {
+                    tail = i + 1;
+                    break;
+                }
+            }
             uart_puts("KRT1|T|esp32-1|");
-            print_bytes(&inv[7..ilen]);
+            print_bytes(&inv[tail..ilen]);
             uart_puts("\n");
             uart_puts("[karte32] invoke replied (uart)\n");
         }
