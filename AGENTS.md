@@ -276,6 +276,6 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`
 - **CI**: GitHub Actions runs build + lint + test + boot-test + smp-test on every push
 - **Coverage (RISC-V, 112 total)**: Syscall (29), FS (15), VMM (10), Sched 2.0 (7: class 2 + readyqueue 4 + 200-task stress), PMM (6), Heap (6), Task (5), SpinLock (5), IntSpinLock (5), YieldMutex (4), Trap (4), Sv39 (3), SStatus (2), Frame (2), BlockingMutex (2), arch-misc (7: user/switch/sie/sbi/satp/process/kernel)
-- **Total**: RISC-V **112/112**, x86_64 **138/138** (measured 2026-10-08 after Scheduler 2.0 landed)
+- **Total**: RISC-V **115/115** (P1.2 added 3 mmap-family tests), x86_64 **138/138** (measured 2026-10-08 after Scheduler 2.0 landed)
 - **x86_64**: `make test-x86` runs x86_64 integration tests in QEMU
 - **Both**: `make test-all` runs RISC-V + x86_64 tests sequentially

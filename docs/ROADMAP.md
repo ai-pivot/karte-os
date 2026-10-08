@@ -137,9 +137,9 @@
 - [x] `kernel/src/mm/vmm.rs` 两个测试引用 x86_64-only 函数缺 `#[cfg]` → 已修复（待提交）
 - [x] `kernel/src/main.rs` x86_64 分支引用不存在的 `user/target/x86_64/shell.elf` → 已改 `user/shell.elf`（待提交）
 - [x] `Cargo.lock`：`x86_64` crate 0.15.4→0.15.5（兼容新 nightly `Step` trait）→ 已修复（待提交）
-- [ ] clippy **8 个 `not_unsafe_ptr_arg_deref` error**（CI lint job 预期红）
-- [ ] AGENTS.md 测试数 96 → 实测 105；README 数字严重过时（"50 tests / 2512 行"，实际 3 万+ 行）
-- [ ] 垃圾文件：`driver/fs.rs_fake.txt`、`driver/fs.rs_addition.txt`、`user/shell-riscv64.elf.bak`、`user/fd_test*`、`user/minclone/`、根目录 `xbot-cli-static`（69MB 二进制）
+- [x] clippy **8 个 `not_unsafe_ptr_arg_deref` error**（CI lint job 预期红）(2026-10-08 用 CI 完整参数实测：`cargo clippy --release --target riscv64gc-unknown-none-elf -- -A <CI allowlist>` 退出码 0、0 error——8 处已在后续重构中消除，CI lint job 现为绿)
+- [x] AGENTS.md 测试数 96 → 实测 115（P1.2 后）；README 数字已同步更新
+- [x] 垃圾文件：`driver/fs.rs_fake.txt`、`driver/fs.rs_addition.txt`、`user/shell-riscv64.elf.bak`、`user/fd_test*`、`user/minclone/`、根目录 `xbot-cli-static`（69MB 二进制）(2026-10-08 已全部清理确认：文件系统与 git 均无残留)
 
 ---
 
