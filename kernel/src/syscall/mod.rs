@@ -73,6 +73,7 @@ pub const SYS_SYSLOG: usize = 81; // syslog(buf, len, offset) → bytes_read
 pub const SYS_SETPRIORITY: usize = 82; // setpriority(pid, class_code, level) → 0
 pub const SYS_GETSCHEDULER: usize = 83; // getscheduler(pid) → (code<<16)|level, or -1
 pub const LINUX_WAIT4: usize = 84; // internal: Linux wait4(pid,&status,opt,rusage) dedicated handler
+pub const LINUX_FCNTL: usize = 86; // internal: Linux fcntl(fd,cmd,arg) dedicated handler
 pub const LINUX_EXECVE: usize = 85; // internal: Linux execve(path,argv,envp) dedicated handler
 
 // ─── Linux compatibility syscalls (translated from Linux x86_64 numbers) ──
@@ -233,6 +234,17 @@ pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
 /// switch inside a syscall (the arch register still points at whichever task
 /// ran last, so the write would land in a different process's copy). This
 /// walks the logical owner's page table explicitly.
+/// Increment the pipe reference count for the END described by `fd_type`.
+/// Per-end refs are required so a shell closing its own pipe fds after
+/// spawning children does not tear down a channel a child still holds.
+fn inc_pipe_ref_for(fd_type: &FdType, pipe_id: usize) {
+    match fd_type {
+        FdType::PipeRead => crate::driver::pipe::inc_read(pipe_id),
+        FdType::PipeWrite => crate::driver::pipe::inc_write(pipe_id),
+        _ => {}
+    }
+}
+
 fn user_translate(addr: usize) -> Option<usize> {
     let proc_idx = crate::sched::slot_to_process(crate::sched::current_slot());
     if proc_idx == usize::MAX {
@@ -1336,7 +1348,7 @@ fn linux_dup(oldfd: usize) -> isize {
                     // Increment pipe ref count if this is a pipe fd
                     if let Some(desc) = fd_table.get(oldfd) {
                         if let Some(pipe_id) = desc.pipe_id {
-                            crate::driver::pipe::inc_ref(pipe_id);
+                            inc_pipe_ref_for(&desc.fd_type, pipe_id);
                         }
                     }
                     return new_fd as isize;
@@ -1614,6 +1626,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_GETSCHEDULER => sys_getscheduler(args[0]),
         LINUX_WAIT4 => sys_wait4(args[0], args[1], args[2], args[3]),
         LINUX_EXECVE => sys_execve_linux(args[0], args[1], args[2]),
+        LINUX_FCNTL => sys_fcntl_linux(args[0], args[1], args[2]),
 
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
         LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
@@ -2888,14 +2901,12 @@ fn cleanup_fd_resources(fd: usize, desc: FileDescriptor) {
     match desc.fd_type {
         FdType::PipeRead => {
             if let Some(pipe_id) = desc.pipe_id {
-                crate::driver::pipe::with_pipe(pipe_id, |p| p.close_read());
-                crate::driver::pipe::dec_ref(pipe_id);
+                crate::driver::pipe::close_read(pipe_id);
             }
         }
         FdType::PipeWrite => {
             if let Some(pipe_id) = desc.pipe_id {
-                crate::driver::pipe::with_pipe(pipe_id, |p| p.close_write());
-                crate::driver::pipe::dec_ref(pipe_id);
+                crate::driver::pipe::close_write(pipe_id);
             }
         }
         FdType::VfsFile(vfs_fd) => {
@@ -4097,8 +4108,8 @@ fn sys_pipe(fd_ptr: usize) -> isize {
         }
         _ => {
             // Failed to allocate fds — clean up pipe
-            crate::driver::pipe::dec_ref(pipe_id);
-            crate::driver::pipe::dec_ref(pipe_id);
+            crate::driver::pipe::close_read(pipe_id);
+            crate::driver::pipe::close_write(pipe_id);
             ERR_NOMEM
         }
     }
@@ -4125,7 +4136,7 @@ fn sys_dup2(old_fd: i32, new_fd: i32) -> isize {
 
         // If it's a pipe fd, increment the pipe reference count
         if let Some(pipe_id) = desc.pipe_id {
-            crate::driver::pipe::inc_ref(pipe_id);
+            inc_pipe_ref_for(&desc.fd_type, pipe_id);
         }
 
         fd_table.set_fd(new_fd as usize, desc);
@@ -4264,15 +4275,15 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
         };
 
         if let Some(desc) = stdin_desc {
-            // Increment pipe ref if applicable
+            // Increment pipe ref if applicable (read end)
             if let Some(pipe_id) = desc.pipe_id {
-                crate::driver::pipe::inc_ref(pipe_id);
+                crate::driver::pipe::inc_read(pipe_id);
             }
             proc.fd_table.lock().set_fd(0, desc);
         }
         if let Some(desc) = stdout_desc {
             if let Some(pipe_id) = desc.pipe_id {
-                crate::driver::pipe::inc_ref(pipe_id);
+                crate::driver::pipe::inc_write(pipe_id);
             }
             proc.fd_table.lock().set_fd(1, desc);
         }
@@ -4402,6 +4413,51 @@ fn sys_execve_linux(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize 
         name.remove(0);
     }
     exec_by_name(name, argv_ptr, envp_ptr)
+}
+
+/// Linux fcntl(fd, cmd, arg) — P1.2. Minimal command set for shells and
+/// busybox: F_DUPFD / F_DUPFD_CLOEXEC duplicate the fd (pipe refcounts
+/// incremented per-end like sys_dup2); F_GETFD/F_SETFD accept CLOEXEC
+/// tracking (untracked, validates the fd); F_GETFL reports O_RDWR;
+/// F_SETFL accepts O_NONBLOCK/O_APPEND as an untracked no-op.
+fn sys_fcntl_linux(fd: usize, cmd: usize, arg: usize) -> isize {
+    const F_DUPFD: usize = 0;
+    const F_GETFD: usize = 1;
+    const F_SETFD: usize = 2;
+    const F_GETFL: usize = 3;
+    const F_SETFL: usize = 4;
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    match cmd {
+        F_GETFD | F_SETFD | F_GETFL | F_SETFL => {
+            crate::process::with_fd_table(|t| {
+                if t.get(fd).is_some() {
+                    if cmd == F_GETFL { 0o2 } else { 0 } // O_RDWR / success
+                } else {
+                    ERR_NOENT
+                }
+            })
+        }
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let min = if arg > 2 { arg } else { 0 };
+            crate::process::with_fd_table(|t| {
+                let desc = match t.get(fd) {
+                    Some(d) => d.clone(),
+                    None => return ERR_NOENT,
+                };
+                for cand in min..MAX_FDS {
+                    if t.get(cand).is_none() {
+                        if let Some(pipe_id) = desc.pipe_id {
+                            inc_pipe_ref_for(&desc.fd_type, pipe_id);
+                        }
+                        t.set_fd(cand, desc);
+                        return cand as isize;
+                    }
+                }
+                -24 // -EMFILE
+            })
+        }
+        _ => ERR_INVAL,
+    }
 }
 
 /// Syscall 60: Send a signal to a process.

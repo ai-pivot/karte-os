@@ -169,23 +169,24 @@ impl Pipe {
 /// Global pipe table.
 static PIPE_TABLE: SpinLock<[Option<Pipe>; MAX_PIPES]> = SpinLock::new([const { None }; MAX_PIPES]);
 
-/// Reference counts per pipe: number of open fds pointing to this pipe.
-/// When ref count drops to 0, the pipe can be freed.
-static PIPE_REFCOUNTS: SpinLock<[usize; MAX_PIPES]> = SpinLock::new([0; MAX_PIPES]);
+/// Per-pipe reference counts as `[read_fds, write_fds]`. An end is marked
+/// closed only when its LAST fd drops: a shell closing its own pipe fds
+/// after spawning children must not tear down a channel a child still
+/// holds (that used to hand writers a spurious EPIPE before data flowed).
+static PIPE_REFS: SpinLock<[[usize; 2]; MAX_PIPES]> = SpinLock::new([const { [0; 2] }; MAX_PIPES]);
 
 pub fn init() {
     // Pipes are lazily allocated, no init needed
 }
 
 /// Allocate a new pipe. Returns (pipe_id, Option<(read_fd_idx, write_fd_idx)>).
-/// On success, pipe starts with refcount=2 (one for each end).
+/// On success, each end starts with refcount=1.
 pub fn alloc_pipe() -> Option<usize> {
     let mut table = PIPE_TABLE.lock();
     for (i, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(Pipe::new());
-            let mut refs = PIPE_REFCOUNTS.lock();
-            refs[i] = 2; // read end + write end
+            PIPE_REFS.lock()[i] = [1, 1];
             return Some(i);
         }
     }
@@ -211,25 +212,57 @@ pub fn pipe_available(pipe_id: usize) -> usize {
     }
 }
 
-/// Increment reference count for a pipe.
-pub fn inc_ref(pipe_id: usize) {
-    let mut refs = PIPE_REFCOUNTS.lock();
-    refs[pipe_id] += 1;
+/// Increment reference count for the READ end of a pipe.
+pub fn inc_read(pipe_id: usize) {
+    PIPE_REFS.lock()[pipe_id][0] += 1;
 }
 
-/// Decrement reference count for a pipe. Returns true if fully released.
-pub fn dec_ref(pipe_id: usize) -> bool {
-    let mut refs = PIPE_REFCOUNTS.lock();
-    if refs[pipe_id] > 0 {
-        refs[pipe_id] -= 1;
+/// Increment reference count for the WRITE end of a pipe.
+pub fn inc_write(pipe_id: usize) {
+    PIPE_REFS.lock()[pipe_id][1] += 1;
+}
+
+/// Drop one reference to the READ end. Marks the end closed (waking blocked
+/// writers, which then see EPIPE) only when the last read fd closes.
+pub fn close_read(pipe_id: usize) {
+    let last = {
+        let mut refs = PIPE_REFS.lock();
+        if refs[pipe_id][0] > 0 {
+            refs[pipe_id][0] -= 1;
+        }
+        refs[pipe_id][0] == 0
+    };
+    if last {
+        with_pipe(pipe_id, |p| p.close_read());
+        try_free(pipe_id);
     }
-    if refs[pipe_id] == 0 {
-        // Free the pipe
+}
+
+/// Drop one reference to the WRITE end. Marks the end closed (waking blocked
+/// readers, which then see EOF) only when the last write fd closes.
+pub fn close_write(pipe_id: usize) {
+    let last = {
+        let mut refs = PIPE_REFS.lock();
+        if refs[pipe_id][1] > 0 {
+            refs[pipe_id][1] -= 1;
+        }
+        refs[pipe_id][1] == 0
+    };
+    if last {
+        with_pipe(pipe_id, |p| p.close_write());
+        try_free(pipe_id);
+    }
+}
+
+/// Release the pipe slot when BOTH ends have no references left.
+fn try_free(pipe_id: usize) {
+    let both = {
+        let refs = PIPE_REFS.lock();
+        refs[pipe_id] == [0, 0]
+    };
+    if both {
         let mut table = PIPE_TABLE.lock();
         table[pipe_id] = None;
-        true
-    } else {
-        false
     }
 }
 

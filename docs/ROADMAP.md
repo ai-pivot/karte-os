@@ -200,7 +200,7 @@
 
 - [x] `fork` 返回值语义修复（子进程 0）+ `wait4(pid, &status, options)`（验收：spawn_test 扩展用例通过）(spawn_test fork 用例全链路通过：子进程 a0=0 从 ecall 返回点恢复、exit(7)、wait4 收 status=0x700。三处修复：① sched::spawn_forked_task 从父 TrapContext 构建子栈（a0=0、sepc+=4）；② fork 页表递归深拷贝（旧代码只拷 root 直接 leaf，三级映射被丢弃；USER 位 leaf 深拷贝、内核/MMIO 映射共享）；③ user_translate — schedule() 切换后 satp 不恢复，内核 VA 直写用户内存会写进别的任务地址空间，改为按逻辑发起者页表 walk 后物理直写（AGENTS.md 新 GOTCHA）)
 - [x] `execve(path, argv, envp)` 完整参数传递 + `exit_group`（验收：busybox ash 能启动）(L_EXECVE(59)→85 专用 handler（NUL 路径+argv/envp 直传），exec_by_name 共享管道；exit_group 已映射 SYS_EXIT。实测 x86_64 busybox-static 2MB ELF：流式加载成功、`busybox echo HI_FROM_BB` 输出正确、exit_group code=0 —— glibc 静态启动序列（uname/openat/write/mmap/brk）全通；交互式 ash 行编辑归 TODO#6 验收一并完成)
-- [ ] `pipe2` / `dup3` / `fcntl`（F_GETFD/F_SETFD/F_GETFL/F_SETFL）（验收：管道+重定向脚本用例通过）
+- [x] `pipe2` / `dup3` / `fcntl`（F_GETFD/F_SETFD/F_GETFL/F_SETFL）（验收：管道+重定向脚本用例通过）(pipe2(293)/dup3(292) 已有 translate；新增 fcntl(72→86) 专用 handler（F_DUPFD/F_GETFD/F_SETFD/F_GETFL/F_SETFL）。**根因修复**：pipe 引用计数分端化 [read_fds, write_fds] 单锁版——shell spawn 子进程后关自己的 pipe fd 不再撕毁子进程仍持有的管道（旧实现 `echo hi | cat` 数据全丢 EPIPE）；close 归零才标记关闭。x86_64 `echo hi | cat` 首次全链路输出 hi；RV 回归 112/112)
 - [ ] `ioctl` TCGETS/TIOCGWINSZ 语义补齐（验收：ash 行编辑不异常）
 - [ ] mmap 家族完善：MAP_FIXED / munmap / 匿名私有语义对齐（验收：新增 ≥3 个 mmap 单测）
 - [ ] 验收里程碑：**静态 busybox（ash + coreutils 子集）在 KarteOS 上跑通一个 shell 脚本**（`echo hi | grep h | wc -l` 类）（验收：演示日志入库）
