@@ -346,8 +346,19 @@ fn merge_page_flags(
 
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = user_pt;
-        let _ = vaddr;
+        // RISC-V PTE permission bits are permissive flags (R/W/X): a page
+        // shared by an executable segment and a writable segment must end
+        // up with the UNION of both, otherwise one of the segments faults.
+        // (Found the hard way: text page 3 shared with .data lost its X bit
+        // and the process died on an instruction page fault at that page.)
+        use crate::mm::page_table::WalkResult;
+        match vmm::walk_mapping(user_pt, vaddr) {
+            WalkResult::Mapped4K { flags, .. } | WalkResult::MappedHuge { flags, .. } => {
+                let existing = vmm::PTEFlags::from_bits_truncate(flags);
+                return existing | new_flags;
+            }
+            _ => {}
+        }
     }
 
     new_flags
@@ -576,6 +587,13 @@ impl Process {
         // 2MB huge pages (PS=1) that overlap with ELF segment addresses.
         let mut max_vaddr = 0usize;
         for segment in &elf.loadable_segments {
+            #[cfg(target_arch = "riscv64")]
+            crate::console_println!(
+                "[exec] seg vaddr={:#x} filesz={:#x} memsz={:#x}",
+                segment.vaddr,
+                segment.file_size,
+                segment.mem_size
+            );
             let page_size = pmm::page_size();
             let seg_vaddr_start = segment.vaddr;
             let seg_vaddr_end = segment.vaddr + segment.mem_size;
