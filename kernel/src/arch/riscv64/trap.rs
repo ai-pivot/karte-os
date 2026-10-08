@@ -73,12 +73,34 @@ impl TrapContext {
 pub static HAS_VECTOR_EXT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Probe misa.V (bit 21) once at boot and record it in HAS_VECTOR_EXT.
+/// Probe for the V extension once at boot by *executing* a vector
+/// instruction. Reading misa is unreliable from S-mode: misa is an M-mode
+/// CSR, so the read is an illegal-instruction (silently skipped by the trap
+/// handler) and yields garbage even on harts that DO implement V — observed
+/// on QEMU 6.2, where vector instructions execute fine. Instead, run
+/// `vsetvli t0, zero, e64, m1` with t0 preloaded with a sentinel: on a
+/// V-capable hart t0 comes back as vl (VLEN/64 = 2 at vlen=128); without V
+/// every vector instruction is skipped by the illegal handler and t0 keeps
+/// the sentinel. MUST be called after stvec is armed (trap::init does this)
+/// so the potential illegal-instruction trap lands on a working handler.
 pub fn detect_vector_ext() {
-    let misa = riscv::register::misa::read();
-    let has_v = misa.has_extension('V');
+    let probe: usize;
+    unsafe {
+        core::arch::asm!(
+            "li      {t0}, 0xDEAD",
+            "li      {t1}, {vs_dirty}", // sstatus.VS = Dirty: legalize vector insns
+            "csrs    sstatus, {t1}",
+            ".option push",
+            ".option arch, +v",
+            "vsetvli {t0}, zero, e64, m1, ta, ma",
+            ".option pop",
+            t0 = out(reg) probe,
+            t1 = out(reg) _,
+            vs_dirty = const 3 << 9,
+        );
+    }
     HAS_VECTOR_EXT.store(
-        if has_v { 1 } else { 0 },
+        if probe != 0xDEAD { 1 } else { 0 },
         core::sync::atomic::Ordering::Relaxed,
     );
 }
