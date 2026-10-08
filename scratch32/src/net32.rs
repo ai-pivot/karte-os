@@ -221,6 +221,9 @@ pub fn init() -> bool {
             mac_store(&m);
         }
         wr(base, REG_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
+        // DRIVER_OK 后再 kick rx 一次：pre-DRIVER_OK 的 kick 可能被设备忽略，
+        // 但 avail idx=8 的预填充需要设备在就绪后显式获知。
+        wr(base, REG_QUEUE_NOTIFY, 0);
         uart_puts("[net32] virtio-net legacy up (slot ");
         uart_dec(slot as u32);
         uart_puts(")\n");
