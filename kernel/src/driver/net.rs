@@ -140,8 +140,10 @@ static RX_QUEUE_MEM: spin::Mutex<Option<QueueMem>> = spin::Mutex::new(None);
 static TX_QUEUE_MEM: spin::Mutex<Option<QueueMem>> = spin::Mutex::new(None);
 /// Last consumed used-ring index for RX (per-driver monotonic cursor).
 static RX_LAST_USED: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
-/// RX frame counter (diagnostic).
-static RX_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// RX frame counters by EtherType (diagnostic: ARP/IPv4/other).
+pub static RX_TYPE_ARP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static RX_TYPE_IPV4: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static RX_TYPE_OTHER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // VirtIONet driver
@@ -605,8 +607,17 @@ pub fn recv_raw(buf: &mut [u8]) -> Option<usize> {
     if let Some(ref mut net) = *guard {
         match net.recv_packet(buf) {
             Ok(len) => {
-                // rx probe: silent counter (P3.3 rx-path fix validation)
-                RX_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // rx probe: EtherType census (P3.3 SYN-ACK hunt)
+                let etype = if len >= 14 {
+                    ((buf[12] as u32) << 8) | buf[13] as u32
+                } else {
+                    0
+                };
+                match etype {
+                    0x0806 => RX_TYPE_ARP.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                    0x0800 => RX_TYPE_IPV4.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                    _ => RX_TYPE_OTHER.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                };
                 Some(len)
             }
             Err(()) => None,

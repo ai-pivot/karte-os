@@ -602,6 +602,16 @@ impl NetStack {
                 crate::console_println!("[drt-net] announce send err={} seq={}", r, seq);
             }
         }
+        // RX EtherType census every ~5s (SYN-ACK hunt: IPv4 count should rise
+        // if the TCP handshake is making progress).
+        if ANNOUNCE_SEQ.load(core::sync::atomic::Ordering::Relaxed) % 5 == 0 {
+            let (arp, v4, other) = (
+                crate::driver::net::RX_TYPE_ARP.load(core::sync::atomic::Ordering::Relaxed),
+                crate::driver::net::RX_TYPE_IPV4.load(core::sync::atomic::Ordering::Relaxed),
+                crate::driver::net::RX_TYPE_OTHER.load(core::sync::atomic::Ordering::Relaxed),
+            );
+            crate::console_println!("[rx] census arp={} ipv4={} other={}", arp, v4, other);
+        }
         // Dispatch received frames (up to 4 per tick).
         let mut buf = [0u8; 256];
         for _ in 0..4 {
