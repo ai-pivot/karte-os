@@ -291,7 +291,7 @@
 
 #### P3.5 MCU 档（S 档）预研
 
-- [ ] riscv32 裁剪可行性报告（内核体积拆解 + feature 矩阵）（验收：报告定稿，含 ≤256KB 路径判断）
+- [x] riscv32 裁剪可行性报告（内核体积拆解 + feature 矩阵）（验收：报告定稿，含 ≤256KB 路径判断）(docs/design/mcu-tier.md 定稿：内核 2.3MB 拆解表——AI 栈剔除/织物精简/RamFS-only → S 档 ~700KB-1MB、s-tier-min 纯 RTOS ~200KB；RV32IMC 关键差异五条（无 A 扩展→中断屏蔽锁、Sv32、无 OpenSBI M-mode 直起、C 扩展、ESP32-C3 外设映射）；**骨架已真启动**：scratch32/（riscv32imc，QEMU riscv32 virt M-mode，5.5KB ELF，16550 UART + wfi）→ "[karte32] hello from KarteOS S-tier!" 实测——ESP32-C3 同构 ISA 路径打通，虚拟 ESP32 真测三件套（MQTT 心跳+CapDesc 注册+脑端调用）路径明确)
 
 **DoD**：M3 真机演示（RPi5 脑 + 双芯片 WASM + OTA 回滚）+ CI 6 job 绿。
 
