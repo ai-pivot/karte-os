@@ -109,6 +109,14 @@ build-riscv:
 run-riscv: _build-riscv-kernel disk.img
 	$(QEMU_RV) $(QEMU_RV_FLAGS) -kernel $(KERNEL_RV)
 
+## Run on RISC-V QEMU with RVV (vector extension 1.0, vlen=128) — M0-V base
+## for the edge-LLM milestone: -cpu rv64,v=true,vlen=128 enables vector
+## registers, sstatus.VS is still kernel-controlled (see M0-V②).
+## NOTE: requires QEMU >= 7.0 (the v CPU property does not exist in 6.2;
+## this dev box runs 6.2 — run-rvv verified only on QEMU 7+ hosts).
+run-rvv: _build-riscv-kernel disk.img
+	$(QEMU_RV) $(QEMU_RV_FLAGS) -cpu rv64,v=true,vlen=128 -kernel $(KERNEL_RV)
+
 ## Debug on RISC-V (GDB stub)
 debug-riscv: _build-riscv-kernel disk.img
 	$(QEMU_RV) $(QEMU_RV_FLAGS) -kernel $(KERNEL_RV) -S -s

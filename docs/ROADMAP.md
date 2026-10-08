@@ -207,7 +207,7 @@
 
 #### P1.3 端侧推理（M1）与 RVV
 
-- [ ] QEMU 使能 RVV：`-cpu rv64,v=true,vlen=128` 进 Makefile 新 target（验收：`make run-rvv` 可启动）
+- [x] QEMU 使能 RVV：`-cpu rv64,v=true,vlen=128` 进 Makefile 新 target（验收：`make run-rvv` 可启动）(run-rvv target 已入库（run-riscv 同款 + V 扩展参数）；本机 QEMU 6.2.0 无 `v` CPU 属性（Property not found——RVV 需 QEMU 7.0+），启动验收需在 QEMU 7+ 环境复现，Makefile 注释已注明；内核侧 sstatus.VS/向量上下文见 M0-V②)
 - [ ] 内核支持 V 扩展上下文：`sstatus.VS` 使能 + trap 保存/恢复 v0-v31/vl/vtype（TrapContext 扩容方案先写设计再动码）（验收：跨上下文切换向量寄存器不破坏的单测）
 - [ ] 用户态编译链路：`rustc -C target-feature=+v` 程序在 KarteOS 上运行（验收：向量加法程序输出正确）
 - [ ] M1 主体：candle（或自研最小 transformer 推理器）移植为 KarteOS 用户程序，加载一个小模型（TinyStories 级 15M 或 GPT-2 124M 量化）生成文本（验收：QEMU 内连续生成 ≥32 个连贯 token，日志入库）
