@@ -171,8 +171,23 @@ pub fn handle_wire(msg: &[u8], now_ms: u64) -> bool {
     };
     match verb {
         b'A' => {
-            let desc = crate::capability::lookup_desc(&id);
-            let Some(desc) = desc else { return false };
+            // Local registered device takes precedence; peer node ids
+            // ("*-node") register as remote devices with an empty tool set
+            // (existence-level discovery; tool-level aggregation is v1).
+            let desc = match crate::capability::lookup_desc(&id) {
+                Some(d) => d,
+                None => {
+                    if !id.ends_with("-node") {
+                        return false;
+                    }
+                    CapDesc {
+                        device_id: "remote",
+                        device_type: "remote",
+                        version: 1,
+                        tools: &[],
+                    }
+                }
+            };
             let mut g = DRT.lock();
             let is_new = g.announce(desc, now_ms);
             if is_new {

@@ -365,6 +365,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     crate::console_println!("[init] Initializing network...");
                     if let Some(mac) = driver::net::init_net_device() {
                         net::iface::NetStack::init(mac);
+                        net::iface::NetStack::drt_net_init();
                     }
                 }
                 #[cfg(target_arch = "x86_64")]
@@ -372,6 +373,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     crate::console_println!("[init] Initializing network...");
                     if let Some(mac) = crate::arch::virtio_net::init_net_device() {
                         net::iface::NetStack::init(mac);
+                        net::iface::NetStack::drt_net_init();
                     }
                 }
 

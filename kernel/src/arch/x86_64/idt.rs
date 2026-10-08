@@ -576,6 +576,7 @@ unsafe extern "C" fn timer_trap_handler(ctx: &mut super::trap::TrapContext) {
     // Poll network stack (~10ms interval, same as RISC-V)
     if crate::net::iface::NetStack::is_initialized() {
         crate::net::iface::NetStack::poll();
+        crate::net::iface::NetStack::drt_net_tick(crate::arch::platform::uptime_ms());
     }
 
     TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

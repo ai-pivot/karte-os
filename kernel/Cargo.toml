@@ -9,6 +9,8 @@ test_mode = []
 llm_demo = []
 klog_trace = []
 klog_debug = []
+# Dual-machine demo: this node is node B (ip 10.0.2.16, device-id prefix "b")
+net_node_b = []
 
 [dependencies]
 linked_list_allocator = "0.10"

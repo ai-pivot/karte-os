@@ -200,6 +200,7 @@ fn handle_timer() {
     // to avoid interfering with user program loading.
     if crate::net::iface::NetStack::is_initialized() {
         crate::net::iface::NetStack::poll();
+        crate::net::iface::NetStack::drt_net_tick(crate::arch::platform::uptime_ms());
     }
 
     set_next_timer();

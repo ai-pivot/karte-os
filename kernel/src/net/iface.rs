@@ -15,6 +15,30 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListe
 
 use super::device::NetDevice;
 
+// ── DRT net integration (P2.5 dual-machine demo) ──
+use crate::drt::DRT_PORT;
+static DRT_FD: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(-1);
+static ANNOUNCE_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ANNOUNCE_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "net_node_b")]
+pub const NODE_PREFIX: &str = "b";
+#[cfg(not(feature = "net_node_b"))]
+pub const NODE_PREFIX: &str = "a";
+
+/// This node's identity on the fabric (registered by peers as a remote device).
+pub const fn self_node_id() -> &'static str {
+    if NODE_PREFIX.as_bytes()[0] == b'b' {
+        "b-node"
+    } else {
+        "a-node"
+    }
+}
+
+fn drt_fd() -> isize {
+    DRT_FD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -518,5 +542,66 @@ impl NetStack {
     /// Check if the network stack is initialized.
     pub fn is_initialized() -> bool {
         NET_STACK.lock().is_some()
+    }
+
+    // ── DRT UDP integration (P2.5 dual-machine demo, port 43110) ──
+
+    /// Bind an internal UDP socket for DRT announce/heartbeat/recv.
+    /// Called once after network init. Device ids get a node prefix so two
+    /// machines don't collide (node A: "a-...", node B: "b-...").
+    pub fn drt_net_init() {
+        if drt_fd() >= 0 {
+            return;
+        }
+        let fd = Self::create_socket(SocketType::Udp);
+        if fd < 0 {
+            crate::console_println!("[drt-net] socket create failed");
+            return;
+        }
+        if Self::bind(fd as usize, DRT_PORT) != 0 {
+            crate::console_println!("[drt-net] bind {} failed", DRT_PORT);
+            return;
+        }
+        DRT_FD.store(fd, core::sync::atomic::Ordering::Relaxed);
+        crate::console_println!(
+            "[drt-net] bound udp/{} fd={} node_prefix={}",
+            DRT_PORT,
+            fd,
+            NODE_PREFIX
+        );
+    }
+
+    /// Periodic DRT tick: announce self, then dispatch any received KRT1
+    /// frames into the DRT state machine. Non-blocking.
+    pub fn drt_net_tick(now_ms: u64) {
+        let fd = drt_fd();
+        if fd < 0 {
+            return;
+        }
+        // Announce self every ~1s (seq makes it idempotent at the DRT).
+        if now_ms >= ANNOUNCE_NEXT.load(core::sync::atomic::Ordering::Relaxed) {
+            ANNOUNCE_NEXT.store(now_ms + 1000, core::sync::atomic::Ordering::Relaxed);
+            let seq = ANNOUNCE_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let frame = crate::drt::Drt::make_wire(b'A', self_node_id(), seq);
+            // Unicast to the peer (subnet-consistent, ARP-resolvable).
+            #[cfg(feature = "net_node_b")]
+            let peer = [10, 0, 2, 15];
+            #[cfg(not(feature = "net_node_b"))]
+            let peer = [10, 0, 2, 16];
+            let r = Self::send(fd as usize, &frame, Some(peer), Some(DRT_PORT));
+            if r < 0 && seq < 3 {
+                crate::console_println!("[drt-net] announce send err={} seq={}", r, seq);
+            }
+        }
+        // Dispatch received frames (up to 4 per tick).
+        let mut buf = [0u8; 256];
+        for _ in 0..4 {
+            match Self::recv(fd as usize, &mut buf) {
+                Ok((n, _, _)) if n > 0 => {
+                    crate::drt::handle_wire(&buf[..n], now_ms);
+                }
+                _ => break,
+            }
+        }
     }
 }
