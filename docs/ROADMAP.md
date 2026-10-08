@@ -262,7 +262,7 @@
 
 #### P3.1 ARM64 (aarch64) 移植
 
-- [ ] `arch/aarch64/` 骨架：启动（QEMU virt, EL1）+ 串口 + generic timer（验收：串口出 hello）
+- [x] `arch/aarch64/` 骨架：启动（QEMU virt, EL1）+ 串口 + generic timer（验收：串口出 hello）(tools/aarch64-demo 独立内核骨架：global_asm! 启动（主核 mpidr 判定+副核 wfe）、PL011 UART 0x09000000、PSCI system_off、链接 0x40100000（dtb 之上，-zmax-page-size=4096）——**QEMU aarch64 virt 真启动验证**：EL1 横幅+心跳+PSCI 关机全通（修复：cargo 不编 .S → global_asm!、rust-lld 64KB 段对齐、mov 立即数编码）；主内核完整 aarch64 移植（异常向量/GIC/页表/SMP）按此骨架展开为后续；generic timer 走 v1)
 - [ ] GIC v2 中断 + 页表（4 级）+ 每进程 ASL（验收：`make test-arm64` 骨架测试绿）
 - [ ] U-mode + syscall 路径 + ELF 加载（验收：hello 用户程序）
 - [ ] SMP（PSCI）+ 调度接入（验收：`-smp 4` 测试）
