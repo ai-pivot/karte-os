@@ -11,6 +11,7 @@
 #![no_std]
 #![no_main]
 
+mod mqtt32;
 mod net32;
 
 use core::arch::asm;
@@ -36,13 +37,33 @@ fn uart_putc(c: u8) {
     }
 }
 
-fn uart_puts(s: &str) {
+/// UART 原始字节流输出（MQTT wire 帧）。
+pub fn uart_tx_bytes(b: &[u8]) {
+    for c in b {
+        uart_putc(*c);
+    }
+}
+
+/// UART 单字节接收（LSR.DR 轮询 + 100M 次上限防死锁；None = 超时）。
+/// host 侧响应延迟可达秒级（python 事件循环），超时必须远大于 RTT。
+pub fn uart_rx_byte() -> Option<u8> {
+    for _ in 0..100_000_000 {
+        unsafe {
+            if read_volatile((UART0 + 5) as *const u8) & 1 != 0 {
+                return Some(read_volatile(UART0 as *const u8));
+            }
+        }
+    }
+    None
+}
+
+pub fn uart_puts(s: &str) {
     for b in s.bytes() {
         uart_putc(b);
     }
 }
 
-fn uart_dec(mut v: u32) {
+pub fn uart_dec(mut v: u32) {
     let mut b = [0u8; 12];
     let mut i = b.len();
     if v == 0 {
@@ -169,7 +190,14 @@ extern "C" fn kmain32() -> ! {
             uart_puts("\n");
             uart_puts("[karte32] invoke replied (uart)\n");
         }
-        // 3) virtio 收帧（网侧 invoke，保留通道）
+        // 3) MQTT 心跳（wire 协议真测，UART 传输；每 3 轮 announce 一次）
+        if seq % 3 == 0 {
+            let ok = mqtt32::heartbeat(2);
+            uart_puts("[karte32] mqtt heartbeat rounds ok=");
+            uart_dec(ok as u32);
+            uart_puts("\n");
+        }
+        // 4) virtio 收帧（网侧 invoke，保留通道）
         for _ in 0..3 {
             net32::poll(|_src, _sport, payload| {
                 uart_puts("[karte32] invoke rx len=");
