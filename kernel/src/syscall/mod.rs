@@ -2193,12 +2193,14 @@ fn linux_mmap_inner(
 
     let target_addr = if addr != 0 && map_fixed {
         // MAP_FIXED: exact address required.
-        // Reject if target range overlaps ELF segments.
+        // Reject if target range overlaps ELF segments: silently "succeeding"
+        // with the aligned address (the old behavior) returned a positive
+        // value that callers read as a successful mapping while nothing was
+        // mapped — later faults would segfault far from the call site.
         let aligned = addr & !(page_size - 1);
         let end = aligned + aligned_len;
         if crate::mm::vma::vma_is_elf(root, aligned) {
-            // Overlaps ELF range — reject.
-            return aligned as isize;
+            return -12; // ENOMEM — cannot place over ELF image
         }
         aligned
     } else if addr != 0 {
@@ -3790,6 +3792,45 @@ pub fn run_tests() {
 
     crate::test::run_test("syscall_mmap_zero_len_returns_error", || {
         dispatch(SYS_MMAP, [0, 0, 0, 0, 0, 0]) == ERR_INVAL
+    });
+
+    crate::test::run_test("syscall_mmap_map_fixed_is_page_aligned", || {
+        // MAP_FIXED rounds the hint down to a page boundary and returns it.
+        let hint = crate::process::USER_MMAP_LIMIT - 0x20_0000 + 0x123; // unaligned
+        let addr = linux_mmap_inner(hint, 8192, 0x3, MAP_ANONYMOUS | MAP_FIXED, usize::MAX, 0);
+        if addr < 0 {
+            return false;
+        }
+        let ok = (addr as usize) & 0xFFF == 0 && addr == ((hint & !0xFFF) as isize);
+        let _ = linux_munmap(addr as usize, 8192);
+        ok
+    });
+
+    crate::test::run_test("syscall_mmap_munmap_cycle", || {
+        // Map a page (kernel-chosen address), then unmap it; both must
+        // succeed and the range must be reusable afterwards.
+        let addr = linux_mmap_inner(0, 4096, 0x3, MAP_ANONYMOUS, usize::MAX, 0);
+        if addr < 0 {
+            return false;
+        }
+        linux_munmap(addr as usize, 4096) == 0
+    });
+
+    crate::test::run_test("syscall_munmap_frees_va_for_reuse", || {
+        // After munmap the VMA is gone: the same MAP_FIXED hint must map
+        // to the exact same address again.
+        let hint = crate::process::USER_MMAP_LIMIT - 0x30_0000;
+        let a1 = linux_mmap_inner(hint, 4096, 0x3, MAP_ANONYMOUS | MAP_FIXED, usize::MAX, 0);
+        if a1 < 0 {
+            return false;
+        }
+        if linux_munmap(hint, 4096) != 0 {
+            return false;
+        }
+        let a2 = linux_mmap_inner(hint, 4096, 0x3, MAP_ANONYMOUS | MAP_FIXED, usize::MAX, 0);
+        let ok = a2 == a1;
+        let _ = linux_munmap(hint, 4096);
+        ok
     });
 
     #[cfg(target_arch = "x86_64")]
