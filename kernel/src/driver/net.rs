@@ -14,6 +14,8 @@ const VIRTIO_MMIO_GUEST_PAGE_SIZE: usize = 0x028;
 const VIRTIO_MMIO_QUEUE_SEL: usize = 0x030;
 const VIRTIO_MMIO_QUEUE_NUM_MAX: usize = 0x034;
 const VIRTIO_MMIO_QUEUE_NUM: usize = 0x038;
+const VIRTIO_MMIO_QUEUE_ALIGN: usize = 0x03C; // legacy: vring alignment
+const VIRTIO_MMIO_QUEUE_PFN: usize = 0x040; // legacy: page-frame number
 const VIRTIO_MMIO_QUEUE_READY: usize = 0x044;
 const VIRTIO_MMIO_QUEUE_NOTIFY: usize = 0x050;
 const VIRTIO_MMIO_STATUS: usize = 0x070;
@@ -102,13 +104,17 @@ struct VringUsed {
 
 /// Receive queue descriptor table, available ring, used ring, and data buffers.
 /// MUST use repr(C) to guarantee field order for VirtIO DMA.
-#[repr(C)]
+/// P3.3 fix: QEMU's virtio-mmio reports version=1 (legacy interface).
+/// Legacy queues are configured via QueuePFN (32-bit page number, vring
+/// page-aligned & contiguous) + QueueAlign — NOT the modern 64-bit
+/// desc/avail/used address registers.
+#[repr(C, align(4096))]
 struct QueueMem {
-    desc: [VringDesc; QUEUE_SIZE as usize],
-    // available ring: flags(2) + idx(2) + ring[QUEUE_SIZE](2*QUEUE_SIZE) + used_event(2)
-    avail_buf: [u8; 4 + 2 * (QUEUE_SIZE as usize) + 2],
-    // used ring: flags(2) + idx(2) + ring[QUEUE_SIZE](8*QUEUE_SIZE) + avail_event(2)
-    used_buf: [u8; 4 + 8 * (QUEUE_SIZE as usize) + 2],
+    desc: [VringDesc; QUEUE_SIZE as usize], // offset 0..128
+    // QEMU legacy vring layout with QUEUE_ALIGN=4096: avail sits right after
+    // the descriptor table, used ring starts at the next 4096 boundary.
+    avail_buf: [u8; 4096 - (QUEUE_SIZE as usize) * 16], // 128..4096 (avail @128)
+    used_buf: [u8; 4096],                               // 4096..8192 (used @4096)
     /// Data buffers for packets
     data: [u8; BUFFER_POOL_SIZE],
 }
@@ -122,8 +128,8 @@ impl QueueMem {
                 flags: 0,
                 next: 0,
             }; QUEUE_SIZE as usize],
-            avail_buf: [0u8; 4 + 2 * (QUEUE_SIZE as usize) + 2],
-            used_buf: [0u8; 4 + 8 * (QUEUE_SIZE as usize) + 2],
+            avail_buf: [0u8; 4096 - (QUEUE_SIZE as usize) * 16],
+            used_buf: [0u8; 4096],
             data: [0u8; BUFFER_POOL_SIZE],
         }
     }
@@ -132,6 +138,10 @@ impl QueueMem {
 /// Two queue memory regions: index 0 = receive, index 1 = transmit.
 static RX_QUEUE_MEM: spin::Mutex<Option<QueueMem>> = spin::Mutex::new(None);
 static TX_QUEUE_MEM: spin::Mutex<Option<QueueMem>> = spin::Mutex::new(None);
+/// Last consumed used-ring index for RX (per-driver monotonic cursor).
+static RX_LAST_USED: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+/// RX frame counter (diagnostic).
+static RX_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // VirtIONet driver
@@ -307,33 +317,46 @@ impl VirtIONet {
             if guard.is_none() {
                 *guard = Some(QueueMem::zeroed());
             }
-            let mem = guard.as_ref().unwrap();
+            let mem = guard.as_mut().unwrap();
 
             let desc_addr = &mem.desc as *const _ as usize;
-            let avail_addr = mem.avail_buf.as_ptr() as usize;
-            let used_addr = mem.used_buf.as_ptr() as usize;
 
-            // Write descriptor table address
-            self.write32(VIRTIO_MMIO_QUEUE_DESC_LOW, desc_addr as u32);
-            self.write32(VIRTIO_MMIO_QUEUE_DESC_HIGH, (desc_addr >> 32) as u32);
+            // P3.3 fix: the receive queue MUST be pre-filled with device-
+            // writable buffer descriptors placed into the available ring —
+            // otherwise the device has nowhere to deliver packets and the
+            // RX path stays empty forever (root cause of SynSent stall).
+            if queue_index == 0 {
+                for i in 0..QUEUE_SIZE as usize {
+                    mem.desc[i] = VringDesc {
+                        addr: (&mem.data[i * NET_MAX_PACKET_SIZE] as *const u8) as u64,
+                        len: NET_MAX_PACKET_SIZE as u32,
+                        flags: VRING_DESC_F_WRITE, // device writes
+                        next: 0,
+                    };
+                }
+                let avail = mem.avail_buf.as_mut_ptr() as *mut u8;
+                unsafe {
+                    let ring = avail.add(4) as *mut u16;
+                    for i in 0..QUEUE_SIZE as usize {
+                        core::ptr::write_volatile(ring.add(i), i as u16);
+                    }
+                    core::ptr::write_volatile(avail.add(2) as *mut u16, QUEUE_SIZE);
+                }
+            }
 
-            // Write available ring address
-            self.write32(VIRTIO_MMIO_QUEUE_AVAIL_LOW, avail_addr as u32);
-            self.write32(VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (avail_addr >> 32) as u32);
-
-            // Write used ring address
-            self.write32(VIRTIO_MMIO_QUEUE_USED_LOW, used_addr as u32);
-            self.write32(VIRTIO_MMIO_QUEUE_USED_HIGH, (used_addr >> 32) as u32);
+            // Legacy virtio-mmio (version=1): QueueAlign + QueuePFN.
+            // The vring (desc+avail+used, contiguous in QueueMem) must be
+            // page-aligned — QueueMem carries #[repr(align(4096))].
+            self.write32(VIRTIO_MMIO_QUEUE_ALIGN, 0x1000);
+            self.write32(VIRTIO_MMIO_QUEUE_PFN, (desc_addr >> 12) as u32);
 
             // Mark queue ready
             self.write32(VIRTIO_MMIO_QUEUE_READY, 1);
 
             crate::console_println!(
-                "[net] Queue {} configured: desc={:#x} avail={:#x} used={:#x}",
+                "[net] Queue {} configured: desc={:#x} (legacy PFN mode)",
                 queue_index,
-                desc_addr,
-                avail_addr,
-                used_addr
+                desc_addr
             );
         }
     }
@@ -350,6 +373,8 @@ impl VirtIONet {
         if data.is_empty() {
             return Err(());
         }
+        // tx probe: unconditional per-frame trace (P3.3 tx-path bug hunt)
+        crate::console_println!("[tx] send_packet len={}", data.len());
 
         let total_len = VIRTIO_NET_HDR_SIZE + data.len();
         if total_len > NET_MAX_PACKET_SIZE {
@@ -401,6 +426,13 @@ impl VirtIONet {
         // Notify the device
         self.write32(VIRTIO_MMIO_QUEUE_NOTIFY, 1); // queue 1 = transmit
 
+        // tx probe: device-consumption check (used ring advance)
+        unsafe {
+            let used = mem.used_buf.as_ptr() as *const u8;
+            let uidx = core::ptr::read_volatile(used.add(2) as *const u16);
+            crate::console_println!("[tx] notify done, tx used_idx={}", uidx);
+        }
+
         Ok(())
     }
 
@@ -418,40 +450,49 @@ impl VirtIONet {
             None => return Err(()),
         };
 
-        // Check used ring for completed descriptors
+        // Check used ring for completed descriptors (monotonic cursor — the
+        // old code only inspected ring[0], so every frame after the first
+        // one was invisible and the RX path starved).
         let used = mem.used_buf.as_ptr() as *const VringUsed;
         unsafe {
-            let _used_idx = core::ptr::read_volatile(&(*used).idx);
-            // We track our last-seen index in the first byte of data (hacky but
-            // avoids extra state). For simplicity, just check if descriptor 0
-            // has been used by the device.
-            let ring_base = (used as *const u8).add(4) as *const VringUsedElem;
-            let elem = core::ptr::read_volatile(ring_base);
-            if elem.id != 0 || elem.len == 0 {
+            let used_idx = core::ptr::read_volatile(&(*used).idx);
+            let last = RX_LAST_USED.load(core::sync::atomic::Ordering::Acquire);
+            if last == used_idx {
                 // No packet available yet
                 return Err(());
             }
+            let slot = (last % QUEUE_SIZE) as usize;
+            let ring_base = (used as *const u8).add(4) as *const VringUsedElem;
+            let elem = core::ptr::read_volatile(ring_base.add(slot));
 
             let total_len = elem.len as usize;
-            if total_len < VIRTIO_NET_HDR_SIZE || total_len > NET_MAX_PACKET_SIZE {
+            let did = elem.id as usize;
+            if total_len < VIRTIO_NET_HDR_SIZE
+                || total_len > NET_MAX_PACKET_SIZE
+                || did >= QUEUE_SIZE as usize
+            {
+                // Malformed entry: consume it so the cursor can advance.
+                RX_LAST_USED.store(last.wrapping_add(1), core::sync::atomic::Ordering::Release);
                 return Err(());
             }
 
             let payload_len = total_len - VIRTIO_NET_HDR_SIZE;
             if payload_len > buf.len() {
+                RX_LAST_USED.store(last.wrapping_add(1), core::sync::atomic::Ordering::Release);
                 return Err(());
             }
 
-            // Copy payload (skip VirtIO net header) into caller's buffer
-            let data_start = VIRTIO_NET_HDR_SIZE;
-            buf[..payload_len].copy_from_slice(&mem.data[data_start..total_len]);
+            // Copy payload (skip VirtIO net header) from the buffer owned by
+            // descriptor `did` into caller's buffer.
+            let src = did * NET_MAX_PACKET_SIZE;
+            buf[..payload_len]
+                .copy_from_slice(&mem.data[src + VIRTIO_NET_HDR_SIZE..src + total_len]);
 
-            // Re-queue the descriptor for future receives
-            let desc_idx: u16 = 0;
-            let buf_offset = (desc_idx as usize) * NET_MAX_PACKET_SIZE;
+            // Re-queue the descriptor (id `did`) for future receives.
+            let buf_offset = did * NET_MAX_PACKET_SIZE;
             let buf_addr = &mem.data[buf_offset] as *const _ as u64;
 
-            mem.desc[desc_idx as usize] = VringDesc {
+            mem.desc[did] = VringDesc {
                 addr: buf_addr,
                 len: NET_MAX_PACKET_SIZE as u32,
                 flags: VRING_DESC_F_WRITE, // device writes into our buffer
@@ -461,9 +502,9 @@ impl VirtIONet {
             // Add back to available ring
             let avail = mem.avail_buf.as_mut_ptr() as *mut u8;
             let avail_idx = core::ptr::read_volatile(avail.add(2) as *const u16);
-            let slot = (avail_idx % QUEUE_SIZE) as usize;
+            let aslot = (avail_idx % QUEUE_SIZE) as usize;
             let ring_ptr = avail.add(4) as *mut u16;
-            core::ptr::write_volatile(ring_ptr.add(slot), desc_idx);
+            core::ptr::write_volatile(ring_ptr.add(aslot), did as u16);
             core::ptr::write_volatile(avail.add(2) as *mut u16, avail_idx.wrapping_add(1));
 
             // Notify device
@@ -563,7 +604,11 @@ pub fn recv_raw(buf: &mut [u8]) -> Option<usize> {
     let mut guard = NET_DEVICE.lock();
     if let Some(ref mut net) = *guard {
         match net.recv_packet(buf) {
-            Ok(len) => Some(len),
+            Ok(len) => {
+                // rx probe: silent counter (P3.3 rx-path fix validation)
+                RX_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                Some(len)
+            }
             Err(()) => None,
         }
     } else {
