@@ -28,7 +28,7 @@ ASM_TARGETS =
 endif
 
 RUST_TARGETS = shell.elf ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf \
- grep.elf sed.elf wc.elf head.elf tail.elf tui-demo.elf dmesg.elf vadd.elf
+ grep.elf sed.elf wc.elf head.elf tail.elf tui-demo.elf dmesg.elf vadd.elf llm.elf
 
 TARGETS = $(ASM_TARGETS) $(RUST_TARGETS)
 
@@ -44,6 +44,10 @@ ls.elf: ls.rs syscall.rs $(LD_SCRIPT)
 # compiles in (M0-V③). Needs QEMU >= 7 (`make run-rvv`) to actually execute.
 vadd.elf: vadd.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -C target-feature=+v -o $@ vadd.rs
+
+# M1 char-level GPT inference: hot loops dominate under TCG, build at O3.
+llm.elf: llm.rs syscall.rs $(LD_SCRIPT)
+	$(RUSTC) $(RUSTFLAGS_USER) -C opt-level=3 -o $@ llm.rs
 
 cat.elf: cat.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -o $@ cat.rs

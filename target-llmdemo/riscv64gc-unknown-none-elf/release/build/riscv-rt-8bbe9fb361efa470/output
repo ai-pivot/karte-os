@@ -1,0 +1,14 @@
+cargo:rustc-check-cfg=cfg(riscvi)
+cargo:rustc-check-cfg=cfg(riscvm)
+cargo:rustc-check-cfg=cfg(riscvf)
+cargo:rustc-check-cfg=cfg(riscvd)
+cargo:rustc-env=RISCV_RT_BASE_ISA=rv64i
+cargo:rustc-env=RISCV_RT_LLVM_ARCH_PATCH=rv64imfd
+cargo:rerun-if-env-changed=RISCV_RT_BASE_ISA
+cargo:rerun-if-env-changed=RISCV_RT_LLVM_ARCH_PATCH
+cargo:rustc-cfg=riscvi
+cargo:rustc-cfg=riscvm
+cargo:rustc-cfg=riscvf
+cargo:rustc-cfg=riscvd
+cargo:rustc-link-search=/home/smith/src/karte-os/target-llmdemo/riscv64gc-unknown-none-elf/release/build/riscv-rt-8bbe9fb361efa470/out
+cargo:rerun-if-changed=link.x

@@ -587,13 +587,6 @@ impl Process {
         // 2MB huge pages (PS=1) that overlap with ELF segment addresses.
         let mut max_vaddr = 0usize;
         for segment in &elf.loadable_segments {
-            #[cfg(target_arch = "riscv64")]
-            crate::console_println!(
-                "[exec] seg vaddr={:#x} filesz={:#x} memsz={:#x}",
-                segment.vaddr,
-                segment.file_size,
-                segment.mem_size
-            );
             let page_size = pmm::page_size();
             let seg_vaddr_start = segment.vaddr;
             let seg_vaddr_end = segment.vaddr + segment.mem_size;

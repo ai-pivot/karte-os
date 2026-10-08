@@ -1193,6 +1193,35 @@ pub fn run_tests() {
         fs.read("a.txt") == Some(&b"hello world"[..])
     });
 
+    // Test: ext4 chunked read via the vfs layer, mirroring what user-space
+    // `cat` does (512 B chunks with a live fd). M1 saw this stall after ~4 KB
+    // while the single-shot ext4::read_file above succeeds — this test
+    // isolates the stall to the chunked/vfs path.
+    crate::test::run_test("ext4_large_file_chunked_read", || {
+        if !crate::driver::ext4::has_ext4() {
+            return true;
+        }
+        let fd = match crate::driver::vfs::open("weights.bin", 0) {
+            Ok(fd) => fd,
+            Err(_) => return true, // not deployed on this disk
+        };
+        let mut buf = [0u8; 512];
+        let mut total = 0usize;
+        let mut ok = true;
+        for _ in 0..24 {
+            match crate::driver::vfs::read(fd, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        crate::driver::vfs::close(fd);
+        ok && total == 24 * 512
+    });
+
     // Test 7: Append to non-existent file fails
     crate::test::run_test("fs_append_nonexistent_fails", || {
         let mut fs = FileSystem::new();

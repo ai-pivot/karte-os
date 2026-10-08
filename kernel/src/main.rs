@@ -390,6 +390,35 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                 )
                 .expect("Failed to register init task");
 
+                // M1 llm_demo (optional feature): spawn the on-device LLM
+                // inference task alongside the shell so the generation demo
+                // runs without interactive stdin (QEMU stdin timing is
+                // unreliable in CI). Both tasks round-robin under the
+                // scheduler; llm writes its output to the same console.
+                #[cfg(all(target_arch = "riscv64", feature = "llm_demo"))]
+                match process::Process::from_elf(
+                    include_bytes!("../../user/llm.elf"),
+                    alloc::vec![b"llm".to_vec()],
+                    alloc::vec![],
+                ) {
+                    Ok(llm_proc) => {
+                        let entry = llm_proc.entry;
+                        let ustack = llm_proc.user_stack_top;
+                        let kstack = llm_proc.kernel_stack_top;
+                        let llm_satp = (8usize << 60) | llm_proc.page_table_root;
+                        if let Some(idx2) = process::add_process(llm_proc) {
+                            if crate::sched::add_user_process(entry, ustack, kstack, llm_satp, idx2)
+                                .is_some()
+                            {
+                                crate::console_println!("[llm_demo] llm task spawned");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        crate::console_println!("[llm_demo] llm load failed: {}", e);
+                    }
+                }
+
                 crate::sched::start_first_task();
             }
         }
