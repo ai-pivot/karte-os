@@ -611,6 +611,29 @@ pub fn sleep_until(wake_tick: u64) {
     }
 }
 
+/// Tickless idle statistics (P3.4): full 10ms ticks vs merged (deep-wfi)
+/// ticks where the next timer was pushed out to the nearest sleep deadline.
+pub static TICKLESS_FULL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static TICKLESS_MERGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Nearest pending sleep deadline in uptime_ms, if any.
+pub fn next_sleep_deadline() -> Option<u64> {
+    let q = match SLEEPQ.try_lock() {
+        Some(guard) => guard,
+        None => return None,
+    };
+    q.iter().map(|e| e.1).min()
+}
+
+/// True when no user task is currently runnable (deep idle candidate).
+pub fn no_ready_tasks() -> bool {
+    let sched = match SCHEDULER.try_lock() {
+        Some(guard) => guard,
+        None => return false,
+    };
+    sched.ready.is_empty()
+}
+
 pub fn tick_sleep_queue() {
     let now = crate::arch::platform::uptime_ms();
     let mut to_wake: Vec<usize> = Vec::new();

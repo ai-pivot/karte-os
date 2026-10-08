@@ -286,8 +286,8 @@
 
 #### P3.4 电源管理
 
-- [ ] tickless idle：无任务时深度 WFI + 定时器合并（验收：idle 功耗事件计数下降可测）
-- [ ] DVFS/休眠框架接口（真机字段留位）（验收：接口文档 + 编译通过）
+- [x] tickless idle：无任务时深度 WFI + 定时器合并（验收：idle 功耗事件计数下降可测）(trap.rs set_next_timer 改造：no_ready_tasks() && 最近 sleep deadline > 10ms 时把下次 timer 推到 deadline（上限 1s 防陈旧 deadline 挂死），否则全 tick；TICKLESS_FULL/TICKLESS_MERGED AtomicU64 计数器可测（idle 功耗事件 = merged/full 比率）；sched/mod.rs 加 next_sleep_deadline()+no_ready_tasks()（ReadyQueue::is_empty）)
+- [x] DVFS/休眠框架接口（真机字段留位）（验收：接口文档 + 编译通过）(kernel/src/power.rs：PState(Max/Mid/Low)+set_pstate（AtomicU8 状态，真机 DVFS 驱动后端接此）、SleepMode(Wfi/Deep)+enter_sleep（深睡唤醒源真机字段留位，QEMU 退化浅睡语义不中断）；RV 164/164 全绿)
 
 #### P3.5 MCU 档（S 档）预研
 

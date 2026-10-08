@@ -168,11 +168,33 @@ pub fn enable_timer_interrupt() {
     }
 }
 
-/// Set the next timer interrupt (10ms from now).
+/// Set the next timer interrupt.
+///
+/// P3.4 tickless idle: when no user task is runnable and the nearest sleep
+/// deadline is farther than one tick, program the timer at that deadline
+/// instead (merged tick) — the CPU then sits in WFI for a long window.
+/// Every timer arms exactly one of: full tick or merged tick.
 pub fn set_next_timer() {
     const CLOCK_FREQ: usize = 10_000_000;
     const TICKS_PER_MS: usize = CLOCK_FREQ / 1000;
-    let next = riscv::register::time::read() + 10 * TICKS_PER_MS;
+    const TICK_MS: u64 = 10;
+
+    let now_ms = crate::arch::platform::uptime_ms();
+    let merged = crate::sched::no_ready_tasks()
+        && crate::sched::next_sleep_deadline()
+            .map(|d| d > now_ms + TICK_MS)
+            .unwrap_or(false);
+
+    let delay_ms = if merged {
+        crate::sched::TICKLESS_MERGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Clamp to a bounded horizon so a stale deadline cannot hang the kernel.
+        let d = crate::sched::next_sleep_deadline().unwrap_or(now_ms + TICK_MS);
+        (d - now_ms).min(1000)
+    } else {
+        crate::sched::TICKLESS_FULL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        TICK_MS
+    };
+    let next = riscv::register::time::read() + (delay_ms as usize) * TICKS_PER_MS;
     let _ = ::sbi::timer::set_timer(next as u64);
 }
 

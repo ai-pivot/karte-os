@@ -25,6 +25,7 @@ pub mod mm;
 pub mod mqtt;
 pub mod net;
 pub mod platform;
+pub mod power;
 pub mod process;
 pub mod sched;
 pub mod sync;
