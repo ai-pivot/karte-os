@@ -37,7 +37,7 @@ QEMU exit: `Ctrl+A` then `X`.
 
 ## ⚠️ Pre-Commit Checklist — MUST follow before every git commit
 
-**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (159 tests), boot-test, smp-test.**
+**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (164 tests), boot-test, smp-test.**
 - **First U-mode entry SP convention**: `build_initial_stack` MUST write `user_stack_top` into the TrapContext **x[2] slot (offset 16)**, matching `trap_return_user`, which restores user sp from x[2] and then swaps sscratch↔sp (sscratch ends up holding kernel_stack_top for the next U-mode trap). Writing user_stack_top into the sscratch slot (272) and kernel_stack_top into x[2] makes the first user instruction store to a kernel physical address → immediate store page fault, shell killed at boot (this broke boot-test; fixed 2026-10-08).
 ALL 5 must pass. Before committing, run:
 
@@ -260,6 +260,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 - **mmap lazy allocation + VMA tracking**: All MAP_ANONYMOUS mmap creates VMA entries (start/end/prot) but does NOT allocate physical frames. The PF handler lazily allocates zeroed frames on first access, validated against the VMA table. PROT_NONE mappings refuse PF allocation. This is the standard Linux behavior; Go relies on it for `sysReserve`→`sysMap`→`sysUsed`→`sysUnused` lifecycle.
 - **madvise MADV_DONTNEED decommits**: MADV_DONTNEED/MADV_FREE releases physical frames (removes PTEs, frees frames via `unmap_user`). MADV_POPULATE/WILLNEED pre-allocates frames. Go's `sysUnused` calls MADV_DONTNEED to release memory; `sysMap` re-commits via mmap(MAP_FIXED). The VMA entry persists across commit/decommit cycles.
 - **QEMU 6.2 socket-netdev 跨实例帧互通实测未达**（P2.5 双机演示）：`-netdev socket,udp=` 模式实为 multicast 专用（单播隧道对端收不到）；TCP 隧道模式（A listen/B connect）A/B rx 均为 0，而内核侧 send 无错误、bind/poll 正常、159 单测全绿——问题在 QEMU 网络层语义，需 host bridge/TAP 或 QEMU 7+ 复测。demo 脚本保留双模式配置（scripts/demo-dual.sh）。多任务并发时 QEMU stdio 观察层字节交错同理（内核 trace 证明 syscall 全到达）——**调试此类问题先做内核侧 trace 分界**（如 sys_write 入口打印），不要在观察层盲调
+- **smoltcp 0.12 `connect` rejects `local_port=0`**（P3.3 MQTT 根因）：返回 `Unaddressable` 而非自动分配本地端口（旧版语义已变）。内核 `NetStack::connect` 必须自行分配临时端口（49152..65534 ephemeral range），否则所有出站 TCP 永久失败。调试外发 TCP 时先确认这个分支：`[net] TCP connect err: Unaddressable` 出现 = local_port==0 或远端地址非法
 - **Runtime logging policy**: All diagnostic logs print unconditionally (no rate-limiting or "first N" counting). Logs are written to UART serial output; redirect to file and grep/filter offline for analysis. Adding back `if count < N` guards is forbidden.
 
 ## Knowledge Files
@@ -277,7 +278,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 
 ## Testing
 
-- **159 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU (measured 2026-10-08)
+- **164 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU (measured 2026-10-08)
 - **Test mode**: `make test` internally builds with `cargo +nightly build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf` (stable cannot compile the x86_64 dep tree; see GOTCHAS)
 - **Test framework**: `kernel/src/test.rs` — TAP-style `run_test(name, || bool)` API
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`

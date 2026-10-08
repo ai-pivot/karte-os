@@ -20,6 +20,7 @@ use crate::drt::DRT_PORT;
 static DRT_FD: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(-1);
 static ANNOUNCE_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ANNOUNCE_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static EPHEMERAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[cfg(feature = "net_node_b")]
 pub const NODE_PREFIX: &str = "b";
@@ -312,10 +313,15 @@ impl NetStack {
 
         let remote_addr = IpAddress::v4(ip[0], ip[1], ip[2], ip[3]);
 
+        // smoltcp 0.12 rejects local_port==0 as Unaddressable — allocate an
+        // ephemeral port here (49152..=65534).
+        let local_port =
+            49152 + (EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 16000) as u16;
+
         // TCP connect needs Context from Interface
         let cx = stack.iface.context();
         let sock = stack.socket_set.get_mut::<tcp::Socket>(meta.handle);
-        match sock.connect(cx, (remote_addr, port), 0) {
+        match sock.connect(cx, (remote_addr, port), local_port) {
             Ok(()) => {
                 meta.state = SocketState::Connecting;
                 crate::console_println!(
@@ -328,7 +334,10 @@ impl NetStack {
                 );
                 0
             }
-            Err(_) => -1,
+            Err(e) => {
+                crate::console_println!("[net] TCP connect err: {:?}", e);
+                -1
+            }
         }
     }
 

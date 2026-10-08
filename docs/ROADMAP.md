@@ -279,7 +279,7 @@
 
 #### P3.3 IoT 协议与 OTA
 
-- [ ] MQTT 3.1.1 客户端（用户态，基于 smoltcp）：pub/sub/QoS1（验收：与 mosquitto 互通）(wire 层 5 单测全绿（kernel/src/mqtt.rs：varint/CONNECT/PUBLISH QoS1/SUBSCRIBE/PUBACK/SUBACK/PING，RV 164/164）；user/mqtt.rs 客户端完整实现（TCP 10.0.2.2:1883 + CONNECT/SUBSCRIBE/PUBLISH + CONNACK/SUBACK/PUBACK 等待 + connect 重试）；tools/mqtt-mini-broker.py 零依赖 broker（host 侧 python 端到端验证 CONNACK+PUBACK OK）；QEMU 侧 net 栈就绪（10.0.2.15/24 + VirtIO Net slot 6）——**端到端受 QEMU stdin 投递抖动**（同 toolserver 已知问题），待 boot 自跑模式（同 llm_demo）复测)
+- [ ] MQTT 3.1.1 客户端（用户态，基于 smoltcp）：pub/sub/QoS1（验收：与 mosquitto 互通）(wire 层 5 单测全绿（kernel/src/mqtt.rs：varint/CONNECT/PUBLISH QoS1/SUBSCRIBE/PUBACK/SUBACK/PING，RV 164/164）；user/mqtt.rs 客户端完整实现（TCP 10.0.2.2:1883 + CONNECT/SUBSCRIBE/PUBLISH + CONNACK/SUBACK/PUBACK 等待 + connect 重试）；tools/mqtt-mini-broker.py 零依赖 broker（host 侧 python 端到端验证 CONNACK+PUBACK OK）；**内核 TCP connect 根因修复**：smoltcp 0.12 拒绝 local_port=0（直接 Unaddressable）——NetStack::connect 改分配临时端口（49152+），`[net] TCP connecting to 10.0.2.2:1883` 已达成；mqtt_demo feature boot 自跑（llm_demo 模式）绕过 QEMU stdin 抖动；**剩余**：SYN→established 链路 trace（ARP/poll 时序）→ CONNACK/SUBACK/PUBACK 端到端)
 - [ ] TLS：rustls（no_std 路线评估）或用户态移植；MQTT over TLS（验收：与公网 broker 握手成功）
 - [ ] mDNS v1 收尾 + CoRE Link Format 资源描述（验收：第三方工具可枚举 KarteOS 设备能力）
 - [ ] OTA A/B：分区约定 + bootloader 交接协议 + 回滚（验收：QEMU 内升级+断电回滚演示）
