@@ -11,6 +11,7 @@ use core::arch::global_asm;
 #[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("arch/riscv64/entry.S"));
 
+pub mod arbiter;
 pub mod arch;
 pub mod brain;
 pub mod capability;
@@ -103,6 +104,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::drt::run_tests();
         crate::mcp_cb::run_tests();
         crate::capauth::run_tests();
+        crate::arbiter::run_tests();
         crate::brain::run_tests();
         crate::mqtt::run_tests();
         crate::wasm::run_tests();

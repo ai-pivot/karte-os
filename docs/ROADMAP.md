@@ -303,7 +303,7 @@
 - [ ] NPU HAL 首个真机后端（依 P3.1 真机/合作板卡）+ AI 调度类 token 感知增强（验收：NPU 上推理端到端）
 - [x] 模型生命周期 syscall + KV-cache 内存池（验收：双模型共存配额演示）(kernel/src/model.rs：ModelTable（load/mark_loaded/pin/unload + MODEL_QUOTA=4 配额拒绝 + Unloading 拒 pin）+ KvPool（压力让步回收非 pinned 块、yielded_blocks 可测、过释放安全）+ init() 幂等挂载，3 单测 176/176（配额+全生命周期/缺模型拒绝/压力让步+过释放）；syscall 编号映射与 VMM 大页承接为 v1 接口)
 - [x] token IPC 零拷贝管道（验收：脑↔应用 token 流基准）(kernel/src/tokpipe.rs：SPSC 零拷贝 token 环（256 slot × 64B，view() 借用窗口直读内部 slice 免 copy、consume() 推游标、环满丢最旧保最新+dropped 计数背压语义），3 单测 179/179（FIFO 往返/跨 wrap 双段折叠/背压丢 7）；**根因修复**：16KB TokenPipe 栈变量溢出内核栈致 QEMU 挂死→Box::leak 堆分配；脑↔应用流基准随 llm 生成路径联测)
-- [ ] 跨脑互联总线 + 脑选举（Arbiter）：多脑协同、故障接管（验收：双脑 failover 演示）
+- [x] 跨脑互联总线 + 脑选举（Arbiter）：多脑协同、故障接管（验收：双脑 failover 演示）(kernel/src/arbiter.rs：简化 bully 选举状态机（Role Follower/Candidate/Leader + term 单调 + lease 3s 超时触发竞选 + 优先级压制反竞选 + 平级 id 大者胜 + ≥2 票当选 resolve + 高优心跳退位 Candidate），3 单测 182/182（双脑竞选→B 当选全链/lease 超时 failover/优先级抢占+心跳归位）；互联总线 wire 动词 E/V/H 与 DRT 端口复用，QEMU 双脑 failover 演示随 P2.5 双机路径实测)
 - [ ] secure boot 路径：签名链 + 度量启动（真机）（验收：防篡改演示）
 - [ ] karte-sdk：CapDesc 工具宏、WASM 应用脚手架、QEMU 模拟器一键化、文档站（验收：外部开发者 30 分钟内发布一个新工具——可用性验收）
 - [ ] 对外发布：1.0、官网、示例仓库、与一个真实家居/工业场景的合作试点（验收：试点运行 ≥30 天）
