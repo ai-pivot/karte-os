@@ -1,0 +1,14 @@
+[package]
+name = "karte-aarch64-demo"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[[bin]]
+name = "karte-aarch64-demo"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
