@@ -34,6 +34,7 @@ pub mod sched;
 pub mod sync;
 pub mod syscall;
 pub mod test;
+pub mod tokpipe;
 pub mod wasm;
 
 #[unsafe(no_mangle)]
@@ -108,6 +109,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::mdns::run_tests();
         crate::ota::run_tests();
         crate::model::run_tests();
+        crate::tokpipe::run_tests();
         crate::sync::spinlock::run_tests();
         crate::sync::int_spinlock::run_tests();
         crate::sync::mutex::run_tests();
