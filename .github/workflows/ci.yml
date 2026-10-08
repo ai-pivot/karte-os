@@ -252,7 +252,9 @@ jobs:
           cd user && make ARCH=riscv64 clean && make ARCH=riscv64 && cd ..
           dd if=/dev/zero of=disk.img bs=1M count=1 2>/dev/null
           make build
-          timeout 15 qemu-system-riscv64 \
+          # TCG emulation of 4 harts is much slower on shared CI runners than
+          # locally (OpenSBI + kernel boot can take >15s there); allow 90s.
+          timeout 90 qemu-system-riscv64 \
             -machine virt -cpu rv64 -nographic -bios default -m 128M -smp 4 \
             -kernel target/riscv64gc-unknown-none-elf/release/karte-os-kernel \
             > /tmp/smp.log 2>&1 || true
