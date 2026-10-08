@@ -17,6 +17,13 @@
 
 set -e
 
+# mkfs.ext4 / mkfs.vfat etc. live in /usr/sbin, which is often absent
+# from a normal user's PATH — add it so `make deploy` works everywhere.
+case ":$PATH:" in
+    *":/usr/sbin:"*) ;;
+    *) export PATH="$PATH:/usr/sbin:/sbin" ;;
+esac
+
 DISK="${DISK:-disk.img}"
 SIZE="${SIZE:-64}"  # MB
 MOUNT="/tmp/karteos-mnt"

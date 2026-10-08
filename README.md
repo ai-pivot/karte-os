@@ -5,10 +5,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/target-riscv64gc-blue" />
+  <img src="https://img.shields.io/badge/target-riscv64gc%20%7C%20x86__64__64-blue" />
   <img src="https://img.shields.io/badge/edition-2024-orange" />
-  <img src="https://img.shields.io/badge/platform-QEMU%20virt-green" />
-  <img src="https://img.shields.io/badge/tests-50%20passed-brightgreen" />
+  <img src="https://img.shields.io/badge/platform-QEMU%20virt%20%7C%20pc-green" />
+  <img src="https://img.shields.io/badge/tests-105%20passed-brightgreen" />
   <img src="https://img.shields.io/badge/license-MIT-informational" />
 </p>
 
@@ -16,13 +16,15 @@
   <img src="https://github.com/ai-pivot/karte-os/actions/workflows/ci.yml/badge.svg" alt="CI" />
 </p>
 
+> 📘 **Master Plan**: [docs/ROADMAP.md](docs/ROADMAP.md) — 终极路线图：五大身份主张、脑-肢架构（MCP 设备织物）、Phase 0-4 阶段计划与详细 Checklist。
+
 ---
 
 ## Overview
 
-KarteOS is a from-scratch operating system targeting **RISC-V 64-bit** (RV64GC), built entirely in Rust 2024 Edition. It runs on QEMU's `virt` machine and leverages OpenSBI as the M-mode firmware layer.
+KarteOS is a from-scratch operating system targeting **RISC-V 64-bit** (RV64GC) and **x86_64**, built entirely in Rust 2024 Edition. The RISC-V build runs on QEMU's `virt` machine (OpenSBI firmware); the x86_64 build runs on QEMU `pc` (Multiboot2/GRUB) and real hardware.
 
-**2512+ lines** of Rust and RISC-V assembly implementing a full OS stack: boot, memory management, virtual memory, trap handling, device drivers, filesystem, networking, system calls, multi-tasking, and SMP multi-core support.
+**30,000+ lines** of Rust and assembly implementing a full OS stack: boot, memory management (per-process Sv39/CR3 address spaces), trap handling, device drivers (VirtIO, AHCI, NVMe), filesystems (ext4/FAT32/RamFS), TCP/IP networking, Linux syscall compatibility, multi-tasking with pipes, and SMP multi-core support.
 
 ## Features
 
@@ -145,7 +147,7 @@ Press `Ctrl+A` then `X`.
 
 ## Testing
 
-KarteOS includes **50 integration tests** that run inside QEMU as a specialized test kernel.
+KarteOS includes **105 integration tests** (RISC-V, all passing) and **131 x86_64 tests** (all passing) that run inside QEMU as specialized test kernels.
 
 ```bash
 # Run all tests
@@ -162,14 +164,16 @@ make boot-test
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
-| **PMM** (Physical Memory) | 6 | alloc, dealloc, cycle, uniqueness, reuse, alignment |
-| **VMM** (Virtual Memory) | 6 | page table creation, map, identity map, PTE flags/PPN/leaf |
-| **Heap** (Allocator) | 6 | Vec, String, large alloc, Box, multiple allocs, drop/realloc |
+| **Syscall** | 29 | dispatch, getpid, write fd, open/brk/mmap semantics, spawn/waitpid, pipes |
 | **Filesystem** | 15 | CRUD, append, overwrite, duplicates, edge cases |
-| **SpinLock** | 5 | lock/unlock, modify, guard drop, complex data, sequential |
-| **Task** | 6 | context zeroed, goto, TCB creation, state transitions |
-| **Syscall** | 6 | dispatch, getpid, write fd, yield, constants |
-| **Total** | **50** | 7 modules fully tested |
+| **VMM** (Virtual Memory) | 10 | page table creation, map/unmap, PTE flags, huge pages, walk_mapping |
+| **PMM** (Physical Memory) | 6 | alloc, dealloc, cycle, uniqueness, reuse, alignment |
+| **Heap** (Allocator) | 6 | Vec, String, large alloc, Box, multiple allocs, drop/realloc |
+| **Task** | 5 | context zeroed, goto, TCB creation, state transitions |
+| **SpinLock / IntSpinLock** | 10 | lock/unlock, modify, guard drop, complex data, sequential |
+| **YieldMutex / BlockingMutex** | 6 | lock, guard, contention yielding |
+| **Trap / Sv39 / arch** | 19 | TrapContext layout, sv39 translation, sstatus, frame, satp, SMP entry |
+| **Total** | **105** | RISC-V, all passing (measured 2026-10-08) |
 
 ### How It Works
 

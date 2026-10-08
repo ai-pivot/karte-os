@@ -73,8 +73,10 @@ jobs:
 
       - name: Install toolchain
         run: |
-          rustup toolchain install nightly
-          rustup component add rust-src --toolchain nightly
+          # Pinned nightly: x86_64 crate 0.15.5 verified against this date.
+          # Bump the pin deliberately together with Cargo.lock (Step-trait-style drift).
+          rustup toolchain install nightly-2026-10-07 --profile minimal --component rust-src
+          rustup component add rust-src --toolchain nightly-2026-10-07
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -95,7 +97,7 @@ jobs:
       - name: Build kernel + ISO
         run: |
           touch user/hello.elf user/heap_test.elf user/file_test.elf user/spawn_test.elf
-          cargo +nightly build --release --target x86_64-unknown-none -p karte-os-kernel -Z build-std=core,alloc
+          cargo +nightly-2026-10-07 build --release --target x86_64-unknown-none -p karte-os-kernel -Z build-std=core,alloc
           mkdir -p target/x86_64-iso/boot/grub
           cp target/x86_64-unknown-none/release/karte-os-kernel target/x86_64-iso/boot/karte-os-kernel
           printf 'set timeout=0\nset default=0\nmenuentry "KarteOS" {\n    multiboot2 /boot/karte-os-kernel\n    boot\n}\n' > target/x86_64-iso/boot/grub/grub.cfg

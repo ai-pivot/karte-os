@@ -73,6 +73,8 @@ make test                             # 4. Run tests (must be ALL PASSED)
 - Rust nightly (required for `abi_x86_interrupt` and `#[unsafe(naked)]`), target `x86_64-unknown-none`
 - `qemu-system-x86_64` (8.2+)
 - `grub-mkrescue` (from `grub-common` / `xorriso`)
+- `dosfstools` (mkfs.vfat, for FAT32 disk images) + `e2fsprogs` (mkfs.ext4); `tools/mkdisk.sh` auto-adds `/usr/sbin` to PATH
+- Note: `mkdisk.sh deploy*` uses loop mounts (`sudo mount`) — requires a privileged host/container; in restricted environments create the image with `mkdisk.sh init` (tests only need the file to exist)
 - Dependencies: `x86_64` crate, `uart_16550`, plus shared deps above
 
 ## Architecture Overview
@@ -256,13 +258,12 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 
 ## Testing
 
-- **59 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU
-- **Test mode**: `cargo build --release --features test_mode` compiles test kernel
+- **105 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU (measured 2026-10-08)
+- **Test mode**: `make test` internally builds with `cargo +nightly build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf` (stable cannot compile the x86_64 dep tree; see GOTCHAS)
 - **Test framework**: `kernel/src/test.rs` — TAP-style `run_test(name, || bool)` API
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`
 - **CI**: GitHub Actions runs build + lint + test + boot-test + smp-test on every push
-- **Coverage**: PMM (6), VMM (6), Heap (6), FS (15), SpinLock (5), IntSpinLock (5), Mutex (6), Task (6), Syscall (15) = **69 tests** (RISC-V core)
-- **Architecture tests**: RISC-V (15) + x86_64 (22) = **37 arch-specific tests**
-- **Total**: RISC-V 96/96, x86_64 102/103 (1 PMM test fails on x86_64 — different physical memory layout)
+- **Coverage (RISC-V, 105 total)**: Syscall (29), FS (15), VMM (10), PMM (6), Heap (6), Task (5), SpinLock (5), IntSpinLock (5), YieldMutex (4), Trap (4), Sv39 (3), SStatus (2), Frame (2), BlockingMutex (2), arch-misc (7: user/switch/sie/sbi/satp/process/kernel)
+- **Total**: RISC-V **105/105**, x86_64 **131/131** (measured 2026-10-08; x86_64 previously showed 102/103 with 1 known PMM diff — now all pass)
 - **x86_64**: `make test-x86` runs x86_64 integration tests in QEMU
 - **Both**: `make test-all` runs RISC-V + x86_64 tests sequentially
