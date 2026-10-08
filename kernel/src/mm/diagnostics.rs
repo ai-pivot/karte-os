@@ -42,8 +42,19 @@ impl PageFaultEvent {
             Some(WalkResult::Mapped4K { frame, flags }) => {
                 alloc::format!("4K frame={:?} flags={:#x}", frame, flags)
             }
-            Some(WalkResult::MappedHuge { frame, level, size, flags }) => {
-                alloc::format!("Huge frame={:?} L={} sz={} flags={:#x}", frame, level, size, flags)
+            Some(WalkResult::MappedHuge {
+                frame,
+                level,
+                size,
+                flags,
+            }) => {
+                alloc::format!(
+                    "Huge frame={:?} L={} sz={} flags={:#x}",
+                    frame,
+                    level,
+                    size,
+                    flags
+                )
             }
             Some(WalkResult::Invalid) => "Invalid".into(),
             None => "NoWalk".into(),
@@ -96,7 +107,7 @@ pub struct PteChain {
 impl PteChain {
     #[cfg(target_arch = "x86_64")]
     fn walk(root: usize, vaddr: usize) -> Self {
-        use crate::mm::vmm::{PageTable, PTEFlags};
+        use crate::mm::vmm::{PTEFlags, PageTable};
 
         fn vpn(addr: usize, level: usize) -> usize {
             (addr >> (12 + 9 * level)) & 0x1FF
@@ -195,7 +206,10 @@ impl PteChain {
     #[cfg(not(target_arch = "x86_64"))]
     fn walk(_root: usize, _vaddr: usize) -> Self {
         Self {
-            pml4e: 0, pdpe: 0, pde: 0, pte: 0,
+            pml4e: 0,
+            pdpe: 0,
+            pde: 0,
+            pte: 0,
             leaf_kind: "N/A",
             translated_frame: None,
         }
@@ -203,9 +217,23 @@ impl PteChain {
 }
 
 /// Log a page-table mutation event.
-pub fn log_pt_mutation(op: &str, pid: usize, root: usize, va: usize, before: &str, after: &str, result: &str) {
+pub fn log_pt_mutation(
+    op: &str,
+    pid: usize,
+    root: usize,
+    va: usize,
+    before: &str,
+    after: &str,
+    result: &str,
+) {
     crate::console_println!(
         "[pt-mut] op={} pid={} root={:#x} va={:#x} before={} after={} result={}",
-        op, pid, root, va, before, after, result
+        op,
+        pid,
+        root,
+        va,
+        before,
+        after,
+        result
     );
 }

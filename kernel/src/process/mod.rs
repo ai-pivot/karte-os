@@ -1762,9 +1762,7 @@ impl Process {
             state: ProcessState::Ready,
             exit_code: 0,
             wait_child_idx: None,
-            fd_table: alloc::sync::Arc::new(spin::Mutex::new(
-                crate::driver::fs::FdTable::new(),
-            )),
+            fd_table: alloc::sync::Arc::new(spin::Mutex::new(crate::driver::fs::FdTable::new())),
             trap_ctx_ptr: 0,
             shared_page_table: false,
             clone_tls: 0,
