@@ -12,6 +12,7 @@ use core::arch::global_asm;
 global_asm!(include_str!("arch/riscv64/entry.S"));
 
 pub mod arch;
+pub mod capability;
 pub mod driver;
 pub mod env;
 pub mod kernel_log;
@@ -87,6 +88,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::mm::vmm::run_tests();
         crate::mm::heap::run_tests();
         crate::driver::fs::run_tests();
+        crate::capability::run_tests();
         crate::sync::spinlock::run_tests();
         crate::sync::int_spinlock::run_tests();
         crate::sync::mutex::run_tests();
@@ -247,6 +249,8 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
         crate::console_println!("[init] Initializing filesystem...");
         driver::fs::init();
+        // P2.1 CapDesc: builtin device capability registration (VFS/timer/GPIO)
+        crate::capability::register_builtin_devices();
 
         crate::console_println!("[init] Initializing virtual filesystem...");
         crate::driver::ramfs::virtual_init();

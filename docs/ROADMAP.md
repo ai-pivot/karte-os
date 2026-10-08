@@ -223,9 +223,9 @@
 
 #### P2.1 L1 能力描述层（CapDesc）
 
-- [ ] 定义 CapDesc ABI（附录 A 定稿），内核侧 `capability.rs` 描述符注册接口（验收：设计评审 + 编译通过）
-- [ ] 3 类示范驱动暴露工具：VFS（read/write/ls）、定时器（sleep_until）、虚拟 GPIO（write/read）（验收：每类驱动 ≥2 个工具 schema 生成正确）
-- [ ] CapDesc → MCP tool JSON schema 自动生成器 + 单测（验收：snapshot 测试）
+- [x] 定义 CapDesc ABI（附录 A 定稿），内核侧 `capability.rs` 描述符注册接口（验收：设计评审 + 编译通过）(kernel/src/capability.rs v1：CapDesc{device_id,device_type,version,tools}/ToolDesc/FieldDesc/Ty 七型/perm 四位（EXEC/READ/WRITE/CONFIG，P2.4 消费）；注册表幂等（重复 device_id 拒绝）+ set_online/offline 状态位 + tool_names 稳定排序；boot 时 register_builtin_devices 挂载)
+- [x] 3 类示范驱动暴露工具：VFS（read/write/ls）、定时器（sleep_until）、虚拟 GPIO（write/read）（验收：每类驱动 ≥2 个工具 schema 生成正确）(VFS 3 工具 + Timer 2 工具 + GPIO 2 工具 = 7 工具，全带 input/output schema 与 perm 位)
+- [x] CapDesc → MCP tool JSON schema 自动生成器 + 单测（验收：snapshot 测试）(tool_json() 生成 name/description/inputSchema(properties+required)/outputSchema/perm；8 个单测：注册/重复拒绝/离线转换/未知 noop/名字排序 + 3 个 JSON snapshot（gpio_read 精确匹配/vfs_read 字段断言/timer required 数组）。RV 125/125，x86 check 0 err)
 
 #### P2.2 L2 发现注册层（DRT）
 
