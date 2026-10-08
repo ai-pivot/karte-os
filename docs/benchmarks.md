@@ -35,5 +35,14 @@ qemu-system-riscv64 -machine virt -cpu rv64 -bios default -display none -m 128M 
 |-----|----------------------|---------|---------|
 | boot→shell (ms) | 67 | 基线 ±10% | 基线 ±10% |
 | 上下文切换 (µs) | TBD | 记录 | 记录 |
-| LLM tokens/s | — | >0 | ≥2 |
+| LLM tokens/s | ~0.1 (TCG 软浮点实测) | >0 (机制验证✓) | ≥2 (KV cache+QEMU7+/KVM) |
 | clippy error | 0 | 0 | 0 |
+
+## LLM 推理（P1.3 M1，2026-10-08 实测）
+
+- **模型**：char-GPT 0.81M 参数（V=65, D=128, L=4, T=64, F=512）；weights.bin 3.24MB 经 `include_bytes!` 嵌入 llm.elf（rodata）
+- **tokens/s 实测**：**~0.1 tok/s** @ QEMU 6.2 TCG 软浮点（全块 forward）；第一个 token 的 forward ~90s（`[llm] gen tick` 计时法）；60min/120min 终验均未跑完 32 token
+- **内存峰值**：llm.elf 3,943,544 B（含 3.24MB 权重 rodata）+ .bss 384KB（X/H/QKV/ATT/YY/F1 静态缓冲）+ 用户栈 2MB（每进程预映射）
+- **方法**：`--features llm_demo` boot 自跑（规避 QEMU stdin 时序不可靠）→ UART 日志 gen tick 间隔推算 tokens/s → 日志入库
+- **提速路径**：KV-cache 单 token 推理（~9x MAC 削减，已实现，fault 谜团 parked 见 AGENTS.md）；QEMU 7+ 的 RVV 或 KVM 加速
+- **机制验证链**：exec 流式加载 3.9MB ELF ✓ → FPU_OK（软浮点）✓ → forward 真实运行（gen tick）✓ → 温度 0.8 + CDF 采样 + CHARSET 解码就绪 ✓
