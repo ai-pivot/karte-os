@@ -321,6 +321,14 @@ pub(crate) fn user_write_u8(addr: usize, byte: u8) {
 pub(crate) fn user_write<T: Copy>(addr: usize, val: T) {
     #[cfg(target_arch = "x86_64")]
     {
+        // No user page table root (test mode / kernel-internal callers):
+        // buffer is kernel memory, write directly — mirrors user_read_u8.
+        if crate::process::current_page_table_root() == 0 {
+            unsafe {
+                core::ptr::write_volatile(addr as *mut T, val);
+            }
+            return;
+        }
         if !ensure_user_write_pages(addr, core::mem::size_of::<T>()) {
             return;
         }
@@ -415,6 +423,16 @@ fn ensure_user_write_pages(addr: usize, len: usize) -> bool {
 pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) {
     #[cfg(target_arch = "x86_64")]
     {
+        // No user page table root (test mode / kernel-internal callers):
+        // buffer is kernel memory, write directly — mirrors user_read_u8's
+        // user_root == 0 fallback. In production every syscall carries a
+        // per-process user table root, so this branch is unreachable there.
+        if crate::process::current_page_table_root() == 0 {
+            for (i, &byte) in src.iter().enumerate() {
+                unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+            }
+            return;
+        }
         if !ensure_user_write_pages(addr, src.len()) {
             return;
         }
