@@ -37,7 +37,8 @@ QEMU exit: `Ctrl+A` then `X`.
 
 ## ⚠️ Pre-Commit Checklist — MUST follow before every git commit
 
-**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (70 tests), boot-test, smp-test.**
+**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (105 tests), boot-test, smp-test.**
+- **First U-mode entry SP convention**: `build_initial_stack` MUST write `user_stack_top` into the TrapContext **x[2] slot (offset 16)**, matching `trap_return_user`, which restores user sp from x[2] and then swaps sscratch↔sp (sscratch ends up holding kernel_stack_top for the next U-mode trap). Writing user_stack_top into the sscratch slot (272) and kernel_stack_top into x[2] makes the first user instruction store to a kernel physical address → immediate store page fault, shell killed at boot (this broke boot-test; fixed 2026-10-08).
 ALL 5 must pass. Before committing, run:
 
 ```bash

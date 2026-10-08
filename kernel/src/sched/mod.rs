@@ -535,10 +535,13 @@ fn build_initial_stack(init: UserTaskInit) -> usize {
         let sw = switch_sp as *mut usize;
         *sw.add(0) = first_task_shim as *const () as usize;
         let ctx = trap_ctx_base as *mut usize;
-        *ctx.add(2) = init.kernel_stack_top;
+        // trap_return_user restores user sp from the x[2] slot (offset 16),
+        // NOT from sscratch — first U-mode entry must follow the same
+        // convention as trap_handler returns.
+        *ctx.add(2) = init.user_stack_top;
         *ctx.add(32) = 0x20;
         *ctx.add(33) = init.entry;
-        *ctx.add(34) = init.user_stack_top;
+        *ctx.add(34) = init.kernel_stack_top;
         *ctx.add(35) = init.user_page_table;
     }
     switch_sp
