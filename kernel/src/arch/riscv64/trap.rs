@@ -306,10 +306,11 @@ extern "C" fn trap_handler(ctx: &mut TrapContext) -> &mut TrapContext {
                 } else {
                     // Not in heap area — fatal page fault
                     crate::console_println!(
-                        "[trap] Page fault (code={}) at sepc={:#x}, stval={:#x}",
+                        "[trap] Page fault (code={}) at sepc={:#x}, stval={:#x}, sp={:#x}",
                         code,
                         ctx.sepc,
-                        stval
+                        stval,
+                        ctx.x[2]
                     );
                     if from_user {
                         crate::console_println!("[trap] Killing user process");

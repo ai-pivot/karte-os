@@ -16,11 +16,13 @@ SECTIONS
     . = ALIGN(4096);
 
     .data : {
-        *(.data)
+        *(.data .data.*)
+        *(.sdata .sdata.*)
     }
 
     .bss : {
-        *(.bss)
+        *(.bss .bss.*)
+        *(.sbss .sbss.*)
     }
 
     /DISCARD/ : {
