@@ -611,6 +611,29 @@ impl NetStack {
                 crate::driver::net::RX_TYPE_OTHER.load(core::sync::atomic::Ordering::Relaxed),
             );
             crate::console_println!("[rx] census arp={} ipv4={} other={}", arp, v4, other);
+            crate::console_println!(
+                "[rx] v4 proto tcp={} udp={} icmp={}",
+                crate::driver::net::RX_V4_TCP.load(core::sync::atomic::Ordering::Relaxed),
+                crate::driver::net::RX_V4_UDP.load(core::sync::atomic::Ordering::Relaxed),
+                crate::driver::net::RX_V4_ICMP.load(core::sync::atomic::Ordering::Relaxed),
+            );
+            // TCP socket state dump alongside the census.
+            if let Some(mut guard) = NET_STACK.try_lock() {
+                if let Some(s) = guard.as_mut() {
+                    for (i, m) in s.socket_metas.iter().enumerate() {
+                        if let Some(m) = m {
+                            if m.socket_type == SocketType::Tcp {
+                                let sock = s.socket_set.get_mut::<tcp::Socket>(m.handle);
+                                crate::console_println!(
+                                    "[net] tcp fd={} state={:?}",
+                                    i,
+                                    sock.state()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         // Dispatch received frames (up to 4 per tick).
         let mut buf = [0u8; 256];

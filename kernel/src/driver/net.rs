@@ -144,6 +144,10 @@ static RX_LAST_USED: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU
 pub static RX_TYPE_ARP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static RX_TYPE_IPV4: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static RX_TYPE_OTHER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// IPv4 protocol breakdown (diagnostic).
+pub static RX_V4_TCP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static RX_V4_UDP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static RX_V4_ICMP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // VirtIONet driver
@@ -607,16 +611,36 @@ pub fn recv_raw(buf: &mut [u8]) -> Option<usize> {
     if let Some(ref mut net) = *guard {
         match net.recv_packet(buf) {
             Ok(len) => {
-                // rx probe: EtherType census (P3.3 SYN-ACK hunt)
+                // rx probe: EtherType + IPv4-proto census (P3.3 SYN-ACK hunt)
                 let etype = if len >= 14 {
                     ((buf[12] as u32) << 8) | buf[13] as u32
                 } else {
                     0
                 };
                 match etype {
-                    0x0806 => RX_TYPE_ARP.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-                    0x0800 => RX_TYPE_IPV4.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-                    _ => RX_TYPE_OTHER.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                    0x0806 => {
+                        RX_TYPE_ARP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    0x0800 => {
+                        RX_TYPE_IPV4.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if len >= 24 {
+                            match buf[23] {
+                                6 => {
+                                    RX_V4_TCP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                }
+                                17 => {
+                                    RX_V4_UDP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                }
+                                1 => {
+                                    RX_V4_ICMP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {
+                        RX_TYPE_OTHER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 };
                 Some(len)
             }
