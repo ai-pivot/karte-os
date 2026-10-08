@@ -28,7 +28,7 @@ ASM_TARGETS =
 endif
 
 RUST_TARGETS = shell.elf ls.elf cat.elf echo.elf mkdir.elf rm.elf env.elf pwd.elf \
- grep.elf sed.elf wc.elf head.elf tail.elf tui-demo.elf dmesg.elf
+ grep.elf sed.elf wc.elf head.elf tail.elf tui-demo.elf dmesg.elf vadd.elf
 
 TARGETS = $(ASM_TARGETS) $(RUST_TARGETS)
 
@@ -39,6 +39,11 @@ shell.elf: shell.rs syscall.rs $(LD_SCRIPT)
 
 ls.elf: ls.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -o $@ ls.rs
+
+# RVV vector-add smoke test: built WITH the V feature so the vector path
+# compiles in (M0-V③). Needs QEMU >= 7 (`make run-rvv`) to actually execute.
+vadd.elf: vadd.rs syscall.rs $(LD_SCRIPT)
+	$(RUSTC) $(RUSTFLAGS_USER) -C target-feature=+v -o $@ vadd.rs
 
 cat.elf: cat.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -o $@ cat.rs

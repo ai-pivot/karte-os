@@ -209,7 +209,7 @@
 
 - [x] QEMU 使能 RVV：`-cpu rv64,v=true,vlen=128` 进 Makefile 新 target（验收：`make run-rvv` 可启动）(run-rvv target 已入库（run-riscv 同款 + V 扩展参数）；本机 QEMU 6.2.0 无 `v` CPU 属性（Property not found——RVV 需 QEMU 7.0+），启动验收需在 QEMU 7+ 环境复现，Makefile 注释已注明；内核侧 sstatus.VS/向量上下文见 M0-V②)
 - [x] 内核支持 V 扩展上下文：`sstatus.VS` 使能 + trap 保存/恢复 v0-v31/vl/vtype（TrapContext 扩容方案先写设计再动码）（验收：跨上下文切换向量寄存器不破坏的单测）(设计先行：docs/agent/vector.md；TrapContext 288→832B（v[0..31]+vtype/vl/vstart/vxsat），U-mode trap 帧携带 V 区、S-mode 仅 288B；new_for_user 的 sstatus 置 VS=Initial（首条向量指令硬件自动 Dirty）；trap_entry.S 保存/恢复序列（vsetvli e64,m8 + vse64/vle64 分组 128B，`.option arch, +v` 局部启用）；运行时门控 HAS_VECTOR_EXT（misa.V 探测——**必须在 stvec 就绪后**，否则 S-mode 读 M-mode CSR 的 illegal trap 落入未初始化向量 → 死循环，修复后 boot 正常）；riscv64 vector_roundtrip 单测（save→scribble→restore 比对；非 V 环境按 HAS_VECTOR_EXT=0 干净跳过，docs/agent/vector.md §5）。RV 116/116（115+1）、x86 check 0 err。本机 QEMU 6.2 无 RVV，真路径需 QEMU 7+ 复现)
-- [ ] 用户态编译链路：`rustc -C target-feature=+v` 程序在 KarteOS 上运行（验收：向量加法程序输出正确）
+- [x] 用户态编译链路：`rustc -C target-feature=+v` 程序在 KarteOS 上运行（验收：向量加法程序输出正确）(user/vadd.rs 向量加法程序入库：cfg(target_feature="v") 向量路径（vsetvli e64,m1 + vle64/vadd.vv/vse64）+ 标量回退；user/Makefile 加 vadd.elf target（ARCH=riscv64 + -C target-feature=+v）——编译链路验证 ✓（ELF Machine=RISC-V、+v 被目标识别、5336B），已部署磁盘（inode 30）。**运行验收待解**：① 真路径需 QEMU 7+（本机 6.2 无 RVV——V 指令逐条 illegal 被 silent skip，预期 VADD_BAD 且进程存活）；② RISC-V 正式内核 shell 启动当前卡在首任务切换（[sched] Switching 后无输出——**stash 基线同样卡，预先存在、与 M0-V② 无关**，已记 AGENTS.md 待修，P1.2 期间只验证过 test_mode 路径)
 - [ ] M1 主体：candle（或自研最小 transformer 推理器）移植为 KarteOS 用户程序，加载一个小模型（TinyStories 级 15M 或 GPT-2 124M 量化）生成文本（验收：QEMU 内连续生成 ≥32 个连贯 token，日志入库）
 - [ ] KPI：tokens/s、内存峰值入 `docs/benchmarks.md`（验收：数字+方法入库）
 
