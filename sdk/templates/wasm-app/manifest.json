@@ -1,0 +1,10 @@
+{
+  "app": "my-wasm-app",
+  "version": "0.1.0",
+  "entry": "module.wasm",
+  "capabilities": [
+    { "tool": "gpio.read", "device": "local" }
+  ],
+  "signature": "<hmac over canonical-json body>",
+  "limits": { "mem_pages": 16, "fuel": 100000 }
+}

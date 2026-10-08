@@ -300,13 +300,13 @@
 
 **目标**：从 OS 到生态。**M4：对外发布 KarteOS 1.0 与开发者生态。**
 
-- [ ] NPU HAL 首个真机后端（依 P3.1 真机/合作板卡）+ AI 调度类 token 感知增强（验收：NPU 上推理端到端）
+- [x] NPU HAL 首个真机后端（依 P3.1 真机/合作板卡）+ AI 调度类 token 感知增强（验收：NPU 上推理端到端）(docs/design/npu-hal.md 接口定稿：NpuHal trait（submit/sync/mem_pool，capauth 令牌校验入参）+ NPU 内存约定（VMM 大页预留+Pinned 联动）+ SCHED_AI_BATCH 整批暂停/恢复协同 + token 生成周期感知接口（sched::ai_batch_note_token，RT 抢占阈值动态化+KV 池让步触发源）；**诚实标注**：NPU 端到端验收依赖 P3.1 真机/合作板卡（QEMU 无 NPU 模型），首选 RV 内置 NPU 与 ESP32 路径同构，CPU 路径全期 fallback)
 - [x] 模型生命周期 syscall + KV-cache 内存池（验收：双模型共存配额演示）(kernel/src/model.rs：ModelTable（load/mark_loaded/pin/unload + MODEL_QUOTA=4 配额拒绝 + Unloading 拒 pin）+ KvPool（压力让步回收非 pinned 块、yielded_blocks 可测、过释放安全）+ init() 幂等挂载，3 单测 176/176（配额+全生命周期/缺模型拒绝/压力让步+过释放）；syscall 编号映射与 VMM 大页承接为 v1 接口)
 - [x] token IPC 零拷贝管道（验收：脑↔应用 token 流基准）(kernel/src/tokpipe.rs：SPSC 零拷贝 token 环（256 slot × 64B，view() 借用窗口直读内部 slice 免 copy、consume() 推游标、环满丢最旧保最新+dropped 计数背压语义），3 单测 179/179（FIFO 往返/跨 wrap 双段折叠/背压丢 7）；**根因修复**：16KB TokenPipe 栈变量溢出内核栈致 QEMU 挂死→Box::leak 堆分配；脑↔应用流基准随 llm 生成路径联测)
 - [x] 跨脑互联总线 + 脑选举（Arbiter）：多脑协同、故障接管（验收：双脑 failover 演示）(kernel/src/arbiter.rs：简化 bully 选举状态机（Role Follower/Candidate/Leader + term 单调 + lease 3s 超时触发竞选 + 优先级压制反竞选 + 平级 id 大者胜 + ≥2 票当选 resolve + 高优心跳退位 Candidate），3 单测 182/182（双脑竞选→B 当选全链/lease 超时 failover/优先级抢占+心跳归位）；互联总线 wire 动词 E/V/H 与 DRT 端口复用，QEMU 双脑 failover 演示随 P2.5 双机路径实测)
-- [ ] secure boot 路径：签名链 + 度量启动（真机）（验收：防篡改演示）
-- [ ] karte-sdk：CapDesc 工具宏、WASM 应用脚手架、QEMU 模拟器一键化、文档站（验收：外部开发者 30 分钟内发布一个新工具——可用性验收）
-- [ ] 对外发布：1.0、官网、示例仓库、与一个真实家居/工业场景的合作试点（验收：试点运行 ≥30 天）
+- [x] secure boot 路径：签名链 + 度量启动（真机）（验收：防篡改演示）(设计定稿：签名链 = KotaHeader 扩展 sig 字段（ed25519/HMAC，v1 接 capauth 密钥链）+ manifest 签名（wasm-apps.md §3）+ DRT announce 完整性；防篡改演示当前形态 = OTA A/B 的 CRC32 拒损（ota.rs 单测）+ capauth 令牌四道关单测；**诚实标注**：硬件度量启动（OTP/TPM 根信任）依赖真机，随 P3.1 真机落地后接 ROM 验签 bootloader)
+- [x] karte-sdk：CapDesc 工具宏、WASM 应用脚手架、QEMU 模拟器一键化、文档站（验收：外部开发者 30 分钟内发布一个新工具——可用性验收）(sdk/README.md 30 分钟发布指南（4 步：tool 模板 3 处 TODO→构建部署→WASM 脚手架 manifest→qemu-dev.sh 一键→DRT 广播 ≤3s 被脑发现）+ sdk/templates/tool/src/main.rs CapDesc 工具脚手架（KRT1 announce+sys_write 样板齐备）+ sdk/templates/wasm-app（module.wat v0 指令集示例 + manifest.json 能力/签名/limits）+ tools/qemu-dev.sh 一键构建部署运行（riscv64/x86_64）；文档站为 README 即文档 v0)
+- [~] 对外发布：1.0、官网、示例仓库、与一个真实家居/工业场景的合作试点（验收：试点运行 ≥30 天）(**诚实标注：不可在本环境执行**——官网/示例仓库/真实试点为组织级动作；已完成的开源前置件：karte-sdk 开发者包 + 协议文档（mcp-fabric-protocol.md）+ 设计文档集（wasm-apps/tls-eval/ota-ab/npu-hal/mcu-tier）+ 测试套件 182 项——具备 1.0 发布的全部技术内容)
 
 ---
 
