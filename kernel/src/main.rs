@@ -12,6 +12,7 @@ use core::arch::global_asm;
 global_asm!(include_str!("arch/riscv64/entry.S"));
 
 pub mod arch;
+pub mod brain;
 pub mod capability;
 pub mod capauth;
 pub mod driver;
@@ -95,6 +96,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::drt::run_tests();
         crate::mcp_cb::run_tests();
         crate::capauth::run_tests();
+        crate::brain::run_tests();
         crate::sync::spinlock::run_tests();
         crate::sync::int_spinlock::run_tests();
         crate::sync::mutex::run_tests();
