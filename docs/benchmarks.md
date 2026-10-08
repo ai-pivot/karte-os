@@ -12,8 +12,9 @@
 | 内核体积（RISC-V release） | **2,366,560 B ≈ 2.26 MB** | `ls -l target/riscv64gc-unknown-none-elf/release/karte-os-kernel` | 含内嵌用户程序 ELF |
 | 内核体积（x86_64 release） | **1,699,344 B ≈ 1.62 MB** | `ls -l target/x86_64-unknown-none/release/karte-os-kernel` | Multiboot2 ELF |
 | 上下文切换延迟 | TBD | P1.1 调度器 2.0 交付基准 harness 后补测 | 需要真实双任务 ping-pong 场景 |
+| RT pick 决策延迟 | **128 cycles** | test kernel `run_tests` 内 rdcycle 打点：1000 次空队列 `SCHEDULER.lock()+ready.pop_next()` 平均 | QEMU TCG 虚拟时钟（rdcycle），2026-10-08（P1.1 d2e5ad2 系列）。完整 RT 抢占延迟上界 = timer tick 粒度（~10ms）+ pick + `__switch` |
 | clippy error | **0** | CI 同款 clippy 命令（见 AGENTS.md Testing） | 2026-10-08 清零 |
-| 测试 | RISC-V 105/105；x86_64 131/131 | `make test` / `make test-x86` | x86_64 需 `grub-pc-bin` 已装 |
+| 测试 | RISC-V 112/112；x86_64 138/138 | `make test` / `make test-x86` | x86_64 需 `grub-pc-bin` 已装 |
 
 ## 复现命令
 

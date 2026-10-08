@@ -31,6 +31,38 @@ pub const AI_BATCH_BOOST_PRIO: u8 = NORMAL_PRIO;
 pub const AI_BATCH_STARVATION_TICKS: u32 = 64;
 
 impl SchedClass {
+    /// Wire encoding for the sys_getscheduler ABI: 0=RtFifo, 1=RtRoundRobin,
+    /// 2=Normal, 3=AiBatch (level in the low byte via `level()`).
+    pub fn code(&self) -> u8 {
+        match self {
+            SchedClass::RtFifo(_) => 0,
+            SchedClass::RtRoundRobin(_) => 1,
+            SchedClass::Normal => 2,
+            SchedClass::AiBatch => 3,
+        }
+    }
+
+    /// RT level argument (1..=16) for the RtFifo/RtRoundRobin variants; 0
+    /// for Normal/AiBatch.
+    pub fn level(&self) -> u8 {
+        match self {
+            SchedClass::RtFifo(n) | SchedClass::RtRoundRobin(n) => *n,
+            _ => 0,
+        }
+    }
+
+    /// Inverse of `code()`/`level()` for the sys_setpriority ABI.
+    /// Returns None for unknown codes.
+    pub fn from_code(code: u8, level: u8) -> Option<Self> {
+        match code {
+            0 => Some(SchedClass::RtFifo(level)),
+            1 => Some(SchedClass::RtRoundRobin(level)),
+            2 => Some(SchedClass::Normal),
+            3 => Some(SchedClass::AiBatch),
+            _ => None,
+        }
+    }
+
     /// Base priority in the 32-level space. RT tasks sort by their level.
     pub fn priority(&self) -> u8 {
         match self {

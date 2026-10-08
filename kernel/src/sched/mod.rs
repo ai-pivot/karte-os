@@ -851,6 +851,45 @@ pub fn remove_task(proc_idx: usize) {
     mark_task_exited_by_proc(proc_idx);
 }
 
+/// Change a task's scheduling class (P1.1 sys_setpriority backend).
+/// Re-queues at the new priority if the task is currently ready.
+pub fn set_task_class(proc_idx: usize, class: SchedClass) -> bool {
+    let slot = proc_slot_get(proc_idx);
+    if slot == NO_SLOT {
+        return false;
+    }
+    let mut sched = SCHEDULER.lock();
+    let was_ready;
+    if let Some(n) = node_mut(&mut sched, slot) {
+        if matches!(n.kind, TaskKind::Empty) {
+            return false;
+        }
+        n.class = class;
+        n.quantum_left = class.quantum();
+        was_ready = n.state == TaskState::Ready;
+        if was_ready {
+            sched.ready.remove(slot);
+        }
+        if was_ready {
+            let prio = class.priority();
+            sched.ready.push(slot, prio);
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Read a task's scheduling class (P1.1 sys_getscheduler backend).
+pub fn get_task_class(proc_idx: usize) -> Option<SchedClass> {
+    let slot = proc_slot_get(proc_idx);
+    if slot == NO_SLOT {
+        return None;
+    }
+    let sched = SCHEDULER.lock();
+    node_ref(&sched, slot).map(|n| n.class)
+}
+
 pub fn get_task_slot(proc_idx: usize) -> usize {
     proc_slot_get(proc_idx)
 }
@@ -968,4 +1007,98 @@ pub fn current_task_id() -> usize {
 
 pub fn set_current_brk(addr: usize) {
     crate::process::set_current_brk(addr);
+}
+
+// ─── Scheduler tests (test_mode) ──────────────────────────────────
+
+#[cfg(target_arch = "riscv64")]
+unsafe fn test_mask_interrupts() {
+    core::arch::asm!("csrci sstatus, 0x2");
+}
+#[cfg(target_arch = "riscv64")]
+unsafe fn test_restore_interrupts() {
+    core::arch::asm!("csrsi sstatus, 0x2");
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn test_mask_interrupts() {
+    x86_64::instructions::interrupts::disable();
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn test_restore_interrupts() {
+    x86_64::instructions::interrupts::enable();
+}
+
+#[cfg(feature = "test_mode")]
+pub fn run_tests() {
+    // Stress the dynamic task table (P1.1 acceptance: 200 tasks, all
+    // schedulable, slots recycled). Interrupts are masked so the timer-driven
+    // schedule() cannot consume the ready queue while address-less fake tasks
+    // are queued (allocate only writes node fields, never task stacks).
+    crate::test::run_test("sched_dynamic_200_task_stress", || {
+        let mut slots: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        unsafe { test_mask_interrupts() };
+        let mut ok = true;
+        for i in 0..200usize {
+            match allocate_user_slot(i, 0, 0x4000_0000 + i * 0x1000) {
+                Ok(s) => slots.push(s),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // All slots unique.
+        let mut sorted = slots.clone();
+        sorted.sort_unstable();
+        ok = ok && sorted.len() == 200 && sorted.windows(2).all(|w| w[0] != w[1]);
+        // All 200 are queued ready and counted as live children.
+        let ready_n = {
+            let sched = SCHEDULER.lock();
+            sched.ready.len()
+        };
+        let children = child_count();
+        ok = ok && ready_n == 200 && children == 200;
+        // Free them all; queue must drain.
+        for i in 0..200usize {
+            mark_task_exited_by_proc(i);
+        }
+        let ready_after = {
+            let sched = SCHEDULER.lock();
+            sched.ready.len()
+        };
+        ok = ok && ready_after == 0;
+        // Slot reuse: the next allocation must come from the free list.
+        let reused = allocate_user_slot(500, 0, 0x5000_0000).ok();
+        ok = ok && reused.map(|s| slots.contains(&s)).unwrap_or(false);
+        if reused.is_some() {
+            mark_task_exited_by_proc(500);
+        }
+        unsafe { test_restore_interrupts() };
+        ok
+    });
+
+    // RT pick-decision latency (P1.1 acceptance: measured number lands in
+    // docs/benchmarks.md). Timer-tick granularity note: full RT preemption
+    // latency is bounded by the tick interval; this measures the in-kernel
+    // pick decision (lock + bitmap scan) that adds on top of it.
+    let t0 = test_cycles();
+    for _ in 0..1000 {
+        let mut sched = SCHEDULER.lock();
+        let _ = sched.ready.pop_next();
+    }
+    let t1 = test_cycles();
+    let per_pick = (t1 - t0) / 1000;
+    crate::console_println!("[bench] sched_pick_empty_avg_cycles={}", per_pick);
+}
+
+#[cfg(all(target_arch = "riscv64", feature = "test_mode"))]
+fn test_cycles() -> u64 {
+    let t: u64;
+    unsafe { core::arch::asm!("rdcycle {}", out(reg) t) };
+    t
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "test_mode"))]
+fn test_cycles() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
 }

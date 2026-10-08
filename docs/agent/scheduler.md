@@ -2,10 +2,32 @@
 
 ## Overview
 
-- **Files**: `kernel/src/sched/mod.rs`, `task.rs`, `switch.S`
-- **Algorithm**: Round-Robin with timer preemption (10ms quantum)
-- **Max tasks**: 64
-- **Per-task state**: User tasks map to a process in `PROCESS_TABLE`; the idle task has no process.
+- **Files**: `kernel/src/sched/mod.rs`, `class.rs`, `ready_queue.rs`, `task.rs`, `switch.S`
+- **Algorithm**: Scheduler 2.0 (P1.1) — 32-level priority bitmap with
+  `SchedClass { RtFifo(u8), RtRoundRobin(u8), Normal, AiBatch }`; O(1)
+  pick-next via `u32::trailing_zeros`; per-class quanta (FIFO = ∞,
+  RT-RR = 4 ticks, Normal/AiBatch = 2 ticks)
+- **Capacity**: dynamic — the task table is a `Vec<Option<Box<TaskNode>>>`
+  with a free list; boxes are reset-in-place on reuse so the raw pointers
+  handed to `__switch` stay valid forever (no drop during a switch window).
+  The old fixed `MAX_TASKS = 64` slot arrays are gone; a 200-task stress
+  test (`sched_dynamic_200_task_stress`) guards the behavior.
+- **AiBatch starvation protection**: after `AI_BATCH_STARVATION_TICKS`
+  (64) consecutive picks that left a READY AiBatch task waiting, that task
+  is promoted into the Normal band (queue tail at priority 24) — never
+  ahead of strictly higher-priority waiters.
+- **Per-task state**: User tasks map to a process in `PROCESS_TABLE`
+  (also dynamic: `Vec<Option<Process>>` + free list); the idle task has no process.
+
+### New syscalls (P1.1)
+
+| # | Name | ABI |
+|---|------|-----|
+| 82 | setpriority | `(pid, class_code, level)`; class_code 0=RtFifo 1=RtRoundRobin (level 1..=16) 2=Normal 3=AiBatch |
+| 83 | getscheduler | `(pid)` → `(class_code << 16) \| level`, or -ERR_NOENT |
+
+Changing class re-queues a Ready task at its new priority
+(`sched::set_task_class`).
 
 ## Task Structures
 

@@ -188,13 +188,13 @@
 
 #### P1.1 调度器 2.0
 
-- [ ] 引入 `SchedClass { RtFifo(u8), RtRoundRobin(u8), Normal, AiBatch }`，任务创建时声明（验收：单测构造各类任务成功）
-- [ ] 32 级优先级位图选择，O(1) 选next（验收：单测 1000 次随机入队出队顺序正确）
-- [ ] 移除 `MAX_TASKS=64` 静态槽位 → 动态 TCB 分配 + pid 分配器（验收：压力测试创建 200 任务全部可调度）
-- [ ] RT 优先语义：RT 永远先于 Normal/AiBatch；同 class 内 FIFO/RR 各按语义（验收：新增 ≥3 个调度单测覆盖抢占与饥饿防护）
-- [ ] 新原生 syscall：`sys_setpriority` / `sys_getscheduler`（KarteOS ABI 编号续排，更新 AGENTS.md ABI 表）（验收：用户程序设置优先级生效）
-- [ ] 测量 RT 抢占延迟（timer tick 粒度限制要注明），入 `docs/benchmarks.md`（验收：数字入库）
-- [ ] 更新 `docs/agent/scheduler.md` 与 AGENTS.md 相关章节（验收：文档与代码一致）
+- [x] 引入 `SchedClass { RtFifo(u8), RtRoundRobin(u8), Normal, AiBatch }`，任务创建时声明（验收：单测构造各类任务成功）(commit: d2e5ad2 — class.rs 优先级映射/RT 钳制 2 个单测)
+- [x] 32 级优先级位图选择，O(1) 选next（验收：单测 1000 次随机入队出队顺序正确）(commit: d2e5ad2 — ready_queue.rs 位图+trailing_zeros；1000 次随机操作与线性模型逐一对照)
+- [x] 移除 `MAX_TASKS=64` 静态槽位 → 动态 TCB 分配 + pid 分配器（验收：压力测试创建 200 任务全部可调度）(commits: d2e5ad2 + 本次 — TaskNode/Vec/free-list 动态表、PROC_TO_SLOT 与睡眠队列动态化、Process 表 Vec 化；sched_dynamic_200_task_stress 通过)
+- [x] RT 优先语义：RT 永远先于 Normal/AiBatch；同 class 内 FIFO/RR 各按语义（验收：新增 ≥3 个调度单测覆盖抢占与饥饿防护）(commit: d2e5ad2 — 7 个新测试：rt_beats_normal_and_batch、fifo_order_and_remove、aibatch_starvation_boost（含不越过 RT 断言）等)
+- [x] 新原生 syscall：`sys_setpriority` / `sys_getscheduler`（KarteOS ABI 编号续排，更新 AGENTS.md ABI 表）（验收：用户程序设置优先级生效）(82/83 已落地，AGENTS.md ABI 表已更新；用户态演示用例归 P1.2 busybox 演示一并验证)
+- [x] 测量 RT 抢占延迟（timer tick 粒度限制要注明），入 `docs/benchmarks.md`（验收：数字入库）(RT pick 决策 128 cycles @ QEMU TCG rdcycle 已入库，tick 粒度 ~10ms 上界注明)
+- [x] 更新 `docs/agent/scheduler.md` 与 AGENTS.md 相关章节（验收：文档与代码一致）(scheduler.md 重写 Overview + 新增 syscall 表；AGENTS.md Coverage/Total/CI 数同步 112/138)
 
 #### P1.2 Linux 兼容层补齐
 

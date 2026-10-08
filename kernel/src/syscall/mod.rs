@@ -70,6 +70,8 @@ pub const SYS_SENDTO: usize = 75; // sendto(fd, buf, len, flags, addr_ptr, addr_
 pub const SYS_RECVFROM: usize = 76; // recvfrom(fd, buf, len, flags, addr_ptr, addr_len_ptr) → received
 pub const SYS_SHUTDOWN: usize = 77; // shutdown(fd, how) → 0
 pub const SYS_SYSLOG: usize = 81; // syslog(buf, len, offset) → bytes_read
+pub const SYS_SETPRIORITY: usize = 82; // setpriority(pid, class_code, level) → 0
+pub const SYS_GETSCHEDULER: usize = 83; // getscheduler(pid) → (code<<16)|level, or -1
 
 // ─── Linux compatibility syscalls (translated from Linux x86_64 numbers) ──
 pub const LINUX_CLONE: usize = 100;
@@ -1590,6 +1592,8 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_RECVFROM => sys_recvfrom(args[0] as i32, args[1], args[2]),
         SYS_SHUTDOWN => sys_shutdown(args[0] as i32),
         SYS_SYSLOG => sys_syslog(args[0], args[1], args[2]),
+        SYS_SETPRIORITY => sys_setpriority(args[0], args[1], args[2]),
+        SYS_GETSCHEDULER => sys_getscheduler(args[0]),
 
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
         LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
@@ -4295,6 +4299,39 @@ fn sys_exec_fd(path: usize, path_len: usize, redir_stdin: i32, redir_stdout: i32
             crate::klog!(DEBUG, "[exec] Failed to schedule process");
             ERR_NOMEM
         }
+    }
+}
+
+/// Syscall 82: Change a task's scheduling class (Scheduler 2.0).
+/// `pid` = target process, `class_code` = 0 RtFifo / 1 RtRoundRobin /
+/// 2 Normal / 3 AiBatch, `level` = RT level (1..=16) for RT classes.
+/// Returns 0 on success, -ERR on failure.
+fn sys_setpriority(pid: usize, class_code: usize, level: usize) -> isize {
+    let class = match crate::sched::class::SchedClass::from_code(class_code as u8, level as u8) {
+        Some(c) => c,
+        None => return ERR_INVAL,
+    };
+    let proc_idx = match crate::process::find_process_by_pid(pid) {
+        Some(idx) => idx,
+        None => return ERR_NOENT,
+    };
+    if crate::sched::set_task_class(proc_idx, class) {
+        ERR_OK
+    } else {
+        ERR_NOENT
+    }
+}
+
+/// Syscall 83: Read a task's scheduling class (Scheduler 2.0).
+/// Returns `(class_code << 16) | level`, or -ERR_NOENT for unknown pids.
+fn sys_getscheduler(pid: usize) -> isize {
+    let proc_idx = match crate::process::find_process_by_pid(pid) {
+        Some(idx) => idx,
+        None => return ERR_NOENT,
+    };
+    match crate::sched::get_task_class(proc_idx) {
+        Some(c) => ((c.code() as isize) << 16) | (c.level() as isize),
+        None => ERR_NOENT,
     }
 }
 

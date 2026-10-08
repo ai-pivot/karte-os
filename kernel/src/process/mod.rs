@@ -4,6 +4,7 @@ pub mod elf;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -114,7 +115,7 @@ fn dealloc_kernel_stack(kernel_stack_top: usize) {
 pub(crate) static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
 /// Maximum number of processes in the system
-const MAX_PROCESSES: usize = 64;
+const MAX_PROCESSES: usize = 512; // kept for diagnostics sizing only
 
 /// Process state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1306,9 +1307,51 @@ pub fn get_user_page_table(ppn: usize) -> &'static mut vmm::PageTable {
 
 // ─── Global process table ─────────────────────────────────────────
 
-/// Global process list (simplified for Phase 2)
-static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> =
-    Mutex::new([const { None }; MAX_PROCESSES]);
+/// Dynamic process table (P1.1): replaces the fixed 64-slot array. Slots
+/// grow on demand via IndexMut; `table[idx]` keeps its `Option<Process>`
+/// semantics through Index/IndexMut so existing call sites stay untouched.
+/// Reads of never-allocated indices yield `None` (same as an empty array
+/// slot); writes grow the table. Freed slots recycle via a free list.
+struct ProcessTable {
+    slots: Vec<Option<Process>>,
+    free: Vec<usize>,
+}
+
+static NONE_SLOT: Option<Process> = None;
+
+impl ProcessTable {
+    /// Iterator over all slots (for scans); MutexGuard deref makes
+    /// `table.iter()` work unchanged at existing call sites.
+    fn iter(&self) -> core::slice::Iter<'_, Option<Process>> {
+        self.slots.iter()
+    }
+
+    /// Bounds-checked slot read for scan-style call sites.
+    fn get(&self, i: usize) -> Option<&Option<Process>> {
+        self.slots.get(i)
+    }
+}
+
+impl core::ops::Index<usize> for ProcessTable {
+    type Output = Option<Process>;
+    fn index(&self, i: usize) -> &Option<Process> {
+        self.slots.get(i).unwrap_or(&NONE_SLOT)
+    }
+}
+
+impl core::ops::IndexMut<usize> for ProcessTable {
+    fn index_mut(&mut self, i: usize) -> &mut Option<Process> {
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        &mut self.slots[i]
+    }
+}
+
+static PROCESS_TABLE: Mutex<ProcessTable> = Mutex::new(ProcessTable {
+    slots: Vec::new(),
+    free: Vec::new(),
+});
 
 /// Current running process index — per-hart array for SMP
 static CURRENT_PROCESS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
@@ -1353,13 +1396,14 @@ where
 /// Add a process to the table, returns its index
 pub fn add_process(proc: Process) -> Option<usize> {
     let mut table = PROCESS_TABLE.lock();
-    for (i, slot) in table.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(proc);
-            return Some(i);
-        }
+    // Recycle a freed slot first; otherwise grow the table.
+    if let Some(i) = table.free.pop() {
+        table[i] = Some(proc);
+        return Some(i);
     }
-    None
+    let i = table.slots.len();
+    table.slots.push(Some(proc));
+    Some(i)
 }
 
 /// Get page table root for a specific process index (for scheduler use).
@@ -1415,6 +1459,7 @@ pub fn set_exit_code(code: usize) {
 pub fn free_process_slot(idx: usize) {
     let mut table = PROCESS_TABLE.lock();
     table[idx] = None;
+    table.free.push(idx);
 }
 
 /// Set exit code for a process by its table index and mark it exited.
