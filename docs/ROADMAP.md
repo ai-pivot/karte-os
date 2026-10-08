@@ -242,8 +242,8 @@
 
 #### P2.4 L4 安全层（与 Phase 3 capability 合流的前置）
 
-- [ ] 能力令牌生成/颁发/校验/吊销链路（附录 A.3 定稿）（验收：无令牌调用被拒 + 吊销后调用被拒的单测）
-- [ ] 设备签名清单（signed manifest）注册校验（验收：伪冒注册被拒）
+- [x] 能力令牌生成/颁发/校验/吊销链路（附录 A.3 定稿）（验收：无令牌调用被拒 + 吊销后调用被拒的单测）(kernel/src/capauth.rs v1：CapToken{token_id,device_id,tool_name,perm_bits,issued,expires} + TokenManager 四道关校验（存在→过期→吊销→perm 匹配）+ revoke 幂等（防时钟回拨复活）+ sweep 过期清理（保留吊销列表）；9 单测覆盖：OK/无令牌/过期/吊销/perm 拒绝/device-tool 不匹配/sweep 语义/manifest)
+- [x] 设备签名清单（signed manifest）注册校验（验收：伪冒注册被拒）(FNV-1a 64 v0 签名原语 + 内置信任锚密钥表（vfs0/timer0/gpio0）；verify_manifest 校验 hash 匹配；伪冒三单测：hash 错/未知设备/密钥错全被拒；真 ed25519 归 Phase3 安全升级。RV 154/154，x86 check 0 err)
 
 #### P2.5 脑端与演示（M2）
 
