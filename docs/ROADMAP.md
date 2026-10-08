@@ -198,7 +198,7 @@
 
 #### P1.2 Linux 兼容层补齐
 
-- [ ] `fork` 返回值语义修复（子进程 0）+ `wait4(pid, &status, options)`（验收：spawn_test 扩展用例通过）
+- [x] `fork` 返回值语义修复（子进程 0）+ `wait4(pid, &status, options)`（验收：spawn_test 扩展用例通过）(spawn_test fork 用例全链路通过：子进程 a0=0 从 ecall 返回点恢复、exit(7)、wait4 收 status=0x700。三处修复：① sched::spawn_forked_task 从父 TrapContext 构建子栈（a0=0、sepc+=4）；② fork 页表递归深拷贝（旧代码只拷 root 直接 leaf，三级映射被丢弃；USER 位 leaf 深拷贝、内核/MMIO 映射共享）；③ user_translate — schedule() 切换后 satp 不恢复，内核 VA 直写用户内存会写进别的任务地址空间，改为按逻辑发起者页表 walk 后物理直写（AGENTS.md 新 GOTCHA）)
 - [ ] `execve(path, argv, envp)` 完整参数传递 + `exit_group`（验收：busybox ash 能启动）
 - [ ] `pipe2` / `dup3` / `fcntl`（F_GETFD/F_SETFD/F_GETFL/F_SETFL）（验收：管道+重定向脚本用例通过）
 - [ ] `ioctl` TCGETS/TIOCGWINSZ 语义补齐（验收：ash 行编辑不异常）

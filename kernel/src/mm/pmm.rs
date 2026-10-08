@@ -218,6 +218,19 @@ pub fn total_memory() -> usize {
     MEMORY_START + unsafe { MEMORY_SIZE }
 }
 
+/// True if `addr` lies inside the allocatable RAM region. Used by fork's
+/// deep page-table copy: device/MMIO frames (outside RAM) must be shared
+/// verbatim between parent and child (MAP_SHARED semantics), never memcpy'd.
+#[cfg(target_arch = "riscv64")]
+pub fn is_ram_frame(addr: usize) -> bool {
+    addr >= MEMORY_START && addr < MEMORY_START + MEMORY_SIZE
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn is_ram_frame(addr: usize) -> bool {
+    addr >= MEMORY_START && addr < MEMORY_START + unsafe { MEMORY_SIZE }
+}
+
 pub fn alloc_frame() -> Option<usize> {
     FRAME_ALLOCATOR.lock().as_mut()?.alloc()
 }

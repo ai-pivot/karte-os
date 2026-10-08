@@ -761,6 +761,79 @@ pub fn spawn_user_task(proc_idx: usize, init: UserTaskInit) -> Result<usize, Sch
     allocate_user_slot(proc_idx, init.kernel_stack_top, initial_sp)
 }
 
+/// Fork entry: build the child's kernel stack from the PARENT's saved
+/// TrapContext so the child resumes right after its fork() ecall with a0=0
+/// (POSIX fork semantics). P1.2: replaces the old "restart at ELF entry"
+/// behavior.
+///
+/// `parent_kernel_stack_top` — parent's kernel stack top; its TrapContext
+/// sits at `top - size_of::<TrapContext>()` (pushed by trap_entry.S).
+/// `user_satp` — the CHILD's page-table root register value.
+#[cfg(target_arch = "riscv64")]
+pub fn spawn_forked_task(
+    proc_idx: usize,
+    kernel_stack_top: usize,
+    parent_kernel_stack_top: usize,
+    user_satp: usize,
+) -> Result<usize, SchedError> {
+    let ctx_size = core::mem::size_of::<crate::arch::trap::TrapContext>();
+    let trap_ctx_base = kernel_stack_top - ctx_size;
+    let switch_sp = trap_ctx_base - 104;
+    let parent_ctx = parent_kernel_stack_top - ctx_size;
+    unsafe {
+        core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + 104);
+        // Copy the parent's saved syscall frame wholesale...
+        core::ptr::copy_nonoverlapping(parent_ctx as *const u8, trap_ctx_base as *mut u8, ctx_size);
+        let ctx = trap_ctx_base as *mut usize;
+        // ...then adjust for the child: a0=0, sepc past the ecall, own
+        // kernel stack and page table. (x[2] user sp and callee registers
+        // are inherited verbatim from the copy.)
+        *ctx.add(10) = 0; // x[10] = a0 = 0 (child fork return)
+        *ctx.add(33) += 4; // sepc: skip the ecall instruction
+        *ctx.add(34) = kernel_stack_top; // sscratch slot = child kernel stack
+        *ctx.add(35) = user_satp; // child page table
+        let sw = switch_sp as *mut usize;
+        *sw.add(0) = first_task_shim as *const () as usize;
+    }
+    allocate_user_slot(proc_idx, kernel_stack_top, switch_sp)
+}
+
+/// x86_64 fork entry: same POSIX semantics, built from the parent's saved
+/// int-0x80 TrapContext.
+#[cfg(target_arch = "x86_64")]
+pub fn spawn_forked_task(
+    proc_idx: usize,
+    kernel_stack_top: usize,
+    parent_kernel_stack_top: usize,
+    user_cr3: usize,
+) -> Result<usize, SchedError> {
+    use crate::arch::trap::TrapContext;
+    let ctx_size = core::mem::size_of::<TrapContext>();
+    let switch_frame_size: usize = 8 * 8 + 512;
+    let switch_sp = (kernel_stack_top - ctx_size - switch_frame_size) & !0xF;
+    let trap_ctx_base = switch_sp + switch_frame_size;
+    let parent_ctx = parent_kernel_stack_top - ctx_size;
+    unsafe {
+        core::ptr::write_bytes(switch_sp as *mut u8, 0, ctx_size + switch_frame_size);
+        let mxcsr_ptr = (switch_sp as *mut u8).add(24) as *mut u32;
+        *mxcsr_ptr = 0x1F80;
+        let sw = switch_sp as *mut usize;
+        *sw.add(512 / 8) = switch_sp + 520; // orig_rsp for __switch pop sequence
+        *sw.add(568 / 8) = first_task_shim as *const () as usize;
+
+        // Copy the parent's saved frame wholesale, then adjust: rax=0 (child
+        // return), own kernel stack, own user CR3. RIP already points past
+        // the int 0x80 (the ISR saved the return address).
+        core::ptr::copy_nonoverlapping(parent_ctx as *const u8, trap_ctx_base as *mut u8, ctx_size);
+        let ctx = trap_ctx_base as *mut TrapContext;
+        (*ctx).rax = 0;
+        (*ctx).kernel_sp = kernel_stack_top as u64;
+        (*ctx).user_cr3 = user_cr3 as u64;
+        (*ctx).trap_from_user = 1;
+    }
+    allocate_user_slot(proc_idx, kernel_stack_top, switch_sp)
+}
+
 pub fn add_user_process(
     entry: usize,
     user_stack_top: usize,

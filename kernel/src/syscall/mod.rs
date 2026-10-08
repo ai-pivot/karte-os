@@ -72,6 +72,7 @@ pub const SYS_SHUTDOWN: usize = 77; // shutdown(fd, how) → 0
 pub const SYS_SYSLOG: usize = 81; // syslog(buf, len, offset) → bytes_read
 pub const SYS_SETPRIORITY: usize = 82; // setpriority(pid, class_code, level) → 0
 pub const SYS_GETSCHEDULER: usize = 83; // getscheduler(pid) → (code<<16)|level, or -1
+pub const LINUX_WAIT4: usize = 84; // internal: Linux wait4(pid,&status,opt,rusage) dedicated handler
 
 // ─── Linux compatibility syscalls (translated from Linux x86_64 numbers) ──
 pub const LINUX_CLONE: usize = 100;
@@ -226,6 +227,28 @@ pub(crate) fn user_read<T: Copy + Default>(addr: usize) -> T {
     }
 }
 
+/// Physical address backing a user VA in the CURRENT syscall owner's address
+/// space. Plain VA dereferencing follows satp/CR3 — WRONG after a schedule()
+/// switch inside a syscall (the arch register still points at whichever task
+/// ran last, so the write would land in a different process's copy). This
+/// walks the logical owner's page table explicitly.
+fn user_translate(addr: usize) -> Option<usize> {
+    let proc_idx = crate::sched::slot_to_process(crate::sched::current_slot());
+    if proc_idx == usize::MAX {
+        return None; // no process context (kernel-internal/test callers)
+    }
+    let root_ppn = crate::process::get_page_table_root(proc_idx);
+    if root_ppn == 0 {
+        return None;
+    }
+    let pt = unsafe { &mut *((root_ppn << 12) as *mut crate::mm::vmm::PageTable) };
+    match crate::mm::vmm::walk_mapping(pt, addr) {
+        crate::mm::page_table::WalkResult::Mapped4K { frame, .. }
+        | crate::mm::page_table::WalkResult::MappedHuge { frame, .. } => Some(frame.as_usize()),
+        _ => None,
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn user_read_u8(addr: usize) -> u8 {
@@ -265,7 +288,13 @@ pub(crate) fn user_read_u8(addr: usize) -> u8 {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 pub(crate) fn user_read_u8(addr: usize) -> u8 {
-    unsafe { core::ptr::read_volatile(addr as *const u8) }
+    if let Some(pa) = user_translate(addr) {
+        unsafe { core::ptr::read_volatile(pa as *const u8) }
+    } else {
+        // No process context (kernel-internal/test callers): address IS the
+        // kernel-visible pointer.
+        unsafe { core::ptr::read_volatile(addr as *const u8) }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -444,7 +473,14 @@ pub(crate) fn user_write_bytes(addr: usize, src: &[u8]) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     for (i, &byte) in src.iter().enumerate() {
-        unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+        // Translate through the syscall owner's page table: after a
+        // schedule() switch satp still points at another task's table, so a
+        // plain VA write would corrupt a foreign address space.
+        if let Some(pa) = user_translate(addr + i) {
+            unsafe { core::ptr::write_volatile(pa as *mut u8, byte) };
+        } else {
+            unsafe { core::ptr::write_volatile((addr + i) as *mut u8, byte) };
+        }
     }
 }
 
@@ -1594,6 +1630,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_SYSLOG => sys_syslog(args[0], args[1], args[2]),
         SYS_SETPRIORITY => sys_setpriority(args[0], args[1], args[2]),
         SYS_GETSCHEDULER => sys_getscheduler(args[0]),
+        LINUX_WAIT4 => sys_wait4(args[0], args[1], args[2], args[3]),
 
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
         LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
@@ -4335,6 +4372,33 @@ fn sys_getscheduler(pid: usize) -> isize {
     }
 }
 
+/// Linux wait4(pid, status, options, rusage) — P1.2.
+/// Blocks until the direct child `pid` exits (the native waitpid backend
+/// yields via schedule() while the child runs), then encodes the exit code
+/// POSIX-style (`code << 8`, i.e. WIFEXITED|WEXITSTATUS) into *status and
+/// returns the child pid. rusage is ignored. Returns -ECHILD for unknown /
+/// non-child pids, -EINVAL for wait-any (0/-1), -EFAULT for bad status_ptr.
+fn sys_wait4(pid: usize, status_ptr: usize, _options: usize, _rusage: usize) -> isize {
+    if pid == 0 || pid == usize::MAX {
+        // wait-any is not supported by the native waitpid backend yet.
+        return -22; // -EINVAL
+    }
+    loop {
+        match sys_waitpid(pid) {
+            code if code >= 0 => {
+                if status_ptr != 0 {
+                    user_write_bytes(status_ptr, &((code as u32) << 8).to_le_bytes());
+                }
+                // POSIX wait4 returns the CHILD PID (not the exit code —
+                // that's already encoded into *status as code << 8).
+                return pid as isize;
+            }
+            WAIT_AGAIN => continue, // backend already yielded the CPU
+            _ => return -10,        // -ECHILD
+        }
+    }
+}
+
 /// Syscall 60: Send a signal to a process.
 /// `pid` = target process ID, `sig` = signal number.
 /// Currently only supports SIGINT (2) which terminates the target.
@@ -4432,6 +4496,66 @@ fn copy_user_pages_x86(
     Ok(copied_any)
 }
 
+/// Recursively deep-copy the USER half of a Sv39 page-table tree.
+/// Intermediate (non-leaf) levels get freshly allocated tables mirroring the
+/// source structure; leaf entries get freshly allocated frames with the
+/// source frame contents (COW is a later optimization). Only entries below
+/// the kernel/high-half boundary (root index < 256) are copied — the child's
+/// kernel mappings were already installed by copy_kernel_mappings().
+/// `level` 2 = root, 1 = mid, 0 = leaf table; leaf size scales with the
+/// level so huge pages (2MB/1GB) are copied with their true size.
+#[cfg(target_arch = "riscv64")]
+fn deep_copy_user_pt(
+    src: &crate::mm::vmm::PageTable,
+    dst: &mut crate::mm::vmm::PageTable,
+    level: usize,
+    _page_size: usize,
+) -> Result<(), isize> {
+    const USER_ROOT_ENTRIES: usize = 256; // Sv39 high half = kernel
+    let count = if level == 2 { USER_ROOT_ENTRIES } else { 512 };
+    for idx in 0..count {
+        let pte = src.entry(idx);
+        if !pte.is_valid() {
+            continue;
+        }
+        if pte.is_leaf() {
+            // Only leaves carrying the USER bit are private user data
+            // (kernel identity/MMIO maps are KRWX without U and must be
+            // shared verbatim — parent and child keep identical kernel
+            // mappings, and copying 128MB of identity frames would OOM).
+            if !pte.flags().contains(crate::mm::vmm::PTEFlags::U)
+                || !crate::mm::pmm::is_ram_frame(pte.ppn() << 12)
+            {
+                dst.set_entry(idx, pte);
+                continue;
+            }
+            let old_frame = pte.ppn() << 12;
+            let new_frame = match crate::mm::pmm::alloc_frame() {
+                Some(f) => f,
+                None => return Err(ERR_NOMEM),
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(old_frame as *const u8, new_frame as *mut u8, 4096);
+            }
+            dst.set_entry(idx, crate::mm::vmm::PTE::new(new_frame >> 12, pte.flags()));
+        } else {
+            if level == 0 {
+                // Leaf tables must contain only leaves; a valid-but-non-leaf
+                // entry here would recurse below level 0 forever (usize
+                // underflow). Skip it defensively.
+                continue;
+            }
+            let src_child = unsafe { &*((pte.ppn() << 12) as *const crate::mm::vmm::PageTable) };
+            let dst_child = crate::mm::vmm::PageTable::zeroed();
+            deep_copy_user_pt(src_child, dst_child, level - 1, _page_size)?;
+            let ppn = (dst_child as *const crate::mm::vmm::PageTable as usize) >> 12;
+            dst.set_entry(idx, crate::mm::vmm::PTE::new(ppn, pte.flags()));
+        }
+    }
+    crate::console_println!("[fork-copy] exit L{}", level);
+    Ok(())
+}
+
 fn sys_fork() -> isize {
     // Get current process info
     let current = match crate::process::current() {
@@ -4441,7 +4565,7 @@ fn sys_fork() -> isize {
     let parent_idx = crate::process::current_index();
 
     // Clone the page table (deep copy user pages)
-    let user_pt = crate::mm::vmm::create_user_page_table();
+    let mut user_pt = crate::mm::vmm::create_user_page_table();
     let parent_ppn = current.page_table_root;
 
     // Allocate kernel stack for child BEFORE copy_kernel_mappings
@@ -4453,7 +4577,10 @@ fn sys_fork() -> isize {
     // Copy kernel mappings (with kernel stack mapping)
     crate::process::copy_kernel_mappings(user_pt, kernel_stack_top);
 
-    // Copy user page table entries (deep copy physical frames)
+    // Copy user page table entries (deep copy physical frames).
+    // P1.2: recursive deep copy — the old loop only copied leaf PTEs that
+    // sat directly in the root table, so a 3-level (L2→L1→L0) user mapping
+    // was silently dropped and the child faulted on its first instruction.
     #[cfg(target_arch = "x86_64")]
     {
         if let Err(err) = crate::arch::trap::with_kernel_cr3(|| {
@@ -4468,28 +4595,11 @@ fn sys_fork() -> isize {
     {
         let parent_pt = crate::process::get_user_page_table(parent_ppn);
         let page_size = crate::mm::pmm::page_size();
-        for vpn in 0..512 {
-            let pte = parent_pt.entry(vpn);
-            if pte.is_valid() && pte.is_leaf() {
-                let old_ppn = pte.ppn();
-                let old_frame = old_ppn << 12;
-                let new_frame = match crate::mm::pmm::alloc_frame() {
-                    Some(f) => f,
-                    None => return ERR_NOMEM,
-                };
-                // Copy frame contents
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        old_frame as *const u8,
-                        new_frame as *mut u8,
-                        page_size,
-                    );
-                }
-                // Map new frame in child page table with same flags
-                let new_pte = crate::mm::vmm::PTE::new(new_frame >> 12, pte.flags());
-                user_pt.set_entry(vpn, new_pte);
-            }
+        crate::console_println!("[fork] deep-copy start");
+        if deep_copy_user_pt(parent_pt, &mut user_pt, 2, page_size).is_err() {
+            return ERR_NOMEM;
         }
+        crate::console_println!("[fork] deep-copy done");
     }
 
     let page_table_ppn = (user_pt as *const crate::mm::vmm::PageTable as usize) >> 12;
@@ -4545,14 +4655,17 @@ fn sys_fork() -> isize {
     #[cfg(target_arch = "x86_64")]
     let user_satp = child_proc.page_table_root << 12;
 
-    match crate::sched::add_user_process(
-        child_proc.entry,
-        child_proc.user_stack_top,
-        child_proc.kernel_stack_top,
-        user_satp,
+    // P1.2: POSIX fork semantics — the child resumes at the parent's saved
+    // syscall frame (right after its ecall / int 0x80) with a 0 return value,
+    // instead of restarting at the ELF entry.
+    crate::console_println!("[fork] spawn_forked_task begin");
+    match crate::sched::spawn_forked_task(
         child_idx,
+        child_proc.kernel_stack_top,
+        current.kernel_stack_top,
+        user_satp,
     ) {
-        Some(_tid) => {
+        Ok(_tid) => {
             crate::console_println!(
                 "[fork] Created child pid={} (parent pid={})",
                 child_pid,
@@ -4560,7 +4673,7 @@ fn sys_fork() -> isize {
             );
             child_pid as isize
         }
-        None => {
+        Err(_) => {
             crate::klog!(DEBUG, "[fork] Failed to schedule child");
             ERR_NOMEM
         }

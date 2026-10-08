@@ -229,6 +229,15 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
         60, 61, // 70-77: socket..shutdown
         70, 71, 72, 73, 74, 75, 76, 77,
     ];
+    // Linux wait4(61) collides with KarteOS native SIGRET(61): intercept it
+    // BEFORE the native-number passthrough so Linux binaries reach the
+    // dedicated wait4 handler instead of the signal-return stub.
+    if id == L_WAIT4 {
+        return Some(Translation::Dispatch {
+            karte_nr: 84, // super::LINUX_WAIT4 dedicated handler
+            args: [args[0], args[1], args[2], args[3], 0, 0],
+        });
+    }
     if KARTEOS_NATIVE_NUMBERS.contains(&id) {
         return None;
     }
