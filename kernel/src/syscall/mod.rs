@@ -938,6 +938,7 @@ fn linux_openat(_dirfd: usize, pathname: usize, flags: usize, _mode: usize) -> i
             })
         }
         Err(e) => {
+            let _ = e;
             // Only fake virtual pseudo-filesystem paths (/proc, /sys, /dev, /etc, /run)
             let is_pseudo = is_pseudo_path(&path_str);
             // /etc/resolv.conf, /etc/localtime etc. — fake these too

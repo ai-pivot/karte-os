@@ -191,13 +191,33 @@ unsafe fn launch(cmd: &[u8], arg: &[u8], redir_stdin: i32, redir_stdout: i32) ->
         argc = 1;
     }
 
-    // Split arg by spaces into argv[1..]
+    // Split arg by spaces into argv[1..]. Quoted segments (single or double)
+    // form a single argument with the quotes stripped, so arguments with
+    // embedded spaces (e.g. ash -c "echo hi | cat") survive intact.
     if !arg.is_empty() {
-        let mut start = 0;
         let arg_bytes = arg;
+        let mut start = 0;
         while start < arg_bytes.len() && argc < MAX_ARGV {
             while start < arg_bytes.len() && arg_bytes[start] == b' ' { start += 1; }
             if start >= arg_bytes.len() { break; }
+            if arg_bytes[start] == b'"' || arg_bytes[start] == b'\'' {
+                let q = arg_bytes[start];
+                let mut j = start + 1;
+                while j < arg_bytes.len() && arg_bytes[j] != q { j += 1; }
+                let content_end = if j < arg_bytes.len() { j } else { arg_bytes.len() };
+                let content = &arg_bytes[start + 1..content_end];
+                let l = content.len().min(MAX_ARG_LEN - 1);
+                core::ptr::copy_nonoverlapping(
+                    content.as_ptr(),
+                    argv_buf[argc].as_mut_ptr(),
+                    l,
+                );
+                argv_buf[argc][l] = 0;
+                argv_lens[argc] = l + 1;
+                argc += 1;
+                start = if j < arg_bytes.len() { j + 1 } else { arg_bytes.len() };
+                continue;
+            }
             let mut end = start;
             while end < arg_bytes.len() && arg_bytes[end] != b' ' { end += 1; }
             let l = (end - start).min(MAX_ARG_LEN - 1);
@@ -478,13 +498,22 @@ fn split_pipe(cmd: &[u8]) -> [Option<&[u8]>; MAX_CMDS_IN_PIPE] {
     let mut result: [Option<&[u8]>; MAX_CMDS_IN_PIPE] = [None; MAX_CMDS_IN_PIPE];
     let mut count = 0usize;
     let mut start = 0usize;
+    // Quote-aware: a '|' inside single/double quotes is data, not a pipe
+    // separator (e.g. ash -c "echo hi | cat").
+    let mut in_dquote = false;
+    let mut in_squote = false;
     for i in 0..cmd.len() {
-        if cmd[i] == b'|' {
-            if count < MAX_CMDS_IN_PIPE {
-                result[count] = Some(trim(&cmd[start..i]));
-                count += 1;
+        match cmd[i] {
+            b'"' if !in_squote => in_dquote = !in_dquote,
+            b'\'' if !in_dquote => in_squote = !in_squote,
+            b'|' if !in_dquote && !in_squote => {
+                if count < MAX_CMDS_IN_PIPE {
+                    result[count] = Some(trim(&cmd[start..i]));
+                    count += 1;
+                }
+                start = i + 1;
             }
-            start = i + 1;
+            _ => {}
         }
     }
     if count < MAX_CMDS_IN_PIPE {
