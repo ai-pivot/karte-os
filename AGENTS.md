@@ -37,7 +37,7 @@ QEMU exit: `Ctrl+A` then `X`.
 
 ## ⚠️ Pre-Commit Checklist — MUST follow before every git commit
 
-**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (137 tests), boot-test, smp-test.**
+**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (145 tests), boot-test, smp-test.**
 - **First U-mode entry SP convention**: `build_initial_stack` MUST write `user_stack_top` into the TrapContext **x[2] slot (offset 16)**, matching `trap_return_user`, which restores user sp from x[2] and then swaps sscratch↔sp (sscratch ends up holding kernel_stack_top for the next U-mode trap). Writing user_stack_top into the sscratch slot (272) and kernel_stack_top into x[2] makes the first user instruction store to a kernel physical address → immediate store page fault, shell killed at boot (this broke boot-test; fixed 2026-10-08).
 ALL 5 must pass. Before committing, run:
 
@@ -276,12 +276,12 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 
 ## Testing
 
-- **137 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU (measured 2026-10-08)
+- **145 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU (measured 2026-10-08)
 - **Test mode**: `make test` internally builds with `cargo +nightly build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf` (stable cannot compile the x86_64 dep tree; see GOTCHAS)
 - **Test framework**: `kernel/src/test.rs` — TAP-style `run_test(name, || bool)` API
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`
 - **CI**: GitHub Actions runs build + lint + test + boot-test + smp-test on every push
-- **Coverage (RISC-V, 125 total)**: Syscall (29), FS (17 incl. ext4 large/chunked read regression), Capability (8: P2.1 CapDesc register/transition/names/JSON snapshots), VMM (10), Sched 2.0 (7: class 2 + readyqueue 4 + 200-task stress), PMM (6), Heap (6), Task (5), SpinLock (5), IntSpinLock (5), YieldMutex (4), Trap (4), Sv39 (3), SStatus (2), Frame (2), BlockingMutex (2), arch-misc (7: user/switch/sie/sbi/satp/process/kernel)
-- **Total**: RISC-V **125/125** (P1.2 mmap 3 + M1 ext4 read 2 + P2.1 CapDesc 8), x86_64 **138/138** (measured 2026-10-08 after Scheduler 2.0 landed)
+- **Coverage (RISC-V, 145 total)**: Syscall (29), FS (17 incl. ext4 large/chunked read regression), Capability (8: P2.1 CapDesc register/transition/names/JSON snapshots), DRT (11: state machine edges + wire + tool table), MCP-CB (8: profile roundtrip + dualpath + call idempotency/timeout), VMM (10), Sched 2.0 (7: class 2 + readyqueue 4 + 200-task stress), PMM (6), Heap (6), Task (5), SpinLock (5), IntSpinLock (5), YieldMutex (4), Trap (4), Sv39 (3), SStatus (2), Frame (2), BlockingMutex (2), arch-misc (7: user/switch/sie/sbi/satp/process/kernel)
+- **Total**: RISC-V **145/145** (P1.2 mmap 3 + M1 ext4 read 2 + P2.1 CapDesc 8 + P2.2 DRT 12 + P2.3 MCP-CB 8), x86_64 **138/138** (measured 2026-10-08 after Scheduler 2.0 landed)
 - **x86_64**: `make test-x86` runs x86_64 integration tests in QEMU
 - **Both**: `make test-all` runs RISC-V + x86_64 tests sequentially

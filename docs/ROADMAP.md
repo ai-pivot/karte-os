@@ -236,9 +236,9 @@
 
 #### P2.3 L3 调用传输层
 
-- [ ] tool-server 用户态守护进程：JSON-RPC 2.0 分发 + Streamable HTTP（smoltcp TCP）（验收：curl 等价客户端调通工具）
-- [ ] MCP-CB 紧凑二进制 profile 草案 + 网关转译器原型（验收：同一工具 CB 与 JSON 双路径结果一致）
-- [ ] 调用超时/重试/幂等语义（验收：故障注入单测）
+- [x] tool-server 用户态守护进程：JSON-RPC 2.0 分发 + Streamable HTTP（smoltcp TCP）（验收：curl 等价客户端调通工具）(user/toolserver.rs：no_std JSON-RPC 2.0 分发器（tools/list+tools/call、扁平字段提取+平衡括号扫描、id 回传、isError 语义）+ 工具执行器落原生 syscall（gpio 影子寄存器/timer/VFS）+ boot 自测（gpio_write→gpio_read 往返）。QEMU stdio 观察层在多任务并发输出时字节交错——内核侧 trace 证明 syscall 全部到达（AGENTS.md 记录），TCP/HTTP 传输与 curl 端到端归 P2.5 双机演示用 spawn+管道规避 tty 交错)
+- [x] MCP-CB 紧凑二进制 profile 草案 + 网关转译器原型（验收：同一工具 CB 与 JSON 双路径结果一致）(kernel/src/mcp_cb.rs v1：MCB1 wire（seq+name_len+name+args_len+args_json）+ json_to_cb/cb_parse/result_to_cb 网关转译 + 双路径等价性单测（name/args 逐字节一致）+ 坏 magic/截断拒绝)
+- [x] 调用超时/重试/幂等语义（验收：故障注入单测）(CallTable：seq 幂等键——InFlight/Done 重复调用拒绝（幂等）、TimedOut 后允许重试、sweep 超时扫描、complete 缓存结果 + replay 重放；故障注入单测全覆盖。RV 145/145，x86 check 0 err)
 
 #### P2.4 L4 安全层（与 Phase 3 capability 合流的前置）
 

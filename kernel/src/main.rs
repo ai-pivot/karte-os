@@ -18,6 +18,7 @@ pub mod drt;
 pub mod env;
 pub mod kernel_log;
 pub mod lang_items;
+pub mod mcp_cb;
 pub mod mm;
 pub mod net;
 pub mod platform;
@@ -91,6 +92,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::driver::fs::run_tests();
         crate::capability::run_tests();
         crate::drt::run_tests();
+        crate::mcp_cb::run_tests();
         crate::sync::spinlock::run_tests();
         crate::sync::int_spinlock::run_tests();
         crate::sync::mutex::run_tests();
