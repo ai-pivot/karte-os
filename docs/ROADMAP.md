@@ -173,7 +173,7 @@
 - [x] AGENTS.md 测试数 96→105（RISC-V）、x86_64 数字核对；README 全面同步（行数/测试数/双架构/核心特性）（验收：两文档数字与实测一致）(commit: 3edcdc6)
 - [x] 本机跑通 `make test-x86`，确认 x86_64 现状并记录（验收：脚本退出码与已知失败项入库）(commit: 4186935 — 修复 user_write 槽位后 **131/131**，发现根因：grub-pc-bin 缺失 + ensure_user_write_pages 拒绝内核栈缓冲)
 - [x] 本机验证 boot-test + smp-test（验收：两脚本各自通过）(commit: 48f3575 — 修复 build_initial_stack 的 x[2]/sscratch 槽位错位；此前 boot-test 必败，属既有回归)
-- [ ] push 后核对 GitHub Actions 5 job 全绿（验收：CI 页面截图/链接）
+- [x] push 后核对 GitHub Actions 5 job 全绿（验收：CI 页面截图/链接）(commits: 88eb671 + 40433f0；https://github.com/ai-pivot/karte-os/actions/runs/37766738861 — 7/7 job success。修复两处：CI 全部 RISC-V job 的 `make` 缺 `ARCH=riscv64`（user/Makefile 默认 x86_64，内核 include_bytes! 找不到 .S 程序 ELF）；smp-test 在共享 runner TCG 下 15s 超时不足改 90s)
 - [x] 工具链防漂移：CI 与 rust-toolchain 对 nightly 采用固定日期版本（验收：CI 安装日志出现日期 pin；`Step` trait 类事故不再复现）(commit: 3edcdc6 — CI x86 job pin nightly-2026-10-07)
 - [x] 建立基准库 `docs/benchmarks.md`：boot→shell 时间、上下文切换延迟、105 测试耗时、内核双架构体积（验收：四项数字入库，含测量方法）(commit: bd4e0c5 — 上下文切换标注 TBD，归 P1.1 基准 harness；boot→shell 67ms / 套件 67ms / RV 2.26MB / x86 1.62MB)
 - [x] 将本路线图链接进 README（验收：README 出现 Master Plan 链接）(commit: 3edcdc6)
