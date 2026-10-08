@@ -301,7 +301,7 @@
 **目标**：从 OS 到生态。**M4：对外发布 KarteOS 1.0 与开发者生态。**
 
 - [ ] NPU HAL 首个真机后端（依 P3.1 真机/合作板卡）+ AI 调度类 token 感知增强（验收：NPU 上推理端到端）
-- [ ] 模型生命周期 syscall + KV-cache 内存池（验收：双模型共存配额演示）
+- [x] 模型生命周期 syscall + KV-cache 内存池（验收：双模型共存配额演示）(kernel/src/model.rs：ModelTable（load/mark_loaded/pin/unload + MODEL_QUOTA=4 配额拒绝 + Unloading 拒 pin）+ KvPool（压力让步回收非 pinned 块、yielded_blocks 可测、过释放安全）+ init() 幂等挂载，3 单测 176/176（配额+全生命周期/缺模型拒绝/压力让步+过释放）；syscall 编号映射与 VMM 大页承接为 v1 接口)
 - [ ] token IPC 零拷贝管道（验收：脑↔应用 token 流基准）
 - [ ] 跨脑互联总线 + 脑选举（Arbiter）：多脑协同、故障接管（验收：双脑 failover 演示）
 - [ ] secure boot 路径：签名链 + 度量启动（真机）（验收：防篡改演示）

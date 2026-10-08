@@ -23,6 +23,7 @@ pub mod lang_items;
 pub mod mcp_cb;
 pub mod mdns;
 pub mod mm;
+pub mod model;
 pub mod mqtt;
 pub mod net;
 pub mod ota;
@@ -106,6 +107,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::wasm::run_tests();
         crate::mdns::run_tests();
         crate::ota::run_tests();
+        crate::model::run_tests();
         crate::sync::spinlock::run_tests();
         crate::sync::int_spinlock::run_tests();
         crate::sync::mutex::run_tests();
