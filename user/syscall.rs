@@ -205,3 +205,39 @@ pub fn winsize() -> (usize, usize) {
         (80, 25) // default
     }
 }
+
+// ── Socket syscalls (70-77) ──
+pub const SYS_SOCKET: usize = 70;
+pub const SYS_BIND: usize = 71;
+pub const SYS_CONNECT: usize = 72;
+pub const SYS_LISTEN: usize = 73;
+pub const SYS_ACCEPT: usize = 74;
+pub const SYS_SENDTO: usize = 75;
+pub const SYS_RECVFROM: usize = 76;
+pub const SYS_SHUTDOWN: usize = 77;
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+pub unsafe fn syscall6(id: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "ecall",
+        in("a7") id,
+        inlateout("a0") a0 => ret,
+        in("a1") a1, in("a2") a2, in("a3") a3, in("a4") a4, in("a5") a5
+    );
+    ret
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn syscall6(id: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    let ret: isize;
+    core::arch::asm!(
+        "int 0x80",
+        inlateout("rax") id => ret,
+        in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4, in("r9") a5,
+        out("rcx") _,
+    );
+    ret
+}

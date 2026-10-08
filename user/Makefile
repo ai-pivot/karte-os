@@ -52,6 +52,9 @@ llm.elf: llm.rs syscall.rs $(LD_SCRIPT)
 toolserver.elf: toolserver.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -C opt-level=1 -o $@ toolserver.rs
 
+mqtt.elf: mqtt.rs syscall.rs $(LD_SCRIPT)
+	$(RUSTC) $(RUSTFLAGS_USER) -C opt-level=1 -o $@ mqtt.rs
+
 cat.elf: cat.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -o $@ cat.rs
 

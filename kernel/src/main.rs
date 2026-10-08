@@ -22,6 +22,7 @@ pub mod kernel_log;
 pub mod lang_items;
 pub mod mcp_cb;
 pub mod mm;
+pub mod mqtt;
 pub mod net;
 pub mod platform;
 pub mod process;
@@ -97,6 +98,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::mcp_cb::run_tests();
         crate::capauth::run_tests();
         crate::brain::run_tests();
+        crate::mqtt::run_tests();
         crate::sync::spinlock::run_tests();
         crate::sync::int_spinlock::run_tests();
         crate::sync::mutex::run_tests();
