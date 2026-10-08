@@ -117,6 +117,16 @@ pub fn online_devices() -> usize {
     REGISTRY.lock().devices.iter().filter(|(_, o)| *o).count()
 }
 
+/// 按 device_id 查找能力描述符（DRT wire 分发用）
+pub fn lookup_desc(device_id: &str) -> Option<CapDesc> {
+    REGISTRY
+        .lock()
+        .devices
+        .iter()
+        .find(|(d, _)| d.device_id == device_id)
+        .map(|(d, _)| d.clone())
+}
+
 /// 已注册设备总数
 pub fn device_count() -> usize {
     REGISTRY.lock().devices.len()

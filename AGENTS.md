@@ -37,7 +37,7 @@ QEMU exit: `Ctrl+A` then `X`.
 
 ## ⚠️ Pre-Commit Checklist — MUST follow before every git commit
 
-**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (125 tests), boot-test, smp-test.**
+**CI runs 5 jobs on every push: build, lint (fmt + clippy), test (137 tests), boot-test, smp-test.**
 - **First U-mode entry SP convention**: `build_initial_stack` MUST write `user_stack_top` into the TrapContext **x[2] slot (offset 16)**, matching `trap_return_user`, which restores user sp from x[2] and then swaps sscratch↔sp (sscratch ends up holding kernel_stack_top for the next U-mode trap). Writing user_stack_top into the sscratch slot (272) and kernel_stack_top into x[2] makes the first user instruction store to a kernel physical address → immediate store page fault, shell killed at boot (this broke boot-test; fixed 2026-10-08).
 ALL 5 must pass. Before committing, run:
 
@@ -276,7 +276,7 @@ User programs use `ecall` with `a7=syscall_num`, args in `a0-a5`, return value i
 
 ## Testing
 
-- **125 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU (measured 2026-10-08)
+- **137 QEMU integration tests** via `make test` — runs in-kernel test suite in QEMU (measured 2026-10-08)
 - **Test mode**: `make test` internally builds with `cargo +nightly build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf` (stable cannot compile the x86_64 dep tree; see GOTCHAS)
 - **Test framework**: `kernel/src/test.rs` — TAP-style `run_test(name, || bool)` API
 - **Test modules**: Each subsystem has `#[cfg(feature = "test_mode")] pub fn run_tests()`

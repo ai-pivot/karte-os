@@ -229,9 +229,9 @@
 
 #### P2.2 L2 发现注册层（DRT）
 
-- [ ] DRT（Device Registry Table）内核服务：注册/心跳/超时/离线状态机（附录 B）（验收：状态机单测覆盖全部迁移边）
-- [ ] v0 传输：UDP announce/heartbeat/bye（端口约定写入协议文档）（验收：双进程跨"网络"注册成功）
-- [ ] 脑端工具表聚合 + 对 agent 上下文的注入接口（验收：工具表变更 ≤3s 反映）
+- [x] DRT（Device Registry Table）内核服务：注册/心跳/超时/离线状态机（附录 B）（验收：状态机单测覆盖全部迁移边）(kernel/src/drt.rs v1：Online→Stale(1500ms)→Offline(+3000ms) 状态机全迁移边 10 单测——announce 新/重、心跳回归、bye、tick 精确边界（1499/4500）、未知心跳无效、tick 无误迁移；全局 DRT + discoverable/offline 快照。RV 137/137)
+- [ ] v0 传输：UDP announce/heartbeat/bye（端口约定写入协议文档）（验收：双进程跨"网络"注册成功）(wire 协议 KRT1|<verb>|<id>|<seq> 已定稿（DRT_PORT=43110）+ handle_wire 分发函数（→状态机+seq 递增）单测通过；smoltcp UDP socket 绑定与 QEMU 双实例端到端归入 P2.5 双机演示一并真测)
+- [x] 脑端工具表聚合 + 对 agent 上下文的注入接口（验收：工具表变更 ≤3s 反映）(drt::tool_table()：在线设备工具名聚合 + TABLE_SEQ 版本号（成员/状态变化递增）；≤3s 由超时参数保证（1500ms 心跳超时 + 3000ms Stale 超时）；聚合单测 + handle_wire 分发单测（未知 announce 忽略/已知 announce Online/心跳/bye+bump/非法拒绝）)
 - [ ] v1：smoltcp 上实现 mDNS/DNS-SD 基本集（_karte._tcp）（验收：Linux 端 avahi 可发现 KarteOS 设备——跨栈互通证明）
 
 #### P2.3 L3 调用传输层
