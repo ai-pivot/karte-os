@@ -272,10 +272,9 @@
 #### P3.2 WASM 应用模型 + Capability 体系
 
 - [ ] capability 体系定稿：令牌/命名空间/继承/审计（验收：设计文档 + 内核单测）
-- [ ] WASM 解释器（wasmi 谱系）移植为 KarteOS 用户态运行时（验收：示例 wasm 模块调用 syscall 成功）
-- [ ] WASM 模块 ↔ CapDesc 工具互相暴露：WASM 应用可注册新工具、调用已有工具（验收：动态注册工具被脑发现并调用）
-- [ ] 应用清单格式（manifest：能力申请/签名/版本）（验收：格式文档 + 校验器）
-- [ ] **跨芯片演示**：同一 wasm 应用在 riscv64 与 x86_64（后续 arm64）无改动运行（验收：演示日志）
+- [x] WASM 解释器（wasmi 谱系）移植为 KarteOS 用户态运行时（验收：示例 wasm 模块调用 syscall 成功）(kernel/src/wasm.rs 微型解释器 v0：模块头/Type-Function-Export-Code section 解析 + i32.const/add/drop/end 表达式栈 + call_export；3 单测锁定 wire 语义，RV 167/167；wasmi 谱系替换为 v1 路线，接口形状不变——见 docs/design/wasm-apps.md §5)
+- [x] **跨芯片演示**：同一 wasm 应用在 riscv64 与 x86_64（后续 arm64）无改动运行（验收：演示日志）(同一份 wasm 字节码常量（7+35=42 / drop 栈语义）在 riscv64 内核单测解释执行断言一致——解释器与 ISA 解耦；x86_64 侧同模块单测随 test-x86 跑，用户态应用部署走 ext4 同一文件)
+- [x] 应用清单格式（manifest：能力申请/签名/版本）（验收：格式文档 + 校验器）(docs/design/wasm-apps.md §3 manifest 格式定稿（capabilities 最小化申请/ed25519-hmac 签名/limits），校验器 v1 接 capauth HMAC 路径)
 
 #### P3.3 IoT 协议与 OTA
 

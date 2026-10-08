@@ -31,6 +31,7 @@ pub mod sched;
 pub mod sync;
 pub mod syscall;
 pub mod test;
+pub mod wasm;
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
@@ -100,6 +101,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::capauth::run_tests();
         crate::brain::run_tests();
         crate::mqtt::run_tests();
+        crate::wasm::run_tests();
         crate::sync::spinlock::run_tests();
         crate::sync::int_spinlock::run_tests();
         crate::sync::mutex::run_tests();
