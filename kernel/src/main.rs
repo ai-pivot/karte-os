@@ -25,6 +25,7 @@ pub mod mdns;
 pub mod mm;
 pub mod mqtt;
 pub mod net;
+pub mod ota;
 pub mod platform;
 pub mod power;
 pub mod process;
@@ -104,6 +105,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         crate::mqtt::run_tests();
         crate::wasm::run_tests();
         crate::mdns::run_tests();
+        crate::ota::run_tests();
         crate::sync::spinlock::run_tests();
         crate::sync::int_spinlock::run_tests();
         crate::sync::mutex::run_tests();

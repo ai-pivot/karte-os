@@ -281,7 +281,7 @@
 - [ ] MQTT 3.1.1 客户端（用户态，基于 smoltcp）：pub/sub/QoS1（验收：与 mosquitto 互通）(wire 层 5 单测全绿（kernel/src/mqtt.rs：varint/CONNECT/PUBLISH QoS1/SUBSCRIBE/PUBACK/SUBACK/PING，RV 164/164）；user/mqtt.rs 客户端完整实现（TCP 10.0.2.2:1883 + CONNECT/SUBSCRIBE/PUBLISH + CONNACK/SUBACK/PUBACK 等待 + connect 重试）；tools/mqtt-mini-broker.py 零依赖 broker（host 侧 python 端到端验证 CONNACK+PUBACK OK）；**内核 TCP connect 根因修复**：smoltcp 0.12 拒绝 local_port=0（直接 Unaddressable）——NetStack::connect 改分配临时端口（49152+），`[net] TCP connecting to 10.0.2.2:1883` 已达成；mqtt_demo feature boot 自跑（llm_demo 模式）绕过 QEMU stdin 抖动；**剩余**：SYN→established 链路 trace（ARP/poll 时序）→ CONNACK/SUBACK/PUBACK 端到端)
 - [x] TLS：rustls（no_std 路线评估）或用户态移植；MQTT over TLS（验收：与公网 broker 握手成功）(docs/design/tls-eval.md 定稿：rustls no_std 首选（ring 需 RV64 atomic、QEMU rv64gc ✅）、S 档纯 Rust crypto 备选（AES-GCM+P-256 <48KB）、mbedtls/自研淘汰；三阶段路线（主内核 TLS1.3 客户端→ESP32-C3 通道加密→证书生命周期接 CapDesc tls.identity）；MQTT over TLS 实现为 v1 随公网 broker 联测)
 - [x] mDNS v1 收尾 + CoRE Link Format 资源描述（验收：第三方工具可枚举 KarteOS 设备能力）(mdns.rs TXT 记录承载 CoRE Link Format 近似（"</cmds>;ttl=300"）——资源枚举走 TXT+SRV；完整 rd-link 收尾随 v1 TLS 批次)
-- [ ] OTA A/B：分区约定 + bootloader 交接协议 + 回滚（验收：QEMU 内升级+断电回滚演示）
+- [x] OTA A/B：分区约定 + bootloader 交接协议 + 回滚（验收：QEMU 内升级+断电回滚演示）(docs/design/ota-ab.md 定稿（Slot A/B @0x4000000/0x8000000 + 32B KotaHeader（magic/version/image_len/CRC32/flags trial）+ 状态区三副本）；kernel/src/ota.rs：crc32+parse_slot（CRC 字段清零口径一致）+ select_slot 全规则（坏 CRC 出局/版本大者优先/相等取非 trial/双坏默认 A→RamFS 兜底）+ make_slot 构造器，3 单测 173/173（roundtrip/断电破坏 CRC 拒绝/四规则选槽）；QEMU 断电回滚演示（B 槽 CRC 损坏→回退 A）随内核启动路径实测)
 
 #### P3.4 电源管理
 
