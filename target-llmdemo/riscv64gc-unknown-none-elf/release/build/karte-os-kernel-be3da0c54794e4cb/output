@@ -1,3 +1,0 @@
-cargo:rustc-link-search=/home/smith/src/karte-os/target-llmdemo/riscv64gc-unknown-none-elf/release/build/karte-os-kernel-be3da0c54794e4cb/out
-cargo:rustc-link-arg=-T/home/smith/src/karte-os/target-llmdemo/riscv64gc-unknown-none-elf/release/build/karte-os-kernel-be3da0c54794e4cb/out/memory.x
-cargo:rerun-if-changed=memory.x
