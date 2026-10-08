@@ -442,18 +442,6 @@ pub struct Flock {
 }
 
 impl Flock {
-    pub fn read_from_user(buf: *const u8) -> Self {
-        unsafe {
-            Flock {
-                l_type: core::ptr::read_unaligned(buf as *const i16),
-                l_whence: core::ptr::read_unaligned(buf.add(2) as *const i16),
-                l_start: core::ptr::read_unaligned(buf.add(4) as *const i64),
-                l_len: core::ptr::read_unaligned(buf.add(12) as *const i64),
-                l_pid: core::ptr::read_unaligned(buf.add(20) as *const i32),
-            }
-        }
-    }
-
     /// Construct a Flock from a byte slice (24 bytes).
     /// Used to safely decode bytes read from user space via user_read_bytes.
     pub fn from_bytes(bytes: &[u8]) -> Self {
@@ -481,16 +469,6 @@ impl Flock {
         buf[12..20].copy_from_slice(&self.l_len.to_ne_bytes());
         buf[20..24].copy_from_slice(&self.l_pid.to_ne_bytes());
         buf
-    }
-
-    pub fn write_to_user(&self, buf: *mut u8) {
-        unsafe {
-            core::ptr::write_unaligned(buf as *mut i16, self.l_type);
-            core::ptr::write_unaligned(buf.add(2) as *mut i16, self.l_whence);
-            core::ptr::write_unaligned(buf.add(4) as *mut i64, self.l_start);
-            core::ptr::write_unaligned(buf.add(12) as *mut i64, self.l_len);
-            core::ptr::write_unaligned(buf.add(20) as *mut i32, self.l_pid);
-        }
     }
 
     /// Resolve the absolute byte offset from l_whence and l_start.
