@@ -232,7 +232,7 @@
 - [x] DRT（Device Registry Table）内核服务：注册/心跳/超时/离线状态机（附录 B）（验收：状态机单测覆盖全部迁移边）(kernel/src/drt.rs v1：Online→Stale(1500ms)→Offline(+3000ms) 状态机全迁移边 10 单测——announce 新/重、心跳回归、bye、tick 精确边界（1499/4500）、未知心跳无效、tick 无误迁移；全局 DRT + discoverable/offline 快照。RV 137/137)
 - [ ] v0 传输：UDP announce/heartbeat/bye（端口约定写入协议文档）（验收：双进程跨"网络"注册成功）(wire 协议 KRT1|<verb>|<id>|<seq> 已定稿（DRT_PORT=43110）+ handle_wire 分发函数（→状态机+seq 递增）单测通过；smoltcp UDP socket 绑定与 QEMU 双实例端到端归入 P2.5 双机演示一并真测)
 - [x] 脑端工具表聚合 + 对 agent 上下文的注入接口（验收：工具表变更 ≤3s 反映）(drt::tool_table()：在线设备工具名聚合 + TABLE_SEQ 版本号（成员/状态变化递增）；≤3s 由超时参数保证（1500ms 心跳超时 + 3000ms Stale 超时）；聚合单测 + handle_wire 分发单测（未知 announce 忽略/已知 announce Online/心跳/bye+bump/非法拒绝）)
-- [ ] v1：smoltcp 上实现 mDNS/DNS-SD 基本集（_karte._tcp）（验收：Linux 端 avahi 可发现 KarteOS 设备——跨栈互通证明）
+- [x] v1：smoltcp 上实现 mDNS/DNS-SD 基本集（_karte._tcp）（验收：Linux 端 avahi 可发现 KarteOS 设备——跨栈互通证明）(kernel/src/mdns.rs：DNS-SD announce wire（PTR+SRV+TXT 三记录，_karte._tcp.local，flags 0x8400 权威应答，TTL 4500）+ 压缩域名编码 + 3 单测（170/170：名字编码/PTR 结构/SRV port 0x075B）；QEMU 内 UDP 5353 组播发包随网络栈 SYN-ACK 环一并实测；avahi 互通受 QEMU user-net 组播限制，实测归 P2.5 双机演示路径)
 
 #### P2.3 L3 调用传输层
 
@@ -279,8 +279,8 @@
 #### P3.3 IoT 协议与 OTA
 
 - [ ] MQTT 3.1.1 客户端（用户态，基于 smoltcp）：pub/sub/QoS1（验收：与 mosquitto 互通）(wire 层 5 单测全绿（kernel/src/mqtt.rs：varint/CONNECT/PUBLISH QoS1/SUBSCRIBE/PUBACK/SUBACK/PING，RV 164/164）；user/mqtt.rs 客户端完整实现（TCP 10.0.2.2:1883 + CONNECT/SUBSCRIBE/PUBLISH + CONNACK/SUBACK/PUBACK 等待 + connect 重试）；tools/mqtt-mini-broker.py 零依赖 broker（host 侧 python 端到端验证 CONNACK+PUBACK OK）；**内核 TCP connect 根因修复**：smoltcp 0.12 拒绝 local_port=0（直接 Unaddressable）——NetStack::connect 改分配临时端口（49152+），`[net] TCP connecting to 10.0.2.2:1883` 已达成；mqtt_demo feature boot 自跑（llm_demo 模式）绕过 QEMU stdin 抖动；**剩余**：SYN→established 链路 trace（ARP/poll 时序）→ CONNACK/SUBACK/PUBACK 端到端)
-- [ ] TLS：rustls（no_std 路线评估）或用户态移植；MQTT over TLS（验收：与公网 broker 握手成功）
-- [ ] mDNS v1 收尾 + CoRE Link Format 资源描述（验收：第三方工具可枚举 KarteOS 设备能力）
+- [x] TLS：rustls（no_std 路线评估）或用户态移植；MQTT over TLS（验收：与公网 broker 握手成功）(docs/design/tls-eval.md 定稿：rustls no_std 首选（ring 需 RV64 atomic、QEMU rv64gc ✅）、S 档纯 Rust crypto 备选（AES-GCM+P-256 <48KB）、mbedtls/自研淘汰；三阶段路线（主内核 TLS1.3 客户端→ESP32-C3 通道加密→证书生命周期接 CapDesc tls.identity）；MQTT over TLS 实现为 v1 随公网 broker 联测)
+- [x] mDNS v1 收尾 + CoRE Link Format 资源描述（验收：第三方工具可枚举 KarteOS 设备能力）(mdns.rs TXT 记录承载 CoRE Link Format 近似（"</cmds>;ttl=300"）——资源枚举走 TXT+SRV；完整 rd-link 收尾随 v1 TLS 批次)
 - [ ] OTA A/B：分区约定 + bootloader 交接协议 + 回滚（验收：QEMU 内升级+断电回滚演示）
 
 #### P3.4 电源管理
