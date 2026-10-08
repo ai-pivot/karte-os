@@ -293,6 +293,12 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             karte_nr: super::SYS_FORK,
             args,
         }),
+        // Linux execve(path, argv, envp) — path is NUL-terminated (unlike
+        // native exec's explicit length) → dedicated handler 85.
+        L_EXECVE => Some(Translation::Dispatch {
+            karte_nr: 85, // super::LINUX_EXECVE
+            args: [args[0], args[1], args[2], 0, 0, 0],
+        }),
 
         // ─── futex ───────────────────────────────────────────
         // Linux futex(addr, op, val, timeout, uaddr2, val3)

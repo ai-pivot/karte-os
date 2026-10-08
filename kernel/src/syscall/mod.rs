@@ -73,6 +73,7 @@ pub const SYS_SYSLOG: usize = 81; // syslog(buf, len, offset) → bytes_read
 pub const SYS_SETPRIORITY: usize = 82; // setpriority(pid, class_code, level) → 0
 pub const SYS_GETSCHEDULER: usize = 83; // getscheduler(pid) → (code<<16)|level, or -1
 pub const LINUX_WAIT4: usize = 84; // internal: Linux wait4(pid,&status,opt,rusage) dedicated handler
+pub const LINUX_EXECVE: usize = 85; // internal: Linux execve(path,argv,envp) dedicated handler
 
 // ─── Linux compatibility syscalls (translated from Linux x86_64 numbers) ──
 pub const LINUX_CLONE: usize = 100;
@@ -252,37 +253,18 @@ fn user_translate(addr: usize) -> Option<usize> {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn user_read_u8(addr: usize) -> u8 {
-    let user_root = crate::process::current_page_table_root();
-    if user_root == 0 {
-        return unsafe { core::ptr::read_volatile(addr as *const u8) };
+    // Walk the syscall owner's page table (same rationale as the riscv64
+    // branch): current_page_table_root() follows whichever task ran last
+    // after a schedule() switch, and an explicit CR3 dance would then load
+    // a FOREIGN table. PA access goes through the kernel identity map.
+    if let Some(pa) = user_translate(addr) {
+        unsafe { core::ptr::read_volatile(pa as *const u8) }
+    } else if crate::process::current_page_table_root() == 0 {
+        // No process context (kernel-internal/test callers).
+        unsafe { core::ptr::read_volatile(addr as *const u8) }
+    } else {
+        0
     }
-
-    let user_cr3 = user_root << 12;
-    let kernel_cr3 = crate::arch::idt::get_kernel_cr3_phys();
-    let rflags: u64;
-    let byte: u8;
-    unsafe {
-        core::arch::asm!(
-            "pushfq",
-            "pop {}",
-            "cli",
-            out(reg) rflags
-        );
-        core::arch::asm!(
-            "mov cr3, {user_cr3}",
-            "mov {byte}, byte ptr [{addr}]",
-            "mov cr3, {kernel_cr3}",
-            user_cr3 = in(reg) user_cr3,
-            kernel_cr3 = in(reg) kernel_cr3,
-            addr = in(reg) addr,
-            byte = lateout(reg_byte) byte,
-            options(nostack)
-        );
-        if (rflags & 0x200) != 0 {
-            core::arch::asm!("sti", options(nomem, nostack));
-        }
-    }
-    byte
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -1631,6 +1613,7 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_SETPRIORITY => sys_setpriority(args[0], args[1], args[2]),
         SYS_GETSCHEDULER => sys_getscheduler(args[0]),
         LINUX_WAIT4 => sys_wait4(args[0], args[1], args[2], args[3]),
+        LINUX_EXECVE => sys_execve_linux(args[0], args[1], args[2]),
 
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
         LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
@@ -3557,6 +3540,13 @@ fn sys_exec_impl(path: usize, path_len: usize, argv_ptr: usize, envp_ptr: usize)
         return ERR_INVAL;
     }
 
+    exec_by_name(name, argv_ptr, envp_ptr)
+}
+
+/// Shared exec pipeline: resolve `name` (bare program name or sub-path) via
+/// the filesystem/PATH search, load its ELF, and replace the current task.
+/// Called from native exec(32) and Linux execve (P1.2).
+fn exec_by_name(name: alloc::string::String, argv_ptr: usize, envp_ptr: usize) -> isize {
     // Try streaming ELF loader from ext4 first
     let argv = if argv_ptr != 0 {
         read_user_argv(argv_ptr)
@@ -4397,6 +4387,21 @@ fn sys_wait4(pid: usize, status_ptr: usize, _options: usize, _rusage: usize) -> 
             _ => return -10,        // -ECHILD
         }
     }
+}
+
+/// Linux execve(path, argv, envp) — P1.2. Unlike native exec(32) the path is
+/// a NUL-terminated string; argv/envp are user pointer arrays. Reuses the
+/// full exec pipeline (ELF load, argv/envp initial stack, PATH search).
+fn sys_execve_linux(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
+    let path = match read_user_path(path_ptr, 256) {
+        Some(p) => p,
+        None => return ERR_INVAL,
+    };
+    let mut name = path;
+    if name.starts_with('/') {
+        name.remove(0);
+    }
+    exec_by_name(name, argv_ptr, envp_ptr)
 }
 
 /// Syscall 60: Send a signal to a process.

@@ -92,26 +92,45 @@ _deploy_arch() {
     local fs_type=$(_detect_fs)
     case "$fs_type" in
         ext*)
-            _mount
-            for elf in "$user_dir"/*.elf; do
-                [ -f "$elf" ] || continue
-                local base="$(basename "$elf" .elf)"
-                # Skip RISC-V assembly programs on x86_64 (they're empty stubs)
-                if [ "$arch" = "x86_64" ]; then
-                    case "$base" in
-                        hello|heap_test|file_test|spawn_test)
-                            # Check if it's a real binary (not an empty stub)
-                            local size
-                            size=$(stat -c%s "$elf" 2>/dev/null || echo "0")
-                            [ "$size" -lt 100 ] && continue
-                            ;;
-                    esac
-                fi
-                sudo cp "$elf" "$MOUNT/$base"
-                count=$((count + 1))
-            done
-            sudo sync
-            _unmount
+            if _mount 2>/dev/null; then
+                for elf in "$user_dir"/*.elf; do
+                    [ -f "$elf" ] || continue
+                    local base="$(basename "$elf" .elf)"
+                    # Skip RISC-V assembly programs on x86_64 (they're empty stubs)
+                    if [ "$arch" = "x86_64" ]; then
+                        case "$base" in
+                            hello|heap_test|file_test|spawn_test)
+                                # Check if it's a real binary (not an empty stub)
+                                local size
+                                size=$(stat -c%s "$elf" 2>/dev/null || echo "0")
+                                [ "$size" -lt 100 ] && continue
+                                ;;
+                        esac
+                    fi
+                    sudo cp "$elf" "$MOUNT/$base"
+                    count=$((count + 1))
+                done
+                sudo sync
+                _unmount
+            else
+                # Fallback: no loop-mount privileges (containers/CI) — write
+                # each ELF into the ext4 image with debugfs.
+                for elf in "$user_dir"/*.elf; do
+                    [ -f "$elf" ] || continue
+                    local base="$(basename "$elf" .elf)"
+                    if [ "$arch" = "x86_64" ]; then
+                        case "$base" in
+                            hello|heap_test|file_test|spawn_test)
+                                local size
+                                size=$(stat -c%s "$elf" 2>/dev/null || echo "0")
+                                [ "$size" -lt 100 ] && continue
+                                ;;
+                        esac
+                    fi
+                    debugfs -w -R "write $elf $base" "$DISK" > /dev/null 2>&1
+                    count=$((count + 1))
+                done
+            fi
             ;;
         FAT*)
             for elf in "$user_dir"/*.elf; do
@@ -182,10 +201,13 @@ cmd_list() {
     case "$fs_type" in
         ext*)
             echo "Files on $DISK (ext4):"
-            _mount
-            find "$MOUNT" -maxdepth 1 -type f -printf "%f %s\n" 2>/dev/null || echo "(empty)"
-            find "$MOUNT" -maxdepth 1 -type d -not -path "$MOUNT" -printf "%f/ -\n" 2>/dev/null || true
-            _unmount
+            if _mount 2>/dev/null; then
+                find "$MOUNT" -maxdepth 1 -type f -printf "%f %s\n" 2>/dev/null || echo "(empty)"
+                find "$MOUNT" -maxdepth 1 -type d -not -path "$MOUNT" -printf "%f/ -\n" 2>/dev/null || true
+                _unmount
+            else
+                debugfs -R "ls -l /" "$DISK" 2>/dev/null | awk '{print $6, $8}' | tail -n +2 || echo "(empty)"
+            fi
             ;;
         FAT*)
             echo "Files on $DISK (FAT32):"
@@ -210,10 +232,15 @@ cmd_put() {
     case "$fs_type" in
         ext*)
             echo "[disk] $src -> $DISK::$dst (ext4)"
-            _mount
-            sudo cp "$src" "$MOUNT/$dst"
-            sudo sync
-            _unmount
+            if _mount 2>/dev/null; then
+                sudo cp "$src" "$MOUNT/$dst"
+                sudo sync
+                _unmount
+            else
+                # Fallback: no loop-mount privileges (containers/CI) — write
+                # the file into the ext4 image with debugfs.
+                debugfs -w -R "write $src $dst" "$DISK" > /dev/null 2>&1
+            fi
             ;;
         FAT*)
             echo "[disk] $src -> $DISK::$dst (FAT32)"
