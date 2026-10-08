@@ -435,6 +435,33 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     }
                 }
 
+                // P3.3 mqtt_demo (optional feature): boot-autorun MQTT client
+                // so the e2e round trip runs without interactive stdin (QEMU
+                // stdin delivery is unreliable). Requires net init above.
+                #[cfg(all(target_arch = "riscv64", feature = "mqtt_demo"))]
+                match process::Process::from_elf(
+                    include_bytes!("../../user/mqtt.elf"),
+                    alloc::vec![b"mqtt".to_vec()],
+                    alloc::vec![],
+                ) {
+                    Ok(mq) => {
+                        let entry = mq.entry;
+                        let ustack = mq.user_stack_top;
+                        let kstack = mq.kernel_stack_top;
+                        let mq_satp = (8usize << 60) | mq.page_table_root;
+                        if let Some(idx3) = process::add_process(mq) {
+                            if crate::sched::add_user_process(entry, ustack, kstack, mq_satp, idx3)
+                                .is_some()
+                            {
+                                crate::console_println!("[mqtt_demo] mqtt client spawned");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        crate::console_println!("[mqtt_demo] mqtt load failed: {}", e);
+                    }
+                }
+
                 crate::sched::start_first_task();
             }
         }

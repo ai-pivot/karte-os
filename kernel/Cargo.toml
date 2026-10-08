@@ -7,6 +7,7 @@ edition = "2024"
 default = []
 test_mode = []
 llm_demo = []
+mqtt_demo = []
 klog_trace = []
 klog_debug = []
 # Dual-machine demo: this node is node B (ip 10.0.2.16, device-id prefix "b")
