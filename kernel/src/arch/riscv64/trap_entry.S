@@ -5,12 +5,19 @@
 //   - S-mode traps: sscratch=0, normal kernel trap handling
 //   - U-mode traps: sscratch=kernel_sp, swap stacks and save user context
 //
-// TrapContext layout (288 bytes):
+// TrapContext layout (U-mode frame = 832 bytes; S-mode frame = 288 bytes —
+// S-mode traps never touch the vector fields, keep in sync with
+// arch/riscv64/trap.rs and sched::add_user_process):
 //   x[0..32]  @ offset 0..256   — 32 general-purpose registers
 //   sstatus   @ offset 256
 //   sepc      @ offset 264
 //   sscratch  @ offset 272      — user sp if from U-mode, else 0
 //   user_satp @ offset 280      — satp to switch to before sret (0 = no switch)
+//   v[0..31]  @ offset 288..800 — 32 vector registers × 16 B (VLEN=128)
+//   vtype     @ offset 800
+//   vl        @ offset 808
+//   vstart    @ offset 816
+//   vxsat     @ offset 824      — reserved, not saved in M0
 
     .section .text
     .globl trap_entry
@@ -134,7 +141,7 @@ trap_entry:
     csrr    t0, sscratch           # t0 = user_sp
     csrw    sscratch, zero         # clear sscratch
 
-    addi    sp, sp, -288
+    addi    sp, sp, -832           # U-mode frame carries the vector area
 
     # Save general-purpose registers
     sd      x1,  8(sp)
@@ -177,6 +184,34 @@ trap_entry:
     sd      t0,  272(sp)           # sscratch field = user_sp
     sd      zero, 280(sp)          # user_satp = 0: satp handled by trap_handler tail
 
+    # ── Save vector state (M0-V; skipped when the hart has no V ext) ──
+    la      t2, HAS_VECTOR_EXT
+    lw      t2, 0(t2)
+    beqz    t2, .Lno_vsave
+    # Target triple is riscv64gc (no V); lift the assembler's V gate for
+    # this block only. Runtime gate is HAS_VECTOR_EXT above.
+    .option push
+    .option arch, +v
+    li      t0, 3 << 9             # VS = Dirty: make vector instructions legal
+    csrs    sstatus, t0
+    vsetvli t0, zero, e64, m8, ta, ma
+    addi    t3, sp, 288
+    vse64.v v0,  (t3)              # LMUL=8 ⇒ each vse covers 8 regs (128 B)
+    addi    t3, sp, 400
+    vse64.v v8,  (t3)
+    addi    t3, sp, 512
+    vse64.v v16, (t3)
+    addi    t3, sp, 624
+    vse64.v v24, (t3)
+    csrr    t0, vtype
+    sd      t0, 800(sp)
+    csrr    t0, vl
+    sd      t0, 808(sp)
+    csrr    t0, vstart
+    sd      t0, 816(sp)
+    .option pop
+.Lno_vsave:
+
     # Call trap_handler(&mut TrapContext)
     mv      a0, sp
     call    trap_handler
@@ -184,6 +219,33 @@ trap_entry:
     # ── Return to U-mode ──
     .globl trap_return_user
 trap_return_user:
+
+    # ── Restore vector state (M0-V; BEFORE the sstatus restore, which would
+    # put back the user's own VS and could make vector insns illegal) ──
+    la      t2, HAS_VECTOR_EXT
+    lw      t2, 0(t2)
+    beqz    t2, .Lno_vrestore
+    ld      t0, 800(sp)
+    csrw    vtype, t0              # vtype write also resets vl on some impls
+    ld      t0, 808(sp)
+    csrw    vl, t0
+    ld      t0, 816(sp)
+    csrw    vstart, t0
+    .option push
+    .option arch, +v
+    li      t0, 3 << 9             # VS = Dirty: make the vector loads legal
+    csrs    sstatus, t0
+    vsetvli t0, zero, e64, m8, ta, ma
+    addi    t3, sp, 288
+    vle64.v v0,  (t3)
+    addi    t3, sp, 400
+    vle64.v v8,  (t3)
+    addi    t3, sp, 512
+    vle64.v v16, (t3)
+    addi    t3, sp, 624
+    vle64.v v24, (t3)
+    .option pop
+.Lno_vrestore:
 
     # Restore CSRs
     ld      t1, 264(sp)
@@ -244,8 +306,8 @@ trap_return_user:
     # sp still points to TrapContext on kernel stack.
     # sscratch holds user_sp.
 
-    # Pop the TrapContext frame
-    addi    sp, sp, 288            # sp = kernel_stack_top
+    # Pop the TrapContext frame (U-mode frame includes the vector area)
+    addi    sp, sp, 832            # sp = kernel_stack_top
 
     # Swap sp and sscratch via csrrw:
     #   tmp = sscratch (user_sp)   → returned to sp

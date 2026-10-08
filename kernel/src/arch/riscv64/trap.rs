@@ -32,6 +32,14 @@ pub struct TrapContext {
     pub sepc: usize,
     pub sscratch: usize,  // If from U-mode: contains user sp; else 0
     pub user_satp: usize, // Page table SATP to switch to before sret (0 = don't switch)
+    // ── Vector extension state (M0-V, saved only on the U-mode path) ──
+    // Offsets are consumed by trap_entry.S: keep in sync there and with
+    // sched::add_user_process (size_of::<TrapContext>() = 832).
+    pub v: [u128; 32], // @288, 32 vector registers × 16 B (VLEN=128)
+    pub vtype: usize,  // @800
+    pub vl: usize,     // @808
+    pub vstart: usize, // @816
+    pub vxsat: usize,  // @824 (reserved slot, not saved in M0)
 }
 
 impl TrapContext {
@@ -43,12 +51,36 @@ impl TrapContext {
             sepc: entry,
             sscratch: user_sp,
             user_satp: 0,
+            v: [0; 32],
+            vtype: 0,
+            vl: 0,
+            vstart: 0,
+            vxsat: 0,
         };
-        // Set sstatus: SPP=0 (return to U-mode), SPIE=1 (enable interrupts after sret)
-        ctx.sstatus = 0x20; // SPIE bit
+        // Set sstatus: SPP=0 (return to U-mode), SPIE=1 (enable interrupts
+        // after sret), VS=Initial (0b01) so the first vector instruction the
+        // task executes auto-promotes VS to Dirty and just works.
+        ctx.sstatus = 0x20 | (1 << 9); // SPIE | VS=Initial
         ctx.x[2] = kernel_sp; // kernel sp (used during trap handling)
         ctx
     }
+}
+
+/// 1 = the hart implements the V extension (misa.V); set once at boot by
+/// `detect_vector_ext()`. trap_entry.S branches on this before touching any
+/// vector instruction so non-RVV harts (and QEMU < 7.0) never execute them.
+#[unsafe(no_mangle)]
+pub static HAS_VECTOR_EXT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Probe misa.V (bit 21) once at boot and record it in HAS_VECTOR_EXT.
+pub fn detect_vector_ext() {
+    let misa = riscv::register::misa::read();
+    let has_v = misa.has_extension('V');
+    HAS_VECTOR_EXT.store(
+        if has_v { 1 } else { 0 },
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Get the address of the trap_return_user assembly label.
@@ -60,12 +92,17 @@ pub fn trap_return_user_addr() -> usize {
 
 /// Set up the trap vector.
 pub fn init() {
+    // stvec MUST be valid BEFORE detect_vector_ext() runs: misa is an
+    // M-mode CSR, so an S-mode read traps with illegal-instruction. With
+    // stvec armed the trap is skipped cleanly (illegal handler advances
+    // sepc); without it the trap vector is stale/zero and the hart loops.
     unsafe {
         stvec::write(stvec::Stvec::new(
             trap_entry as *const () as usize,
             stvec::TrapMode::Direct,
         ));
     }
+    detect_vector_ext();
 }
 
 /// Jump to user mode for the first time.

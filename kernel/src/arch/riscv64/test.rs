@@ -15,6 +15,7 @@ pub fn run_tests() {
     test_trap_context_size();
     test_trap_context_field_offsets();
     test_trap_context_register_array();
+    test_vector_roundtrip();
     test_sstatus_bits();
     test_sstatus_spie_mask();
     test_sie_timer_mask();
@@ -36,8 +37,9 @@ pub fn run_tests() {
 fn test_trap_context_size() {
     run_test("riscv64 trap_context_size", || {
         use super::trap::TrapContext;
-        // 32 GP regs × 8 + sstatus + sepc + sscratch + user_satp = 36 × 8 = 288 bytes
-        core::mem::size_of::<TrapContext>() == 288
+        // 288 B GP/CSR frame + 32 vector regs × 16 B (512) + vtype/vl/vstart/vxsat
+        // (32) = 832 bytes; 16-byte aligned so the vector save area is aligned.
+        core::mem::size_of::<TrapContext>() == 832
     });
 }
 
@@ -63,12 +65,91 @@ fn test_trap_context_register_array() {
             sepc: 0x1000,
             sscratch: 0x7FFFF000,
             user_satp: 0,
+            v: [0; 32],
+            vtype: 0,
+            vl: 0,
+            vstart: 0,
+            vxsat: 0,
         };
         // x[0] is always zero (ABI convention), x[1] = ra, x[2] = sp
         ctx.x.len() == 32 && ctx.sepc == 0x1000 && ctx.sscratch == 0x7FFFF000
     });
 }
 
+/// Vector save/restore round-trip, mirroring the exact sequences used in
+/// trap_entry.S (vsetvli e64,m8 + vse64/vle64 in 128 B groups). On harts
+/// without V (dev-box QEMU 6.2) the kernel gates all vector code on
+/// HAS_VECTOR_EXT == 0 and this sequence can never execute there, so we
+/// treat that as a clean environment skip (see docs/agent/vector.md §5).
+/// Run on a QEMU >= 7 host with `make test` to exercise the real path.
+fn test_vector_roundtrip() {
+    run_test("riscv64 vector_roundtrip", || {
+        use super::trap::HAS_VECTOR_EXT;
+        use core::sync::atomic::Ordering;
+        if HAS_VECTOR_EXT.load(Ordering::Relaxed) == 0 {
+            return true; // environment skip: hart has no V extension
+        }
+        let mut saved = [0u128; 32];
+        let mut restored = [0u128; 32];
+        unsafe {
+            core::arch::asm!(
+                ".option push",
+                ".option arch, +v",
+                "li      t0, 3 << 9",          // sstatus.VS = Dirty
+                "csrs    sstatus, t0",
+                "vsetvli t0, zero, e64, m8, ta, ma",
+                // Broadcast a distinctive pattern into v0, v8, v16, v24 groups
+                "li      t3, 0x5a5a",
+                "vmv.v.x v0,  t3",
+                "li      t3, 0xa5a5",
+                "vmv.v.x v8,  t3",
+                "li      t3, 0x0f0f",
+                "vmv.v.x v16, t3",
+                "li      t3, 0x3c3c",
+                "vmv.v.x v24, t3",
+                // save (same layout as trap_entry.S)
+                "addi    t3, {save}, 0",
+                "vse64.v v0,  (t3)",
+                "addi    t3, {save}, 128",
+                "vse64.v v8,  (t3)",
+                "addi    t3, {save}, 256",
+                "vse64.v v16, (t3)",
+                "addi    t3, {save}, 384",
+                "vse64.v v24, (t3)",
+                // scribble all groups
+                "vsetvli t0, zero, e8, m1, ta, ma",
+                "vmv.v.i v0,  0",
+                "vmv.v.i v8,  0",
+                "vmv.v.i v16, 0",
+                "vmv.v.i v24, 0",
+                // restore from the buffer
+                "vsetvli t0, zero, e64, m8, ta, ma",
+                "addi    t3, {save}, 0",
+                "vle64.v v0,  (t3)",
+                "addi    t3, {save}, 128",
+                "vle64.v v8,  (t3)",
+                "addi    t3, {save}, 256",
+                "vle64.v v16, (t3)",
+                "addi    t3, {save}, 384",
+                "vle64.v v24, (t3)",
+                // dump restored values for comparison
+                "addi    t3, {out}, 0",
+                "vse64.v v0,  (t3)",
+                "addi    t3, {out}, 128",
+                "vse64.v v8,  (t3)",
+                "addi    t3, {out}, 256",
+                "vse64.v v16, (t3)",
+                "addi    t3, {out}, 384",
+                "vse64.v v24, (t3)",
+                ".option pop",
+                save = in(reg) saved.as_mut_ptr(),
+                out = in(reg) restored.as_mut_ptr(),
+                out("t0") _, out("t3") _,
+            );
+        }
+        saved == restored
+    });
+}
 // ────────────────────────────────────────────────────────────────────
 // CSR / SSTATUS tests
 // ────────────────────────────────────────────────────────────────────
