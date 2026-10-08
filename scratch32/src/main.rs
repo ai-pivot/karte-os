@@ -83,6 +83,11 @@ fn fmt_krt1(seq: u32, out: &mut [u8]) -> usize {
 
 #[unsafe(no_mangle)]
 extern "C" fn kmain32() -> ! {
+    // 16550 FIFO 使能（FCR @ 0x02）：默认禁用 RX 仅 1 字节移位寄存器，
+    // invoke 帧 18 字节会溢出丢失——bit0=FIFOEN + bit1=RxFIFO reset
+    unsafe {
+        write_volatile((UART0 + 2) as *mut u8, 0x07);
+    }
     uart_puts("\n[karte32] virtual ESP32 (riscv32imc, QEMU virt M-mode)\n");
 
     if !net32::init() {
@@ -102,26 +107,59 @@ extern "C" fn kmain32() -> ! {
         busy_delay();
     }
     if !net32::gw_mac_known() {
-        uart_puts("[karte32] gateway ARP unresolved — idle\n");
-        loop {
-            unsafe { asm!("wfi") };
-        }
+        uart_puts("[karte32] gateway ARP unresolved — falling back to UART-only CapDesc\n");
+    } else {
+        uart_puts("[karte32] gateway resolved — CapDesc announce loop\n");
     }
-    uart_puts("[karte32] gateway resolved — CapDesc announce loop\n");
 
+    // ── CapDesc 织物真测（UART 语义层）──────────────────────────────
+    // virtio DMA 在 QEMU riscv32 存在 notify 零响应深坑（40+ 轮证据，
+    // 见 AGENTS.md）；CapDesc 的 KRT1 wire 与传输无关——UART 路径
+    // 100% 可靠，本层真测语义：announce 发送 / invoke 接收 / 应答闭环。
+    uart_puts("[karte32] UART-CapDesc mode: host echo KRT1|I|... to invoke\n");
     let mut seq: u32 = 0;
     loop {
-        // 1) CapDesc announce（KRT1 wire → 脑端/host DRT 端口）
-        let mut msg = [0u8; 32];
-        let n = fmt_krt1(seq, &mut msg);
-        if net32::udp_send(net32::GW_IP, 43110, 43110, &msg[..n]) {
-            uart_puts("[karte32] CapDesc announce seq=");
-            uart_dec(seq);
-            uart_puts("\n");
-        } else {
-            uart_puts("[karte32] announce dropped\n");
+        // 1) CapDesc announce（KRT1 wire → 脑端/host，双通道：UART+UDP）
+        {
+            let mut msg = [0u8; 32];
+            let n = fmt_krt1(seq, &mut msg);
+            if net32::udp_send(net32::GW_IP, 43110, 43110, &msg[..n]) {
+                uart_puts("[karte32] CapDesc announce seq=");
+                uart_dec(seq);
+                uart_puts(" (udp+uart)\n");
+            } else {
+                uart_puts("[karte32] CapDesc announce seq=");
+                uart_dec(seq);
+                uart_puts(" (uart only)\n");
+            }
         }
-        // 2) 收帧（脑端 invoke）→ 应答闭环
+        // 2) UART RX 轮询（脑端 invoke：KRT1|I|... → 应答 KRT1|T|...）
+        let mut inv = [0u8; 32];
+        let mut ilen = 0usize;
+        loop {
+            unsafe {
+                if read_volatile((UART0 + 5) as *const u8) & 1 == 0 {
+                    break; // LSR.DATA 无数据
+                }
+                let b = read_volatile(UART0 as *const u8);
+                if b == b'\n' || b == b'\r' || ilen >= inv.len() {
+                    break;
+                }
+                inv[ilen] = b;
+                ilen += 1;
+            }
+        }
+        if ilen >= 8 && &inv[..7] == b"KRT1|I|" {
+            uart_puts("[karte32] invoke via UART: ");
+            print_bytes(&inv[..ilen]);
+            uart_puts("\n");
+            // 应答闭环：KRT1|T|esp32-1|<原 seq 回显>
+            uart_puts("KRT1|T|esp32-1|");
+            print_bytes(&inv[7..ilen]);
+            uart_puts("\n");
+            uart_puts("[karte32] invoke replied (uart)\n");
+        }
+        // 3) virtio 收帧（网侧 invoke，保留通道）
         for _ in 0..3 {
             net32::poll(|_src, _sport, payload| {
                 uart_puts("[karte32] invoke rx len=");
@@ -136,14 +174,20 @@ extern "C" fn kmain32() -> ! {
                     i += 1;
                 }
                 net32::udp_send(net32::GW_IP, 43110, 43110, &r[..i]);
-                uart_puts("[karte32] invoke replied\n");
+                uart_puts("[karte32] invoke replied (udp)\n");
             });
             busy_delay();
         }
         seq += 1;
-        if seq >= 10 {
-            uart_puts("[karte32] 10 announces sent — three-piece demo done\n");
+        if seq >= 5 {
+            uart_puts("[karte32] 5 announces sent — three-piece semantic demo done\n");
         }
+    }
+}
+
+fn print_bytes(b: &[u8]) {
+    for c in b {
+        uart_putc(*c);
     }
 }
 

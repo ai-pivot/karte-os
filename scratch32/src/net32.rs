@@ -180,6 +180,8 @@ fn setup_queue(base: usize, queue_index: u32, is_rx: bool) {
 }
 
 /// 探测 8 个 slot 找 DeviceID=1（net），完成 legacy 初始化。
+/// 序列与主内核（kernel/src/driver/net.rs）严格一致：
+/// RESET(0)→ACK→DRIVER→features→FEATURES_OK(校验)→GUEST_PAGE_SIZE→queues→DRIVER_OK
 pub fn init() -> bool {
     for slot in 0..VIRTIO_SLOTS {
         let base = VIRTIO_BASE + slot * 0x1000;
@@ -196,18 +198,20 @@ pub fn init() -> bool {
         wr(base, REG_QUEUE_SEL, 0);
         uart_dec(rd(base, REG_QUEUE_NUM_MAX));
         uart_puts("\n");
+        // 与主内核一致：先 RESET（status=0）再 ACK
+        wr(base, REG_STATUS, 0);
         wr(base, REG_STATUS, S_ACK);
         wr(base, REG_STATUS, S_ACK | S_DRIVER);
         // 不协商任何 feature（0）：最小驱动，帧不带 offload
         let _ = rd(base, REG_DEV_FEATURES);
         wr(base, REG_DRV_FEATURES, 0);
-        // legacy 必需：GuestPageSize（0x028）= 4096（vring 页单位）
-        wr(base, 0x028, 4096);
         wr(base, REG_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK);
         if rd(base, REG_STATUS) & S_FEATURES_OK == 0 {
             uart_puts("[net32] FEATURES_OK failed\n");
             return false;
         }
+        // legacy 必需：GuestPageSize（0x028）= 4096（FEATURES_OK 之后，与主内核同序）
+        wr(base, 0x028, 4096);
         unsafe {
             TX = Some(TxRing2 {
                 avail_idx: 0,
