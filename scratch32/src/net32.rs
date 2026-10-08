@@ -174,6 +174,8 @@ fn setup_queue(base: usize, queue_index: u32, is_rx: bool) {
         // legacy：页对齐 vring，PFN = 物理地址 >> 12
         wr(base, REG_QUEUE_ALIGN, 4096);
         wr(base, REG_QUEUE_PFN, mem_addr >> 12);
+        // 与主内核序列一致：QueueReady（0x044，legacy 设备忽略但保持 diff-free）
+        wr(base, 0x044, 1);
     }
 }
 
@@ -193,6 +195,8 @@ pub fn init() -> bool {
         // 不协商任何 feature（0）：最小驱动，帧不带 offload
         let _ = rd(base, REG_DEV_FEATURES);
         wr(base, REG_DRV_FEATURES, 0);
+        // legacy 必需：GuestPageSize（0x028）= 4096（vring 页单位）
+        wr(base, 0x028, 4096);
         wr(base, REG_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK);
         if rd(base, REG_STATUS) & S_FEATURES_OK == 0 {
             uart_puts("[net32] FEATURES_OK failed\n");
