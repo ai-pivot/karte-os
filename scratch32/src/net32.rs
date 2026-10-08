@@ -312,6 +312,9 @@ pub fn recv_frame(out: &mut [u8]) -> Option<usize> {
             return None;
         }
         let ist = rd(base, REG_INT_STATUS);
+        uart_puts("[net32] int_status=");
+        uart_dec(ist);
+        uart_puts("\n");
         if ist != 0 {
             wr(base, REG_INT_ACK, ist);
         }
