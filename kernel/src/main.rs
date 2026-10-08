@@ -288,7 +288,7 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             #[cfg(target_arch = "x86_64")]
             {
                 process::Process::from_elf(
-                    include_bytes!("../../user/target/x86_64/shell.elf"),
+                    include_bytes!("../../user/shell.elf"),
                     alloc::vec![b"shell".to_vec()],
                     alloc::vec![],
                 )

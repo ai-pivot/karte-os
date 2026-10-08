@@ -11,6 +11,10 @@ fn main() {
             let memory_x = include_bytes!("memory.x");
             fs::write(out_dir.join("memory.x"), memory_x).unwrap();
             println!("cargo:rustc-link-search={}", out_dir.display());
+            println!(
+                "cargo:rustc-link-arg=-T{}",
+                out_dir.join("memory.x").display()
+            );
             println!("cargo:rerun-if-changed=memory.x");
         }
         "x86_64" => {

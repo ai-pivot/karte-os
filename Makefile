@@ -167,13 +167,13 @@ test:
 	@cd user && $(MAKE) ARCH=riscv64 clean > /dev/null 2>&1 && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
 	@rm -f $(KERNEL_RV)
 	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
-	cargo build --release -p karte-os-kernel --features test_mode
+	cargo +nightly build --release -p karte-os-kernel --features test_mode --target riscv64gc-unknown-none-elf -Z build-std=core,alloc
 	@bash scripts/run-tests.sh
 	@echo ""
 	@echo "Restoring normal kernel build..."
 	@rm -f $(KERNEL_RV)
 	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
-	@cargo build --release -p karte-os-kernel > /dev/null 2>&1
+	@cargo +nightly build --release -p karte-os-kernel --target riscv64gc-unknown-none-elf > /dev/null 2>&1
 
 ## Run x86_64 integration tests (103 tests)
 test-x86:

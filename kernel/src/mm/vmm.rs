@@ -951,6 +951,7 @@ pub fn run_tests() {
         true
     });
 
+    #[cfg(target_arch = "x86_64")]
     crate::test::run_test("vmm_huge_page_split_preserves_data", || {
         // Simulate copy_kernel_mappings: set up 2MB huge page identity mapping,
         // then map code frames on top (splitting the huge page),
@@ -1053,6 +1054,7 @@ pub fn run_tests() {
         true
     });
 
+    #[cfg(target_arch = "x86_64")]
     crate::test::run_test("vmm_split_does_not_clobber_sibling_pages", || {
         // After a 2MB huge page is split into 4KB entries, verify that
         // pages we DID NOT explicitly map still have valid identity mappings.
@@ -1278,7 +1280,11 @@ pub fn run_tests() {
         match result {
             super::page_table::WalkResult::MappedHuge { size, level, .. } => {
                 if size != 2 * 1024 * 1024 {
-                    crate::console_println!("[FAIL] huge size={} expected={}", size, 2*1024*1024);
+                    crate::console_println!(
+                        "[FAIL] huge size={} expected={}",
+                        size,
+                        2 * 1024 * 1024
+                    );
                     false
                 } else if level != 1 {
                     crate::console_println!("[FAIL] huge level={} expected=1", level);
