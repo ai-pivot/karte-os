@@ -32,6 +32,13 @@ unsafe impl core::alloc::GlobalAlloc for IrqSafeHeap {
         let irq_was_enabled = crate::arch::platform::irq_save();
         let result = self.inner.lock().allocate_first_fit(layout);
         crate::arch::platform::irq_restore(irq_was_enabled);
+        if result.is_err() {
+            crate::console_println!(
+                "[alloc] FAIL size={} align={}",
+                layout.size(),
+                layout.align()
+            );
+        }
         result.map_or(core::ptr::null_mut(), |p| p.as_ptr())
     }
 

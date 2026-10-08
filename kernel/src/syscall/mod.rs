@@ -73,7 +73,10 @@ pub const SYS_SYSLOG: usize = 81; // syslog(buf, len, offset) → bytes_read
 pub const SYS_SETPRIORITY: usize = 82; // setpriority(pid, class_code, level) → 0
 pub const SYS_GETSCHEDULER: usize = 83; // getscheduler(pid) → (code<<16)|level, or -1
 pub const LINUX_WAIT4: usize = 84; // internal: Linux wait4(pid,&status,opt,rusage) dedicated handler
-pub const LINUX_FCNTL: usize = 86; // internal: Linux fcntl(fd,cmd,arg) dedicated handler
+// NOTE: Linux fcntl(72) needs NO dedicated int-0x80 handler — busybox and
+// friends issue fcntl via the `syscall` instruction, which routes to
+// linux_fcntl() in dispatch_linux_syscall (72). A dedicated translate()
+// interception here would collide with native SENDTO(72) for no benefit.
 pub const LINUX_EXECVE: usize = 85; // internal: Linux execve(path,argv,envp) dedicated handler
 
 // ─── Linux compatibility syscalls (translated from Linux x86_64 numbers) ──
@@ -1626,7 +1629,6 @@ fn dispatch_inner(id: usize, args: [usize; 6]) -> isize {
         SYS_GETSCHEDULER => sys_getscheduler(args[0]),
         LINUX_WAIT4 => sys_wait4(args[0], args[1], args[2], args[3]),
         LINUX_EXECVE => sys_execve_linux(args[0], args[1], args[2]),
-        LINUX_FCNTL => sys_fcntl_linux(args[0], args[1], args[2]),
 
         // Linux compatibility syscalls (translated from x86_64 Linux numbers)
         LINUX_CLONE => linux_clone(args[0], args[1], args[2], args[3], args[4]),
@@ -2451,6 +2453,27 @@ fn linux_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     use crate::driver::fs::*;
 
     match cmd {
+        0 | 1030 => {
+            // F_DUPFD / F_DUPFD_CLOEXEC: duplicate fd to the smallest free
+            // fd >= arg (arg <= 2 means 0). Pipe refs are incremented per-end.
+            let min = if arg > 2 { arg } else { 0 };
+            crate::process::with_fd_table(|fd_table| {
+                let desc = match fd_table.get(fd) {
+                    Some(d) => d.clone(),
+                    None => return -9, // EBADF
+                };
+                for cand in min..MAX_FDS {
+                    if fd_table.get(cand).is_none() {
+                        if let Some(pipe_id) = desc.pipe_id {
+                            inc_pipe_ref_for(&desc.fd_type, pipe_id);
+                        }
+                        fd_table.set_fd(cand, desc);
+                        return cand as isize;
+                    }
+                }
+                -24 // EMFILE
+            })
+        }
         F_GETFD => {
             // Return close-on-exec flag. We don't track this yet, return 0.
             0
@@ -4415,51 +4438,8 @@ fn sys_execve_linux(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize 
     exec_by_name(name, argv_ptr, envp_ptr)
 }
 
-/// Linux fcntl(fd, cmd, arg) — P1.2. Minimal command set for shells and
-/// busybox: F_DUPFD / F_DUPFD_CLOEXEC duplicate the fd (pipe refcounts
-/// incremented per-end like sys_dup2); F_GETFD/F_SETFD accept CLOEXEC
-/// tracking (untracked, validates the fd); F_GETFL reports O_RDWR;
-/// F_SETFL accepts O_NONBLOCK/O_APPEND as an untracked no-op.
-fn sys_fcntl_linux(fd: usize, cmd: usize, arg: usize) -> isize {
-    const F_DUPFD: usize = 0;
-    const F_GETFD: usize = 1;
-    const F_SETFD: usize = 2;
-    const F_GETFL: usize = 3;
-    const F_SETFL: usize = 4;
-    const F_DUPFD_CLOEXEC: usize = 1030;
-    match cmd {
-        F_GETFD | F_SETFD | F_GETFL | F_SETFL => {
-            crate::process::with_fd_table(|t| {
-                if t.get(fd).is_some() {
-                    if cmd == F_GETFL { 0o2 } else { 0 } // O_RDWR / success
-                } else {
-                    ERR_NOENT
-                }
-            })
-        }
-        F_DUPFD | F_DUPFD_CLOEXEC => {
-            let min = if arg > 2 { arg } else { 0 };
-            crate::process::with_fd_table(|t| {
-                let desc = match t.get(fd) {
-                    Some(d) => d.clone(),
-                    None => return ERR_NOENT,
-                };
-                for cand in min..MAX_FDS {
-                    if t.get(cand).is_none() {
-                        if let Some(pipe_id) = desc.pipe_id {
-                            inc_pipe_ref_for(&desc.fd_type, pipe_id);
-                        }
-                        t.set_fd(cand, desc);
-                        return cand as isize;
-                    }
-                }
-                -24 // -EMFILE
-            })
-        }
-        _ => ERR_INVAL,
-    }
-}
-
+/// Linux fcntl(fd, cmd, arg) — see linux_fcntl() (the single implementation
+/// shared with the `syscall`-instruction path; P1.2 merged the duplicate).
 /// Syscall 60: Send a signal to a process.
 /// `pid` = target process ID, `sig` = signal number.
 /// Currently only supports SIGINT (2) which terminates the target.
@@ -4765,8 +4745,11 @@ pub const TERM_ECHO_OFF: usize = 3; // Disable echo
 ///   cmd=TCSETS, arg=TERM_ECHO_OFF: Disable echo
 ///   cmd=TIOCGWINSZ: Returns (cols << 16 | rows) packed into usize
 pub fn sys_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
-    // Log all ioctl calls for debugging TUI init
-    if fd != 0 && fd != 1 {
+    // Log all ioctl calls for debugging TUI init.
+    // fd 0/1/2 (stdin/stdout/stderr) all refer to the console tty — busybox
+    // ash probes its controlling terminal via stderr (fd 2), so accept all
+    // three; anything else has no tty semantics.
+    if fd < 0 || fd > 2 {
         return ERR_INVAL;
     }
 

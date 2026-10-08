@@ -238,17 +238,6 @@ fn translate_x86_64(id: usize, args: [usize; 6]) -> Option<Translation> {
             args: [args[0], args[1], args[2], args[3], 0, 0],
         });
     }
-    // Linux fcntl(72) collides with KarteOS native SENDTO(72): intercept
-    // BEFORE the native-number passthrough (shell/busybox use fcntl to
-    // manage CLOEXEC and duplicate fds). NOTE: native dup2(33) = SYS_EXEC_FD
-    // is deliberately NOT intercepted here — shell pipelines depend on it;
-    // the Linux `syscall`-instruction path handles Linux dup2 separately.
-    if id == L_FCNTL {
-        return Some(Translation::Dispatch {
-            karte_nr: 86, // super::LINUX_FCNTL dedicated handler
-            args: [args[0], args[1], args[2], 0, 0, 0],
-        });
-    }
     if KARTEOS_NATIVE_NUMBERS.contains(&id) {
         return None;
     }
