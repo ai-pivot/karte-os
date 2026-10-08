@@ -49,6 +49,9 @@ vadd.elf: vadd.rs syscall.rs $(LD_SCRIPT)
 llm.elf: llm.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -C opt-level=3 -o $@ llm.rs
 
+toolserver.elf: toolserver.rs syscall.rs $(LD_SCRIPT)
+	$(RUSTC) $(RUSTFLAGS_USER) -C opt-level=1 -o $@ toolserver.rs
+
 cat.elf: cat.rs syscall.rs $(LD_SCRIPT)
 	$(RUSTC) $(RUSTFLAGS_USER) -o $@ cat.rs
 
