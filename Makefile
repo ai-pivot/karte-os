@@ -82,7 +82,7 @@ _build-riscv-kernel:
 	@cd user && $(MAKE) ARCH=riscv64 clean > /dev/null 2>&1 && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
 	@rm -f $(KERNEL_RV)
 	@rm -rf target/$(TARGET_RV)/release/.fingerprint/karte-os-kernel-*
-	cargo build --release -p karte-os-kernel
+	cargo build --release -p karte-os-kernel --target $(TARGET_RV)
 
 # Build x86_64 user programs + kernel + ISO
 _build-x86-iso:
@@ -185,7 +185,7 @@ test-all: test test-x86
 ## Build test kernel only
 build-test:
 	@cd user && $(MAKE) ARCH=riscv64 > /dev/null 2>&1
-	cargo build --release -p karte-os-kernel --features test_mode
+	cargo build --release -p karte-os-kernel --features test_mode --target $(TARGET_RV)
 
 ## Boot test (verify shell starts)
 boot-test: _build-riscv-kernel disk.img
