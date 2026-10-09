@@ -1,0 +1,15 @@
+[package]
+name = "karte-a-node"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[[bin]]
+name = "karte-a-node"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

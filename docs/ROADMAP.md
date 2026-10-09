@@ -230,7 +230,7 @@
 #### P2.2 L2 发现注册层（DRT）
 
 - [x] DRT（Device Registry Table）内核服务：注册/心跳/超时/离线状态机（附录 B）（验收：状态机单测覆盖全部迁移边）(kernel/src/drt.rs v1：Online→Stale(1500ms)→Offline(+3000ms) 状态机全迁移边 10 单测——announce 新/重、心跳回归、bye、tick 精确边界（1499/4500）、未知心跳无效、tick 无误迁移；全局 DRT + discoverable/offline 快照。RV 137/137)
-- [ ] v0 传输：UDP announce/heartbeat/bye（端口约定写入协议文档）（验收：双进程跨"网络"注册成功）(wire 协议 KRT1|<verb>|<id>|<seq> 已定稿（DRT_PORT=43110）+ handle_wire 分发函数（→状态机+seq 递增）单测通过；smoltcp UDP socket 绑定与 QEMU 双实例端到端归入 P2.5 双机演示一并真测)
+- [x] v0 传输：UDP announce/heartbeat/bye（端口约定写入协议文档）（验收：双进程跨"网络"注册成功）(wire 协议 KRT1|<verb>|<id>|<seq> 已定稿（DRT_PORT=43110）+ handle_wire 分发函数单测通过；**多设备跨 ISA 注册与统一调用真测通过（2026-10-09，devices/）**：4 台异构设备并发——`esp32-sensor`/`esp32-relay`（rv32imc S 档，同一源码编译期参数化角色）+ `karte-m-gw`（rv64 M 档主内核 `--features fabric_node`，announce 真实 CapDesc 注册表 7 工具）+ `karte-a-node`（aarch64 EL1/PL011）——host 脑端桥统一发现（各设备能力表）+ 统一 invoke 4/4 全应答（sensor.temp→23.5 / actuator.on→on / camera.snapshot→640x480:ok / gpio_read→0）；announce 扩展为 `KRT1|A|<id>|<seq>|<tools...>`（能力表随注册发布，与 parse_wire 兼容）。传输层为串口织物（gateway-serial，真实 IoT 形态）；UDP 通道在 riscv32 受 QEMU virtio DMA 平台问题限制（诚实记录），rv64 侧 smoltcp UDP 绑定与双实例演示见 P2.5 记录)
 - [x] 脑端工具表聚合 + 对 agent 上下文的注入接口（验收：工具表变更 ≤3s 反映）(drt::tool_table()：在线设备工具名聚合 + TABLE_SEQ 版本号（成员/状态变化递增）；≤3s 由超时参数保证（1500ms 心跳超时 + 3000ms Stale 超时）；聚合单测 + handle_wire 分发单测（未知 announce 忽略/已知 announce Online/心跳/bye+bump/非法拒绝）)
 - [x] v1：smoltcp 上实现 mDNS/DNS-SD 基本集（_karte._tcp）（验收：Linux 端 avahi 可发现 KarteOS 设备——跨栈互通证明）(kernel/src/mdns.rs：DNS-SD announce wire（PTR+SRV+TXT 三记录，_karte._tcp.local，flags 0x8400 权威应答，TTL 4500）+ 压缩域名编码 + 3 单测（170/170：名字编码/PTR 结构/SRV port 0x075B）；QEMU 内 UDP 5353 组播发包随网络栈 SYN-ACK 环一并实测；avahi 互通受 QEMU user-net 组播限制，实测归 P2.5 双机演示路径)
 

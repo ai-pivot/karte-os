@@ -19,6 +19,8 @@ pub mod capauth;
 pub mod driver;
 pub mod drt;
 pub mod env;
+#[cfg(feature = "fabric_node")]
+pub mod fabric_serial;
 pub mod kernel_log;
 pub mod lang_items;
 pub mod mcp_cb;
@@ -309,6 +311,14 @@ unsafe extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
         crate::console_println!("[init] Initializing scheduler...");
         sched::init();
+
+        // ── fabric_node 设备模式（M 档网关节点）──────────────────────
+        // 内核作为 CapDesc 织物节点运行（专用固件模式，不启动 shell）
+        #[cfg(feature = "fabric_node")]
+        {
+            crate::console_println!("[init] fabric_node mode — CapDesc gateway device");
+            crate::fabric_serial::run_device_loop();
+        }
 
         // ── Load user program ──
         crate::console_println!("[init] Loading user program...");

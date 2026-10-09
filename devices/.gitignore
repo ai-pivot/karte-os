@@ -1,0 +1,3 @@
+artifacts/
+mcu-rv32/target/
+aarch64-node/target/

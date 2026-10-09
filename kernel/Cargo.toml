@@ -12,6 +12,8 @@ klog_trace = []
 klog_debug = []
 # Dual-machine demo: this node is node B (ip 10.0.2.16, device-id prefix "b")
 net_node_b = []
+# Multi-device fabric: run the kernel as a CapDesc gateway device (M-tier node)
+fabric_node = []
 
 [dependencies]
 linked_list_allocator = "0.10"

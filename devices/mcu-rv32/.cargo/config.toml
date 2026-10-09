@@ -1,0 +1,8 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tlink32.ld",
+    "-C", "link-arg=-zmax-page-size=4096",
+]
