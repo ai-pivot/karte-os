@@ -247,7 +247,7 @@
 
 #### P2.5 脑端与演示（M2）
 
-- [x] brain 极简 agent 循环：读工具表 → 决策（规则引擎 v0；LLM v1 复用 M1 推理栈）→ 调用 → 结果回填（验收：规则脑完成跨设备任务：A 设备写文件 → B 设备定时读出）(kernel/src/brain.rs：Brain 规则引擎（demo_script 跨设备任务脚本——ExpectOnline→gpio_write→gpio_read 回读验证；complete_step 回填推进/失败标记不推进）+ LocalQueue 肢体本地队列（脑下发/断脑继续执行/恢复回报 report）；LLM v1 挂 M1 推理栈接口已预留。5 单测：脚本推进回填/失败不推进/断脑继续执行+回报/在线状态标志/未知设备失败)
+- [x] brain 极简 agent 循环：读工具表 → 决策（规则引擎 v0；LLM v1 复用 M1 推理栈）→ 调用 → 结果回填（验收：规则脑完成跨设备任务：A 设备写文件 → B 设备定时读出）(kernel/src/brain.rs：Brain 规则引擎（demo_script 跨设备任务脚本——ExpectOnline→gpio_write→gpio_read 回读验证；complete_step 回填推进/失败标记不推进）+ LocalQueue 肢体本地队列（脑下发/断脑继续执行/恢复回报 report）；LLM v1 挂 M1 推理栈接口已预留。5 单测：脚本推进回填/失败不推进/断脑继续执行+回报/在线状态标志/未知设备失败；**LLM v1 云端接入真测完成（2026-10-09，devices/bridge/llm_brain.py）**：4 台异构设备 16 个 CapDesc 能力注入云端大模型 function-calling 工具集，模型自主多轮决策驱动「读温湿度→条件判断→开继电器→拍快照」跨 3 台设备（rv32imc×2+aarch64）因果联动，4/4 tool call 真实执行（`LLM FABRIC OK`）；模型运行在云端（deepseek-v4-flash），设备跑在 QEMU)
 - [ ] **双机演示**：QEMU 双实例 + 发现广播，脑自动发现 ≥5 工具、完成端到端任务（验收：演示脚本一键复现，录屏/日志入库）(脚本 scripts/demo-dual.sh 一键复现：双内核（net_node_b feature → 10.0.2.16/prefix b）+ QEMU socket-netdev 互联（UDP 与 TCP 隧道双模式）；内核侧 DRT UDP 全链路集成（bind 43110/单播 announce/handle_wire synthetic 远端登记）已落地且 159 单测全绿。**限制（诚实记录）：QEMU 6.2 socket-netdev 跨实例帧互通实测未达**（UDP 模式实为 multicast 专用；TCP 隧道模式 A/B rx 均为 0，内核侧 send 无错误、bind/poll 正常）——需 host bridge/TAP 或 QEMU 7+ 复测，本地链路以单测为准)
 - [x] **断脑自治**：杀掉脑 30s，肢体按缓存策略继续执行预置任务，脑恢复后状态回报（验收：演示脚本 + 日志）(brain.rs LocalQueue：heartbeat(false) 标记脑离线 → tick() 断脑自治核心（brain_online==false 也继续执行缓存任务）→ heartbeat(true) 恢复时 Done 任务标记 Reported → report() 回报结果清单（id+result）；单测覆盖离线执行+恢复回报全链路。演示脚本随双机演示项一并入库)
 - **协议文档 `docs/design/mcp-device-fabric.md` 定稿**：见 docs/design/mcp-device-fabric.md（v1，与 capability/drt/mcp_cb/capauth/brain 实现一一对应；附录 A/B 抽离至此）

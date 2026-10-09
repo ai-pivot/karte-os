@@ -82,8 +82,12 @@ for d in "${DEVICES[@]}"; do
   launch "$id" "$art" "$mach"
 done
 
-# 脑端桥：统一发现 + 统一调用
-python3 "$ROOT/devices/bridge/fabric_brain.py" "$SOCKDIR" "${#DEVICES[@]}" "" "$DEADLINE"
+# 脑端：FABRIC_BRAIN=fabric（确定性脚本桥）| llm（云端 LLM function calling）
+if [ "${FABRIC_BRAIN:-fabric}" = "llm" ]; then
+  python3 "$ROOT/devices/bridge/llm_brain.py" "$SOCKDIR" "${#DEVICES[@]}"
+else
+  python3 "$ROOT/devices/bridge/fabric_brain.py" "$SOCKDIR" "${#DEVICES[@]}" "" "$DEADLINE"
+fi
 RC=$?
 echo "[fabric] bridge rc=$RC"
 exit $RC

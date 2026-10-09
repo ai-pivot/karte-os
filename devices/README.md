@@ -48,6 +48,36 @@ devices/run-fabric.sh 60
 [brain] FABRIC OK: 4 devices registered, 4 unified invocations answered
 ```
 
+## AI 脑端 —— 云端 LLM 的 tool call（真测 C）
+
+`devices/bridge/llm_brain.py` 把设备的 16 个 CapDesc 能力注入**云端大模型**的
+function-calling 工具集；模型自主决策 → 桥经 KRT1 路由到对应设备 → tool result
+回填 → 多轮直到给出最终回答。**模型跑在云端（不在设备上）**，设备跑在 QEMU 里。
+
+```bash
+FABRIC_BRAIN=llm devices/run-fabric.sh 60     # 默认任务：现场巡逻联动
+```
+
+实测输出（deepseek-v4-flash @ api.deepseek.com）：
+
+```
+[llm] fabric ready: 4 devices, 16 tools injected into model context
+[llm] turn 0: model decided -> sensor_temp (device=esp32-sensor tool=sensor.temp)
+[llm-fabric] result <- esp32-sensor tool=sensor.temp result=23.5
+[llm] turn 0: model decided -> sensor_humidity (device=esp32-sensor tool=sensor.humidity)
+[llm-fabric] result <- esp32-sensor tool=sensor.humidity result=41
+[llm] turn 1: model decided -> actuator_on (device=esp32-relay tool=actuator.on)
+[llm-fabric] result <- esp32-relay tool=actuator.on result=on
+[llm] turn 1: model decided -> camera_snapshot (device=karte-a-node tool=camera.snapshot)
+[llm-fabric] result <- karte-a-node tool=camera.snapshot result=640x480:ok
+[llm] final answer: 汇报：本次巡逻读取到环境温度 23.5℃、湿度 41%，两者均高于阈值
+（20℃/40%），因此我打开了继电器（返回 on）……依据是设备实时读数满足联动条件。
+[llm] LLM FABRIC OK: 4 devices, 4 tool calls executed by the model
+```
+
+**关键**：模型的决定**依赖设备返回值**（23.5>20 且 41>40 才开继电器），跨 3 台
+不同 ISA 的设备完成因果联动——「脑在云端、肢体在端侧、能力出厂即工具」的完整闭环。
+
 ## 织物协议（KRT1，与 `kernel/src/drt.rs` 同构）
 
 ```
